@@ -12,6 +12,7 @@ aerugo-formats.workspace = true
 aerugo-vfs.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+glam.workspace = true
 
 [lints]
 workspace = true

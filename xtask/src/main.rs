@@ -40,6 +40,15 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Fit how PS2 motion channels map onto an HD skeleton (rotation order, translation scale).
+    MotionFit {
+        /// HD model archive path.
+        model: String,
+        /// Motion group archive path.
+        mgrp: String,
+    },
+    /// Parse every motion group of both games.
+    CheckMotions,
     /// Count vertex stream layouts, primitive and index types over all model clusters.
     ModelCensus,
     /// Print a Phyre cluster: header, instance lists and every object's fields.
@@ -63,6 +72,8 @@ fn main() -> Result<()> {
             check_phyre(&install, every.max(1), verbose, threads)
         }
         Command::ModelCensus => model_census(&install),
+        Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
+        Command::CheckMotions => check_motions(&install),
         Command::DumpPhyre { path, class } => dump_phyre(&install, &path, class.as_deref()),
     }
 }
@@ -440,6 +451,111 @@ fn model_census(install: &Install) -> Result<()> {
     }
     for (k, v) in counts {
         println!("{v:>8}  {k}");
+    }
+    Ok(())
+}
+
+fn motion_fit(install: &Install, model: &str, mgrp: &str) -> Result<()> {
+    use aerugo_formats::motion::MotionGroup;
+    use aerugo_formats::phyre::Cluster;
+    use glam::{EulerRot, Mat3, Mat4, Vec3};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let c = Cluster::parse(vfs.read(model)?)?;
+    let m = aerugo_formats::mesh::read_model(&c)?;
+    let sk = m
+        .meshes
+        .iter()
+        .filter_map(|mesh| aerugo_formats::skeleton::read_skeleton(&c, mesh.mesh))
+        .max_by_key(|s| s.len())
+        .context("no skeleton")?;
+    let group = MotionGroup::parse(&vfs.read(mgrp)?)?;
+    let motion = group.motions.first().context("no motion")?;
+    println!("motion: {} frames, {} joints; HD skeleton {} joints", motion.frames, motion.joints, sk.len());
+    let pairs: Vec<(usize, usize)> = sk
+        .names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| n.strip_prefix("SkeletonNode_")?.parse::<usize>().ok().map(|ps2| (i, ps2)))
+        .filter(|&(_, ps2)| ps2 < motion.joints as usize)
+        .collect();
+    // Translation scale.
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for &(hd, ps2) in &pairs {
+        let l = &sk.default_pose[hd];
+        let t = Vec3::new(l[12], l[13], l[14]);
+        let r = Vec3::from(motion.joint(ps2, 0).translation);
+        num += f64::from(t.dot(r));
+        den += f64::from(r.dot(r));
+    }
+    let k = if den > 0.0 { num / den } else { 0.0 } as f32;
+    let terr: f32 = pairs
+        .iter()
+        .map(|&(hd, ps2)| {
+            let l = &sk.default_pose[hd];
+            (Vec3::new(l[12], l[13], l[14]) - Vec3::from(motion.joint(ps2, 0).translation) * k).length()
+        })
+        .sum::<f32>()
+        / pairs.len().max(1) as f32;
+    println!("translation scale {k:e}, mean error {terr:.4} over {} joints", pairs.len());
+    let orders = [
+        ("XYZ", EulerRot::XYZ),
+        ("XZY", EulerRot::XZY),
+        ("YXZ", EulerRot::YXZ),
+        ("YZX", EulerRot::YZX),
+        ("ZXY", EulerRot::ZXY),
+        ("ZYX", EulerRot::ZYX),
+    ];
+    for (name, order) in orders {
+        for sign in [1.0f32, -1.0] {
+            let err: f32 = pairs
+                .iter()
+                .map(|&(hd, ps2)| {
+                    let l = Mat4::from_cols_array(&sk.default_pose[hd]);
+                    let hd_rot = Mat3::from_mat4(l);
+                    let hd_rot = Mat3::from_cols(
+                        hd_rot.x_axis.normalize_or_zero(),
+                        hd_rot.y_axis.normalize_or_zero(),
+                        hd_rot.z_axis.normalize_or_zero(),
+                    );
+                    let p = motion.joint(ps2, 0).rotation;
+                    // EulerRot applies the first-named axis first in glam's convention for from_euler(a, b, c).
+                    let (a, b, cc) = match name {
+                        "XYZ" => (p[0], p[1], p[2]),
+                        "XZY" => (p[0], p[2], p[1]),
+                        "YXZ" => (p[1], p[0], p[2]),
+                        "YZX" => (p[1], p[2], p[0]),
+                        "ZXY" => (p[2], p[0], p[1]),
+                        _ => (p[2], p[1], p[0]),
+                    };
+                    let r = Mat3::from_euler(order, a * sign, b * sign, cc * sign);
+                    (0..3).map(|i| (hd_rot.col(i) - r.col(i)).length()).sum::<f32>()
+                })
+                .sum::<f32>()
+                / pairs.len().max(1) as f32;
+            println!("  order {name} sign {sign:+}: mean error {err:.4}");
+        }
+    }
+    Ok(())
+}
+
+fn check_motions(install: &Install) -> Result<()> {
+    use aerugo_formats::motion::MotionGroup;
+    let (mut ok, mut motions, mut failed) = (0, 0, Vec::new());
+    for archive in open_all(install)? {
+        for e in archive.entries().iter().filter(|e| e.path.ends_with(".mgrp") && e.size > 16) {
+            match MotionGroup::parse(&archive.read(e)?) {
+                Ok(g) => {
+                    ok += 1;
+                    motions += g.motions.len();
+                }
+                Err(err) => failed.push(format!("{}: {err}", e.path)),
+            }
+        }
+    }
+    println!("{ok} motion groups, {motions} motions, {} failed", failed.len());
+    for f in failed.iter().take(20) {
+        println!("  {f}");
     }
     Ok(())
 }

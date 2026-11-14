@@ -1921,6 +1921,7 @@ dependencies = [
  "aerugo-vfs",
  "anyhow",
  "clap",
+ "glam",
 ]
 
 [[package]]

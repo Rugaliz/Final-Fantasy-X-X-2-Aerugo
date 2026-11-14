@@ -93,6 +93,15 @@ pub struct ModelBrowser {
     /// (mesh, joint) being rotated by the test sliders.
     selected: Option<(usize, usize)>,
     test_rotation: [f32; 3],
+    motions: Vec<(String, aerugo_formats::motion::Motion)>,
+    motion: Option<usize>,
+    /// Current frame (fractional).
+    time: f32,
+    playing: bool,
+    speed: f32,
+    /// Interpolate between frames (off shows the 30 Hz steps).
+    interpolate: bool,
+    translation_scale: f32,
 }
 
 impl ModelBrowser {
@@ -107,6 +116,13 @@ impl ModelBrowser {
             show_bones: false,
             selected: None,
             test_rotation: [0.0; 3],
+            motions: Vec::new(),
+            motion: None,
+            time: 0.0,
+            playing: true,
+            speed: 1.0,
+            interpolate: true,
+            translation_scale: 0.01,
         }
     }
 
@@ -123,6 +139,9 @@ impl ModelBrowser {
         }
         self.selected = None;
         self.test_rotation = [0.0; 3];
+        self.motions = load_motions(vfs, &path);
+        self.motion = None;
+        self.time = 0.0;
         let result = load_model(vfs, renderer, &path);
         if let Ok(m) = &result {
             self.camera = OrbitCamera::framing(m.min, m.max);
@@ -145,6 +164,7 @@ impl ModelBrowser {
         });
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
+            self.advance_motion(ui);
             let Some((_, Ok(model))) = &self.loaded else {
                 ui.label(match &self.loaded {
                     Some((_, Err(e))) => e.clone(),
@@ -222,6 +242,16 @@ impl ModelBrowser {
     fn posed_world(&self, mi: usize, m: &crate::assets::GpuMeshInstance) -> Option<Vec<[f32; 16]>> {
         let sk = m.skeleton.as_ref()?;
         let mut local = sk.default_pose.clone();
+        if let Some((_, motion)) = self.motion.and_then(|i| self.motions.get(i)) {
+            let frame = if self.interpolate { self.time } else { self.time.floor() };
+            for (i, name) in sk.names.iter().enumerate() {
+                if let Some(j) =
+                    aerugo_formats::motion::ps2_joint(name).filter(|&j| j < motion.joints as usize)
+                {
+                    local[i] = motion.joint_at(j, frame).matrix(self.translation_scale);
+                }
+            }
+        }
         if let Some((sm, j)) = self.selected
             && sm == mi
             && let Some(l) = local.get_mut(j)
@@ -300,7 +330,75 @@ impl ModelBrowser {
         }
     }
 
+    fn advance_motion(&mut self, ui: &egui::Ui) {
+        let Some((_, motion)) = self.motion.and_then(|i| self.motions.get(i)) else { return };
+        let frames = motion.frames.max(1) as f32;
+        if self.playing {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            let rate = f32::from(motion.rate.max(1)) / f32::from(0x1E00u16);
+            self.time += dt * 30.0 * rate * self.speed;
+        }
+        let last = (frames - 1.0).max(0.0);
+        if self.time > last {
+            self.time = if last > 0.0 { self.time % last } else { 0.0 };
+        }
+        if self.time < 0.0 {
+            self.time = 0.0;
+        }
+    }
+
+    fn select_motion(&mut self, index: usize) {
+        self.motion = Some(index);
+        self.time = 0.0;
+        if let (Some((_, Ok(m))), Some((_, motion))) = (&self.loaded, self.motions.get(index))
+            && let Some(sk) = m.meshes.iter().filter_map(|x| x.skeleton.as_ref()).max_by_key(|s| s.len())
+        {
+            self.translation_scale =
+                aerugo_formats::motion::fit_translation_scale(&sk.names, &sk.default_pose, motion);
+        }
+    }
+
+    fn motion_ui(&mut self, ui: &mut egui::Ui) {
+        if self.motions.is_empty() {
+            ui.weak("No PS2 motions found for this model.");
+            return;
+        }
+        let current = self
+            .motion
+            .and_then(|i| self.motions.get(i))
+            .map(|(l, _)| l.clone())
+            .unwrap_or_else(|| "bind pose".into());
+        let mut pick = None;
+        egui::ComboBox::from_label("Motion").selected_text(current).height(500.0).show_ui(ui, |ui| {
+            if ui.selectable_label(self.motion.is_none(), "bind pose").clicked() {
+                self.motion = None;
+            }
+            for (i, (label, _)) in self.motions.iter().enumerate() {
+                if ui.selectable_label(self.motion == Some(i), label).clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            self.select_motion(i);
+        }
+        if let Some((_, motion)) = self.motion.and_then(|i| self.motions.get(i)) {
+            let last = (motion.frames.max(1) - 1) as f32;
+            ui.horizontal(|ui| {
+                if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
+                    self.playing = !self.playing;
+                }
+                ui.add(egui::Slider::new(&mut self.speed, 0.05..=4.0).logarithmic(true).text("speed"));
+            });
+            ui.add(egui::Slider::new(&mut self.time, 0.0..=last).text("frame"));
+            ui.checkbox(&mut self.interpolate, "Interpolate between frames");
+            ui.weak(format!("{} joints · translation scale {:.5}", motion.joints, self.translation_scale));
+        }
+    }
+
     fn info_ui(&mut self, ui: &mut egui::Ui) {
+        self.motion_ui(ui);
+        ui.separator();
         ui.checkbox(&mut self.lit, "Lighting");
         ui.checkbox(&mut self.skinning, "Skinning (default pose)").on_hover_text(
             "Off: the stored bind-pose vertices. On: vertices moved by the skeleton in its default pose.",
@@ -378,4 +476,31 @@ impl ModelBrowser {
             }
         }
     }
+}
+
+/// Every motion in the PS2 motion groups that belong to a character model.
+fn load_motions(vfs: &Vfs, model_path: &str) -> Vec<(String, aerugo_formats::motion::Motion)> {
+    use aerugo_formats::motion::{MotionGroup, motion_dir};
+    let Some(dir) = motion_dir(model_path) else { return Vec::new() };
+    let mut paths: Vec<String> = vfs
+        .archives()
+        .flat_map(|(_, a)| {
+            a.entries()
+                .iter()
+                .filter(|e| e.path.starts_with(&dir) && e.path.ends_with(".mgrp") && e.size > 16)
+                .map(|e| e.path.clone())
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut out = Vec::new();
+    for path in paths {
+        let Ok(bytes) = vfs.read(&path) else { continue };
+        let Ok(group) = MotionGroup::parse(&bytes) else { continue };
+        let file = path.rsplit('/').next().unwrap_or(&path).trim_end_matches(".mgrp").to_owned();
+        for (i, m) in group.motions.into_iter().enumerate() {
+            out.push((format!("{file} #{i} ({} frames)", m.frames), m));
+        }
+    }
+    out
 }

@@ -3,6 +3,7 @@
 
 pub mod kernel;
 pub mod mesh;
+pub mod motion;
 pub mod phyre;
 pub mod skeleton;
 pub mod text;
