@@ -1,0 +1,5 @@
+/target
+*.log
+# local developer files
+/aerugo-portable/
+/local/

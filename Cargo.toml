@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/aerugo",
+    "crates/platform",
+    "crates/vfs",
+    "crates/gfx",
+    "crates/sim",
+    "crates/debug-ui",
+    "xtask",
+]
+default-members = ["crates/aerugo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/Rugaliz/Final-Fantasy-X-X-2-Aerugo"
+publish = false
+
+[workspace.dependencies]
+# internal
+aerugo-platform = { path = "crates/platform" }
+aerugo-vfs = { path = "crates/vfs" }
+aerugo-gfx = { path = "crates/gfx" }
+aerugo-sim = { path = "crates/sim" }
+aerugo-debug-ui = { path = "crates/debug-ui" }
+
+# external (licences checked by deny.toml)
+anyhow = "1.0"
+ash = "0.38"
+ash-window = "0.13"
+clap = { version = "4.6", features = ["derive"] }
+dirs = "7.0"
+egui = "0.36"
+egui-ash-renderer = { version = "0.13", features = ["gpu-allocator"] }
+env_logger = "0.11"
+flate2 = "1.1"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
+log = "0.4"
+proptest = "1.12"
+raw-window-handle = "0.6"
+sdl3 = { version = "0.22", features = ["raw-window-handle"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = "1.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+# Keep decompression and parsing reasonably fast in debug builds.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
