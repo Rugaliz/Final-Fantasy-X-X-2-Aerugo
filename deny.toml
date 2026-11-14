@@ -21,6 +21,13 @@ allow = [
     "LicenseRef-UFL-1.0",
 ]
 confidence-threshold = 0.9
+# The list also covers licences expected from future dependencies.
+unused-allowed-license = "allow"
+
+# File-level copyleft, used unmodified: fine to ship with an MIT project. Pulled in by `dirs`.
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
 
 [bans]
 multiple-versions = "allow"
