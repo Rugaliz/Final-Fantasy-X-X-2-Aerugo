@@ -1,0 +1,28 @@
+[package]
+name = "aerugo"
+description = "Final Fantasy X / X-2 source port: launcher, game sessions and tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Build SDL3 from source and link it statically (Windows, CI).
+sdl-from-source = ["aerugo-platform/sdl-from-source"]
+
+[dependencies]
+aerugo-debug-ui.workspace = true
+aerugo-gfx.workspace = true
+aerugo-platform.workspace = true
+aerugo-sim.workspace = true
+aerugo-vfs.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
