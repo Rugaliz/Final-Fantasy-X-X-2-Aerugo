@@ -109,6 +109,41 @@ impl VbfArchive {
     }
 
     /// Read and decompress a whole entry.
+    /// Read `len` bytes of an entry starting at `start`, inflating only the blocks that cover them.
+    pub fn read_range(&self, entry: &Entry, start: u64, len: u64) -> Result<Vec<u8>, VbfError> {
+        let end = (start + len).min(entry.size);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let first = start / BLOCK_SIZE;
+        let last = (end - 1) / BLOCK_SIZE;
+        let mut pos = entry.offset;
+        for i in 0..first {
+            pos += self.stored_size(entry, i) as u64;
+        }
+        let mut out = Vec::with_capacity(((last - first + 1) * BLOCK_SIZE) as usize);
+        let mut stored_buf = Vec::with_capacity(BLOCK_SIZE as usize);
+        for i in first..=last {
+            let want = (entry.size - i * BLOCK_SIZE).min(BLOCK_SIZE) as usize;
+            let stored = self.stored_size(entry, i);
+            stored_buf.resize(stored, 0);
+            read_exact_at(&self.file, &mut stored_buf, pos)
+                .map_err(|source| VbfError::Io { path: self.path.clone(), source })?;
+            pos += stored as u64;
+            if stored == want {
+                out.extend_from_slice(&stored_buf);
+            } else {
+                inflate_block(&stored_buf, want, &mut out).map_err(|reason| VbfError::BadEntry {
+                    path: self.path.clone(),
+                    entry: entry.path.clone(),
+                    reason,
+                })?;
+            }
+        }
+        let skip = (start - first * BLOCK_SIZE) as usize;
+        Ok(out[skip..skip + (end - start) as usize].to_vec())
+    }
+
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, VbfError> {
         let mut out = Vec::with_capacity(entry.size as usize);
         let mut pos = entry.offset;
@@ -331,6 +366,25 @@ mod tests {
         }
         assert!(a.find("/DIR/EMPTY.BIN").is_some(), "lookup is case-insensitive and ignores a leading slash");
         assert!(a.find("missing").is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ranged_reads_match_full_reads() {
+        let noise = pseudo_random(300_000, 3);
+        let text = b"range test ".repeat(30_000);
+        let (path, a) = temp_archive(&test_archive::build(&[("n", noise.clone()), ("t", text.clone())]));
+        for (name, data) in [("n", &noise), ("t", &text)] {
+            let e = a.find(name).unwrap();
+            for (start, len) in
+                [(0u64, 10u64), (65_530, 20), (100_000, 70_000), (data.len() as u64 - 5, 100), (12, 0)]
+            {
+                let got = a.read_range(e, start, len).unwrap();
+                let s = (start as usize).min(data.len());
+                let end = (start + len).min(data.len() as u64) as usize;
+                assert_eq!(got, data[s..end], "{name} {start}+{len}");
+            }
+        }
         std::fs::remove_file(path).ok();
     }
 

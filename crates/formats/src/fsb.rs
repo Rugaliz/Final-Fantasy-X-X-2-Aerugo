@@ -48,7 +48,41 @@ fn u32_at(d: &[u8], at: usize) -> Result<u32> {
 }
 
 impl Bank {
+    /// Bytes needed to parse a bank's header (sample headers and names), given its first 0x40 bytes.
+    pub fn header_len(first: &[u8]) -> Result<usize> {
+        if first.get(0..4) != Some(b"FSB5") {
+            return Err(FsbError::NotFsb5);
+        }
+        let header = if u32_at(first, 4)? == 0 { 0x40 } else { 0x3C };
+        Ok(header + u32_at(first, 12)? as usize + u32_at(first, 16)? as usize)
+    }
+
+    /// Parse from the header bytes only (see [`Bank::header_len`]); `file_len` is the whole bank's size.
+    /// Sample ranges are positions in the whole file.
+    pub fn parse_header(head: &[u8], file_len: usize) -> Result<Bank> {
+        Bank::parse_with_len(head, file_len)
+    }
+
+    /// Decode a sample from its encoded bytes (read separately, e.g. with a ranged read).
+    pub fn decode_data(&self, sample: &Sample, data: &[u8]) -> Result<Vec<i16>> {
+        match self.codec {
+            Codec::ImaAdpcm => {
+                Ok(decode_xbox_ima(data, sample.channels.max(1) as usize, sample.frames as usize))
+            }
+            Codec::Pcm16 => Ok(data
+                .chunks_exact(2)
+                .take(sample.frames as usize * sample.channels as usize)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()),
+            Codec::Other(m) => Err(FsbError::Codec(m)),
+        }
+    }
+
     pub fn parse(d: &[u8]) -> Result<Bank> {
+        Bank::parse_with_len(d, d.len())
+    }
+
+    fn parse_with_len(d: &[u8], file_len: usize) -> Result<Bank> {
         if d.get(0..4) != Some(b"FSB5") {
             return Err(FsbError::NotFsb5);
         }
@@ -66,7 +100,7 @@ impl Bank {
         let header = if version == 0 { 0x40 } else { 0x3C };
         let names_at = header + headers_size;
         let data_at = names_at + names_size;
-        if data_at + data_size > d.len() || count > 1 << 20 {
+        if data_at + data_size > file_len || data_at > d.len() || count > 1 << 20 {
             return Err(FsbError::Truncated("bank"));
         }
         let mut p = header;

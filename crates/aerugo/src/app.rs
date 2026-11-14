@@ -14,7 +14,7 @@ use anyhow::Result;
 
 use crate::launcher::{InstallSource, Launcher, LauncherAction, entry_status};
 use crate::scene::SceneState;
-use crate::settings::{Settings, VoiceLanguage};
+use crate::settings::{MusicSet, Settings, VoiceLanguage};
 use crate::viewer::{Viewer, ViewerAction};
 
 const FRAME_LIMIT_PRESETS: [u32; 8] = [0, 30, 60, 120, 144, 165, 240, 360];
@@ -330,7 +330,10 @@ impl App {
             self.cjk_fonts = true;
         }
         let lang = Language::from_code(&self.ui.settings.game.text_language).unwrap_or(Language::English);
-        self.ui.viewer = Some(Viewer::open(self.ui.launcher.current(), lang, &self.platform.sdl));
+        let japanese = self.ui.settings.game.voice == VoiceLanguage::Japanese;
+        let original = self.ui.settings.game.music == MusicSet::Original;
+        self.ui.viewer =
+            Some(Viewer::open(self.ui.launcher.current(), lang, &self.platform.sdl, japanese, original));
         self.ui.screen = Screen::Viewer;
     }
 
@@ -530,6 +533,12 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, info: &RenderInfo) {
         ui.label("Voices:");
         for v in [VoiceLanguage::English, VoiceLanguage::Japanese] {
             ui.radio_value(&mut settings.game.voice, v, v.label());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("FFX music:");
+        for m in [MusicSet::Arranged, MusicSet::Original] {
+            ui.radio_value(&mut settings.game.music, m, m.label());
         }
     });
     let current = Language::from_code(&settings.game.text_language).map_or("?", Language::name);

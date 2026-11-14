@@ -81,3 +81,38 @@ fn decoder_matches_ffmpeg() {
     eprintln!("{compared} samples identical to ffmpeg");
     assert!(compared > 10);
 }
+
+/// Events resolve to waveforms: every event of every 5th project names a sample in the project's banks, and
+/// voice and music projects exist in both voice languages / music sets.
+#[test]
+fn events_resolve_to_bank_samples() {
+    use aerugo_formats::fev::{Project, bank_prefix, variant_path};
+    let Some(vfs) = vfs() else { return };
+    let all: Vec<String> =
+        vfs.archives().flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone())).collect();
+    let (mut projects, mut events) = (0, 0);
+    for fev in all.iter().filter(|p| p.ends_with(".fev")).step_by(5) {
+        let project = Project::parse(&vfs.read(fev).unwrap()).unwrap_or_else(|e| panic!("{fev}: {e}"));
+        let prefix = bank_prefix(fev);
+        let mut names = std::collections::HashSet::new();
+        for bank in all.iter().filter(|p| p.starts_with(&prefix) && p.ends_with(".fsb")) {
+            for s in Bank::parse(&vfs.read(bank).unwrap()).unwrap().samples {
+                names.insert(s.name);
+            }
+        }
+        for e in &project.events {
+            assert!(names.contains(e), "{fev}: event {e} has no sample");
+            events += 1;
+        }
+        // The other language / music set has the same project.
+        if fev.contains("/voice/") || fev.contains("/music") {
+            let other = variant_path(fev, !fev.contains("/jp/"), !fev.contains("_ps2"));
+            if fev.contains("/voice/") || all.contains(&other) {
+                assert!(all.contains(&other), "{fev}: no {other}");
+            }
+        }
+        projects += 1;
+    }
+    eprintln!("{projects} projects, {events} events resolved");
+    assert!(projects > 400 && events > 5000);
+}

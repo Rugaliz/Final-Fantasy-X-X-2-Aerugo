@@ -53,6 +53,8 @@ impl Viewer {
         install: Option<&Install>,
         text_language: Language,
         sdl: &aerugo_platform::sdl3::Sdl,
+        japanese_voices: bool,
+        original_music: bool,
     ) -> Viewer {
         let audio = match aerugo_audio::AudioOutput::open(sdl) {
             Ok(a) => Some(a),
@@ -83,7 +85,7 @@ impl Viewer {
             textures: TextureBrowser::new(),
             models: ModelBrowser::new(),
             maps: MapBrowser::new(),
-            sounds: SoundBrowser::new(),
+            sounds: SoundBrowser::with_languages(japanese_voices, original_music),
             audio,
         }
     }

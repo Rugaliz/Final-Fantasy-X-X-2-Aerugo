@@ -59,12 +59,33 @@ impl VoiceLanguage {
     }
 }
 
+/// Which recording of the FFX soundtrack plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MusicSet {
+    /// The remaster's rearranged soundtrack.
+    #[default]
+    Arranged,
+    /// The original PS2 soundtrack.
+    Original,
+}
+
+impl MusicSet {
+    pub fn label(self) -> &'static str {
+        match self {
+            MusicSet::Arranged => "Remastered",
+            MusicSet::Original => "Original (PS2)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameSettings {
     /// Install folder chosen by the user; empty = automatic discovery.
     pub dir: Option<PathBuf>,
     pub voice: VoiceLanguage,
+    pub music: MusicSet,
     /// Text language code (us, jp, de, fr, it, es, kr, cn, ch).
     pub text_language: String,
 }
@@ -89,7 +110,12 @@ impl Default for UiSettings {
 
 impl Default for GameSettings {
     fn default() -> Self {
-        Self { dir: None, voice: VoiceLanguage::English, text_language: "us".into() }
+        Self {
+            dir: None,
+            voice: VoiceLanguage::English,
+            music: MusicSet::Arranged,
+            text_language: "us".into(),
+        }
     }
 }
 

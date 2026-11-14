@@ -29,3 +29,18 @@ index, 1 unused byte) is the first frame; the 32 bytes of nibbles (low nibble fi
 bytes) give the next 63 frames; the last nibble of a block is unused. Each nibble *n* changes the predictor by
 ±((2 · (*n* & 7) + 1) · step) / 8 with the standard IMA step and index tables. This matches FFmpeg's
 `adpcm_ima_xbox` decoder sample for sample on every bank checked.
+
+## Event projects (FEV)
+
+`*.fev` files are RIFF (`RIFF` … `FEV `) with a `LIST`/`PROJ` holding `OBCT`, `PROP` (project name), `LGCY` (the
+older binary event data: banks, categories, groups, events, sound definitions and waveforms), `EPRP`, `STRR` and
+`LANG`. `STRR` is the string table: a `u32` count, `u32` offsets, then NUL-terminated strings.
+
+Both games use only *simple events*: each event has one sound definition, named
+`/__simpleevent_sounddef__/<event>_<n>` in the string table, with one waveform whose bank sample has the event's
+name. The string table lists the groups first (`voice`, `music`, `loop`, `nonloop`), then the events, then the
+sound definitions. The project's banks are `<project>_bankNN.fsb` beside it. Voice and sound-effect projects
+exist per voice language (`/us/`, `/jp/`, with the code also in the voice file names); FFX's music exists as the
+remaster's arrangement (`music/ffx_music`) and the original soundtrack (`music_ps2/ffx_music_ps2`).
+
+Event properties in `LGCY` (volume, looping per group, 3D settings) are not read yet.

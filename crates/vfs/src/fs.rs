@@ -109,6 +109,49 @@ impl Vfs {
     }
 
     /// Read a whole file.
+    /// Size of a file in bytes.
+    pub fn size(&self, path: &str) -> Option<u64> {
+        let norm = normalize_path(path);
+        for s in &self.sources {
+            match s {
+                Source::Loose(dir) => {
+                    if let Some(p) = find_loose(dir, &norm) {
+                        return std::fs::metadata(&p).ok().map(|m| m.len());
+                    }
+                }
+                Source::Archive { archive, .. } => {
+                    if let Some(e) = archive.find(&norm) {
+                        return Some(e.size);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Read part of a file (from archives, only the blocks that cover it are inflated).
+    pub fn read_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, VfsError> {
+        let norm = normalize_path(path);
+        for s in &self.sources {
+            match s {
+                Source::Loose(dir) => {
+                    if let Some(p) = find_loose(dir, &norm) {
+                        let all = std::fs::read(&p).map_err(|source| VfsError::Io { path: p, source })?;
+                        let a = (start as usize).min(all.len());
+                        let b = (start.saturating_add(len) as usize).min(all.len());
+                        return Ok(all[a..b].to_vec());
+                    }
+                }
+                Source::Archive { archive, .. } => {
+                    if let Some(e) = archive.find(&norm) {
+                        return Ok(archive.read_range(e, start, len)?);
+                    }
+                }
+            }
+        }
+        self.read(path)
+    }
+
     pub fn read(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let norm = normalize_path(path);
         for s in &self.sources {
