@@ -45,7 +45,7 @@ cargo run --release -- --game-dir "/path/to/FINAL FANTASY FFX&FFX-2 HD Remaster"
 cargo run --release -- --list-games        # print what was detected and exit
 cargo run --release -- --portable          # keep settings next to the executable
 cargo run --release -- --test-scene        # timing test scene (30 Hz simulation at display rate)
-cargo run --release -- --viewer            # asset viewer (data tables, textures, …)
+cargo run --release -- --viewer            # asset viewer: tables, textures, models, motions, maps
 cargo run --release -- --fps-limit 240 --present-mode mailbox
 cargo run --release -- --help              # all options
 ```

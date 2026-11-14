@@ -3,6 +3,7 @@
 //! Requires Vulkan 1.3 with dynamic rendering and synchronization2. All `unsafe` Vulkan usage in Aerugo
 //! lives in this crate.
 
+pub mod aspect;
 pub mod context;
 pub mod offscreen;
 pub mod quad;

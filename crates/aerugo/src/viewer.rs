@@ -1,6 +1,7 @@
 //! Asset viewer: browses the game data. Tabs are added as readers arrive.
 
 mod filelist;
+mod maps;
 mod models;
 mod tables;
 mod textures;
@@ -11,6 +12,7 @@ use aerugo_debug_ui::egui;
 use aerugo_gfx::Renderer;
 use aerugo_vfs::{Install, Language, Vfs};
 
+use maps::MapBrowser;
 use models::ModelBrowser;
 use tables::TableBrowser;
 use textures::TextureBrowser;
@@ -20,6 +22,7 @@ enum Tab {
     Tables,
     Textures,
     Models,
+    Maps,
 }
 
 #[derive(Debug)]
@@ -30,6 +33,7 @@ pub struct Viewer {
     tables: TableBrowser,
     textures: TextureBrowser,
     models: ModelBrowser,
+    maps: MapBrowser,
 }
 
 /// What the viewer asks the app to do.
@@ -62,6 +66,7 @@ impl Viewer {
             tables,
             textures: TextureBrowser::new(),
             models: ModelBrowser::new(),
+            maps: MapBrowser::new(),
         }
     }
 
@@ -69,6 +74,7 @@ impl Viewer {
     pub fn close(&mut self, renderer: &mut Renderer) {
         self.textures.close(renderer);
         self.models.close(renderer);
+        self.maps.close(renderer);
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -82,6 +88,7 @@ impl Viewer {
                 ui.selectable_value(&mut self.tab, Tab::Tables, "Tables");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "Textures");
                 ui.selectable_value(&mut self.tab, Tab::Models, "Models");
+                ui.selectable_value(&mut self.tab, Tab::Maps, "Maps");
             });
         });
         match (&self.vfs, &self.error) {
@@ -89,6 +96,7 @@ impl Viewer {
                 Tab::Tables => self.tables.ui(ui, vfs),
                 Tab::Textures => self.textures.ui(ui, vfs, renderer),
                 Tab::Models => self.models.ui(ui, vfs, renderer),
+                Tab::Maps => self.maps.ui(ui, vfs, renderer),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

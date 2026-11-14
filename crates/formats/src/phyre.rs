@@ -59,13 +59,18 @@ pub struct ClassDesc {
     pub super_class: Option<usize>,
     pub size: u32,
     pub members: Range<usize>,
+    /// Where the base class's part starts inside this class (4 when a vtable precedes it).
+    pub base_offset: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDesc {
     pub name: String,
     pub type_id: u32,
+    /// Byte offset of the data in an object of the class asked about (base-class parts may be shifted).
     pub offset: u32,
+    /// Offset as declared, which fixups use to name the member.
+    pub slot: u32,
     pub size: u32,
     pub flags: u32,
     pub fixed_array_size: u32,
@@ -123,6 +128,19 @@ impl Namespace {
             next = if guard > 64 { None } else { self.classes.get(c)?.super_class };
             Some(c)
         })
+    }
+
+    /// Shift of members declared in `declaring` when they are part of an object of class `class`: the sum of
+    /// base offsets on the way up.
+    pub fn data_shift(&self, class: usize, declaring: usize) -> u32 {
+        let mut shift = 0;
+        for c in self.lineage(class) {
+            if c == declaring {
+                return shift;
+            }
+            shift += self.classes[c].base_offset;
+        }
+        0
     }
 
     pub fn is_a(&self, class: usize, base: &str) -> bool {
@@ -663,6 +681,7 @@ impl Cluster {
                 super_class: (c[0] as usize).checked_sub(1).filter(|&s| s < n_classes),
                 size: c[1] & 0x0FFF_FFFF,
                 members,
+                base_offset: c[4],
             });
         }
         if first != n_members {
@@ -679,6 +698,7 @@ impl Cluster {
                     name: name(m[0]),
                     type_id: m[1],
                     offset: m[2],
+                    slot: m[2],
                     size: m[3],
                     flags: m[4],
                     fixed_array_size: m[5],
@@ -797,14 +817,20 @@ impl Cluster {
     /// A member by name; `a.b` names member `b` of the embedded struct `a`. The offset is from the object start.
     pub fn member(&self, id: ObjectId, name: &str) -> Option<MemberDesc> {
         let mut class = self.list(id).class;
-        let mut offset = 0;
+        let (mut offset, mut slot) = (0, 0);
         let mut parts = name.split('.').peekable();
         while let Some(part) = parts.next() {
             let m = self.namespace.member(class, part)?;
+            let shift = self.namespace.data_shift(class, m.class);
             if parts.peek().is_none() {
-                return Some(MemberDesc { offset: offset + m.offset, ..m.clone() });
+                return Some(MemberDesc {
+                    offset: offset + shift + m.offset,
+                    slot: slot + m.offset,
+                    ..m.clone()
+                });
             }
-            offset += m.offset;
+            offset += shift + m.offset;
+            slot += m.offset;
             class = match self.namespace.type_of(m.type_id) {
                 TypeRef::Class(c) => c,
                 _ => return None,
@@ -848,7 +874,7 @@ impl Cluster {
     /// Pointer member by name; for `PArray<T>`-style members name the `m_els` slot via [`Self::array_ptr`].
     pub fn pointer(&self, id: ObjectId, name: &str) -> Option<Pointer> {
         let m = self.member(id, name)?;
-        self.pointer_at(id, m.offset, 0)
+        self.pointer_at(id, m.slot, 0)
     }
 
     /// Target object of a pointer member.
@@ -868,7 +894,7 @@ impl Cluster {
     /// member's offset plus `slot` (4 for `PArray`, whose count comes first).
     pub fn array(&self, id: ObjectId, name: &str, slot: u32) -> Option<ArrayRef> {
         let m = self.member(id, name)?;
-        self.array_at(id, m.offset + slot)
+        self.array_at(id, m.slot + slot)
     }
 
     /// Element count stored in a `PArray` member (its first word).
@@ -899,8 +925,8 @@ impl Cluster {
     pub fn array_pointers(&self, id: ObjectId, name: &str) -> Vec<Pointer> {
         let Some(m) = self.member(id, name) else { return Vec::new() };
         // `PArray` keeps its element pointer after the count; other containers keep it first.
-        for slot in [m.offset + 4, m.offset] {
-            if slot >= m.offset + m.size.max(4) {
+        for slot in [m.slot + 4, m.slot] {
+            if slot >= m.slot + m.size.max(4) {
                 continue;
             }
             if self.pointer_arrays.contains_key(&(id, slot)) {
@@ -951,11 +977,11 @@ impl Cluster {
     /// A NUL-terminated string member (`PString` or `PChar *`).
     pub fn string(&self, id: ObjectId, name: &str) -> Option<String> {
         let m = self.member(id, name)?;
-        if let Some(a) = self.array_at(id, m.offset) {
+        if let Some(a) = self.array_at(id, m.slot) {
             let l = self.list(id);
             return Some(cstr(&self.data[..l.arrays.end], a.start));
         }
-        match self.pointer_at(id, m.offset, 0)? {
+        match self.pointer_at(id, m.slot, 0)? {
             Pointer::User(u) => Some(self.user_string(u)),
             Pointer::Object { .. } => None,
         }
@@ -1036,7 +1062,7 @@ impl Cluster {
     /// for references, raw bytes otherwise.
     pub fn describe(&self, id: ObjectId) -> Vec<FieldView> {
         let mut out = Vec::new();
-        self.describe_into(id, self.list(id).class, 0, "", 0, &mut out);
+        self.describe_into(id, self.list(id).class, (0, 0), "", 0, &mut out);
         out
     }
 
@@ -1044,7 +1070,7 @@ impl Cluster {
         &self,
         id: ObjectId,
         class: usize,
-        base: u32,
+        (base, base_slot): (u32, u32),
         prefix: &str,
         depth: u32,
         out: &mut Vec<FieldView>,
@@ -1052,15 +1078,16 @@ impl Cluster {
         let ns = &self.namespace;
         let bytes = self.object_bytes(id);
         for m in ns.all_members(class) {
-            let offset = base + m.offset;
+            let offset = base + ns.data_shift(class, m.class) + m.offset;
+            let member_slot = base_slot + m.offset;
             let start = offset as usize;
             let raw = bytes.get(start..start + m.size as usize).unwrap_or(&[]);
             let type_name = ns.type_name(m.type_id).to_owned();
             let name = format!("{prefix}{}", m.name);
             // Pointer and array slots at this member (PArray keeps its pointer 4 bytes in).
             let mut refs = Vec::new();
-            for slot in [offset, offset + 4] {
-                if slot >= offset + m.size.max(1) {
+            for slot in [member_slot, member_slot + 4] {
+                if slot >= member_slot + m.size.max(1) {
                     continue;
                 }
                 if let Some(a) = self.array_at(id, slot) {
@@ -1083,7 +1110,7 @@ impl Cluster {
                 && !ns.all_members(c).is_empty()
                 && ns.classes[c].size <= m.size
             {
-                self.describe_into(id, c, offset, &format!("{name}."), depth + 1, out);
+                self.describe_into(id, c, (offset, member_slot), &format!("{name}."), depth + 1, out);
                 continue;
             }
             let value = if !refs.is_empty() {

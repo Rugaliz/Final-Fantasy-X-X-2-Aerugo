@@ -133,3 +133,41 @@ fn skeletons_reproduce_the_bind_pose() {
     assert!(exact * 100 >= skinned * 95, "bind pose reproduced by only {exact} of {skinned}");
     assert!(bad_weights * 1000 <= weight_sets, "too many weight sets do not sum to one");
 }
+
+/// Every map with pre-rendered 2D layers has a placed scene camera to view them through.
+#[test]
+fn layered_maps_have_a_scene_camera() {
+    use aerugo_formats::camera::read_cameras;
+    use aerugo_formats::mesh::IDENTITY;
+    let Some(inst) = install_from_env() else {
+        eprintln!("skipped: set {GAME_DIR_ENV} to a game installation to run this test");
+        return;
+    };
+    let mut vfs = Vfs::new();
+    vfs.mount_install(&inst).unwrap_or_else(|e| panic!("{e}"));
+    let (mut maps, mut with_camera, mut missing) = (0, 0, Vec::new());
+    for (_, archive) in vfs.archives() {
+        for e in archive.entries().iter().filter(|e| {
+            e.path.contains("/ps3data/map/")
+                && e.path.contains("/2d/mdl/d3d11/")
+                && e.path.ends_with(".dae.phyre")
+        }) {
+            let c = Cluster::parse(archive.read(e).unwrap()).unwrap();
+            if c.objects("PMeshInstance").is_empty() {
+                continue;
+            }
+            maps += 1;
+            let placed = read_cameras(&c)
+                .iter()
+                .any(|cam| cam.name.starts_with("CameraNodeScene") && cam.world != IDENTITY);
+            if placed {
+                with_camera += 1;
+            } else {
+                missing.push(e.path.clone());
+            }
+        }
+    }
+    eprintln!("{maps} layered maps, {with_camera} with a placed scene camera; without: {missing:#?}");
+    assert!(maps > 100);
+    assert!(with_camera * 100 >= maps * 95, "{missing:#?}");
+}

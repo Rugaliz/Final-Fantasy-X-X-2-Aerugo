@@ -80,3 +80,19 @@ User fixups point at strings such as class names, texture formats and vertex sem
 user fixup: `DXT1`, `DXT3`, `DXT5`, `ARGB8` (bytes B, G, R, A) or `L8`. Levels follow each other in the
 texture data, largest first, face after face; `m_maxMipLevel` + 1 levels fill the data exactly in every texture
 of both games.
+
+## Base-class offsets
+
+A class's third layout word gives where its base class's part starts inside it (4 when a vtable comes first).
+Data of inherited members is shifted by the sum of these offsets on the way from the object's class up to the
+declaring class; fixups still name members by their declared offsets. Cameras are the main case:
+`PCameraProjection` puts `PCamera`'s members 4 bytes later.
+
+## Models and cameras
+
+- Mesh instances take their transform from the node whose `m_worldMatrix` is the instance's
+  `m_localToWorldMatrix`, composed from `m_localMatrix` up the `m_parent` chain. The world uses the PS2
+  convention: Y points down.
+- Maps with pre-rendered backgrounds have a `2d` model: layered quads and a scene camera (`CameraNodeScene*`)
+  placed in front of them. The viewer fits the camera's field of view so the farthest layer fills the frame;
+  the frame comes out at about 8:7, the PS2's 512 × 448.

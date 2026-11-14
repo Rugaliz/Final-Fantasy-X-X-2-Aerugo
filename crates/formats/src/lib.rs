@@ -1,6 +1,7 @@
 //! Readers for the games' data formats. Pure parsing: each reader takes bytes and never panics on bad input.
 //! Functions that name archive paths take a [`Game`].
 
+pub mod camera;
 pub mod kernel;
 pub mod mesh;
 pub mod motion;
