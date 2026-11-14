@@ -15,6 +15,7 @@ use anyhow::Result;
 use crate::launcher::{InstallSource, Launcher, LauncherAction, entry_status};
 use crate::scene::SceneState;
 use crate::settings::{Settings, VoiceLanguage};
+use crate::viewer::{Viewer, ViewerAction};
 
 const FRAME_LIMIT_PRESETS: [u32; 8] = [0, 30, 60, 120, 144, 165, 240, 360];
 
@@ -29,12 +30,15 @@ pub struct StartOptions {
     pub install: Option<(Install, InstallSource)>,
     pub notice: Option<String>,
     pub test_scene: bool,
+    /// Open the asset viewer instead of the launcher.
+    pub viewer: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Launcher,
     TestScene,
+    Viewer,
 }
 
 /// Renderer facts shown in the UI, copied once per frame.
@@ -53,6 +57,7 @@ struct UiState {
     screen: Screen,
     launcher: Launcher,
     scene: SceneState,
+    viewer: Option<Viewer>,
     settings: Settings,
     show_debug: bool,
     show_settings: bool,
@@ -86,6 +91,7 @@ pub struct App {
     last_save: Instant,
     last_frame: Instant,
     quit: bool,
+    cjk_fonts: bool,
     platform: Platform,
 }
 
@@ -97,6 +103,7 @@ impl std::fmt::Debug for App {
 
 impl App {
     pub fn new(opts: StartOptions) -> Result<Self> {
+        let start_in_viewer = opts.viewer;
         let settings = opts.settings;
         let platform = Platform::new(&WindowConfig {
             title: "Aerugo".into(),
@@ -125,13 +132,14 @@ impl App {
             screen: if opts.test_scene { Screen::TestScene } else { Screen::Launcher },
             launcher,
             scene: SceneState::new(),
+            viewer: None,
             settings: settings.clone(),
             show_debug: opts.test_scene,
             show_settings: false,
             graph: FrameTimeGraph::default(),
             last_frame_ms: 0.0,
         };
-        Ok(Self {
+        let mut app = Self {
             platform,
             egui,
             limiter: FrameLimiter::new(Some(settings.graphics.frame_limit)),
@@ -145,8 +153,13 @@ impl App {
             last_save: Instant::now(),
             last_frame: Instant::now(),
             quit: false,
+            cjk_fonts: false,
             renderer,
-        })
+        };
+        if start_in_viewer {
+            app.open_viewer();
+        }
+        Ok(app)
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -260,7 +273,10 @@ impl App {
 
     fn handle_action(&mut self, action: Action) {
         match action {
-            Action::BackToLauncher => self.ui.screen = Screen::Launcher,
+            Action::BackToLauncher => {
+                self.ui.screen = Screen::Launcher;
+                self.ui.viewer = None;
+            }
             Action::Launcher(a) => match a {
                 LauncherAction::StartGame(game) => {
                     let status = entry_status(self.ui.launcher.current(), game);
@@ -271,6 +287,7 @@ impl App {
                     self.ui.screen = Screen::TestScene;
                     self.ui.show_debug = true;
                 }
+                LauncherAction::OpenViewer => self.open_viewer(),
                 LauncherAction::OpenSettings => self.ui.show_settings = true,
                 LauncherAction::UseFolder(dir) => {
                     let install = Install::inspect(dir);
@@ -302,6 +319,16 @@ impl App {
                 LauncherAction::Quit => self.quit = true,
             },
         }
+    }
+
+    fn open_viewer(&mut self) {
+        if !self.cjk_fonts {
+            aerugo_debug_ui::fonts::add_cjk_fallbacks(&self.egui.ctx);
+            self.cjk_fonts = true;
+        }
+        let lang = Language::from_code(&self.ui.settings.game.text_language).unwrap_or(Language::English);
+        self.ui.viewer = Some(Viewer::open(self.ui.launcher.current(), lang));
+        self.ui.screen = Screen::Viewer;
     }
 
     /// Apply settings the user edited this frame.
@@ -387,6 +414,13 @@ fn draw_ui(ui: &mut egui::Ui, state: &mut UiState, info: &RenderInfo, actions: &
         Screen::Launcher => {
             if let Some(a) = state.launcher.ui(ui) {
                 actions.push(Action::Launcher(a));
+            }
+        }
+        Screen::Viewer => {
+            if let Some(viewer) = &mut state.viewer
+                && viewer.ui(ui) == Some(ViewerAction::Back)
+            {
+                actions.push(Action::BackToLauncher);
             }
         }
         Screen::TestScene => {

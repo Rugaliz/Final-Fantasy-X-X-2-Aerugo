@@ -5,6 +5,7 @@ mod cli;
 mod launcher;
 mod scene;
 mod settings;
+mod viewer;
 
 use std::process::ExitCode;
 
@@ -60,9 +61,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         let status = entry_status(install.as_ref().map(|(i, _)| i), game);
         notice = Some(format!("{}: {}", game.title(), status.describe()));
     }
-    if cli.viewer {
-        notice = Some("The asset viewer arrives with the viewer milestone.".into());
-    }
 
     // Command-line options override the stored settings for this run only.
     let mut effective = settings.clone();
@@ -87,6 +85,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         install,
         notice,
         test_scene: cli.test_scene,
+        viewer: cli.viewer,
     };
     let mut app = app::App::new(opts)?;
     app.run()?;

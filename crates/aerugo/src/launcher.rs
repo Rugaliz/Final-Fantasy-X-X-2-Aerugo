@@ -106,6 +106,7 @@ pub fn choose_install(
 pub enum LauncherAction {
     StartGame(GameId),
     OpenTestScene,
+    OpenViewer,
     OpenSettings,
     UseFolder(PathBuf),
     Rescan,
@@ -227,8 +228,14 @@ impl Launcher {
                         if ui.button("Timing test scene").clicked() {
                             action = Some(LauncherAction::OpenTestScene);
                         }
-                        ui.add_enabled(false, egui::Button::new("Asset viewer"))
-                            .on_disabled_hover_text("Arrives with the viewer milestone");
+                        let has_data = self.current().is_some_and(Install::is_usable);
+                        if ui
+                            .add_enabled(has_data, egui::Button::new("Asset viewer"))
+                            .on_disabled_hover_text("Needs the game data")
+                            .clicked()
+                        {
+                            action = Some(LauncherAction::OpenViewer);
+                        }
                         if ui.button("Settings").clicked() {
                             action = Some(LauncherAction::OpenSettings);
                         }

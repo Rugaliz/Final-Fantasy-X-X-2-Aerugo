@@ -13,6 +13,7 @@ sdl-from-source = ["aerugo-platform/sdl-from-source"]
 
 [dependencies]
 aerugo-debug-ui.workspace = true
+aerugo-formats.workspace = true
 aerugo-gfx.workspace = true
 aerugo-platform.workspace = true
 aerugo-sim.workspace = true

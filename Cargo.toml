@@ -7,6 +7,7 @@ members = [
     "crates/gfx",
     "crates/sim",
     "crates/debug-ui",
+    "crates/formats",
     "xtask",
 ]
 default-members = ["crates/aerugo"]
@@ -26,6 +27,7 @@ aerugo-vfs = { path = "crates/vfs" }
 aerugo-gfx = { path = "crates/gfx" }
 aerugo-sim = { path = "crates/sim" }
 aerugo-debug-ui = { path = "crates/debug-ui" }
+aerugo-formats = { path = "crates/formats" }
 
 # external (licences checked by deny.toml)
 anyhow = "1.0"

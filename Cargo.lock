@@ -22,6 +22,7 @@ name = "aerugo"
 version = "0.1.0"
 dependencies = [
  "aerugo-debug-ui",
+ "aerugo-formats",
  "aerugo-gfx",
  "aerugo-platform",
  "aerugo-sim",
@@ -41,6 +42,15 @@ dependencies = [
  "aerugo-platform",
  "egui",
  "log",
+]
+
+[[package]]
+name = "aerugo-formats"
+version = "0.1.0"
+dependencies = [
+ "aerugo-vfs",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

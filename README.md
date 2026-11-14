@@ -45,9 +45,13 @@ cargo run --release -- --game-dir "/path/to/FINAL FANTASY FFX&FFX-2 HD Remaster"
 cargo run --release -- --list-games        # print what was detected and exit
 cargo run --release -- --portable          # keep settings next to the executable
 cargo run --release -- --test-scene        # timing test scene (30 Hz simulation at display rate)
+cargo run --release -- --viewer            # asset viewer (data tables so far)
 cargo run --release -- --fps-limit 240 --present-mode mailbox
 cargo run --release -- --help              # all options
 ```
+
+The asset viewer shows Japanese, Chinese and Korean text with a system font (Noto Sans CJK on Linux, the
+standard CJK fonts on Windows); nothing is bundled.
 
 Keys: **F3** debug panel, **F11** or **Alt+Enter** fullscreen, **Esc** back to the launcher.
 Settings are stored in `settings.toml` in your config folder (`~/.config/aerugo` on Linux,

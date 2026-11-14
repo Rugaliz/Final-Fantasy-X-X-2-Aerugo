@@ -8,6 +8,7 @@
 | `aerugo-platform` | SDL3 window and events, user directories, frame limiter |
 | `aerugo-vfs` | Finding the game installation, reading the VBF archives, the virtual file system |
 | `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
+| `aerugo-formats` | Readers for the games' data formats: text encoding, data tables |
 | `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation |
 | `aerugo-debug-ui` | egui integration with SDL3 input, debug panels |
 | `xtask` | Developer commands (`cargo run -p xtask -- <command>`) |
