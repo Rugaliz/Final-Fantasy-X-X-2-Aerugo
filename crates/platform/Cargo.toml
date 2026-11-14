@@ -1,0 +1,22 @@
+[package]
+name = "aerugo-platform"
+description = "SDL3 window, events, user directories and frame pacing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Build SDL3 from source and link it statically (Windows, CI).
+sdl-from-source = ["sdl3/build-from-source-static"]
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+sdl3.workspace = true
+
+[lints]
+workspace = true
