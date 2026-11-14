@@ -108,6 +108,8 @@ impl Material {
 pub struct Mesh {
     pub name: String,
     pub instance: ObjectId,
+    /// The `PMesh` object (skeleton data lives there).
+    pub mesh: ObjectId,
     /// Column-major 4×4 transform of the instance, from the node that carries it (identity when none does).
     pub world: [f32; 16],
     pub segments: Vec<Segment>,
@@ -323,6 +325,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
         meshes.push(Mesh {
             name: cluster.string(inst, "m_name").unwrap_or_default(),
             instance: inst,
+            mesh,
             world,
             segments,
             materials,

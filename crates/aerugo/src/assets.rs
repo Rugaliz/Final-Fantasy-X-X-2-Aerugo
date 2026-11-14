@@ -60,6 +60,11 @@ pub struct GpuMeshInstance {
     pub world: Mat4,
     pub skinned: bool,
     pub parts: Vec<String>,
+    /// Format segment index of each GPU part.
+    pub part_segments: Vec<usize>,
+    /// Index into the model's meshes (skeleton and segments live there).
+    pub source: usize,
+    pub skeleton: Option<aerugo_formats::skeleton::Skeleton>,
 }
 
 impl GpuModel {
@@ -105,8 +110,9 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
     let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
     let mut texture_cache: HashMap<String, Option<TextureHandle>> = HashMap::new();
-    for m in &model.meshes {
+    for (source, m) in model.meshes.iter().enumerate() {
         let world = Mat4::from_cols_array(&m.world);
+        let mut part_segments = Vec::new();
         let mut vertices: Vec<SceneVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut parts = Vec::new();
@@ -170,6 +176,7 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
                 texture,
                 alpha_cutoff: 0.3,
             });
+            part_segments.push(si);
         }
         if vertices.is_empty() {
             continue;
@@ -179,7 +186,17 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
         let handle = renderer
             .create_mesh(&MeshDesc { vertices: &vertices, indices: &indices, parts })
             .map_err(|e| format!("{e:#}"))?;
-        out.meshes.push(GpuMeshInstance { name: m.name.clone(), mesh: handle, world, skinned, parts: names });
+        let skeleton = aerugo_formats::skeleton::read_skeleton(&cluster, m.mesh);
+        out.meshes.push(GpuMeshInstance {
+            name: m.name.clone(),
+            mesh: handle,
+            world,
+            skinned: skinned && skeleton.is_some(),
+            parts: names,
+            part_segments,
+            source,
+            skeleton,
+        });
     }
     if out.meshes.is_empty() {
         out.min = Vec3::splat(-1.0);

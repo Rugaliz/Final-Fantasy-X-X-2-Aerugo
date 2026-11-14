@@ -75,3 +75,61 @@ fn models_read_and_their_textures_exist() {
     eprintln!("{models} models, {textures} texture references");
     assert!(models > 2500);
 }
+
+/// Skinned meshes: the default pose reproduces the bind pose (world × skeleton matrix ≈ identity) for nearly
+/// all meshes, and skin weights sum to one.
+#[test]
+fn skeletons_reproduce_the_bind_pose() {
+    use aerugo_formats::mesh::{read_model, stream_floats};
+    use aerugo_formats::skeleton::{identity_error, read_skeleton};
+    let Some(inst) = install_from_env() else {
+        eprintln!("skipped: set {GAME_DIR_ENV} to a game installation to run this test");
+        return;
+    };
+    let mut vfs = Vfs::new();
+    vfs.mount_install(&inst).unwrap_or_else(|e| panic!("{e}"));
+    let (mut skinned, mut exact, mut weight_sets, mut bad_weights) = (0, 0, 0, 0);
+    for (_, archive) in vfs.archives() {
+        for e in archive.entries().iter().filter(|e| e.path.ends_with(".dae.phyre")) {
+            let c = Cluster::parse(archive.read(e).unwrap()).unwrap();
+            for mesh in read_model(&c).unwrap().meshes {
+                let Some(sk) = read_skeleton(&c, mesh.mesh) else { continue };
+                assert_eq!(sk.parents.len(), sk.len(), "{}", e.path);
+                assert!(sk.parents.iter().all(|&p| p < sk.len() as i32), "{}: parent out of range", e.path);
+                let world = sk.world(&sk.default_pose);
+                let worst = mesh
+                    .segments
+                    .iter()
+                    .flat_map(|s| sk.palette(&world, s))
+                    .map(|p| identity_error(&p))
+                    .fold(0.0, f32::max);
+                skinned += 1;
+                if worst < 0.1 {
+                    exact += 1;
+                }
+                for s in &mesh.segments {
+                    for &(h, k) in &s.skin_bones {
+                        assert!(
+                            (h as usize) < sk.len() && (k as usize) < sk.inverse_bind.len(),
+                            "{}: bone out of range",
+                            e.path
+                        );
+                    }
+                    if let Some(ws) = s.stream("SkinWeights") {
+                        weight_sets += 1;
+                        let w = stream_floats(&c, ws);
+                        if w.chunks_exact(4).any(|v| (v.iter().sum::<f32>() - 1.0).abs() > 0.01) {
+                            bad_weights += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{skinned} skinned meshes, {exact} reproduce the bind pose; {bad_weights} of {weight_sets} weight sets off"
+    );
+    assert!(skinned > 1000);
+    assert!(exact * 100 >= skinned * 95, "bind pose reproduced by only {exact} of {skinned}");
+    assert!(bad_weights * 1000 <= weight_sets, "too many weight sets do not sum to one");
+}

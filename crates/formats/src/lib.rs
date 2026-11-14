@@ -4,6 +4,7 @@
 pub mod kernel;
 pub mod mesh;
 pub mod phyre;
+pub mod skeleton;
 pub mod text;
 pub mod texture;
 

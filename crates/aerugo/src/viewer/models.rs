@@ -87,6 +87,12 @@ pub struct ModelBrowser {
     camera: OrbitCamera,
     lit: bool,
     background: [f32; 3],
+    /// Draw skinned meshes through their skeleton (default pose) instead of the stored bind pose.
+    skinning: bool,
+    show_bones: bool,
+    /// (mesh, joint) being rotated by the test sliders.
+    selected: Option<(usize, usize)>,
+    test_rotation: [f32; 3],
 }
 
 impl ModelBrowser {
@@ -97,6 +103,10 @@ impl ModelBrowser {
             camera: OrbitCamera::framing(Vec3::splat(-1.0), Vec3::splat(1.0)),
             lit: true,
             background: [0.18, 0.19, 0.22],
+            skinning: true,
+            show_bones: false,
+            selected: None,
+            test_rotation: [0.0; 3],
         }
     }
 
@@ -111,6 +121,8 @@ impl ModelBrowser {
         if let Some((_, Ok(m))) = self.loaded.take() {
             m.destroy(renderer);
         }
+        self.selected = None;
+        self.test_rotation = [0.0; 3];
         let result = load_model(vfs, renderer, &path);
         if let Ok(m) = &result {
             self.camera = OrbitCamera::framing(m.min, m.max);
@@ -153,29 +165,174 @@ impl ModelBrowser {
             let response = ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
             self.camera.handle(ui, &response);
             let view_proj = self.camera.view_proj(size.x / size.y.max(1.0));
-            let draws = model
-                .meshes
-                .iter()
-                .map(|m| Draw {
-                    mesh: m.mesh,
-                    model: m.world.to_cols_array(),
-                    joint_base: None,
-                    lit: self.lit,
-                    part: None,
-                })
-                .collect();
+            let mut draws = Vec::new();
+            let mut joints = Vec::new();
+            let mut overlay = Vec::new();
+            for (mi, m) in model.meshes.iter().enumerate() {
+                let posed = self.posed_world(mi, m);
+                match (&m.skeleton, &posed) {
+                    (Some(sk), Some(world)) if self.skinning && m.skinned => {
+                        for (pi, &si) in m.part_segments.iter().enumerate() {
+                            let seg = &model.model.meshes[m.source].segments[si];
+                            let base = joints.len() as u32;
+                            joints.extend(sk.palette(world, seg));
+                            draws.push(Draw {
+                                mesh: m.mesh,
+                                model: m.world.to_cols_array(),
+                                joint_base: Some(base),
+                                lit: self.lit,
+                                part: Some(pi),
+                            });
+                        }
+                    }
+                    _ => draws.push(Draw {
+                        mesh: m.mesh,
+                        model: m.world.to_cols_array(),
+                        joint_base: None,
+                        lit: self.lit,
+                        part: None,
+                    }),
+                }
+                if let (Some(sk), Some(world)) = (&m.skeleton, posed) {
+                    overlay.push((
+                        mi,
+                        sk.parents.clone(),
+                        sk.names.clone(),
+                        world
+                            .iter()
+                            .map(|w| m.world.transform_point3(Vec3::new(w[12], w[13], w[14])))
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+            }
             let [r, g, b] = self.background;
             renderer.submit_scene(SceneView {
                 view_proj: view_proj.to_cols_array(),
                 clear: [r, g, b, 1.0],
                 draws,
-                joints: Vec::new(),
+                joints,
             });
+            if self.show_bones {
+                self.draw_bones(ui, &response, view_proj, &overlay);
+            }
         });
+    }
+
+    /// World matrices of a mesh's joints in the current pose (default pose plus the test rotation).
+    fn posed_world(&self, mi: usize, m: &crate::assets::GpuMeshInstance) -> Option<Vec<[f32; 16]>> {
+        let sk = m.skeleton.as_ref()?;
+        let mut local = sk.default_pose.clone();
+        if let Some((sm, j)) = self.selected
+            && sm == mi
+            && let Some(l) = local.get_mut(j)
+        {
+            let [x, y, z] = self.test_rotation.map(f32::to_radians);
+            let rot = Mat4::from_euler(glam::EulerRot::XYZ, x, y, z);
+            *l = (Mat4::from_cols_array(l) * rot).to_cols_array();
+        }
+        Some(sk.world(&local))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn draw_bones(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        view_proj: Mat4,
+        overlay: &[(usize, Vec<i32>, Vec<String>, Vec<Vec3>)],
+    ) {
+        let rect = response.rect;
+        let painter = ui.painter_at(rect);
+        let project = |p: Vec3| -> Option<egui::Pos2> {
+            let c = view_proj * p.extend(1.0);
+            (c.w > 0.0).then(|| {
+                egui::pos2(
+                    rect.min.x + (c.x / c.w + 1.0) * 0.5 * rect.width(),
+                    rect.min.y + (c.y / c.w + 1.0) * 0.5 * rect.height(),
+                )
+            })
+        };
+        let hover = response.hover_pos();
+        let mut hovered: Option<(usize, usize, egui::Pos2)> = None;
+        for (mi, parents, names, points) in overlay {
+            let screen: Vec<Option<egui::Pos2>> = points.iter().map(|&p| project(p)).collect();
+            for (j, p) in screen.iter().enumerate() {
+                let Some(p) = *p else { continue };
+                if let Some(&parent) = parents.get(j)
+                    && parent >= 0
+                    && let Some(Some(q)) = screen.get(parent as usize)
+                {
+                    painter
+                        .line_segment([p, *q], egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 60)));
+                }
+                let selected = self.selected == Some((*mi, j));
+                let color = if selected {
+                    egui::Color32::from_rgb(255, 80, 80)
+                } else {
+                    egui::Color32::from_rgb(90, 220, 255)
+                };
+                painter.circle_filled(p, if selected { 4.5 } else { 2.5 }, color);
+                if let Some(h) = hover
+                    && h.distance(p) < 12.0
+                    && hovered.is_none_or(|(_, _, best)| h.distance(p) < h.distance(best))
+                {
+                    hovered = Some((*mi, j, p));
+                }
+            }
+            if let Some((hm, j, p)) = hovered
+                && hm == *mi
+            {
+                let name = names.get(j).cloned().unwrap_or_default();
+                painter.text(
+                    p + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{j}: {name}"),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        if response.clicked()
+            && let Some((mi, j, _)) = hovered
+        {
+            self.selected = Some((mi, j));
+            self.test_rotation = [0.0; 3];
+        }
     }
 
     fn info_ui(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(&mut self.lit, "Lighting");
+        ui.checkbox(&mut self.skinning, "Skinning (default pose)").on_hover_text(
+            "Off: the stored bind-pose vertices. On: vertices moved by the skeleton in its default pose.",
+        );
+        ui.checkbox(&mut self.show_bones, "Bones")
+            .on_hover_text("Click a joint to select it for the rotation test.");
+        if let Some((_, Ok(m))) = &self.loaded
+            && let Some((mi, sk)) =
+                m.meshes.iter().enumerate().find_map(|(i, x)| x.skeleton.as_ref().map(|s| (i, s)))
+        {
+            let current = self.selected.filter(|&(s, _)| s == mi).map(|(_, j)| j);
+            let label = current
+                .map(|j| format!("{j}: {}", sk.names.get(j).cloned().unwrap_or_default()))
+                .unwrap_or_else(|| "pick a joint".into());
+            egui::ComboBox::from_label("Joint").selected_text(label).height(400.0).show_ui(ui, |ui| {
+                for (j, name) in sk.names.iter().enumerate() {
+                    if ui.selectable_label(current == Some(j), format!("{j}: {name}")).clicked() {
+                        self.selected = Some((mi, j));
+                        self.test_rotation = [0.0; 3];
+                    }
+                }
+            });
+        }
+        if let Some((mi, j)) = self.selected {
+            ui.label(format!("Joint {j} of mesh {mi}: rotate to check the skin weights"));
+            for (axis, v) in ["X", "Y", "Z"].iter().zip(self.test_rotation.iter_mut()) {
+                ui.add(egui::Slider::new(v, -180.0..=180.0).text(*axis).suffix("°"));
+            }
+            if ui.button("Clear joint").clicked() {
+                self.selected = None;
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("Background");
             ui.color_edit_button_rgb(&mut self.background);

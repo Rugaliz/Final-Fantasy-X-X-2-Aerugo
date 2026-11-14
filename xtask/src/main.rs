@@ -314,6 +314,7 @@ fn model_census(install: &Install) -> Result<()> {
     use aerugo_formats::phyre::{Cluster, Pointer};
     use std::collections::BTreeMap;
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut counts_examples = 0;
     let mut add = |k: String| *counts.entry(k).or_default() += 1;
     for archive in open_all(install)? {
         for e in archive.entries().iter().filter(|e| e.path.ends_with(".dae.phyre")) {
@@ -368,6 +369,47 @@ fn model_census(install: &Install) -> Result<()> {
             match aerugo_formats::mesh::read_model(&c) {
                 Ok(m) => {
                     add("model ok".into());
+                    for mesh in &m.meshes {
+                        let Some(sk) = aerugo_formats::skeleton::read_skeleton(&c, mesh.mesh) else {
+                            continue;
+                        };
+                        let world = sk.world(&sk.default_pose);
+                        let worst = mesh
+                            .segments
+                            .iter()
+                            .flat_map(|s| sk.palette(&world, s))
+                            .map(|p| aerugo_formats::skeleton::identity_error(&p))
+                            .fold(0.0f32, f32::max);
+                        let bucket = if worst < 1e-3 {
+                            "<1e-3"
+                        } else if worst < 1e-2 {
+                            "<1e-2"
+                        } else if worst < 1e-1 {
+                            "<0.1"
+                        } else {
+                            ">=0.1"
+                        };
+                        add(format!("skin bind error {bucket}"));
+                        if worst >= 0.1 && counts_examples < 5 {
+                            counts_examples += 1;
+                            println!("  bind error {worst:.3}: {}", e.path);
+                        }
+                        // Weights should sum to one.
+                        for s in &mesh.segments {
+                            if let Some(ws) = s.stream("SkinWeights") {
+                                let w = aerugo_formats::mesh::stream_floats(&c, ws);
+                                let bad = w
+                                    .chunks_exact(4)
+                                    .filter(|v| (v.iter().sum::<f32>() - 1.0).abs() > 0.01)
+                                    .count();
+                                add(if bad == 0 {
+                                    "weights sum to 1".into()
+                                } else {
+                                    "weights do NOT sum to 1".into()
+                                });
+                            }
+                        }
+                    }
                     for mesh in &m.meshes {
                         for mat in &mesh.materials {
                             add(format!("material textures {}", mat.textures.len().min(5)));
