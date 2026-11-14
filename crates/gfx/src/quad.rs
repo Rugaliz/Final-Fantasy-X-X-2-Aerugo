@@ -151,7 +151,7 @@ impl QuadPipeline {
     }
 }
 
-fn shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
+pub(crate) fn shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
     let words = ash::util::read_spv(&mut std::io::Cursor::new(spv))?;
     let info = vk::ShaderModuleCreateInfo::default().code(&words);
     // SAFETY: valid device; the code was produced and validated by the shader compiler at build time.

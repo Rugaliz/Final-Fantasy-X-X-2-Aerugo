@@ -794,8 +794,23 @@ impl Cluster {
         &self.data[start..start + l.object_size]
     }
 
-    pub fn member(&self, id: ObjectId, name: &str) -> Option<&MemberDesc> {
-        self.namespace.member(self.list(id).class, name)
+    /// A member by name; `a.b` names member `b` of the embedded struct `a`. The offset is from the object start.
+    pub fn member(&self, id: ObjectId, name: &str) -> Option<MemberDesc> {
+        let mut class = self.list(id).class;
+        let mut offset = 0;
+        let mut parts = name.split('.').peekable();
+        while let Some(part) = parts.next() {
+            let m = self.namespace.member(class, part)?;
+            if parts.peek().is_none() {
+                return Some(MemberDesc { offset: offset + m.offset, ..m.clone() });
+            }
+            offset += m.offset;
+            class = match self.namespace.type_of(m.type_id) {
+                TypeRef::Class(c) => c,
+                _ => return None,
+            };
+        }
+        None
     }
 
     /// Raw bytes of a member.
@@ -870,27 +885,67 @@ impl Cluster {
 
     /// Objects referenced by a `PArray<T *>` / `PArray<T>` member.
     pub fn array_targets(&self, id: ObjectId, name: &str) -> Vec<ObjectId> {
+        self.array_pointers(id, name)
+            .into_iter()
+            .filter_map(|p| match p {
+                Pointer::Object { target, .. } => Some(target),
+                Pointer::User(_) => None,
+            })
+            .collect()
+    }
+
+    /// Elements of an array member as pointers: arrays of pointers yield one pointer per element (external
+    /// ones as user fixups); arrays of objects yield one pointer per object.
+    pub fn array_pointers(&self, id: ObjectId, name: &str) -> Vec<Pointer> {
         let Some(m) = self.member(id, name) else { return Vec::new() };
-        let count = self.array_count(id, name).unwrap_or(0);
-        let slot = m.offset + 4;
-        if self.pointer_arrays.contains_key(&(id, slot)) {
-            // Array of pointers: one pointer per element.
-            (0..count)
-                .filter_map(|e| match self.pointer_at(id, slot, e)? {
-                    Pointer::Object { target, .. } => Some(target),
-                    Pointer::User(_) => None,
-                })
-                .collect()
-        } else {
-            // Array of objects: one pointer to the first element.
-            match self.pointer_at(id, slot, 0) {
-                Some(Pointer::Object { target, .. }) => (0..count)
+        // `PArray` keeps its element pointer after the count; other containers keep it first.
+        for slot in [m.offset + 4, m.offset] {
+            if slot >= m.offset + m.size.max(4) {
+                continue;
+            }
+            if self.pointer_arrays.contains_key(&(id, slot)) {
+                let mut v: Vec<(u32, Pointer)> = self
+                    .pointers
+                    .iter()
+                    .filter(|((o, off, _), _)| *o == id && *off == slot)
+                    .map(|(&(_, _, e), &p)| (e, p))
+                    .collect();
+                v.sort_by_key(|&(e, _)| e);
+                return v.into_iter().map(|(_, p)| p).collect();
+            }
+            if let Some(Pointer::Object { target, offset, count }) = self.pointer_at(id, slot, 0) {
+                let n = if count > 0 { count } else { self.array_count(id, name).unwrap_or(1) };
+                return (0..n)
                     .map(|k| ObjectId { list: target.list, index: target.index + k })
                     .filter(|o| o.index < self.list(*o).count)
-                    .collect(),
-                _ => Vec::new(),
+                    .map(|target| Pointer::Object { target, offset, count: 0 })
+                    .collect();
             }
         }
+        Vec::new()
+    }
+
+    /// An external asset named by a user fixup: (asset id, asset class), e.g. a texture or effect in another
+    /// cluster.
+    pub fn import(&self, u: usize) -> Option<(String, String)> {
+        let f = self.user_fixups.get(u)?;
+        if self.namespace.type_name(f.type_id) != "PAssetReferenceImport" {
+            return None;
+        }
+        let d = &self.data[f.data.clone()];
+        let index = match d.len() {
+            1 => u32::from(d[0]),
+            2 => u32::from(u16::from_be_bytes([d[0], d[1]])),
+            4 => u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+            _ => return None,
+        };
+        let list = self.objects("PAssetReferenceImport");
+        let obj = *list.get(index as usize)?;
+        let class = match self.pointer(obj, "m_targetAssetType") {
+            Some(Pointer::User(t)) => self.user_string(t),
+            _ => String::new(),
+        };
+        Some((self.string(obj, "m_id")?, class))
     }
 
     /// A NUL-terminated string member (`PString` or `PChar *`).
@@ -980,22 +1035,37 @@ impl Cluster {
     /// Members of an object with decoded values: numbers for primitive types, pointer targets and array sizes
     /// for references, raw bytes otherwise.
     pub fn describe(&self, id: ObjectId) -> Vec<FieldView> {
+        let mut out = Vec::new();
+        self.describe_into(id, self.list(id).class, 0, "", 0, &mut out);
+        out
+    }
+
+    fn describe_into(
+        &self,
+        id: ObjectId,
+        class: usize,
+        base: u32,
+        prefix: &str,
+        depth: u32,
+        out: &mut Vec<FieldView>,
+    ) {
         let ns = &self.namespace;
         let bytes = self.object_bytes(id);
-        let mut out = Vec::new();
-        for m in ns.all_members(self.list(id).class) {
-            let start = m.offset as usize;
+        for m in ns.all_members(class) {
+            let offset = base + m.offset;
+            let start = offset as usize;
             let raw = bytes.get(start..start + m.size as usize).unwrap_or(&[]);
             let type_name = ns.type_name(m.type_id).to_owned();
+            let name = format!("{prefix}{}", m.name);
             // Pointer and array slots at this member (PArray keeps its pointer 4 bytes in).
             let mut refs = Vec::new();
-            for slot in [m.offset, m.offset + 4] {
-                if slot >= m.offset + m.size.max(1) {
+            for slot in [offset, offset + 4] {
+                if slot >= offset + m.size.max(1) {
                     continue;
                 }
                 if let Some(a) = self.array_at(id, slot) {
                     refs.push(if a.count > 0 { format!("[{} elements]", a.count) } else { "[data]".into() });
-                    if type_name == "PString" || ns.type_name(m.type_id) == "PChar" {
+                    if type_name == "PString" || type_name == "PChar" {
                         refs.push(format!("\"{}\"", cstr(&self.data[..self.list(id).arrays.end], a.start)));
                     }
                 }
@@ -1007,14 +1077,22 @@ impl Cluster {
                     refs.push(format!("[{n} pointers]"));
                 }
             }
+            if refs.is_empty()
+                && depth < 4
+                && let TypeRef::Class(c) = ns.type_of(m.type_id)
+                && !ns.all_members(c).is_empty()
+                && ns.classes[c].size <= m.size
+            {
+                self.describe_into(id, c, offset, &format!("{name}."), depth + 1, out);
+                continue;
+            }
             let value = if !refs.is_empty() {
                 refs.join(" ")
             } else {
                 format_primitive(&type_name, raw, m.fixed_array_size)
             };
-            out.push(FieldView { name: m.name.clone(), type_name, offset: m.offset, value });
+            out.push(FieldView { name, type_name, offset, value });
         }
-        out
     }
 }
 

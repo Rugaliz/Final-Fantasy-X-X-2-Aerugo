@@ -2,6 +2,7 @@
 //! Functions that name archive paths take a [`Game`].
 
 pub mod kernel;
+pub mod mesh;
 pub mod phyre;
 pub mod text;
 pub mod texture;

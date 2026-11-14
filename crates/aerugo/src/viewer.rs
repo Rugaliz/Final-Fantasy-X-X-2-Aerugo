@@ -1,6 +1,7 @@
 //! Asset viewer: browses the game data. Tabs are added as readers arrive.
 
 mod filelist;
+mod models;
 mod tables;
 mod textures;
 
@@ -10,6 +11,7 @@ use aerugo_debug_ui::egui;
 use aerugo_gfx::Renderer;
 use aerugo_vfs::{Install, Language, Vfs};
 
+use models::ModelBrowser;
 use tables::TableBrowser;
 use textures::TextureBrowser;
 
@@ -17,6 +19,7 @@ use textures::TextureBrowser;
 enum Tab {
     Tables,
     Textures,
+    Models,
 }
 
 #[derive(Debug)]
@@ -26,6 +29,7 @@ pub struct Viewer {
     tab: Tab,
     tables: TableBrowser,
     textures: TextureBrowser,
+    models: ModelBrowser,
 }
 
 /// What the viewer asks the app to do.
@@ -51,12 +55,20 @@ impl Viewer {
         if let Some(vfs) = &vfs {
             tables.refresh(vfs);
         }
-        Viewer { vfs, error, tab: Tab::Tables, tables, textures: TextureBrowser::new() }
+        Viewer {
+            vfs,
+            error,
+            tab: Tab::Tables,
+            tables,
+            textures: TextureBrowser::new(),
+            models: ModelBrowser::new(),
+        }
     }
 
     /// Release GPU resources before the viewer is dropped.
     pub fn close(&mut self, renderer: &mut Renderer) {
         self.textures.close(renderer);
+        self.models.close(renderer);
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -69,12 +81,14 @@ impl Viewer {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Tables, "Tables");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "Textures");
+                ui.selectable_value(&mut self.tab, Tab::Models, "Models");
             });
         });
         match (&self.vfs, &self.error) {
             (Some(vfs), _) => match self.tab {
                 Tab::Tables => self.tables.ui(ui, vfs),
                 Tab::Textures => self.textures.ui(ui, vfs, renderer),
+                Tab::Models => self.models.ui(ui, vfs, renderer),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

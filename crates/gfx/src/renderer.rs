@@ -8,8 +8,11 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Context, ContextOptions};
 use crate::quad::{Quad, QuadPipeline};
+use crate::scene::{
+    DEPTH_FORMAT, MeshDesc, MeshHandle, SceneState, SceneView, Target, VIEWPORT_FORMAT, Viewport,
+};
 use crate::swapchain::{PresentMode, Swapchain, color_range};
-use crate::texture::{Texture, TextureDesc};
+use crate::texture::{TexFormat, Texture, TextureDesc};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 /// Descriptor sets available for textures shown in the UI.
@@ -126,6 +129,8 @@ pub struct Renderer {
     quad: QuadPipeline,
     egui: Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
     ui_textures: UiTextures,
+    scene: SceneState,
+    white: Option<TextureHandle>,
     textures: HashMap<u64, TextureEntry>,
     next_texture: u64,
     wanted_size: (u32, u32),
@@ -202,8 +207,9 @@ impl Renderer {
         .context("creating the egui renderer")?;
 
         let ui_textures = UiTextures::new(device)?;
+        let scene = SceneState::new(&ctx, FRAMES_IN_FLIGHT)?;
 
-        Ok(Self {
+        let mut renderer = Self {
             swapchain: Some(swapchain),
             frames,
             frame_index: 0,
@@ -211,13 +217,27 @@ impl Renderer {
             quad,
             egui: Some(egui),
             ui_textures,
+            scene,
+            white: None,
             textures: HashMap::new(),
             next_texture: 1,
             wanted_size: size,
             wanted_mode: present_mode,
             needs_recreate: false,
             ctx,
-        })
+        };
+        let white = [255u8; 4];
+        renderer.white = Some(renderer.create_texture(&TextureDesc {
+            format: TexFormat::Rgba8,
+            width: 1,
+            height: 1,
+            levels: 1,
+            layers: 1,
+            cube: false,
+            data: vec![&white],
+            name: "white",
+        })?);
+        Ok(renderer)
     }
 
     /// Upload a texture (all levels and layers); waits for the copy.
@@ -293,8 +313,134 @@ impl Renderer {
                 device.destroy_image_view(view, None);
             }
         }
+        self.scene.forget_view(&self.ctx, entry.texture.view);
         // SAFETY: the device is idle.
         unsafe { entry.texture.destroy(&self.ctx) };
+    }
+
+    /// Upload a mesh. Parts without a texture sample white.
+    pub fn create_mesh(&mut self, desc: &MeshDesc<'_>) -> Result<MeshHandle> {
+        let mut sets = Vec::with_capacity(desc.parts.len());
+        for part in &desc.parts {
+            let handle = part.texture.or(self.white).context("no white texture")?;
+            let view = self.textures.get(&handle.0).context("unknown texture")?.texture.view;
+            sets.push(self.scene.material_set(&self.ctx, view)?);
+        }
+        self.scene.create_mesh(&self.ctx, desc, sets)
+    }
+
+    /// Destroy a mesh (waits for the GPU).
+    pub fn destroy_mesh(&mut self, mesh: MeshHandle) {
+        self.ctx.wait_idle();
+        self.scene.destroy_mesh(&self.ctx, mesh);
+    }
+
+    /// The UI texture showing the 3D viewport, (re)created at `size` pixels.
+    pub fn viewport_texture(&mut self, size: (u32, u32)) -> Result<egui::TextureId> {
+        let extent = vk::Extent2D { width: size.0.clamp(1, 16384), height: size.1.clamp(1, 16384) };
+        if let Some(vp) = &self.scene.viewport
+            && vp.extent == extent
+        {
+            return Ok(vp.ui_id);
+        }
+        self.ctx.wait_idle();
+        self.drop_viewport();
+        let ctx = &self.ctx;
+        let mut color = Target::new(
+            ctx,
+            VIEWPORT_FORMAT,
+            extent,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let depth = match Target::new(
+            ctx,
+            DEPTH_FORMAT,
+            extent,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageAspectFlags::DEPTH,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                // SAFETY: never used.
+                unsafe { color.destroy(ctx) };
+                return Err(e);
+            }
+        };
+        // Start in the layout the UI samples from.
+        crate::scene::one_time_submit(ctx, |cmd| {
+            // SAFETY: recording; the image is ours.
+            unsafe {
+                image_barrier(
+                    &ctx.device,
+                    cmd,
+                    color.image,
+                    (vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    ),
+                )
+            };
+        })?;
+        let layouts = [self.ui_textures.layout];
+        // SAFETY: valid pool and layout.
+        let set = unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.ui_textures.pool)
+                    .set_layouts(&layouts),
+            )
+        }?[0];
+        let info = [vk::DescriptorImageInfo::default()
+            .sampler(self.ui_textures.linear)
+            .image_view(color.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let write = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&info)];
+        // SAFETY: the set is new.
+        unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
+        let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
+        self.scene.viewport = Some(Viewport {
+            color,
+            depth,
+            extent,
+            ui_set: set,
+            ui_id,
+            color_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        });
+        Ok(ui_id)
+    }
+
+    /// Release the viewport (waits for the GPU).
+    pub fn release_viewport(&mut self) {
+        if self.scene.viewport.is_some() {
+            self.ctx.wait_idle();
+            self.drop_viewport();
+        }
+    }
+
+    fn drop_viewport(&mut self) {
+        if let Some(mut vp) = self.scene.viewport.take() {
+            if let Some(egui) = self.egui.as_mut() {
+                egui.remove_user_texture(vp.ui_id);
+            }
+            // SAFETY: callers waited for the device.
+            unsafe {
+                self.ctx.device.free_descriptor_sets(self.ui_textures.pool, &[vp.ui_set]).ok();
+                vp.color.destroy(&self.ctx);
+                vp.depth.destroy(&self.ctx);
+            }
+        }
+    }
+
+    /// Draw `view` into the viewport this frame.
+    pub fn submit_scene(&mut self, view: SceneView) {
+        self.scene.pending = Some(view);
     }
 
     pub fn context(&self) -> &Context {
@@ -411,6 +557,7 @@ impl Renderer {
                 cmd,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            self.scene.record(&self.ctx, cmd, self.frame_index)?;
             image_barrier(
                 &device,
                 cmd,
@@ -492,9 +639,13 @@ impl Drop for Renderer {
         self.ctx.wait_idle();
         // egui's renderer frees its GPU memory through the shared allocator; drop it before the context.
         self.egui = None;
+        self.drop_viewport();
+        // Textures free their scene descriptor sets, so they go before the scene's pool.
         for handle in self.textures.keys().copied().collect::<Vec<_>>() {
             self.destroy_texture(TextureHandle(handle));
         }
+        // SAFETY: the device is idle.
+        unsafe { self.scene.destroy(&self.ctx) };
         let device = &self.ctx.device;
         // SAFETY: the device is idle; every object below was created from it and is destroyed once.
         unsafe {

@@ -40,6 +40,8 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Count vertex stream layouts, primitive and index types over all model clusters.
+    ModelCensus,
     /// Print a Phyre cluster: header, instance lists and every object's fields.
     DumpPhyre {
         /// Archive path (as printed by `list`).
@@ -60,6 +62,7 @@ fn main() -> Result<()> {
         Command::CheckPhyre { every, verbose, threads } => {
             check_phyre(&install, every.max(1), verbose, threads)
         }
+        Command::ModelCensus => model_census(&install),
         Command::DumpPhyre { path, class } => dump_phyre(&install, &path, class.as_deref()),
     }
 }
@@ -303,6 +306,98 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
                 println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, f.value);
             }
         }
+    }
+    Ok(())
+}
+
+fn model_census(install: &Install) -> Result<()> {
+    use aerugo_formats::phyre::{Cluster, Pointer};
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut add = |k: String| *counts.entry(k).or_default() += 1;
+    for archive in open_all(install)? {
+        for e in archive.entries().iter().filter(|e| e.path.ends_with(".dae.phyre")) {
+            let Ok(c) = Cluster::parse(archive.read(e)?) else { continue };
+            for s in c.objects("PVertexStream") {
+                let sem = match c.pointer(s, "m_renderDataType") {
+                    Some(Pointer::User(u)) => c.user_string(u),
+                    _ => "?".into(),
+                };
+                add(format!("stream {sem} type {}", c.u32(s, "m_type").unwrap_or(999)));
+            }
+            for b in c.objects("PDataBlock") {
+                let streams = c.array_count(b, "m_streams").unwrap_or(0);
+                add(format!("block streams {streams}"));
+                if streams == 1
+                    && let Some(s) = c.array_targets(b, "m_streams").first()
+                {
+                    {
+                        let sem = match c.pointer(*s, "m_renderDataType") {
+                            Some(Pointer::User(u)) => c.user_string(u),
+                            _ => "?".into(),
+                        };
+                        add(format!(
+                            "layout {sem} type {} stride {}",
+                            c.u32(*s, "m_type").unwrap_or(999),
+                            c.u32(b, "m_stride").unwrap_or(0)
+                        ));
+                    }
+                }
+            }
+            for g in c.objects("PMeshSegment") {
+                let n = c.u32(g, "m_indexData.m_elementCount").unwrap_or(0);
+                add(format!(
+                    "segment primitive {} index type {} count%3 {}",
+                    c.u32(g, "m_primitiveType").unwrap_or(999),
+                    c.u32(g, "m_indexData.m_type").unwrap_or(999),
+                    n % 3
+                ));
+                let size = c.u32(g, "m_indexData.m_dataSize").unwrap_or(0);
+                if let Some(per) = size.checked_div(n) {
+                    add(format!("index bytes/element {per}"));
+                }
+            }
+            for u in &c.user_fixups {
+                let t = c.namespace.type_name(u.type_id).to_owned();
+                if t == "PAssetReferenceImport" {
+                    let d = &c.data()[u.data.clone()];
+                    add(format!("import fixup len {} first {}", d.len(), d.first().copied().unwrap_or(0)));
+                }
+            }
+            add(format!("instances {}", c.objects("PMeshInstance").len().min(9)));
+            match aerugo_formats::mesh::read_model(&c) {
+                Ok(m) => {
+                    add("model ok".into());
+                    for mesh in &m.meshes {
+                        for mat in &mesh.materials {
+                            add(format!("material textures {}", mat.textures.len().min(5)));
+                            for t in &mat.textures {
+                                let path = aerugo_formats::mesh::texture_cluster_path(&e.path, &t.asset);
+                                add(if archive.find(&path).is_some() {
+                                    "texture found".into()
+                                } else {
+                                    format!("texture missing (param {})", t.parameter)
+                                });
+                            }
+                        }
+                        for s in &mesh.segments {
+                            if s.positions().is_none() {
+                                add("segment without positions".into());
+                            }
+                            if (s.material as usize) >= mesh.materials.len() {
+                                add("segment material out of range".into());
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    add(format!("model error {err}"));
+                }
+            }
+        }
+    }
+    for (k, v) in counts {
+        println!("{v:>8}  {k}");
     }
     Ok(())
 }
