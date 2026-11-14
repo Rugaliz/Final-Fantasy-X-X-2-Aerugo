@@ -57,6 +57,8 @@ dependencies = [
 name = "aerugo-gfx"
 version = "0.1.0"
 dependencies = [
+ "aerugo-formats",
+ "aerugo-vfs",
  "anyhow",
  "ash",
  "ash-window",

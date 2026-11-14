@@ -8,8 +8,10 @@ pub mod offscreen;
 pub mod quad;
 pub mod renderer;
 pub mod swapchain;
+pub mod texture;
 
-pub use context::{Context, ContextOptions};
+pub use context::{Context, ContextOptions, validation_error_count};
 pub use quad::{Quad, QuadPipeline};
-pub use renderer::{EguiFrame, FrameInput, Renderer};
+pub use renderer::{EguiFrame, FrameInput, Renderer, TextureHandle};
 pub use swapchain::PresentMode;
+pub use texture::{TexFormat, Texture, TextureDesc};

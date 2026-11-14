@@ -192,8 +192,9 @@ impl App {
             let clipboard = self.platform.video.clipboard();
             let mut actions = Vec::new();
             let ui_state = &mut self.ui;
+            let renderer = &mut self.renderer;
             let mut frame = self.egui.run(&self.platform.window, &clipboard, |ui| {
-                draw_ui(ui, ui_state, &info, &mut actions);
+                draw_ui(ui, ui_state, renderer, &info, &mut actions);
             });
             for action in actions {
                 self.handle_action(action);
@@ -275,7 +276,9 @@ impl App {
         match action {
             Action::BackToLauncher => {
                 self.ui.screen = Screen::Launcher;
-                self.ui.viewer = None;
+                if let Some(mut v) = self.ui.viewer.take() {
+                    v.close(&mut self.renderer);
+                }
             }
             Action::Launcher(a) => match a {
                 LauncherAction::StartGame(game) => {
@@ -408,7 +411,13 @@ fn without_untouched_overrides(current: &Settings, launch: &Settings, file: &Set
     out
 }
 
-fn draw_ui(ui: &mut egui::Ui, state: &mut UiState, info: &RenderInfo, actions: &mut Vec<Action>) {
+fn draw_ui(
+    ui: &mut egui::Ui,
+    state: &mut UiState,
+    renderer: &mut Renderer,
+    info: &RenderInfo,
+    actions: &mut Vec<Action>,
+) {
     let ctx = ui.ctx().clone();
     match state.screen {
         Screen::Launcher => {
@@ -418,7 +427,7 @@ fn draw_ui(ui: &mut egui::Ui, state: &mut UiState, info: &RenderInfo, actions: &
         }
         Screen::Viewer => {
             if let Some(viewer) = &mut state.viewer
-                && viewer.ui(ui) == Some(ViewerAction::Back)
+                && viewer.ui(ui, renderer) == Some(ViewerAction::Back)
             {
                 actions.push(Action::BackToLauncher);
             }

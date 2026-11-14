@@ -1,17 +1,22 @@
-//! Asset viewer: browses the game data. Tabs are added as readers arrive (tables first).
+//! Asset viewer: browses the game data. Tabs are added as readers arrive.
 
+mod filelist;
 mod tables;
+mod textures;
 
 use std::sync::Arc;
 
 use aerugo_debug_ui::egui;
+use aerugo_gfx::Renderer;
 use aerugo_vfs::{Install, Language, Vfs};
 
 use tables::TableBrowser;
+use textures::TextureBrowser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Tables,
+    Textures,
 }
 
 #[derive(Debug)]
@@ -20,6 +25,7 @@ pub struct Viewer {
     error: Option<String>,
     tab: Tab,
     tables: TableBrowser,
+    textures: TextureBrowser,
 }
 
 /// What the viewer asks the app to do.
@@ -45,10 +51,15 @@ impl Viewer {
         if let Some(vfs) = &vfs {
             tables.refresh(vfs);
         }
-        Viewer { vfs, error, tab: Tab::Tables, tables }
+        Viewer { vfs, error, tab: Tab::Tables, tables, textures: TextureBrowser::new() }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ViewerAction> {
+    /// Release GPU resources before the viewer is dropped.
+    pub fn close(&mut self, renderer: &mut Renderer) {
+        self.textures.close(renderer);
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
         let mut action = None;
         egui::Panel::top("viewer-bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -57,11 +68,13 @@ impl Viewer {
                 }
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Tables, "Tables");
+                ui.selectable_value(&mut self.tab, Tab::Textures, "Textures");
             });
         });
         match (&self.vfs, &self.error) {
             (Some(vfs), _) => match self.tab {
                 Tab::Tables => self.tables.ui(ui, vfs),
+                Tab::Textures => self.textures.ui(ui, vfs, renderer),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

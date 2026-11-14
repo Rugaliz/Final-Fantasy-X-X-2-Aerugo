@@ -138,9 +138,13 @@ impl Context {
             if surface_fn.is_some() { vec![ash::khr::swapchain::NAME.as_ptr()] } else { vec![] };
         let mut features13 =
             vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
+        // The games' textures are BC1–BC3; every desktop GPU supports them.
+        let core = vk::PhysicalDeviceFeatures::default().texture_compression_bc(true);
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&device_exts)
+            .push_next(&mut features2)
             .push_next(&mut features13);
         // SAFETY: physical device and queue family were validated by pick_device.
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
@@ -229,7 +233,12 @@ fn pick_device(
         let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13);
         // SAFETY: valid physical device; the chain lives on the stack for the call.
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+        let bc = f2.features.texture_compression_bc;
         if f13.dynamic_rendering == vk::FALSE || f13.synchronization2 == vk::FALSE {
+            continue;
+        }
+        if bc == vk::FALSE {
+            log::info!("skipping {name}: BC texture compression required");
             continue;
         }
         if surface_fn.is_some() {
@@ -269,6 +278,13 @@ fn pick_device(
     }
 }
 
+static VALIDATION_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Validation-layer errors reported so far in this process (for tests).
+pub fn validation_error_count() -> u64 {
+    VALIDATION_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _types: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -280,6 +296,8 @@ unsafe extern "system" fn debug_callback(
         .map(|m| m.to_string_lossy().into_owned())
         .unwrap_or_default();
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Vulkan validation: {message}");
         log::error!("Vulkan: {message}");
     } else {
         log::warn!("Vulkan: {message}");

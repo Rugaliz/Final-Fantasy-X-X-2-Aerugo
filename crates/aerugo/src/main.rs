@@ -1,6 +1,7 @@
 //! Aerugo: a source port of Final Fantasy X and X-2. Needs the player's own copy of the HD Remaster.
 
 mod app;
+mod assets;
 mod cli;
 mod launcher;
 mod scene;
