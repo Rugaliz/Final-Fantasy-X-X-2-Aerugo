@@ -1,0 +1,22 @@
+[package]
+name = "aerugo-vfs"
+description = "Game installation discovery, VBF archive reader and virtual file system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
