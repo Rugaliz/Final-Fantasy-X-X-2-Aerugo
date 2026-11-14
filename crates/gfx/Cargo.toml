@@ -1,0 +1,24 @@
+[package]
+name = "aerugo-gfx"
+description = "Vulkan layer: device, swapchain, frame pacing, pipelines, egui drawing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ash.workspace = true
+ash-window.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+gpu-allocator.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+
+[build-dependencies]
+naga = { version = "30", features = ["glsl-in", "spv-out"] }
+
+[lints]
+workspace = true
