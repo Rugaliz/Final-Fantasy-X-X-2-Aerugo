@@ -3,6 +3,7 @@
 mod filelist;
 mod maps;
 mod models;
+mod sounds;
 mod tables;
 mod textures;
 
@@ -14,6 +15,7 @@ use aerugo_vfs::{Install, Language, Vfs};
 
 use maps::MapBrowser;
 use models::ModelBrowser;
+use sounds::SoundBrowser;
 use tables::TableBrowser;
 use textures::TextureBrowser;
 
@@ -23,6 +25,7 @@ enum Tab {
     Textures,
     Models,
     Maps,
+    Sounds,
 }
 
 #[derive(Debug)]
@@ -34,6 +37,8 @@ pub struct Viewer {
     textures: TextureBrowser,
     models: ModelBrowser,
     maps: MapBrowser,
+    sounds: SoundBrowser,
+    audio: Option<aerugo_audio::AudioOutput>,
 }
 
 /// What the viewer asks the app to do.
@@ -44,7 +49,18 @@ pub enum ViewerAction {
 
 impl Viewer {
     /// Mounts the archives of `install`. Errors are shown in the viewer instead of failing.
-    pub fn open(install: Option<&Install>, text_language: Language) -> Viewer {
+    pub fn open(
+        install: Option<&Install>,
+        text_language: Language,
+        sdl: &aerugo_platform::sdl3::Sdl,
+    ) -> Viewer {
+        let audio = match aerugo_audio::AudioOutput::open(sdl) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                log::warn!("{e:#}");
+                None
+            }
+        };
         let (vfs, error) = match install {
             None => (None, Some("No game installation selected.".to_owned())),
             Some(install) => {
@@ -67,6 +83,8 @@ impl Viewer {
             textures: TextureBrowser::new(),
             models: ModelBrowser::new(),
             maps: MapBrowser::new(),
+            sounds: SoundBrowser::new(),
+            audio,
         }
     }
 
@@ -75,6 +93,7 @@ impl Viewer {
         self.textures.close(renderer);
         self.models.close(renderer);
         self.maps.close(renderer);
+        self.sounds.close(self.audio.as_ref());
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -89,6 +108,7 @@ impl Viewer {
                 ui.selectable_value(&mut self.tab, Tab::Textures, "Textures");
                 ui.selectable_value(&mut self.tab, Tab::Models, "Models");
                 ui.selectable_value(&mut self.tab, Tab::Maps, "Maps");
+                ui.selectable_value(&mut self.tab, Tab::Sounds, "Sounds");
             });
         });
         match (&self.vfs, &self.error) {
@@ -97,6 +117,7 @@ impl Viewer {
                 Tab::Textures => self.textures.ui(ui, vfs, renderer),
                 Tab::Models => self.models.ui(ui, vfs, renderer),
                 Tab::Maps => self.maps.ui(ui, vfs, renderer),
+                Tab::Sounds => self.sounds.ui(ui, vfs, self.audio.as_ref()),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

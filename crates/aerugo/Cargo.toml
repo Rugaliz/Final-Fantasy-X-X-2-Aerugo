@@ -12,6 +12,7 @@ publish.workspace = true
 sdl-from-source = ["aerugo-platform/sdl-from-source"]
 
 [dependencies]
+aerugo-audio.workspace = true
 aerugo-debug-ui.workspace = true
 aerugo-formats.workspace = true
 aerugo-gfx.workspace = true

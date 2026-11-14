@@ -2,6 +2,7 @@
 //! Functions that name archive paths take a [`Game`].
 
 pub mod camera;
+pub mod fsb;
 pub mod kernel;
 pub mod mesh;
 pub mod motion;

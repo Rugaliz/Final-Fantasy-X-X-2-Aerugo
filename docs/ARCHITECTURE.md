@@ -10,6 +10,7 @@
 | `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
 | `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures |
 | `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation |
+| `aerugo-audio` | Float mixer with windowed-sinc resampling and a limiter, SDL3 playback |
 | `aerugo-debug-ui` | egui integration with SDL3 input, debug panels |
 | `xtask` | Developer commands (`cargo run -p xtask -- <command>`) |
 

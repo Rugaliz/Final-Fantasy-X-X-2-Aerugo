@@ -330,7 +330,7 @@ impl App {
             self.cjk_fonts = true;
         }
         let lang = Language::from_code(&self.ui.settings.game.text_language).unwrap_or(Language::English);
-        self.ui.viewer = Some(Viewer::open(self.ui.launcher.current(), lang));
+        self.ui.viewer = Some(Viewer::open(self.ui.launcher.current(), lang, &self.platform.sdl));
         self.ui.screen = Screen::Viewer;
     }
 

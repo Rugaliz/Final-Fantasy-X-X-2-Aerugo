@@ -1,0 +1,16 @@
+[package]
+name = "aerugo-audio"
+description = "Audio output: float mixer, sinc resampling, limiter, SDL3 device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aerugo-platform.workspace = true
+anyhow.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

@@ -49,6 +49,19 @@ enum Command {
     },
     /// Parse every motion group of both games.
     CheckMotions,
+    /// Decode FSB5 samples and compare them with ffmpeg's Xbox IMA decoder, sample for sample.
+    FsbCompare {
+        /// Archive path filter for banks (e.g. "sound_pc/voice/us").
+        filter: String,
+        /// Banks to check (every Nth bank matching the filter).
+        #[arg(long, default_value_t = 1)]
+        every: usize,
+        /// Samples per bank to check.
+        #[arg(long, default_value_t = 4)]
+        samples: usize,
+    },
+    /// Write one decoded FSB5 sample as a WAV file.
+    FsbExport { bank: String, index: usize, out: PathBuf },
     /// Count vertex stream layouts, primitive and index types over all model clusters.
     ModelCensus,
     /// Print a Phyre cluster: header, instance lists and every object's fields.
@@ -74,6 +87,10 @@ fn main() -> Result<()> {
         Command::ModelCensus => model_census(&install),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
+        Command::FsbCompare { filter, every, samples } => {
+            fsb_compare(&install, &filter, every.max(1), samples)
+        }
+        Command::FsbExport { bank, index, out } => fsb_export(&install, &bank, index, &out),
         Command::DumpPhyre { path, class } => dump_phyre(&install, &path, class.as_deref()),
     }
 }
@@ -557,5 +574,87 @@ fn check_motions(install: &Install) -> Result<()> {
     for f in failed.iter().take(20) {
         println!("  {f}");
     }
+    Ok(())
+}
+
+fn ffmpeg_decode(wav: &[u8], scratch: &std::path::Path) -> Result<Vec<i16>> {
+    let input = scratch.join("aerugo-fsb-ref.wav");
+    std::fs::write(&input, wav)?;
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-c:a", "adpcm_ima_xbox", "-i"])
+        .arg(&input)
+        .args(["-f", "s16le", "-"])
+        .output()
+        .context("running ffmpeg")?;
+    if !out.status.success() {
+        bail!("ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(out.stdout.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+fn fsb_compare(install: &Install, filter: &str, every: usize, per_bank: usize) -> Result<()> {
+    use aerugo_formats::fsb::{Bank, wav_xbox_ima};
+    let scratch = std::env::temp_dir();
+    let (mut checked, mut identical, mut frames_total) = (0usize, 0usize, 0usize);
+    let mut worst = (0i32, String::new());
+    for archive in open_all(install)? {
+        let banks: Vec<_> = archive
+            .entries()
+            .iter()
+            .filter(|e| e.path.ends_with(".fsb") && e.path.contains(filter))
+            .step_by(every)
+            .collect();
+        for e in banks {
+            let data = archive.read(e)?;
+            let bank = Bank::parse(&data)?;
+            let n = bank.samples.len();
+            for s in bank.samples.iter().step_by((n / per_bank.max(1)).max(1)).take(per_bank) {
+                let ours = bank.decode(&data, s)?;
+                let reference =
+                    ffmpeg_decode(&wav_xbox_ima(s.rate, s.channels, &data[s.data.clone()]), &scratch)?;
+                let len = ours.len().min(reference.len());
+                let diff = ours[..len]
+                    .iter()
+                    .zip(&reference[..len])
+                    .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+                    .max()
+                    .unwrap_or(0);
+                checked += 1;
+                frames_total += len;
+                if diff == 0 && reference.len() >= ours.len() {
+                    identical += 1;
+                } else if diff >= worst.0 {
+                    worst = (
+                        diff,
+                        format!(
+                            "{} #{} ({}): ours {} values, ffmpeg {}",
+                            e.path,
+                            s.name,
+                            s.frames,
+                            ours.len(),
+                            reference.len()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    println!("{checked} samples ({frames_total} values) compared, {identical} identical");
+    if identical != checked {
+        println!("largest difference {}: {}", worst.0, worst.1);
+        bail!("decoders differ");
+    }
+    Ok(())
+}
+
+fn fsb_export(install: &Install, bank: &str, index: usize, out: &std::path::Path) -> Result<()> {
+    use aerugo_formats::fsb::{Bank, wav_pcm16};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let data = vfs.read(bank)?;
+    let b = Bank::parse(&data)?;
+    let s = b.samples.get(index).context("no such sample")?;
+    std::fs::write(out, wav_pcm16(s.rate, s.channels, &b.decode(&data, s)?))?;
+    println!("{}: {} Hz, {} channels, {} frames, loop {:?}", s.name, s.rate, s.channels, s.frames, s.looping);
     Ok(())
 }
