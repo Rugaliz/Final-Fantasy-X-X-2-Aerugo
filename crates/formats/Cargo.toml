@@ -1,6 +1,6 @@
 [package]
 name = "aerugo-formats"
-description = "Readers for the games' data formats: text, data tables"
+description = "Readers for the games' data formats"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

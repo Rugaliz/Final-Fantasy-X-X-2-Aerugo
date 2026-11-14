@@ -2,9 +2,12 @@
 //! Functions that name archive paths take a [`Game`].
 
 pub mod kernel;
+pub mod phyre;
 pub mod text;
+pub mod texture;
 
 pub use kernel::{KernelError, KernelTable};
+pub use phyre::{Cluster, ObjectId, PhyreError, Pointer};
 pub use text::{Charset, Token};
 
 use aerugo_vfs::GameId;
