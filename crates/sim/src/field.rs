@@ -8,7 +8,7 @@ use aerugo_formats::script::Script;
 use aerugo_formats::text::{self, Charset};
 use aerugo_script::natives::{Native, World, wrap_angle};
 
-use crate::trigger::{self, PlayerStep, Trigger};
+use crate::trigger::{self, PlayerStep, Talk, Talker, Trigger};
 use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
@@ -123,6 +123,12 @@ pub struct Window {
     pub opening: u8,
     /// Ticks left of the closing animation (a message wait ends once it is over).
     pub closing: u8,
+    /// How many characters the text reveal counts for the open message (names spelled out).
+    pub reveal: usize,
+    /// Where the reveal stops until confirm is pressed, in the same count.
+    pub stops: Vec<usize>,
+    /// Flags a script set for the window; 0x1000 shows the text at once.
+    pub flags: u16,
 }
 
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
@@ -134,6 +140,21 @@ const CLOSE_TICKS: u8 = 2;
 /// Characters revealed per tick.
 const TEXT_SPEED: usize = 2;
 
+/// Window flag: the text appears at once instead of a few characters per tick.
+const WINDOW_INSTANT: u16 = 0x1000;
+
+/// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
+const NAMES: usize = 0x634C;
+const NAME_SLOT: usize = 0x14;
+
+/// Characters in a character's name as the save image spells it.
+fn name_chars(image: &[u8], chr: u8) -> usize {
+    let at = NAMES + usize::from(chr) * NAME_SLOT;
+    let slot = image.get(at..at + NAME_SLOT).unwrap_or_default();
+    // Page leads and the extension prefix start two-byte characters.
+    slot.iter().take_while(|&&b| b != 0).filter(|&&b| !matches!(b, 0x04 | 0x2C..=0x2F)).count()
+}
+
 /// One event message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Message {
@@ -143,6 +164,19 @@ pub struct Message {
     pub raw: String,
     /// How many of the last lines are choices.
     pub choices: u8,
+    /// What the text reveal goes through: everything but line breaks, after a first line that is only control
+    /// codes (the speaker's name, shown at once).
+    pub reveal: Vec<RevealPart>,
+}
+
+/// A piece of a message's text reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealPart {
+    Chars(usize),
+    /// A character's name, counted by its length in the save image.
+    Name(u8),
+    /// The reveal waits here for confirm.
+    Pause,
 }
 
 impl Message {
@@ -240,6 +274,8 @@ pub struct Input {
     /// Confirm pressed this tick (advances messages, talks).
     pub confirm: bool,
     pub cancel: bool,
+    /// The second talk button pressed this tick (square on a PlayStation pad): talks with another signal type.
+    pub alt: bool,
     /// The stick moved from rest this tick (for menus and choices).
     pub stick_pressed: bool,
 }
@@ -285,6 +321,12 @@ pub struct FieldState {
     /// between).
     pub player_prev: [f32; 3],
     player_start: Option<[f32; 3]>,
+    /// The player has control (scripts turn it on and off); talking needs it.
+    pub user_control: bool,
+    /// Added to every talk radius (a script sets it; 0 by default).
+    pub talk_reach: f32,
+    /// The talk started this tick, while workers offer themselves.
+    pub talk: Option<Talk>,
 }
 
 impl FieldState {
@@ -309,7 +351,23 @@ impl World for FieldState {
         }
         let bits = a.flags;
         out.retain(|&t| bits & (1 << t) != 0);
+        if let Some(talk) = self.talk.as_mut().filter(|_| bits & 1 != 0 && w != p) {
+            let talker = Talker { pos: step.cur, yaw: self.actors[p].yaw, reach: self.talk_reach };
+            let a = &self.actors[w];
+            match kind {
+                1 if a.model.is_some() => trigger::talk_character(&a.trigger, w, a.pos, &talker, talk),
+                2 => trigger::talk_line_zone(&a.trigger, w, a.pos, &talker, talk),
+                3 => trigger::talk_box(&a.trigger, w, a.pos, a.yaw, &talker, talk),
+                _ => {}
+            }
+        }
         out
+    }
+
+    fn talk(&mut self) -> Option<(usize, u8)> {
+        let talk = self.talk.take()?;
+        let (w, _) = talk.best.filter(|_| self.user_control)?;
+        Some((w, talk.signal))
     }
 
     fn party_worker(&mut self, slot: i32) -> Option<usize> {
@@ -323,6 +381,13 @@ impl World for FieldState {
 }
 
 impl FieldState {
+    /// Start a talk when a talk button is pressed while the player has control and no message window is open.
+    fn begin_talk(&mut self) {
+        let pressed = self.input.confirm || self.input.alt;
+        self.talk = (pressed && self.user_control && !self.windows.iter().any(|w| w.open))
+            .then(|| Talk::new(if self.input.confirm { trigger::TALK } else { trigger::TALK_ALT }));
+    }
+
     fn actor(&mut self, w: usize) -> &mut Actor {
         if self.actors.len() <= w {
             self.actors.resize(w + 1, Actor::default());
@@ -333,7 +398,6 @@ impl FieldState {
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
         self.camera.update();
-        let messages = &self.messages;
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
         }
@@ -342,8 +406,15 @@ impl FieldState {
                 w.opening -= 1;
                 continue;
             }
-            let len = w.message.and_then(|m| messages.get(m)).map_or(0, Message::len);
-            w.shown = (w.shown + TEXT_SPEED).min(len);
+            // Up to the next pause; confirm there lets the reveal go on from the next tick.
+            let stop = w.stops.first().copied().unwrap_or(w.reveal).min(w.reveal);
+            if w.shown >= stop && stop < w.reveal {
+                if self.input.confirm {
+                    w.stops.remove(0);
+                }
+                continue;
+            }
+            w.shown = if w.flags & WINDOW_INSTANT != 0 { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
         for a in &mut self.actors {
             if let Some(m) = &mut a.moving {
@@ -452,9 +523,39 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
                     _ => None,
                 })
                 .collect();
-            Message { text, raw: text::to_display(&tokens), choices: (word(i * 8 + 2) >> 8) as u8 }
+            let reveal = reveal_parts(&tokens);
+            Message { text, raw: text::to_display(&tokens), choices: (word(i * 8 + 2) >> 8) as u8, reveal }
         })
         .collect()
+}
+
+/// Name code: the character's name (argument 0x30 + character id).
+const NAME_CODE: u8 = 0x13;
+
+/// Pause code: the text waits for confirm before going on.
+const PAUSE_CODE: u8 = 0x01;
+
+/// What the text reveal goes through in a message: characters, names spelled out, and pauses.
+fn reveal_parts(tokens: &[text::Token]) -> Vec<RevealPart> {
+    let first_break = tokens.iter().position(|t| matches!(t, text::Token::LineBreak));
+    let speaker_line =
+        first_break.filter(|&n| !tokens[..n].iter().any(|t| matches!(t, text::Token::Char(_))));
+    let body = speaker_line.map_or(tokens, |n| &tokens[n + 1..]);
+    let mut parts = Vec::new();
+    for t in body {
+        match *t {
+            text::Token::Char(_) | text::Token::Unmapped(_) => match parts.last_mut() {
+                Some(RevealPart::Chars(n)) => *n += 1,
+                _ => parts.push(RevealPart::Chars(1)),
+            },
+            text::Token::Control { code: NAME_CODE, arg: Some(a) } if a >= 0x30 => {
+                parts.push(RevealPart::Name(a - 0x30))
+            }
+            text::Token::Control { code: PAUSE_CODE, arg: None } => parts.push(RevealPart::Pause),
+            _ => {}
+        }
+    }
+    parts
 }
 
 /// The map the event most likely uses: area from the first four letters, map from the first six
@@ -527,6 +628,7 @@ impl Event {
         if let Some(pos) = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos) {
             self.state.player_prev = self.state.player_start.replace(pos).unwrap_or(pos);
         }
+        self.state.begin_talk();
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
         self.tick += 1;
@@ -609,8 +711,10 @@ fn message_wait() -> Native<FieldState> {
                     if g.input.stick[1] > 0.0 { (win.choice + n - 1) % n } else { (win.choice + 1) % n };
             }
             if g.input.confirm {
-                if win.shown < msg.len() {
-                    win.shown = msg.len();
+                if win.shown < win.reveal {
+                    // The rest appears at once (up to a pause, which the tick's update lets go of).
+                    win.shown =
+                        win.stops.first().copied().unwrap_or(win.reveal).min(win.reveal).max(win.shown);
                 } else {
                     win.close();
                     return 0;
@@ -620,6 +724,42 @@ fn message_wait() -> Native<FieldState> {
         }),
         result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
     }
+}
+
+/// Workers turned off (they stop running, but keep their requests) and on again.
+fn register_workers(n: &mut Natives<FieldState>) {
+    fn set(c: &mut NativeCall, on: bool) -> Value {
+        let w = c.stack.pop_int().max(0) as usize;
+        c.effects.push(aerugo_script::vm::Effect::Enable(w, on));
+        Value::Int(0)
+    }
+    n.register(0x00A7, Native::result(|_, c| set(c, false)));
+    n.register(0x00A8, Native::result(|_, c| set(c, true)));
+}
+
+/// Player control on and off, and the player's talk reach.
+fn register_control(n: &mut Natives<FieldState>) {
+    n.register(
+        0x005D,
+        Native::result(|g, _| {
+            g.user_control = true;
+            Value::Int(1)
+        }),
+    );
+    n.register(
+        0x005E,
+        Native::result(|g, _| {
+            g.user_control = false;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x0192,
+        Native::result(|g, c| {
+            g.talk_reach = c.stack.pop_float();
+            Value::Int(0)
+        }),
+    );
 }
 
 /// Trigger shapes: lines (kinds 2 and 5), boxes (3 and 6), and the touch and talk sizes of characters.
@@ -779,6 +919,24 @@ fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
     t.height = h;
     t.dirty = true;
     Value::Int(1)
+}
+
+fn camera_move_time(g: &mut FieldState, c: &mut NativeCall) -> Value {
+    let _d = c.stack.pop_int();
+    let frames: i32 = (0..3).map(|_| c.stack.pop_int().max(0)).sum();
+    let cam = &mut g.camera;
+    let parts = cam.parts.unwrap_or(7);
+    for (bit, t) in cam.timers.iter_mut().enumerate() {
+        if parts & (1 << bit) != 0 {
+            *t = frames as u32 + 1;
+        }
+    }
+    if parts & 7 != 0 {
+        cam.move_frames = frames.max(1) as u32;
+        cam.moving = None;
+        cam.pending = true;
+    }
+    Value::Int(0)
 }
 
 fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
@@ -1076,7 +1234,18 @@ fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let _mode = c.stack.pop_int();
             let w = window(c);
+            let image = &c.memory.global[0];
+            let (mut reveal, mut stops) = (0, Vec::new());
+            for part in g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(&[][..], |m| &m.reveal) {
+                match *part {
+                    RevealPart::Chars(n) => reveal += n,
+                    RevealPart::Name(chr) => reveal += name_chars(image, chr),
+                    RevealPart::Pause => stops.push(reveal),
+                }
+            }
             let win = &mut g.windows[w];
+            win.reveal = reveal;
+            win.stops = stops;
             win.open = true;
             win.shown = 0;
             win.choice = 0;
@@ -1094,8 +1263,17 @@ fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let w = window(c);
             let win = &g.windows[w];
-            let len = win.message.and_then(|m| g.messages.get(m)).map_or(0, Message::len);
-            Value::Int(i32::from(!win.open || (win.opening == 0 && win.shown >= len)))
+            Value::Int(i32::from(!win.open || (win.opening == 0 && win.shown >= win.reveal)))
+        }),
+    );
+    // Window flags.
+    n.register(
+        0x009D,
+        Native::result(|g, c| {
+            let flags = c.stack.pop_int();
+            let w = window(c);
+            g.windows[w].flags = flags as u16;
+            Value::Int(0)
         }),
     );
     n.register(0x0097, Native::result(|g, c| Value::Int(g.windows[window(c)].state())));
@@ -1132,33 +1310,19 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    n.register(
-        0x6014,
-        Native::result(|g, c| {
-            // Speeding up, steady and slowing down frame counts, then a fourth value; the move takes the first
-            // three together, and a camera wait polls as not done for one tick more.
-            let _d = c.stack.pop_int();
-            let frames: i32 = (0..3).map(|_| c.stack.pop_int().max(0)).sum();
-            let cam = &mut g.camera;
-            let parts = cam.parts.unwrap_or(7);
-            for (bit, t) in cam.timers.iter_mut().enumerate() {
-                if parts & (1 << bit) != 0 {
-                    *t = frames as u32 + 1;
-                }
-            }
-            if parts & 7 != 0 {
-                cam.move_frames = frames.max(1) as u32;
-                cam.moving = None;
-                cam.pending = true;
-            }
-            Value::Int(0)
-        }),
-    );
+    // Speeding up, steady and slowing down frame counts, then a fourth value; the move takes the first three
+    // together, and a camera wait polls as not done for one tick more. 0x6015 sets another mode with the same
+    // timing.
+    for id in [0x6014u16, 0x6015] {
+        n.register(id, Native::result(camera_move_time));
+    }
     // Eye and focus along a path: (path, start, step per tick, mode); the position on the path goes from the
     // start to 1 by the step each tick.
     n.register(0x6046, Native::result(|g, c| path_move(g, c, 0)));
     n.register(0x6047, Native::result(|g, c| path_move(g, c, 1)));
     register_triggers(n);
+    register_control(n);
+    register_workers(n);
     // Mark a worker for an extra pass this frame.
     n.register(
         0x0117,
@@ -1255,7 +1419,12 @@ mod tests {
         let mut natives = Natives::new(Game::Ffx);
         register(&mut natives);
         let mut state = FieldState {
-            messages: vec![Message { text: "Hello there".into(), raw: String::new(), choices: 0 }],
+            messages: vec![Message {
+                text: "Hello there".into(),
+                raw: String::new(),
+                choices: 0,
+                reveal: vec![RevealPart::Chars(11)],
+            }],
             ..FieldState::default()
         };
         let done = |vm: &Vm| vm.memory.global[0][aerugo_script::memory::AREA0_OFFSET] == 1;

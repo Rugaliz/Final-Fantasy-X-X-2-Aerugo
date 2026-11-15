@@ -76,6 +76,15 @@ enum Command {
     OracleArity { dir: PathBuf },
     /// List every turn in a recording: its speed arguments, mode, start and target yaw, and how long it took.
     OracleTurns { dir: PathBuf },
+    /// List every message window a recording opens: the setup natives' arguments and how many frames until the
+    /// window reports its text done.
+    OracleWindows { dir: PathBuf },
+    /// Print the frames of a recording where the scripts' pressed pad word is not zero.
+    OracleInput {
+        dir: PathBuf,
+        #[arg(long)]
+        run: Option<usize>,
+    },
     /// Print one worker's recorded position and yaw, polls and results frame by frame in one event run.
     OracleTrack {
         dir: PathBuf,
@@ -123,6 +132,8 @@ fn main() -> Result<()> {
         Command::OracleCompare { dir, run } => oracle_compare(&install, &dir, run),
         Command::OracleArity { dir } => oracle_arity(&dir),
         Command::OracleTurns { dir } => oracle_turns(&install, &dir),
+        Command::OracleInput { dir, run } => oracle_input(&dir, run),
+        Command::OracleWindows { dir } => oracle_windows(&install, &dir),
         Command::OracleTrack { dir, run, worker, frames } => oracle_track(&dir, run, worker, frames),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
@@ -378,6 +389,109 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
 }
 
 /// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
+fn oracle_windows(install: &Install, dir: &std::path::Path) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_formats::script::op_info;
+    use aerugo_script::recording::{Record, parse};
+    use aerugo_sim::field::Event;
+    use std::collections::HashMap;
+    #[derive(Default)]
+    struct W {
+        pushes: Vec<u16>,
+        setup: Vec<String>,
+        // (frame opened, setup, polls not done)
+        open: Option<(u32, String, u32)>,
+        last_call: u16,
+        message: Option<usize>,
+    }
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let (mut frame, mut name) = (0u32, String::new());
+    let mut messages: Vec<aerugo_sim::field::Message> = Vec::new();
+    let mut ws: HashMap<u16, W> = HashMap::new();
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => {
+                ws.clear();
+                frame = 0;
+                name = path.clone();
+                messages = archive_event_path(path)
+                    .and_then(|p| {
+                        let game = if p.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
+                        Event::load(&vfs, game, &p, aerugo_vfs::Language::English).ok()
+                    })
+                    .map(|e| e.state.messages.clone())
+                    .unwrap_or_default();
+            }
+            Record::Frame(_) => frame += 1,
+            Record::Instruction { worker, op, operand, .. } => {
+                let w = ws.entry(*worker).or_default();
+                let m = op_info(*op).mnemonic;
+                if m == "push.imm" {
+                    w.pushes.push(operand.unwrap_or(0));
+                } else if m.starts_with("call") {
+                    let id = operand.unwrap_or(0);
+                    w.last_call = id;
+                    let args: Vec<String> = w.pushes.iter().map(|v| format!("{v:#x}")).collect();
+                    if id == 0x64 {
+                        w.message = w.pushes.last().map(|&m| usize::from(m));
+                    }
+                    if matches!(id, 0x64 | 0x65 | 0x66 | 0x9d | 0x6a) {
+                        w.setup.push(format!("{id:x}({})", args.join(",")));
+                    }
+                    if id == 0x6a {
+                        w.open = Some((frame, w.setup.join(" "), 0));
+                        w.setup.clear();
+                    }
+                    w.pushes.clear();
+                } else {
+                    w.pushes.clear();
+                }
+            }
+            Record::NativeResult { worker, native: 0x8f, value, .. } => {
+                let w = ws.entry(*worker).or_default();
+                if let Some((f0, setup, n)) = &mut w.open {
+                    if *value == 0 {
+                        *n += 1;
+                    } else {
+                        let m = w.message.and_then(|m| messages.get(m));
+                        println!(
+                            "{name} w{worker} f{f0}: done after {} frames ({n} not done) {setup} length {:?} {:?}",
+                            frame - *f0,
+                            m.map(|m| m.len()),
+                            m.map(|m| m.raw.as_str()).unwrap_or_default()
+                        );
+                        w.open = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn oracle_input(dir: &std::path::Path, only: Option<usize>) -> Result<()> {
+    use aerugo_script::recording::{event_runs, parse};
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    for (i, run) in event_runs(&records).iter().enumerate() {
+        if only.is_some_and(|o| o != i) {
+            continue;
+        }
+        println!("run {i} {}", run.path);
+        let word =
+            |d: &[u8], at: usize| d.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        for (f, d) in run.inputs.iter().enumerate() {
+            let words: Vec<String> = (0..8).map(|k| format!("{:08x}", word(d, k * 4))).collect();
+            if words.iter().skip(4).any(|w| w != "00000000") {
+                println!("  f{f}: {}", words.join(" "));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn oracle_turns(install: &Install, dir: &std::path::Path) -> Result<()> {
     use aerugo_formats::script::{Operand, Script, op_info};
     use aerugo_script::recording::{Record, parse};
@@ -610,7 +724,7 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         let mut ours = Vec::new();
         let mut found = None;
         for f in 0..run.frames.len() {
-            // The player goes where the original's went (Aerugo does not replay the pad yet). The original moves
+            // The player goes where the original's went (the stick is not replayed). The original moves
             // the player in its own turn, before other workers' triggers test it: by the position recorded at the
             // start of the next frame.
             if let Some(p) = ev.state.player
@@ -621,7 +735,19 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 a.pos = rec.pos;
                 a.yaw = rec.yaw;
             }
-            ev.step(Input::default());
+            // Buttons the scripts saw pressed this frame (the original's pressed word).
+            let pressed = run
+                .inputs
+                .get(f)
+                .and_then(|d| d.get(0x10..0x14))
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four bytes")));
+            let input = Input {
+                confirm: pressed & 0x20 != 0,
+                cancel: pressed & 0x40 != 0,
+                alt: pressed & 0x80 != 0,
+                ..Input::default()
+            };
+            ev.step(input);
             if let Ok(spec) = std::env::var("COMPARE_DEBUG")
                 && let Some((w, from, to)) = (|| {
                     let mut it = spec.split(',').map(|x| x.parse::<usize>().ok());
@@ -640,6 +766,10 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     a.flags,
                     a.trigger
                 );
+                for (k, win) in ev.state.windows.iter().enumerate().filter(|(_, w)| w.open || w.closing > 0) {
+                    let len = win.message.and_then(|m| ev.state.messages.get(m)).map_or(0, |m| m.len());
+                    eprintln!("  window {k}: {win:?} length {len}");
+                }
             }
             ours.push(std::mem::take(ev.vm.trace.as_mut().expect("tracing")));
             if let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {

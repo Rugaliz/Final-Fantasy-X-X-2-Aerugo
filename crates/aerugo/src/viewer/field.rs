@@ -242,8 +242,13 @@ impl FieldView {
         for _ in 0..steps {
             let stick_pressed = stick != [0.0, 0.0] && self.last_stick == [0.0, 0.0];
             self.last_stick = stick;
-            let input =
-                Input { stick, confirm: std::mem::take(&mut self.confirm), cancel: false, stick_pressed };
+            let input = Input {
+                stick,
+                confirm: std::mem::take(&mut self.confirm),
+                cancel: false,
+                alt: false,
+                stick_pressed,
+            };
             self.tick(input);
         }
         self.handle_jump(vfs);

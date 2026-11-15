@@ -2,8 +2,12 @@
 //! (around a line, or a box) the player enters and leaves. The engine tests each entity after its worker's turn
 //! and raises signal types that become requests on that worker.
 
+use aerugo_script::natives::{heading, wrap_angle};
+
 /// Signal types.
 pub const TALK: u8 = 0;
+/// Talking with the second talk button.
+pub const TALK_ALT: u8 = 1;
 pub const TOUCH: u8 = 3;
 pub const CROSS: u8 = 4;
 pub const ENTER: u8 = 5;
@@ -270,6 +274,89 @@ pub fn test_box(t: &mut Trigger, centre: [f32; 3], yaw: f32, step: PlayerStep, o
     zone_signals(inside, was_inside, crossed, out);
 }
 
+/// A talk the player started this tick: the signal type and the nearest entity offered so far.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Talk {
+    pub signal: u8,
+    /// Worker and score (squared distance for characters; squared reach for zones).
+    pub best: Option<(usize, f32)>,
+}
+
+impl Talk {
+    pub fn new(signal: u8) -> Talk {
+        Talk { signal, best: None }
+    }
+
+    fn beats(&self, score: f32) -> bool {
+        self.best.is_none_or(|(_, b)| score < b)
+    }
+}
+
+/// The player as a talker: where it stands, which way it faces, and how far its reach adds to every talk radius.
+#[derive(Debug, Clone, Copy)]
+pub struct Talker {
+    pub pos: [f32; 3],
+    pub yaw: f32,
+    pub reach: f32,
+}
+
+impl Talker {
+    /// Whether the point lies within `half_angle` of the player's facing.
+    fn faces(&self, x: f32, z: f32, half_angle: f32) -> bool {
+        wrap_angle(heading(self.pos[0], self.pos[2], x, z) - self.yaw).abs() < half_angle
+    }
+}
+
+/// Offer a character (kind 1) at `pos` to the talk: in reach and height, nearer than the best so far, faced.
+pub fn talk_character(t: &Trigger, w: usize, pos: [f32; 3], p: &Talker, talk: &mut Talk) {
+    let dy = p.pos[1] - pos[1];
+    let (dx, dz) = (p.pos[0] - pos[0], p.pos[2] - pos[2]);
+    let d2 = dx * dx + dz * dz + if t.talk_height < 0.0 { dy * dy } else { 0.0 };
+    let r = p.reach + t.talk_radius;
+    if d2 >= r * r || (t.talk_height >= 0.0 && dy.abs() >= t.talk_height) {
+        return;
+    }
+    if talk.beats(d2) && p.faces(pos[0], pos[2], t.talk_angle) {
+        talk.best = Some((w, d2));
+    }
+}
+
+/// Offer a line zone (kind 2) from `a` to `t.b`: the nearest point of the line in reach (and height), faced.
+pub fn talk_line_zone(t: &Trigger, w: usize, a: [f32; 3], p: &Talker, talk: &mut Talk) {
+    let q = nearest_on_segment(p.pos, a, t.b);
+    let d2 = (q[0] - p.pos[0]).powi(2) + (q[2] - p.pos[2]).powi(2);
+    let r = p.reach + t.talk_radius;
+    let r2 = r * r;
+    if d2 > r2 || (t.height > 0.0 && (p.pos[1] > q[1] + t.height || p.pos[1] < q[1] - t.height)) {
+        return;
+    }
+    if talk.beats(r2) && p.faces(q[0], q[2], t.talk_angle) {
+        talk.best = Some((w, r2));
+    }
+}
+
+/// Offer a box zone (kind 3): inside it, or outside within reach (and height) of its edge; the centre faced.
+pub fn talk_box(t: &Trigger, w: usize, centre: [f32; 3], yaw: f32, p: &Talker, talk: &mut Talk) {
+    let (s, c) = (-yaw).sin_cos();
+    let (dx, dy, dz) = (p.pos[0] - centre[0], p.pos[1] - centre[1], p.pos[2] - centre[2]);
+    let local = [c * dx - s * dz, dy, dx * s + dz * c];
+    let (code, clamped) = box_outcode(local, t.b[0], t.b[2], t.height);
+    let r = p.reach + t.talk_radius;
+    let r2 = r * r;
+    if code != 0 {
+        let h = t.height;
+        if h > 0.0 && !(local[1] < h && -h < local[1]) {
+            return;
+        }
+        if (local[0] - clamped[0]).powi(2) + (local[2] - clamped[1]).powi(2) > r2 {
+            return;
+        }
+    }
+    if talk.beats(r2) && p.faces(centre[0], centre[2], t.talk_angle) {
+        talk.best = Some((w, r2));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +403,32 @@ mod tests {
         out.clear();
         test_box(&mut t, [0.0; 3], 0.0, step([0.0, 0.0, 0.0], [3.0, 0.0, 0.0]), &mut out);
         assert_eq!(out, [LEAVE]);
+    }
+
+    #[test]
+    fn talk_picks_the_nearest_faced_character() {
+        let t = Trigger::for_kind(1);
+        // Facing +x (heading 0); reach 0, talk radius 2.
+        let p = Talker { pos: [0.0; 3], yaw: 0.0, reach: 0.0 };
+        let mut talk = Talk::new(TALK);
+        talk_character(&t, 3, [1.5, 0.0, 0.0], &p, &mut talk);
+        talk_character(&t, 4, [1.0, 0.0, 0.2], &p, &mut talk);
+        // Behind the player, nearer still: not faced.
+        talk_character(&t, 5, [-0.5, 0.0, 0.0], &p, &mut talk);
+        // Too far.
+        talk_character(&t, 6, [2.5, 0.0, 0.0], &p, &mut talk);
+        assert_eq!(talk.best.map(|b| b.0), Some(4));
+    }
+
+    #[test]
+    fn talk_reaches_a_box_from_outside() {
+        let t = Trigger { active: true, b: [1.0, 0.0, 1.0], talk_radius: 1.0, ..Trigger::for_kind(3) };
+        let mut talk = Talk::new(TALK);
+        let far = Talker { pos: [-3.0, 0.0, 0.0], yaw: 0.0, reach: 0.0 };
+        talk_box(&t, 7, [0.0; 3], 0.0, &far, &mut talk);
+        assert_eq!(talk.best, None);
+        let near = Talker { pos: [-1.5, 0.0, 0.0], ..far };
+        talk_box(&t, 7, [0.0; 3], 0.0, &near, &mut talk);
+        assert_eq!(talk.best.map(|b| b.0), Some(7));
     }
 }

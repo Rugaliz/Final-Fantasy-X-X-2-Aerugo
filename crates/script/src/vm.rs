@@ -172,6 +172,8 @@ pub struct Worker {
     pub index: usize,
     pub kind: u8,
     pub active: bool,
+    /// Runs at all (scripts turn other workers off and on); a worker turned off still takes requests.
+    pub enabled: bool,
     /// Takes requests (set once the event is set up).
     pub accepts: bool,
     /// An entry has ended at least once (the init phase waits for this).
@@ -311,6 +313,8 @@ pub enum Effect {
     /// Run this worker again in an extra pass after this one, and let its requests mark their targets the same
     /// way.
     ExtraPass(usize),
+    /// Turn a worker on or off.
+    Enable(usize, bool),
 }
 
 impl Vm {
@@ -334,6 +338,7 @@ impl Vm {
                     index: i,
                     kind: w.kind,
                     active: runs,
+                    enabled: true,
                     accepts: runs,
                     ended_entry: !runs,
                     entry: 0,
@@ -424,7 +429,7 @@ impl Vm {
             Phase::Running => {
                 for w in 0..self.workers.len() {
                     self.run_worker(w, host);
-                    if self.workers[w].active {
+                    if self.workers[w].active && self.workers[w].enabled {
                         for t in host.worker_ran(w, self.workers[w].kind) {
                             self.engine_signal(w, t);
                         }
@@ -639,7 +644,7 @@ impl Vm {
 
     /// Run worker `w` for this frame.
     pub fn run_worker(&mut self, w: usize, host: &mut dyn Host) {
-        if !self.workers[w].active {
+        if !self.workers[w].active || !self.workers[w].enabled {
             return;
         }
         // Speed: a rate below 1 skips frames.
@@ -963,6 +968,11 @@ impl Vm {
                         Effect::ExtraPass(t) => {
                             if let Some(t) = self.workers.get_mut(t) {
                                 t.pass_marks = t.pass_marks & !0x400 | 0x1200;
+                            }
+                        }
+                        Effect::Enable(t, on) => {
+                            if let Some(t) = self.workers.get_mut(t) {
+                                t.enabled = on;
                             }
                         }
                     }

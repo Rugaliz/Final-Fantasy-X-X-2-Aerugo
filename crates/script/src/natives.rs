@@ -239,6 +239,18 @@ pub trait World {
 impl World for () {}
 
 /// Wrap an angle into [−π, π].
+/// Heading on the ground plane from (x1, z1) to (x2, z2), the engine's way (exact axes taken apart).
+pub fn heading(x1: f32, z1: f32, x2: f32, z2: f32) -> f32 {
+    let (dx, dz) = (x2 - x1, z2 - z1);
+    if dx == 0.0 {
+        if dz < 0.0 { -PI / 2.0 } else { PI / 2.0 }
+    } else if dz == 0.0 {
+        if dx < 0.0 { PI } else { -0.0 }
+    } else {
+        dz.atan2(dx)
+    }
+}
+
 pub fn wrap_angle(mut a: f32) -> f32 {
     if !a.is_finite() {
         return 0.0;
@@ -325,15 +337,7 @@ fn register_common<G>(n: &mut Natives<G>) {
         0x1011,
         Native::result(|_, c| {
             let [x1, z1, x2, z2] = pop_f::<4>(c);
-            let (dx, dz) = (x2 - x1, z2 - z1);
-            let a = if dx == 0.0 {
-                if dz < 0.0 { -PI / 2.0 } else { PI / 2.0 }
-            } else if dz == 0.0 {
-                if dx < 0.0 { PI } else { -0.0 }
-            } else {
-                dz.atan2(dx)
-            };
-            Value::Float(a)
+            Value::Float(heading(x1, z1, x2, z2))
         }),
     );
     n.register(0x1013, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));

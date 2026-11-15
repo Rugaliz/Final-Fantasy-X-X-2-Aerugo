@@ -233,6 +233,8 @@ pub struct EventRun {
     pub replay: crate::natives::Replay,
     /// Worker positions recorded in each frame (version 3; empty before).
     pub positions: Vec<Vec<WorkerPosition>>,
+    /// Input recorded at the start of each frame (version 3; empty before): the scripts' pad words, then pad 0.
+    pub inputs: Vec<Vec<u8>>,
 }
 
 /// Split a recording into event runs. Each frame record starts a frame (the recorder writes it when the frame
@@ -287,7 +289,15 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                     run.replay.polls.entry((*worker, *native)).or_default().push_back(*flags);
                 }
             }
-            Record::Input(_) => {}
+            Record::Input(d) => {
+                if let Some(run) = runs.last_mut() {
+                    let f = run.frames.len().saturating_sub(1);
+                    if run.inputs.len() <= f {
+                        run.inputs.resize(f + 1, Vec::new());
+                    }
+                    run.inputs[f] = d.clone();
+                }
+            }
             Record::Positions(p) => {
                 if let Some(run) = runs.last_mut() {
                     let f = run.frames.len().saturating_sub(1);
