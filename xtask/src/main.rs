@@ -985,6 +985,16 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         let mut control = aerugo_sim::control::PlayerControl::default();
         let mut step_errors: Vec<f32> = Vec::new();
         for f in 0..run.frames.len() {
+            // Battles (recordings with battle records): the battle's own script runs in the original; skip
+            // those frames, then end Aerugo's placeholder battle with it.
+            let in_battle = run.battles.iter().rev().find(|b| b.0 as usize <= f).is_some_and(|b| b.1);
+            if in_battle {
+                ours.push(Vec::new());
+                continue;
+            }
+            if ev.state.battle.is_some() && run.battles.iter().any(|b| b.1 && (b.0 as usize) < f) {
+                ev.finish_battle();
+            }
             if std::env::var("PLAYER_SIM").is_ok()
                 && let Some(p) = ev.state.player
                 && let Some(d) = run.inputs.get(f).filter(|d| d.len() >= 0x30)

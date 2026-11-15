@@ -471,6 +471,8 @@ pub struct FieldState {
     pub encounters_off: bool,
     /// A battle about to start or running (scripts hold while it runs), and whether it has started.
     pub battle: Option<(crate::encounter::Battle, bool)>,
+    /// Values natives set for parts of the engine not ported yet, by (native, worker or actor).
+    pub settings: std::collections::HashMap<(u16, usize), Vec<Value>>,
     /// The shop price rate in percent, when scripts changed it from 100.
     pub shop_rate: Option<i32>,
     /// A switch scripts turn off around menus they open (0241).
@@ -1198,6 +1200,251 @@ fn window(c: &mut NativeCall<'_>) -> usize {
     c.stack.pop_int().clamp(0, 7) as usize
 }
 
+/// Natives that set a value for later (an actor's, a worker's or the field's) and give back what the original
+/// returns; the values are kept by (native, worker) for the parts of the engine not ported yet.
+fn register_settings(n: &mut Natives<FieldState>) {
+    fn keep(g: &mut FieldState, id: u16, w: usize, values: Vec<Value>) {
+        g.settings.insert((id, w), values);
+    }
+    // One float, returned (worker settings: 002d, 006d–0071, 00e4).
+    macro_rules! float_back {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = c.stack.pop_float();
+                keep(g, $id, c.worker, vec![Value::Float(v)]);
+                Value::Float(v)
+            }));
+        )*};
+    }
+    float_back!(0x002D, 0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x00E4);
+    // One int, returned (0074 worker setting, 00bb/00bc/00f3 field settings, 0116 actor flag).
+    macro_rules! int_back {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = c.stack.pop_int();
+                keep(g, $id, c.worker, vec![Value::Int(v)]);
+                Value::Int(v)
+            }));
+        )*};
+    }
+    int_back!(0x0074, 0x00BB, 0x00BC, 0x00F3, 0x0116, 0x017A);
+    // One float kept, nothing useful returned (actor heights and radii: 0025, 002e, 002f, 0030).
+    macro_rules! float_set {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = c.stack.pop_float();
+                keep(g, $id, c.worker, vec![Value::Float(v)]);
+                Value::Int(0)
+            }));
+        )*};
+    }
+    float_set!(0x0025, 0x002E, 0x002F, 0x0030);
+    // One int kept, 1 returned (0007, 0151).
+    macro_rules! int_one {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = c.stack.pop_int();
+                keep(g, $id, c.worker, vec![Value::Int(v)]);
+                Value::Int(1)
+            }));
+        )*};
+    }
+    int_one!(0x0007, 0x0151);
+    // The entrance and the area id in the save image.
+    n.register(
+        0x0010,
+        Native::result(|_, c| Value::Int(i32::from(c.memory.global[0].get(0xC).copied().unwrap_or(0)))),
+    );
+    n.register(
+        0x0086,
+        Native::result(|_, c| {
+            let b = c.memory.global[0].get(4..6).map_or([0, 0], |b| [b[0], b[1]]);
+            Value::Int(i32::from(u16::from_le_bytes(b)))
+        }),
+    );
+    // Two words into the save image at 0xb4 and 0xb6.
+    n.register(
+        0x016E,
+        Native::result(|_, c| {
+            let b = c.stack.pop_int() as u16;
+            let a = c.stack.pop_int() as u16;
+            if let Some(d) = c.memory.global[0].get_mut(0xB4..0xB8) {
+                d[0..2].copy_from_slice(&a.to_le_bytes());
+                d[2..4].copy_from_slice(&b.to_le_bytes());
+            }
+            Value::Int(1)
+        }),
+    );
+    // Two field switches; returns the first.
+    n.register(
+        0x0114,
+        Native::result(|g, c| {
+            let b = c.stack.pop_int();
+            let a = c.stack.pop_int();
+            keep(g, 0x0114, 0, vec![Value::Int(a), Value::Int(b)]);
+            Value::Int(i32::from(a != 0))
+        }),
+    );
+    // An actor's value (as on|0x80000000, or 0), returned.
+    n.register(
+        0x0148,
+        Native::result(|g, c| {
+            let chr = c.stack.pop_int();
+            let v = c.stack.pop_int() as u32;
+            let stored = if v != 0 { v | 0x8000_0000 } else { 0 } as i32;
+            keep(g, 0x0148, chr.max(0) as usize, vec![Value::Int(stored)]);
+            Value::Int(stored)
+        }),
+    );
+    // A window's style byte; returns the window.
+    n.register(
+        0x0066,
+        Native::result(|g, c| {
+            let style = c.stack.pop_int();
+            let w = window(c);
+            keep(g, 0x0066, w, vec![Value::Int(style)]);
+            Value::Int(w as i32)
+        }),
+    );
+}
+
+/// Natives that only hand values to parts of the engine Aerugo does not draw or simulate yet (actor drawing and
+/// motion blending, screen effects, map layer animation): they take their arguments (by the native's arity),
+/// keep them, and return what the original returns.
+fn register_engine_settings(n: &mut Natives<FieldState>) {
+    fn take(g: &mut FieldState, c: &mut NativeCall<'_>, id: u16) -> Vec<Value> {
+        let (ints, floats) = aerugo_formats::script::arity(Game::Ffx, id).map_or((0, 0), |a| (a.0, a.1));
+        let mut v: Vec<Value> = (0..u32::from(ints) + u32::from(floats)).map(|_| c.stack.pop()).collect();
+        v.reverse();
+        g.settings.insert((id, c.worker), v.clone());
+        v
+    }
+    // Returning 0.
+    macro_rules! zero {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                take(g, c, $id);
+                Value::Int(0)
+            }));
+        )*};
+    }
+    zero!(
+        0x500B, 0x500E, 0x500F, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x4013,
+        0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x6032, 0x5001, 0x5010
+    );
+    n.register(
+        0x4034,
+        Native::result(|g, c| {
+            take(g, c, 0x4034);
+            Value::Float(0.0)
+        }),
+    );
+    n.register(
+        0x8009,
+        Native::result(|g, c| {
+            take(g, c, 0x8009);
+            Value::Int(1)
+        }),
+    );
+    // Map layer animations (on/off by the second argument): return it.
+    macro_rules! second {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = take(g, c, $id);
+                v.get(1).copied().unwrap_or(Value::Int(0))
+            }));
+        )*};
+    }
+    second!(0x8002, 0x800D);
+    // Map switch: returns the first argument.
+    n.register(
+        0x8000,
+        Native::result(|g, c| {
+            let v = take(g, c, 0x8000);
+            v.first().copied().unwrap_or(Value::Int(0))
+        }),
+    );
+}
+
+/// Natives whose effects are on systems not ported yet (sound banks, effects, model parts, screen) and whose
+/// results are fixed or follow from the arguments (third sweep).
+fn register_fixed_results(n: &mut Natives<FieldState>) {
+    fn take(g: &mut FieldState, c: &mut NativeCall<'_>, id: u16) -> Vec<Value> {
+        let (ints, floats) = aerugo_formats::script::arity(Game::Ffx, id).map_or((0, 0), |a| (a.0, a.1));
+        let mut v: Vec<Value> = (0..u32::from(ints) + u32::from(floats)).map(|_| c.stack.pop()).collect();
+        v.reverse();
+        g.settings.insert((id, c.worker), v.clone());
+        v
+    }
+    fn int(v: &[Value], i: usize) -> i32 {
+        match v.get(i) {
+            Some(Value::Int(x)) => *x,
+            Some(Value::Float(f)) => *f as i32,
+            _ => 0,
+        }
+    }
+    macro_rules! fixed {
+        ($ret:expr; $($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                take(g, c, $id);
+                Value::Int($ret)
+            }));
+        )*};
+    }
+    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x00E3, 0x0119, 0x0004);
+    fixed!(1; 0x019C, 0x01EB, 0x0103, 0x0104, 0x01CE, 0x01CF, 0x0205, 0x0209, 0x01D0, 0x022E);
+    // Switches that return whether they were turned on: the only argument (013e), the second (01d4), the int of
+    // (int, float) (c02f).
+    n.register(0x013E, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0x013E), 0) != 0))));
+    n.register(0x01D4, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0x01D4), 1) != 0))));
+    n.register(0xC02F, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0xC02F), 0) != 0))));
+    // Returns its int argument (01e6: int, float, float).
+    n.register(0x01E6, Native::result(|g, c| Value::Int(int(&take(g, c, 0x01E6), 0))));
+    // (0102/0105 load sound banks and wait for the loader: replayed until sound loading is ported.)
+    // Wait n ticks (the call ends the worker's turn).
+    n.register(
+        0x01D1,
+        Native {
+            init: Some(|g, c| {
+                c.scratch[0] = int(&take(g, c, 0x01D1), 0);
+            }),
+            wait: Some(|_, c| {
+                c.scratch[0] -= 1;
+                if c.scratch[0] < 1 { WAIT_DONE } else { 0 }
+            }),
+            result: None,
+        },
+    );
+}
+
+/// Worker switches and the player.
+fn register_worker_switches(n: &mut Natives<FieldState>) {
+    // A worker switch (bit 0x200 of its flags): on/off by the argument (0031: on); returns the new state.
+    n.register(
+        0x0060,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            g.settings.insert((0x0060, c.worker), vec![Value::Int(i32::from(on))]);
+            Value::Int(i32::from(on))
+        }),
+    );
+    n.register(
+        0x0031,
+        Native::result(|g, c| {
+            g.settings.insert((0x0060, c.worker), vec![Value::Int(1)]);
+            Value::Int(1)
+        }),
+    );
+    // The calling worker becomes the one the player controls; returns its number.
+    n.register(
+        0x0043,
+        Native::result(|g, c| {
+            g.player = Some(c.worker);
+            Value::Int(c.worker as i32)
+        }),
+    );
+}
+
 /// Open a window on its message: the text reveal starts over.
 fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
     let (mut reveal, mut stops) = (0, Vec::new());
@@ -1746,6 +1993,10 @@ fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
 pub fn register(n: &mut Natives<FieldState>) {
     register_treasure(n);
     register_menus(n);
+    register_settings(n);
+    register_engine_settings(n);
+    register_worker_switches(n);
+    register_fixed_results(n);
     // Worker ids: the own id for a negative argument.
     n.register(
         0x0033,

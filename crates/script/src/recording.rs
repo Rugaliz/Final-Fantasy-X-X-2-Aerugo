@@ -8,6 +8,7 @@
 //! | 3 | random number: stream `u8`, value `u32` |
 //! | 4 | event start: index `i32`, path (`u16` length + bytes) |
 //! | 5 | map change: target `i32`, entrance `i32` |
+//! | 0x0B | battle state: in battle `u8`, pending `u8`, area `u16`, group `u8`, formation `u8` |
 
 use crate::vm::TraceEvent;
 
@@ -68,6 +69,15 @@ pub enum Record {
     Positions(Vec<WorkerPosition>),
     /// The active camera's two points (the pair the player's heading comes from) at the start of a frame.
     Camera([f32; 4], [f32; 4]),
+    /// The battle state when it changes: in a battle, a battle pending (1 random, 2 scripted), and the battle's
+    /// area index, group and formation.
+    Battle {
+        active: bool,
+        pending: u8,
+        area: u16,
+        group: u8,
+        formation: u8,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -168,6 +178,18 @@ pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
                 let f = |i: usize| u32_at(at + 1 + 4 * i).map(f32::from_bits);
                 Some((Record::Camera([f(0)?, f(1)?, f(2)?, f(3)?], [f(4)?, f(5)?, f(6)?, f(7)?]), 33))
             })(),
+            0x0B => (|| {
+                Some((
+                    Record::Battle {
+                        active: *d.get(at + 1)? != 0,
+                        pending: *d.get(at + 2)?,
+                        area: u16_at(at + 3)?,
+                        group: *d.get(at + 5)?,
+                        formation: *d.get(at + 6)?,
+                    },
+                    7,
+                ))
+            })(),
             t => return Err(RecordingError::UnknownRecord(t, at)),
         };
         let Some((r, n)) = rec else { break };
@@ -214,7 +236,8 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
             | Record::NativePoll { .. }
             | Record::Input(_)
             | Record::Positions(_)
-            | Record::Camera(..) => {}
+            | Record::Camera(..)
+            | Record::Battle { .. } => {}
             Record::MapChange { target, entrance } => {
                 d.push(5);
                 d.extend(target.to_le_bytes());
@@ -244,6 +267,8 @@ pub struct EventRun {
     pub inputs: Vec<Vec<u8>>,
     /// The active camera's two points per frame (recordings that have them).
     pub cameras: Vec<Option<([f32; 4], [f32; 4])>>,
+    /// Battle state changes: (frame in the run, in a battle).
+    pub battles: Vec<(u32, bool)>,
 }
 
 /// Split a recording into event runs. Each frame record starts a frame (the recorder writes it when the frame
@@ -305,6 +330,12 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                         run.inputs.resize(f + 1, Vec::new());
                     }
                     run.inputs[f] = d.clone();
+                }
+            }
+            Record::Battle { active, .. } => {
+                if let Some(run) = runs.last_mut() {
+                    let f = run.frames.len().saturating_sub(1) as u32;
+                    run.battles.push((f, *active));
                 }
             }
             Record::Camera(a, b) => {
@@ -404,6 +435,12 @@ mod tests {
             d.extend(v.to_le_bytes());
         }
         assert_eq!(parse(&d).unwrap(), vec![Record::Camera([1.0, 2.0, 3.0, 1.0], [4.0, 5.0, 6.0, 1.0])]);
+        let mut d = MAGIC_V3.to_vec();
+        d.extend([0x0B, 1, 2, 0x34, 0x12, 1, 3]);
+        assert_eq!(
+            parse(&d).unwrap(),
+            vec![Record::Battle { active: true, pending: 2, area: 0x1234, group: 1, formation: 3 }]
+        );
     }
 
     #[test]
