@@ -291,6 +291,8 @@ pub struct Vm {
     pub phase: Phase,
     pub frame: u64,
     next_request: u32,
+    /// The instruction just run ended the worker's turn (an END).
+    turn_over: bool,
     /// Trace of executed instructions, when enabled.
     pub trace: Option<Vec<TraceEvent>>,
     /// Faults with the worker and pc they happened at.
@@ -361,6 +363,7 @@ impl Vm {
             phase: Phase::Init,
             frame: 0,
             next_request: 1,
+            turn_over: false,
             trace: None,
             faults: Vec::new(),
             effects: Vec::new(),
@@ -694,6 +697,8 @@ impl Vm {
                 return;
             }
             match self.step(w, host) {
+                // An END finishes the worker's turn, whatever the stack still holds.
+                Ok(_) if std::mem::take(&mut self.turn_over) => return,
                 Ok(keep) => run = keep.unwrap_or(run),
                 Err(f) => {
                     self.fault(w, f);
@@ -1048,6 +1053,7 @@ impl Vm {
                 let restart = matches!(insn.op, 0x3E | 0x3F);
                 // The pc stays on the instruction: an idle worker re-runs it every frame.
                 self.end_entry(w, cancel, restart);
+                self.turn_over = true;
                 return Ok(Some(false));
             }
             0x40 => {}

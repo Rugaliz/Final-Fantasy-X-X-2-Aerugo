@@ -784,11 +784,7 @@ impl Event {
             game,
             name,
             path: path.to_owned(),
-            vm: {
-                let mut vm = Vm::new(Arc::new(script));
-                vm.enter(0);
-                vm
-            },
+            vm: Vm::new(Arc::new(script)),
             natives,
             state,
             map_model,
@@ -799,6 +795,12 @@ impl Event {
 
     /// One 30 Hz tick: scripts first, then movement and player control.
     pub fn step(&mut self, input: Input) {
+        // Arriving: the entrance the save image names picks the entrance worker's entry (read on the first tick,
+        // once a loaded or restored image is in place).
+        if self.tick == 0 {
+            let entrance = self.vm.memory.global[0].get(ENTRANCE_INDEX).copied().unwrap_or(0);
+            self.vm.enter(usize::from(entrance));
+        }
         self.state.input = input;
         let image = &self.vm.memory.global[0];
         if let Some(p) = image.get(PARTY_SLOTS..PARTY_SLOTS + 3) {

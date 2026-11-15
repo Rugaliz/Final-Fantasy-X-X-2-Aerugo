@@ -551,6 +551,15 @@ fn script_dump(install: &Install, event: &str, worker: usize) -> Result<()> {
     let path = archive_event_path(event).ok_or_else(|| anyhow::anyhow!("event path not understood"))?;
     let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
     let script = aerugo_formats::script::Script::parse(&vfs.read(&path)?)?;
+    for (i, e) in script.entrances().iter().enumerate() {
+        println!(
+            "; entrance {i}: entry {} heading {} at {:?} (worker {:?})",
+            e.entry,
+            e.yaw,
+            e.pos,
+            script.entrance_entry(i).map(|w| w.0)
+        );
+    }
     print!("{}", script.disassemble(worker, game));
     Ok(())
 }
@@ -906,9 +915,14 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 && let Some(d) = run.inputs.get(f).filter(|d| d.len() >= 0x30)
             {
                 let held = u32::from_le_bytes(d[0..4].try_into().expect("four bytes"));
+                // Pad 0's stick: x at +0xE, y at +0xF (0 up), 0x80 centred. The controller reads it two frames
+                // ahead of the recorded pad block.
+                let d = run.inputs.get(f + 2).filter(|d| d.len() >= 0x30).unwrap_or(d);
                 let stick =
-                    [(f32::from(d[0x2f]) * 2.0 - 256.0) / 256.0, (128.0 - f32::from(d[0x2e])) * 2.0 / 256.0];
-                let predicted = control.tick(stick, held & 0x40 != 0, false).map_or(0.0, |p| p.step);
+                    [(f32::from(d[0x2e]) * 2.0 - 256.0) / 256.0, (128.0 - f32::from(d[0x2f])) * 2.0 / 256.0];
+                let predicted = control
+                    .tick(stick, held & 0x40 != 0, std::env::var("PLAYER_SWIM").is_ok())
+                    .map_or(0.0, |p| p.step);
                 let find = |k: usize| {
                     run.positions
                         .get(k)
@@ -966,8 +980,8 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     let cam = &ev.state.camera;
                     eprintln!(
                         "dir f{f} stick {} {} buttons {:02x}{:02x} step {:.4} {:.4} {:.4} eye {:?} focus {:?}",
-                        d[0x2f],
                         d[0x2e],
+                        d[0x2f],
                         d[0x23],
                         d[0x22],
                         b[0] - a[0],
@@ -977,6 +991,19 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                         cam.focus
                     );
                 }
+            }
+            // CAMERA_CMP: the original's camera points next to Aerugo's script camera, per frame.
+            if std::env::var("CAMERA_CMP").is_ok()
+                && let Some(Some((a, b))) = run.cameras.get(f + 1)
+            {
+                let cam = &ev.state.camera;
+                eprintln!(
+                    "cam f{f} orig {:?} {:?} aerugo {:?} {:?}",
+                    &a[..3],
+                    &b[..3],
+                    cam.position,
+                    cam.focus
+                );
             }
             if let Ok(spec) = std::env::var("COMPARE_DEBUG")
                 && let Some((w, from, to)) = (|| {
