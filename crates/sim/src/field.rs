@@ -111,7 +111,12 @@ pub struct Window {
     pub shown: usize,
     /// Highlighted choice for messages that offer choices.
     pub choice: usize,
+    /// Ticks left of the opening animation (text appears once it is over).
+    pub opening: u8,
 }
+
+/// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
+const OPEN_TICKS: u8 = 2;
 
 /// Characters revealed per tick.
 const TEXT_SPEED: usize = 2;
@@ -138,9 +143,13 @@ impl Message {
 }
 
 impl Window {
-    /// The window's state as scripts see it: 0 closed, 2 showing.
+    /// The window's state as scripts see it: 0 closed, 1 opening, 2 showing.
     pub fn state(&self) -> i32 {
-        if self.open { 2 } else { 0 }
+        match (self.open, self.opening) {
+            (false, _) => 0,
+            (true, 0) => 2,
+            (true, _) => 1,
+        }
     }
 }
 
@@ -270,6 +279,10 @@ impl FieldState {
         self.camera.update();
         let messages = &self.messages;
         for w in self.windows.iter_mut().filter(|w| w.open) {
+            if w.opening > 0 {
+                w.opening -= 1;
+                continue;
+            }
             let len = w.message.and_then(|m| messages.get(m)).map_or(0, Message::len);
             w.shown = (w.shown + TEXT_SPEED).min(len);
         }
@@ -803,6 +816,7 @@ fn register(n: &mut Natives<FieldState>) {
             win.open = true;
             win.shown = 0;
             win.choice = 0;
+            win.opening = OPEN_TICKS;
             Value::Int(w as i32)
         }),
     );
@@ -816,7 +830,7 @@ fn register(n: &mut Natives<FieldState>) {
             let w = window(c);
             let win = &g.windows[w];
             let len = win.message.and_then(|m| g.messages.get(m)).map_or(0, Message::len);
-            Value::Int(i32::from(!win.open || win.shown >= len))
+            Value::Int(i32::from(!win.open || (win.opening == 0 && win.shown >= len)))
         }),
     );
     n.register(0x0097, Native::result(|g, c| Value::Int(g.windows[window(c)].state())));
