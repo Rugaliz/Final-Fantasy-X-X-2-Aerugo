@@ -327,6 +327,8 @@ pub struct CameraState {
     path_timers: [u32; 2],
     /// A timed move whose destination may still be set this tick.
     pending: bool,
+    /// The field camera following the player (when a script turns it on).
+    pub follow: crate::follow_camera::FollowCamera,
 }
 
 impl CameraState {
@@ -573,6 +575,13 @@ impl FieldState {
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
         self.camera.update();
+        let actors = &self.actors;
+        if let Some((focus, eye)) = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos)) {
+            self.camera.focus = Some(focus);
+            if eye.is_some() {
+                self.camera.position = eye;
+            }
+        }
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
         }
@@ -1560,6 +1569,7 @@ fn register(n: &mut Natives<FieldState>) {
         0x6002,
         Native::result(|g, c| {
             g.camera.position = Some(pop3(c));
+            g.camera.follow.orbit = None;
             g.camera.moving = None;
             Value::Int(0)
         }),
@@ -1630,9 +1640,79 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
+    // The follow camera: follow workers (−1: none) with a height offset; limits on the focus; easing; the eye
+    // around the focus.
+    n.register(
+        0x6027,
+        Native::result(|g, c| {
+            let f = c.stack.pop_float();
+            let b = c.stack.pop_int();
+            let a = c.stack.pop_int();
+            let w = |v: i32| usize::try_from(v).ok();
+            g.camera.follow.follow = Some(([w(a), w(b)], [0.0, f, 0.0]));
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x602D,
+        Native::result(|g, _| {
+            g.camera.follow.clear_limits();
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6029,
+        Native::result(|g, c| {
+            // (x0, z0) to (x1, z1), then the share kept past it.
+            let k = c.stack.pop_float();
+            let z1 = c.stack.pop_float();
+            let x1 = c.stack.pop_float();
+            let z0 = c.stack.pop_float();
+            let x0 = c.stack.pop_float();
+            let limit = crate::follow_camera::Limit::Line { start: [x0, z0], dir: [x1 - x0, z1 - z0], k };
+            g.camera.follow.add_limit(limit);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x602B,
+        Native::result(|g, c| {
+            let k = c.stack.pop_float();
+            let max = c.stack.pop_float();
+            let min = c.stack.pop_float();
+            g.camera.follow.add_limit(crate::follow_camera::Limit::Height { min, max, k });
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6035,
+        Native::result(|g, c| {
+            let _ = c.stack.pop_float();
+            let z = c.stack.pop_float();
+            let y = c.stack.pop_float();
+            let x = c.stack.pop_float();
+            g.camera.follow.ease = [x, y, z];
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6006,
+        Native::result(|g, c| {
+            let dist_div = c.stack.pop_float();
+            let dist = c.stack.pop_float();
+            let pitch_div = c.stack.pop_float();
+            let pitch = c.stack.pop_float().to_radians();
+            let b = c.stack.pop_float();
+            let a = c.stack.pop_float();
+            g.camera.follow.orbit =
+                Some(crate::follow_camera::Orbit { anchor: [a, b], pitch, pitch_div, dist, dist_div });
+            Value::Int(0)
+        }),
+    );
     n.register(
         0x6020,
         Native::result(|g, c| {
+            g.camera.follow.stop();
             g.camera.focus = Some(pop3(c));
             Value::Int(0)
         }),
