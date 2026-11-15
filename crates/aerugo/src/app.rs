@@ -332,8 +332,14 @@ impl App {
         let lang = Language::from_code(&self.ui.settings.game.text_language).unwrap_or(Language::English);
         let japanese = self.ui.settings.game.voice == VoiceLanguage::Japanese;
         let original = self.ui.settings.game.music == MusicSet::Original;
-        self.ui.viewer =
-            Some(Viewer::open(self.ui.launcher.current(), lang, &self.platform.sdl, japanese, original));
+        self.ui.viewer = Some(Viewer::open(
+            self.ui.launcher.current(),
+            lang,
+            &self.platform.sdl,
+            japanese,
+            original,
+            &self.ui.settings.ui.viewer_tab,
+        ));
         self.ui.screen = Screen::Viewer;
     }
 
@@ -429,10 +435,13 @@ fn draw_ui(
             }
         }
         Screen::Viewer => {
-            if let Some(viewer) = &mut state.viewer
-                && viewer.ui(ui, renderer) == Some(ViewerAction::Back)
-            {
-                actions.push(Action::BackToLauncher);
+            if let Some(viewer) = &mut state.viewer {
+                if viewer.ui(ui, renderer) == Some(ViewerAction::Back) {
+                    actions.push(Action::BackToLauncher);
+                }
+                if state.settings.ui.viewer_tab != viewer.tab_name() {
+                    state.settings.ui.viewer_tab = viewer.tab_name().to_owned();
+                }
             }
         }
         Screen::TestScene => {

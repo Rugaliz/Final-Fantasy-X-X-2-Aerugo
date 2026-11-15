@@ -43,6 +43,10 @@ and a Vulkan device). The references are game imagery: keep them outside the rep
 with `AERUGO_GOLDEN_UPDATE=1`; failing cases leave a `*.actual.png` next to the reference. The test also checks
 that face culling keeps the visible side of every case.
 
+`cargo test -p aerugo layered_maps` opens every map with pre-rendered layers through the viewer's code and renders
+its best stored camera at 4:3, 16:9, 21:9 and 32:9 in crop and fit. It reports how many maps frame their background
+cleanly and fails if a known-good map or the overall count regresses.
+
 ## Platform notes
 
 - **Linux**: install SDL3 from your distribution (`sdl3` / `libsdl3-dev`), and the Vulkan loader.

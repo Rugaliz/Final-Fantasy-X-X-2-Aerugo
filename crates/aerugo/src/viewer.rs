@@ -36,6 +36,35 @@ enum Tab {
     Scripts,
 }
 
+impl Tab {
+    const ALL: [Tab; 7] =
+        [Tab::Tables, Tab::Textures, Tab::Models, Tab::Maps, Tab::Sounds, Tab::Movies, Tab::Scripts];
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Tables => "tables",
+            Tab::Textures => "textures",
+            Tab::Models => "models",
+            Tab::Maps => "maps",
+            Tab::Sounds => "sounds",
+            Tab::Movies => "movies",
+            Tab::Scripts => "scripts",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Tables => "Tables",
+            Tab::Textures => "Textures",
+            Tab::Models => "Models",
+            Tab::Maps => "Maps",
+            Tab::Sounds => "Sounds",
+            Tab::Movies => "Movies",
+            Tab::Scripts => "Scripts",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Viewer {
     vfs: Option<Arc<Vfs>>,
@@ -65,6 +94,7 @@ impl Viewer {
         sdl: &aerugo_platform::sdl3::Sdl,
         japanese_voices: bool,
         original_music: bool,
+        tab: &str,
     ) -> Viewer {
         let audio = match aerugo_audio::AudioOutput::open(sdl) {
             Ok(a) => Some(a),
@@ -90,7 +120,7 @@ impl Viewer {
         Viewer {
             vfs,
             error,
-            tab: Tab::Tables,
+            tab: Tab::ALL.into_iter().find(|t| t.name() == tab).unwrap_or(Tab::Tables),
             tables,
             textures: TextureBrowser::new(),
             models: ModelBrowser::new(),
@@ -100,6 +130,11 @@ impl Viewer {
             scripts: ScriptBrowser::new(),
             audio,
         }
+    }
+
+    /// The shown tab's settings name.
+    pub fn tab_name(&self) -> &'static str {
+        self.tab.name()
     }
 
     /// Release GPU resources before the viewer is dropped.
@@ -119,13 +154,31 @@ impl Viewer {
                     action = Some(ViewerAction::Back);
                 }
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Tables, "Tables");
-                ui.selectable_value(&mut self.tab, Tab::Textures, "Textures");
-                ui.selectable_value(&mut self.tab, Tab::Models, "Models");
-                ui.selectable_value(&mut self.tab, Tab::Maps, "Maps");
-                ui.selectable_value(&mut self.tab, Tab::Sounds, "Sounds");
-                ui.selectable_value(&mut self.tab, Tab::Movies, "Movies");
-                ui.selectable_value(&mut self.tab, Tab::Scripts, "Scripts");
+                for (i, tab) in Tab::ALL.into_iter().enumerate() {
+                    ui.selectable_value(&mut self.tab, tab, tab.label())
+                        .on_hover_text(format!("Ctrl+{}", i + 1));
+                }
+                // Ctrl+1 … Ctrl+7 switch tabs.
+                let keys = [
+                    egui::Key::Num1,
+                    egui::Key::Num2,
+                    egui::Key::Num3,
+                    egui::Key::Num4,
+                    egui::Key::Num5,
+                    egui::Key::Num6,
+                    egui::Key::Num7,
+                ];
+                for (tab, key) in Tab::ALL.into_iter().zip(keys) {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
+                        self.tab = tab;
+                    }
+                }
+                if let Some(vfs) = &self.vfs {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let files: usize = vfs.archives().map(|(_, a)| a.entries().len()).sum();
+                        ui.weak(format!("{} archives · {files} files", vfs.archives().count()));
+                    });
+                }
             });
         });
         match (&self.vfs, &self.error) {

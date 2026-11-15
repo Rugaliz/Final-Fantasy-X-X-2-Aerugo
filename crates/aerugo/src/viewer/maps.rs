@@ -49,6 +49,8 @@ struct Loaded {
     cameras: Vec<Camera>,
     /// Design aspect of the layers through each camera.
     design: Vec<f32>,
+    /// The background's extent through each camera, as view-space tangents (left, right, top, bottom).
+    frusta: Vec<Option<[f32; 4]>>,
     errors: Vec<String>,
 }
 
@@ -169,13 +171,14 @@ impl MapBrowser {
             }
         }
         // With layers, each camera is fitted to frame them exactly (field of view and frame shape).
-        let fitted: Vec<Option<(f32, f32)>> =
-            cameras.iter().map(|c| fit_layers(c, layers.as_ref())).collect();
-        for (c, f) in cameras.iter_mut().zip(&fitted) {
-            if let Some((fov_y, _)) = f {
-                c.projection = Projection::Perspective { fov_y: *fov_y };
+        let frusta: Vec<Option<[f32; 4]>> = cameras.iter().map(|c| fit_layers(c, layers.as_ref())).collect();
+        for (c, f) in cameras.iter_mut().zip(&frusta) {
+            if let Some([_, _, top, bottom]) = f {
+                c.projection = Projection::Perspective { fov_y: bottom.atan() - top.atan() };
             }
         }
+        let fitted: Vec<Option<(f32, f32)>> =
+            frusta.iter().map(|f| f.map(|[l, r, t, b]| (0.0, (r - l) / (b - t)))).collect();
         let design = fitted.iter().map(|f| f.map_or(16.0 / 9.0, |(_, a)| a)).collect();
         // Frame whatever is there.
         let bounds = [&model, &layers].into_iter().flatten().fold(None, |acc: Option<(Vec3, Vec3)>, m| {
@@ -189,9 +192,13 @@ impl MapBrowser {
             self.fly_pitch = dir.y.asin();
             self.fly_speed = ((max - min).length() * 0.2).max(1.0);
         }
-        self.view = if layers.is_some() && !cameras.is_empty() { View::Scene(0) } else { View::Orbit };
+        self.view = if layers.is_some() && !cameras.is_empty() {
+            View::Scene(best_camera(&fitted))
+        } else {
+            View::Orbit
+        };
         self.follow = [0.0, 0.0];
-        self.loaded = Some(Loaded { entry, model, layers, cameras, design, errors });
+        self.loaded = Some(Loaded { entry, model, layers, cameras, design, frusta, errors });
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, vfs: &Vfs, renderer: &mut Renderer) {
@@ -347,7 +354,7 @@ impl MapBrowser {
                     self.follow[1] = (self.follow[1] - d.y / size.y * 2.0).clamp(-1.0, 1.0);
                 }
                 let (Some(cam), Some(&design)) = (l.cameras.get(i), l.design.get(i)) else { return };
-                let base = camera_view_proj(cam, design);
+                let base = camera_view_proj(cam, design, l.frusta.get(i).copied().flatten());
                 let crop = clip_transform(design, aspect, self.mode, self.follow);
                 Mat4::from_cols_array(&crop.matrix()) * base
             }
@@ -414,14 +421,47 @@ impl MapBrowser {
 }
 
 /// View-projection of a stored camera for its design aspect (Vulkan clip space). Cameras look down −Z.
-fn camera_view_proj(cam: &Camera, design: f32) -> Mat4 {
+/// The camera that frames the layers best: its fitted frame is closest to the PS2's 512 × 448. Maps keep
+/// cameras for other shots too, which may not face the background at all.
+fn best_camera(fitted: &[Option<(f32, f32)>]) -> usize {
+    let score = |f: &Option<(f32, f32)>| f.map_or(f32::MAX, |(_, a)| (a - 512.0 / 448.0).abs());
+    (0..fitted.len()).min_by(|&a, &b| score(&fitted[a]).total_cmp(&score(&fitted[b]))).unwrap_or(0)
+}
+
+/// A camera's view-projection. With a fitted frustum the frame is exactly the background (which may sit off
+/// the camera's axis); otherwise the camera's own field of view at the `design` aspect.
+fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 4]>) -> Mat4 {
     let world = Mat4::from_cols_array(&cam.world);
     let view = world.inverse();
-    let proj = match cam.projection {
-        Projection::Perspective { fov_y } => {
+    let (near, far) = (cam.near.max(0.001), cam.far.max(cam.near + 1.0));
+    let proj = match (frustum, cam.projection) {
+        (Some([l, r, t, b]), _) => {
+            // Off-centre perspective, right-handed, depth 0–1: x/-z = l maps to -1, = r to +1 (y likewise, t to
+            // the top of the screen).
+            let zr = far / (near - far);
+            Mat4::from_cols_array(&[
+                2.0 / (r - l),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                2.0 / (b - t),
+                0.0,
+                0.0,
+                (r + l) / (r - l),
+                (b + t) / (b - t),
+                zr,
+                -1.0,
+                0.0,
+                0.0,
+                zr * near,
+                0.0,
+            ])
+        }
+        (None, Projection::Perspective { fov_y }) => {
             Mat4::perspective_rh(fov_y, design, cam.near.max(0.001), cam.far.max(cam.near + 1.0))
         }
-        Projection::Orthographic { height } => {
+        (None, Projection::Orthographic { height }) => {
             let h = height * 0.5;
             Mat4::orthographic_rh(-h * design, h * design, -h, h, cam.near, cam.far)
         }
@@ -433,9 +473,14 @@ fn camera_view_proj(cam: &Camera, design: f32) -> Mat4 {
 /// Field of view and frame shape that make the 2D background exactly fill a camera's frame. The background is
 /// the layer farthest from the camera (foreground layers may reach past the frame); the fit is a perspective
 /// from the camera's position, looking down its −Z axis.
-fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<(f32, f32)> {
+fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<[f32; 4]> {
     let layers = layers?;
     let view = Mat4::from_cols_array(&cam.world).inverse();
+    // Half-height tangent of the camera's own view.
+    let reach = match cam.projection {
+        Projection::Perspective { fov_y } => (fov_y * 0.5).tan().clamp(0.05, 4.0),
+        Projection::Orthographic { .. } => 4.0,
+    };
     let corners = |min: Vec3, max: Vec3| {
         (0..8).map(move |c| {
             Vec3::new(
@@ -457,18 +502,166 @@ fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<(f32, f32)> {
             let pts: Vec<Vec3> =
                 corners(min, max).map(|p| view.transform_point3(world.transform_point3(p))).collect();
             let depth = pts.iter().map(|p| -p.z).fold(f32::MAX, f32::min);
-            (depth > 1e-3 && m.bounds_size[0] * m.bounds_size[1] > 0.0).then_some((depth, pts))
+            // Maps with several screens have a background per camera: keep layers whose centre lies inside
+            // (a generous margin around) this camera's own view.
+            let centre = view.transform_point3(world.transform_point3(min + Vec3::from(m.bounds_size) * 0.5));
+            let in_view = centre.z < 0.0
+                && (centre.x / -centre.z).abs() < 2.0 * reach
+                && (centre.y / -centre.z).abs() < 1.5 * reach;
+            (depth > 1e-3 && in_view && m.bounds_size[0] * m.bounds_size[1] > 0.0).then_some((depth, pts))
         })
         .max_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, pts)| pts)
         .unwrap_or_else(|| corners(layers.min, layers.max).map(|p| view.transform_point3(p)).collect());
-    let (mut tx, mut ty) = (0.0f32, 0.0f32);
+    let (mut l, mut r, mut t, mut b) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
     for v in background {
         if v.z >= -1e-3 {
             continue;
         }
-        tx = tx.max((v.x / -v.z).abs());
-        ty = ty.max((v.y / -v.z).abs());
+        let (x, y) = (v.x / -v.z, v.y / -v.z);
+        (l, r, t, b) = (l.min(x), r.max(x), t.min(y), b.max(y));
     }
-    (tx > 0.0 && ty > 0.0).then(|| (2.0 * ty.atan(), (tx / ty).clamp(0.5, 4.0)))
+    (r - l > 1e-4 && b - t > 1e-4 && (r - l) / (b - t) < 8.0 && (b - t) / (r - l) < 8.0)
+        .then_some([l, r, t, b])
+}
+
+#[cfg(test)]
+mod tests {
+    //! M1 gate for maps (local: needs `AERUGO_GAME_DIR` and a Vulkan device): pre-rendered maps open and their
+    //! stored camera follows the aspect policy at 4:3, 16:9, 21:9 and 32:9.
+
+    use super::*;
+    use aerugo_gfx::ContextOptions;
+    use aerugo_vfs::install_from_env;
+
+    const CLEAR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+    /// Single-screen backgrounds that frame cleanly at all four ratios in crop and fit.
+    const KNOWN_GOOD: [&str; 2] = ["X guad/guad02", "X azit/azit00"];
+    /// How many layered maps framed cleanly when this test was written (a regression floor).
+    const MIN_CLEAN: usize = 27;
+
+    /// Share of the image's outermost columns (left and right) that show the clear colour.
+    fn edge_clear_share(px: &[u8], w: u32, h: u32) -> f64 {
+        let mut clear = 0;
+        for y in 0..h {
+            for x in [0, w - 1] {
+                let i = ((y * w + x) * 4) as usize;
+                if px[i] > 250 && px[i + 1] < 5 && px[i + 2] > 250 {
+                    clear += 1;
+                }
+            }
+        }
+        f64::from(clear) / f64::from(2 * h)
+    }
+
+    #[test]
+    fn layered_maps_follow_the_aspect_policy() {
+        let Some(inst) = install_from_env() else {
+            eprintln!("skipped: set AERUGO_GAME_DIR");
+            return;
+        };
+        let mut renderer =
+            match Renderer::new_headless(&ContextOptions { validation: true, preferred_gpu: None }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("skipped: no usable Vulkan device ({e:#})");
+                    return;
+                }
+            };
+        let mut vfs = Vfs::new();
+        vfs.mount_install(&inst).unwrap();
+        let entries: Vec<MapEntry> =
+            MapBrowser::list(&vfs).into_iter().filter(|e| e.layers.is_some()).collect();
+        assert!(entries.len() > 150, "{} layered maps", entries.len());
+        let mut browser = MapBrowser::new();
+        let (mut checked, mut skipped, mut bad, mut clean) =
+            (0, Vec::new(), Vec::<String>::new(), Vec::new());
+        for entry in entries {
+            let label = entry.label.clone();
+            let problems_before = bad.len();
+            browser.open(&vfs, &mut renderer, entry);
+            let l = browser.loaded.as_ref().unwrap();
+            assert!(l.errors.is_empty(), "{label}: {:?}", l.errors);
+            if l.layers.is_none() {
+                eprintln!("{label}: the 2d model has no layer geometry; skipped");
+                skipped.push(label);
+                continue;
+            }
+            let View::Scene(best) = browser.view else {
+                panic!(
+                    "{label}: no scene view (layers {}, cameras {:?})",
+                    l.layers.as_ref().map_or(0, |m| m.meshes.len()),
+                    l.cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+                )
+            };
+            let frustum = l.frusta.get(best).copied().flatten();
+            let (Some(layers), Some(cam), Some(&design)) =
+                (&l.layers, l.cameras.get(best), l.design.get(best))
+            else {
+                panic!("{label}: no layers or camera");
+            };
+            let draws: Vec<Draw> = layers
+                .meshes
+                .iter()
+                .map(|m| Draw {
+                    mesh: m.mesh,
+                    model: m.world.to_cols_array(),
+                    joint_base: None,
+                    lit: false,
+                    part: None,
+                })
+                .collect();
+            let h = 180u32;
+            for aspect in [4.0f32 / 3.0, 16.0 / 9.0, 21.0 / 9.0, 32.0 / 9.0] {
+                let w = (h as f32 * aspect).round() as u32;
+                for mode in [AspectMode::Crop, AspectMode::Fit] {
+                    let c = clip_transform(design, w as f32 / h as f32, mode, [0.0, 0.0]);
+                    let view_proj =
+                        Mat4::from_cols_array(&c.matrix()) * camera_view_proj(cam, design, frustum);
+                    let view = SceneView {
+                        view_proj: view_proj.to_cols_array(),
+                        clear: CLEAR,
+                        draws: draws.clone(),
+                        joints: Vec::new(),
+                        culling: true,
+                        mirrored: false,
+                    };
+                    let px = renderer.render_offscreen(view, (w, h)).unwrap();
+                    let share = edge_clear_share(&px, w, h);
+                    // Crop fills the frame at every ratio; fit leaves bars beside a frame narrower than the view.
+                    match mode {
+                        AspectMode::Crop => {
+                            if share >= 0.05 {
+                                bad.push(format!("{label} crop at {aspect:.2}: edges {share:.2} empty"));
+                            }
+                        }
+                        AspectMode::Fit if aspect > design + 0.05 => {
+                            // Foreground layers may reach into the bars; most of the edge must still be empty.
+                            if share <= 0.25 {
+                                bad.push(format!("{label} fit at {aspect:.2}: no bars ({share:.2})"));
+                            }
+                        }
+                        AspectMode::Fit => {}
+                    }
+                }
+            }
+            checked += 1;
+            if bad.len() == problems_before {
+                clean.push(label);
+            }
+        }
+        browser.close(&mut renderer);
+        eprintln!(
+            "{checked} layered maps rendered at 4:3, 16:9, 21:9 and 32:9 (crop and fit); {} skipped",
+            skipped.len()
+        );
+        eprintln!("{} of {} maps frame their background cleanly at every ratio", clean.len(), checked);
+        // Fitting the frame from the layers alone works for single-screen backgrounds; maps with several screens
+        // or scrolling backgrounds need the game's own camera control (later milestones). These must keep working:
+        for want in KNOWN_GOOD {
+            assert!(clean.iter().any(|c| c == want), "{want} no longer frames cleanly:\n{}", bad.join("\n"));
+        }
+        assert!(clean.len() >= MIN_CLEAN, "only {} maps frame cleanly (was {MIN_CLEAN})", clean.len());
+        assert_eq!(aerugo_gfx::validation_error_count(), 0, "Vulkan validation errors");
+    }
 }

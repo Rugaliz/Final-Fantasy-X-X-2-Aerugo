@@ -41,6 +41,8 @@ pub struct GraphicsSettings {
 pub struct UiSettings {
     /// Zoom applied on top of the display scale.
     pub scale: f32,
+    /// The asset viewer tab shown last.
+    pub viewer_tab: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +106,7 @@ impl Default for GraphicsSettings {
 
 impl Default for UiSettings {
     fn default() -> Self {
-        Self { scale: 1.0 }
+        Self { scale: 1.0, viewer_tab: "tables".into() }
     }
 }
 

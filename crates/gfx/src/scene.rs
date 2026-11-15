@@ -101,10 +101,15 @@ impl Buffer {
                 MemoryLocation::GpuOnly,
             )?;
             let region = [vk::BufferCopy::default().size(data.len() as u64)];
-            let copy = one_time_submit(ctx, |cmd| {
-                // SAFETY: both buffers are valid and large enough.
-                unsafe { ctx.device.cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &region) };
-            });
+            // Empty data still gets a (minimum-size) buffer, but nothing to copy.
+            let copy = if data.is_empty() {
+                Ok(())
+            } else {
+                one_time_submit(ctx, |cmd| {
+                    // SAFETY: both buffers are valid and large enough.
+                    unsafe { ctx.device.cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &region) };
+                })
+            };
             if let Err(e) = copy {
                 let mut dst = dst;
                 // SAFETY: the copy failed to submit or completed.
