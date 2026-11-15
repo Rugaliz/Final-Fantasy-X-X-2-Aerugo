@@ -18,6 +18,7 @@ pub const RATE: u32 = 48_000;
 
 enum Command {
     Play(VoiceId, Sound, VoiceParams),
+    PlayStream(VoiceId, crate::mixer::SharedStream, u16, u32, f32),
     Params(VoiceId, VoiceParams),
     Stop(VoiceId),
     StopAll,
@@ -43,6 +44,7 @@ impl AudioCallback<f32> for Callback {
         while let Ok(c) = self.commands.try_recv() {
             match c {
                 Command::Play(id, s, p) => self.mixer.play(id, s, p),
+                Command::PlayStream(id, s, ch, rate, gain) => self.mixer.play_stream(id, s, ch, rate, gain),
                 Command::Params(id, p) => self.mixer.set_params(id, p),
                 Command::Stop(id) => self.mixer.stop(id),
                 Command::StopAll => self.mixer.stop_all(),
@@ -94,6 +96,19 @@ impl AudioOutput {
     pub fn play(&self, sound: Sound, params: VoiceParams) -> VoiceId {
         let id = VoiceId(self.next.fetch_add(1, Ordering::Relaxed));
         let _ = self.commands.send(Command::Play(id, sound, params));
+        id
+    }
+
+    /// Play audio that is appended to `stream` while it plays.
+    pub fn play_stream(
+        &self,
+        stream: crate::mixer::SharedStream,
+        channels: u16,
+        rate: u32,
+        gain: f32,
+    ) -> VoiceId {
+        let id = VoiceId(self.next.fetch_add(1, Ordering::Relaxed));
+        let _ = self.commands.send(Command::PlayStream(id, stream, channels, rate, gain));
         id
     }
 

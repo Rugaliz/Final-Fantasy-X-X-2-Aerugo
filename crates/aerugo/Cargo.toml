@@ -19,6 +19,7 @@ aerugo-gfx.workspace = true
 aerugo-platform.workspace = true
 aerugo-sim.workspace = true
 aerugo-vfs.workspace = true
+aerugo-video.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 env_logger.workspace = true

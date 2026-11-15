@@ -249,6 +249,12 @@ impl Renderer {
         Ok(TextureHandle(id))
     }
 
+    /// Replace a texture's first level (same format and size).
+    pub fn update_texture(&mut self, handle: TextureHandle, data: &[u8]) -> Result<()> {
+        let entry = self.textures.get_mut(&handle.0).context("unknown texture")?;
+        entry.texture.update(&self.ctx, data)
+    }
+
     pub fn texture(&self, handle: TextureHandle) -> Option<&Texture> {
         self.textures.get(&handle.0).map(|e| &e.texture)
     }

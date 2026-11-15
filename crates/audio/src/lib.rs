@@ -7,4 +7,4 @@ pub mod mixer;
 pub mod resample;
 
 pub use device::AudioOutput;
-pub use mixer::{Mixer, Sound, VoiceId, VoiceParams};
+pub use mixer::{Mixer, SharedStream, Sound, Stream, VoiceId, VoiceParams};

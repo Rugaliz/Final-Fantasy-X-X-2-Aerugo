@@ -207,6 +207,84 @@ impl Texture {
         Ok(unsafe { ctx.device.create_image_view(&info, None) }?)
     }
 
+    /// Replace level 0 of layer 0 (e.g. a movie frame), waiting for the copy. Earlier GPU reads of the texture
+    /// on the same queue finish first.
+    pub fn update(&mut self, ctx: &Context, data: &[u8]) -> Result<()> {
+        let size = self.format.level_size(self.width, self.height);
+        if data.len() < size {
+            bail!("texture update: {} bytes, needs {size}", data.len());
+        }
+        let device = &ctx.device;
+        let mut staging = crate::scene::Buffer::new(
+            ctx,
+            size as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        )?;
+        let result = (|| -> Result<()> {
+            staging.mapped().context("staging buffer is not host-visible")?[..size]
+                .copy_from_slice(&data[..size]);
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let image = self.image;
+            let copy = [vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })];
+            let buffer = staging.buffer;
+            crate::scene::one_time_submit(ctx, |cmd| {
+                // SAFETY: recording; the image and buffer belong to this device.
+                unsafe {
+                    let to_dst = [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(image)
+                        .subresource_range(range)];
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+                    );
+                    device.cmd_copy_buffer_to_image(
+                        cmd,
+                        buffer,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &copy,
+                    );
+                    let to_read = [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(image)
+                        .subresource_range(range)];
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+                    );
+                }
+            })
+        })();
+        // SAFETY: the copy completed (or never ran).
+        unsafe { staging.destroy(ctx) };
+        result
+    }
+
     /// # Safety
     /// The GPU must no longer use the texture or views created from it.
     pub unsafe fn destroy(&mut self, ctx: &Context) {

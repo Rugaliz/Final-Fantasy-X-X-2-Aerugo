@@ -47,6 +47,31 @@ impl Default for VoiceParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VoiceId(pub u64);
 
+/// Audio fed while it plays (movies, streamed music): interleaved samples appended by the producer.
+#[derive(Debug, Default)]
+pub struct Stream {
+    pub samples: std::collections::VecDeque<f32>,
+    /// No more samples will come; the voice ends when the queue runs dry.
+    pub finished: bool,
+    /// Frames the mixer has consumed so far (a clock for synchronising pictures).
+    pub played_frames: u64,
+}
+
+pub type SharedStream = Arc<std::sync::Mutex<Stream>>;
+
+#[derive(Debug)]
+struct StreamVoice {
+    id: VoiceId,
+    shared: SharedStream,
+    channels: usize,
+    rate: u32,
+    gain: f32,
+    /// Local window of interleaved samples; `base` is the frame index of its first frame.
+    buf: Vec<f32>,
+    base: i64,
+    pos: f64,
+}
+
 #[derive(Debug)]
 struct Voice {
     id: VoiceId,
@@ -93,6 +118,7 @@ impl Limiter {
 pub struct Mixer {
     rate: u32,
     voices: Vec<Voice>,
+    streams: Vec<StreamVoice>,
     table: Arc<SincTable>,
     pub master: f32,
     limiter: Limiter,
@@ -105,6 +131,7 @@ impl Mixer {
         Mixer {
             rate: rate.max(1),
             voices: Vec::new(),
+            streams: Vec::new(),
             table: Arc::new(SincTable::new(1.0)),
             master: 1.0,
             limiter: Limiter::new(rate.max(1)),
@@ -123,12 +150,28 @@ impl Mixer {
         self.voices.push(Voice { id, sound, params, pos: 0.0, table });
     }
 
+    /// Play a stream; samples are pulled from `shared` as needed.
+    pub fn play_stream(&mut self, id: VoiceId, shared: SharedStream, channels: u16, rate: u32, gain: f32) {
+        self.streams.push(StreamVoice {
+            id,
+            shared,
+            channels: channels.max(1) as usize,
+            rate: rate.max(1),
+            gain,
+            buf: Vec::new(),
+            base: 0,
+            pos: 0.0,
+        });
+    }
+
     pub fn stop(&mut self, id: VoiceId) {
         self.voices.retain(|v| v.id != id);
+        self.streams.retain(|v| v.id != id);
     }
 
     pub fn stop_all(&mut self) {
         self.voices.clear();
+        self.streams.clear();
     }
 
     pub fn set_params(&mut self, id: VoiceId, params: VoiceParams) {
@@ -147,7 +190,7 @@ impl Mixer {
     }
 
     pub fn voice_count(&self) -> usize {
-        self.voices.len()
+        self.voices.len() + self.streams.len()
     }
 
     /// Mix into interleaved stereo `out` (overwrites it).
@@ -205,6 +248,7 @@ impl Mixer {
             }
         }
         self.voices.retain(|v| !finished.contains(&v.id));
+        self.render_streams(out);
         let mut peak = 0.0f32;
         for frame in out.chunks_exact_mut(2) {
             let mut fr = [frame[0] * self.master, frame[1] * self.master];
@@ -213,6 +257,60 @@ impl Mixer {
             frame.copy_from_slice(&fr);
         }
         self.last_peak = peak;
+    }
+}
+
+impl Mixer {
+    fn render_streams(&mut self, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        let rate = f64::from(self.rate);
+        let half = crate::resample::HALF_TAPS as i64;
+        let table = &self.table;
+        let mut ended = Vec::new();
+        for s in &mut self.streams {
+            let ch = s.channels;
+            let step = f64::from(s.rate) / rate;
+            let need_frames = (s.pos + step * frames as f64).ceil() as i64 + half + 1 - s.base;
+            let finished = {
+                let Ok(mut shared) = s.shared.lock() else { continue };
+                let have = (s.buf.len() / ch) as i64;
+                let want = ((need_frames - have).max(0) as usize * ch).min(shared.samples.len());
+                s.buf.extend(shared.samples.drain(..want));
+                shared.finished
+            };
+            let available = (s.buf.len() / ch) as i64;
+            if finished && s.pos as i64 >= s.base + available {
+                ended.push(s.id);
+                continue;
+            }
+            let (buf, base) = (&s.buf, s.base);
+            let fetch = |i: i64, c: usize| -> f32 {
+                let k = i - base;
+                if k < 0 || k >= available { 0.0 } else { buf[k as usize * ch + c] }
+            };
+            let start_pos = s.pos;
+            for f in 0..frames {
+                // Without data yet, wait (silence) rather than run ahead of the producer.
+                if (s.pos as i64) + half >= s.base + available && !finished {
+                    break;
+                }
+                let l = table.interpolate(s.pos, |i| fetch(i, 0));
+                let r = if ch > 1 { table.interpolate(s.pos, |i| fetch(i, 1)) } else { l };
+                out[2 * f] += l * s.gain;
+                out[2 * f + 1] += r * s.gain;
+                s.pos += step;
+            }
+            let played = (s.pos.floor() - start_pos.floor()).max(0.0) as u64;
+            if let Ok(mut shared) = s.shared.lock() {
+                shared.played_frames += played;
+            }
+            // Drop frames well behind the read position.
+            let keep_from = (s.pos as i64 - half - 2).max(s.base);
+            let drop = ((keep_from - s.base) as usize * ch).min(s.buf.len());
+            s.buf.drain(..drop);
+            s.base = keep_from;
+        }
+        self.streams.retain(|s| !ended.contains(&s.id));
     }
 }
 
@@ -276,6 +374,28 @@ mod tests {
         assert!(m.is_playing(VoiceId(7)));
         assert!(out[2 * 47000..].iter().any(|s| s.abs() > 0.1));
         m.stop(VoiceId(7));
+        assert_eq!(m.voice_count(), 0);
+    }
+
+    #[test]
+    fn streams_play_what_is_fed_and_end() {
+        let mut m = Mixer::new(48000);
+        let shared: SharedStream = Default::default();
+        m.play_stream(VoiceId(3), shared.clone(), 2, 48000, 1.0);
+        let mut out = vec![0.0; 2 * 480];
+        m.render(&mut out);
+        assert!(out.iter().all(|s| *s == 0.0), "no data yet: silence");
+        {
+            let mut s = shared.lock().unwrap();
+            s.samples.extend(std::iter::repeat_n([0.5f32, -0.25], 4800).flatten());
+            s.finished = true;
+        }
+        m.render(&mut out);
+        assert!((out[200] - 0.5).abs() < 0.01 && (out[201] + 0.25).abs() < 0.01);
+        for _ in 0..12 {
+            m.render(&mut out);
+        }
+        assert!(shared.lock().unwrap().played_frames >= 4800 - 40);
         assert_eq!(m.voice_count(), 0);
     }
 

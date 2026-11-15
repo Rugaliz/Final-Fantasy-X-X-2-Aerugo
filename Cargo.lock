@@ -28,6 +28,7 @@ dependencies = [
  "aerugo-platform",
  "aerugo-sim",
  "aerugo-vfs",
+ "aerugo-video",
  "anyhow",
  "clap",
  "env_logger",
@@ -105,6 +106,18 @@ dependencies = [
  "proptest",
  "thiserror",
  "winreg",
+]
+
+[[package]]
+name = "aerugo-video"
+version = "0.1.0"
+dependencies = [
+ "aerugo-vfs",
+ "lewton",
+ "libloading",
+ "log",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -317,6 +330,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -959,6 +978,16 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
+]
+
+[[package]]
+name = "lewton"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777b48df9aaab155475a83a7df3070395ea1ac6902f5cd062b8f2b028075c030"
+dependencies = [
+ "byteorder",
+ "tinyvec",
 ]
 
 [[package]]
@@ -1687,6 +1716,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "toml"

@@ -8,6 +8,7 @@ members = [
     "crates/sim",
     "crates/debug-ui",
     "crates/audio",
+    "crates/video",
     "crates/formats",
     "xtask",
 ]
@@ -29,6 +30,7 @@ aerugo-gfx = { path = "crates/gfx" }
 aerugo-sim = { path = "crates/sim" }
 aerugo-debug-ui = { path = "crates/debug-ui" }
 aerugo-audio = { path = "crates/audio" }
+aerugo-video = { path = "crates/video" }
 aerugo-formats = { path = "crates/formats" }
 
 # external (licences checked by deny.toml)
@@ -42,6 +44,8 @@ egui-ash-renderer = { version = "0.13", features = ["gpu-allocator"] }
 env_logger = "0.11"
 flate2 = "1.1"
 glam = "0.30"
+lewton = { version = "0.10", default-features = false }
+libloading = "0.8"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
 log = "0.4"
 proptest = "1.12"

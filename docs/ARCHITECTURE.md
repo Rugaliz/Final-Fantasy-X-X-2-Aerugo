@@ -11,11 +11,11 @@
 | `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures |
 | `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation |
 | `aerugo-audio` | Float mixer with windowed-sinc resampling and a limiter, SDL3 playback |
+| `aerugo-video` | WebM movies: Matroska demuxing, VP8 through libvpx (loaded at run time), Vorbis through lewton |
 | `aerugo-debug-ui` | egui integration with SDL3 input, debug panels |
 | `xtask` | Developer commands (`cargo run -p xtask -- <command>`) |
 
-More crates arrive with later milestones: file-format parsers, scene renderer, audio, video, the script
-runtime, and one crate per game.
+More crates arrive with later milestones: the script runtime and one crate per game.
 
 ### Dependency rules
 

@@ -3,6 +3,7 @@
 mod filelist;
 mod maps;
 mod models;
+mod movies;
 mod sounds;
 mod tables;
 mod textures;
@@ -15,6 +16,7 @@ use aerugo_vfs::{Install, Language, Vfs};
 
 use maps::MapBrowser;
 use models::ModelBrowser;
+use movies::MoviePlayer;
 use sounds::SoundBrowser;
 use tables::TableBrowser;
 use textures::TextureBrowser;
@@ -26,6 +28,7 @@ enum Tab {
     Models,
     Maps,
     Sounds,
+    Movies,
 }
 
 #[derive(Debug)]
@@ -38,6 +41,7 @@ pub struct Viewer {
     models: ModelBrowser,
     maps: MapBrowser,
     sounds: SoundBrowser,
+    movies: MoviePlayer,
     audio: Option<aerugo_audio::AudioOutput>,
 }
 
@@ -86,6 +90,7 @@ impl Viewer {
             models: ModelBrowser::new(),
             maps: MapBrowser::new(),
             sounds: SoundBrowser::with_languages(japanese_voices, original_music),
+            movies: MoviePlayer::new(),
             audio,
         }
     }
@@ -96,6 +101,7 @@ impl Viewer {
         self.models.close(renderer);
         self.maps.close(renderer);
         self.sounds.close(self.audio.as_ref());
+        self.movies.close(renderer, self.audio.as_ref());
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -111,6 +117,7 @@ impl Viewer {
                 ui.selectable_value(&mut self.tab, Tab::Models, "Models");
                 ui.selectable_value(&mut self.tab, Tab::Maps, "Maps");
                 ui.selectable_value(&mut self.tab, Tab::Sounds, "Sounds");
+                ui.selectable_value(&mut self.tab, Tab::Movies, "Movies");
             });
         });
         match (&self.vfs, &self.error) {
@@ -120,6 +127,7 @@ impl Viewer {
                 Tab::Models => self.models.ui(ui, vfs, renderer),
                 Tab::Maps => self.maps.ui(ui, vfs, renderer),
                 Tab::Sounds => self.sounds.ui(ui, vfs, self.audio.as_ref()),
+                Tab::Movies => self.movies.ui(ui, vfs, renderer, self.audio.as_ref()),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
