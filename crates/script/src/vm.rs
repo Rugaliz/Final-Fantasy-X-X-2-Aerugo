@@ -353,6 +353,15 @@ impl Vm {
         vm
     }
 
+    /// Arrive by `entrance`: the script's entrance worker is asked (at level 1) to run the entry the entrance
+    /// names. Call right after creating the machine, before the first frame.
+    pub fn enter(&mut self, entrance: usize) -> bool {
+        match self.script.entrance_entry(entrance) {
+            Some((worker, entry)) => self.request(None, usize::from(worker), RequestMode::Plain, 1, entry),
+            None => false,
+        }
+    }
+
     /// Run one frame (1/30 s of game time).
     pub fn frame(&mut self, host: &mut dyn Host) {
         match self.phase {

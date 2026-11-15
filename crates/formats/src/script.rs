@@ -364,6 +364,27 @@ impl Script {
         self.code as u32
     }
 
+    /// What arriving by `entrance` starts: the header names an entrance worker (+0x18) and a table of 0x20-byte
+    /// entrance records (+0x04 to +0x08) whose `u16` at +6 is the entry that worker runs (at level 1). An entrance
+    /// past the table uses the first record. `None` when the script has no entrance worker or the entry is 0.
+    pub fn entrance_entry(&self, entrance: usize) -> Option<(u16, u16)> {
+        let worker = u16_at(&self.data, 0x18).ok()?;
+        if worker == 0xFFFF {
+            return None;
+        }
+        let table = u32_at(&self.data, 4).ok()? as usize;
+        let end = u32_at(&self.data, 8).ok()? as usize;
+        if table == 0 {
+            return None;
+        }
+        let mut at = table + entrance * 0x20;
+        if at >= end {
+            at = table;
+        }
+        let entry = u16_at(&self.data, at + 6).ok()?;
+        (entry != 0).then_some((worker, entry))
+    }
+
     /// The map number the script names in its header (event scripts), if any.
     pub fn map_number(&self) -> Option<i16> {
         let table = u32_at(&self.data, 4).ok()? as usize;

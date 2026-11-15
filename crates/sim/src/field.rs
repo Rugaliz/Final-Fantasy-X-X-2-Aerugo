@@ -413,7 +413,11 @@ impl Event {
             game,
             name,
             path: path.to_owned(),
-            vm: Vm::new(Arc::new(script)),
+            vm: {
+                let mut vm = Vm::new(Arc::new(script));
+                vm.enter(0);
+                vm
+            },
             natives,
             state,
             map_model,
