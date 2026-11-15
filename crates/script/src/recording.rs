@@ -14,14 +14,58 @@ use crate::vm::TraceEvent;
 pub const MAGIC: &[u8; 8] = b"AEORACL1";
 /// Version 2 adds the worker's stack depth (before the instruction) to instruction records.
 pub const MAGIC_V2: &[u8; 8] = b"AEORACL2";
+/// Version 3 adds native results and polls, input and worker positions per frame.
+pub const MAGIC_V3: &[u8; 8] = b"AEORACL3";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A worker's place at the start of a frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkerPosition {
+    pub worker: u16,
+    pub kind: u8,
+    pub pos: [f32; 3],
+    pub pitch: f32,
+    pub yaw: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Record {
     Frame(u32),
-    Instruction { worker: u16, level: u8, pc: u32, op: u8, operand: Option<u16>, depth: Option<u8> },
-    Random { stream: u8, value: u32 },
-    Event { index: i32, path: String },
-    MapChange { target: i32, entrance: i32 },
+    Instruction {
+        worker: u16,
+        level: u8,
+        pc: u32,
+        op: u8,
+        operand: Option<u16>,
+        depth: Option<u8>,
+    },
+    Random {
+        stream: u8,
+        value: u32,
+    },
+    Event {
+        index: i32,
+        path: String,
+    },
+    MapChange {
+        target: i32,
+        entrance: i32,
+    },
+    /// A finished native call's result (tag 1 int, 2 float; the value's raw bits).
+    NativeResult {
+        worker: u16,
+        native: u16,
+        tag: u8,
+        value: u32,
+    },
+    /// A native's poll result flags.
+    NativePoll {
+        worker: u16,
+        native: u16,
+        flags: u8,
+    },
+    /// Input at the start of a frame: the scripts' pad words, then pad 0's state block.
+    Input(Vec<u8>),
+    Positions(Vec<WorkerPosition>),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -34,7 +78,8 @@ pub enum RecordingError {
 
 /// Parse a recording. A record cut off at the end (the game was closed mid-write) ends the list.
 pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
-    let v2 = d.starts_with(MAGIC_V2);
+    let v3 = d.starts_with(MAGIC_V3);
+    let v2 = d.starts_with(MAGIC_V2) || v3;
     if !d.starts_with(MAGIC) && !v2 {
         return Err(RecordingError::NotARecording);
     }
@@ -75,6 +120,47 @@ pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
                     Record::MapChange { target: u32_at(at + 1)? as i32, entrance: u32_at(at + 5)? as i32 },
                     9,
                 ))
+            })(),
+            6 => (|| {
+                Some((
+                    Record::NativeResult {
+                        worker: u16_at(at + 1)?,
+                        native: u16_at(at + 3)?,
+                        tag: *d.get(at + 5)?,
+                        value: u32_at(at + 6)?,
+                    },
+                    10,
+                ))
+            })(),
+            7 => (|| {
+                Some((
+                    Record::NativePoll {
+                        worker: u16_at(at + 1)?,
+                        native: u16_at(at + 3)?,
+                        flags: *d.get(at + 5)?,
+                    },
+                    6,
+                ))
+            })(),
+            8 => (|| {
+                let n = usize::from(u16_at(at + 1)?);
+                Some((Record::Input(d.get(at + 3..at + 3 + n)?.to_vec()), 3 + n))
+            })(),
+            9 => (|| {
+                let n = usize::from(u16_at(at + 1)?);
+                let mut v = Vec::with_capacity(n);
+                for k in 0..n {
+                    let o = at + 3 + k * 23;
+                    let f = |i: usize| u32_at(o + 3 + 4 * i).map(f32::from_bits);
+                    v.push(WorkerPosition {
+                        worker: u16_at(o)?,
+                        kind: *d.get(o + 2)?,
+                        pos: [f(0)?, f(1)?, f(2)?],
+                        pitch: f(3)?,
+                        yaw: f(4)?,
+                    });
+                }
+                Some((Record::Positions(v), 3 + n * 23))
             })(),
             t => return Err(RecordingError::UnknownRecord(t, at)),
         };
@@ -118,6 +204,10 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
                 d.extend((path.len() as u16).to_le_bytes());
                 d.extend(path.as_bytes());
             }
+            Record::NativeResult { .. }
+            | Record::NativePoll { .. }
+            | Record::Input(_)
+            | Record::Positions(_) => {}
             Record::MapChange { target, entrance } => {
                 d.push(5);
                 d.extend(target.to_le_bytes());
@@ -183,6 +273,10 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                     run.random.push(*value);
                 }
             }
+            Record::NativeResult { .. }
+            | Record::NativePoll { .. }
+            | Record::Input(_)
+            | Record::Positions(_) => {}
             Record::MapChange { target, entrance } => {
                 if let Some(run) = runs.last_mut() {
                     run.map_changes.push((frame, *target, *entrance));
@@ -253,6 +347,25 @@ pub fn first_divergence(expected: &[Vec<TraceEvent>], got: &[Vec<TraceEvent>]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_version_3_records() {
+        let mut d = MAGIC_V3.to_vec();
+        d.extend([6, 3, 0, 0x01, 0x10, 2]);
+        d.extend(1.5f32.to_bits().to_le_bytes());
+        d.extend([7, 3, 0, 0x00, 0x00, 5]);
+        d.extend([8, 2, 0, 0xAA, 0xBB]);
+        d.extend([9, 1, 0, 4, 0, 1]);
+        for v in [1.0f32, -2.0, 3.0, 0.0, 0.5] {
+            d.extend(v.to_bits().to_le_bytes());
+        }
+        let r = parse(&d).unwrap();
+        assert_eq!(r[0], Record::NativeResult { worker: 3, native: 0x1001, tag: 2, value: 1.5f32.to_bits() });
+        assert_eq!(r[1], Record::NativePoll { worker: 3, native: 0, flags: 5 });
+        assert_eq!(r[2], Record::Input(vec![0xAA, 0xBB]));
+        let Record::Positions(p) = &r[3] else { panic!() };
+        assert_eq!((p[0].worker, p[0].kind, p[0].pos, p[0].yaw), (4, 1, [1.0, -2.0, 3.0], 0.5));
+    }
 
     #[test]
     fn parses_and_splits() {
