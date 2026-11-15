@@ -53,7 +53,9 @@ impl Ground {
         Ground { tris, min: lo, dims, cells }
     }
 
-    /// Triangles of every mesh of a map model, placed in map space.
+    /// Triangles of every mesh of a map model, placed in game space (the model is in view space, turned half a
+    /// turn around X: Y and Z flip). This is the drawn geometry, not the original's walk mesh, so floors are close
+    /// but not exact.
     pub fn from_model(cluster: &Cluster, model: &Model) -> Ground {
         let mut tris = Vec::new();
         for m in &model.meshes {
@@ -61,8 +63,8 @@ impl Ground {
             let place = |p: [f32; 3]| {
                 [
                     w[0] * p[0] + w[4] * p[1] + w[8] * p[2] + w[12],
-                    w[1] * p[0] + w[5] * p[1] + w[9] * p[2] + w[13],
-                    w[2] * p[0] + w[6] * p[1] + w[10] * p[2] + w[14],
+                    -(w[1] * p[0] + w[5] * p[1] + w[9] * p[2] + w[13]),
+                    -(w[2] * p[0] + w[6] * p[1] + w[10] * p[2] + w[14]),
                 ]
             };
             for seg in &m.segments {
@@ -94,7 +96,7 @@ impl Ground {
     }
 
     /// Floor heights (Y, down positive) under (x, z).
-    fn heights(&self, x: f32, z: f32) -> impl Iterator<Item = f32> + '_ {
+    pub fn heights(&self, x: f32, z: f32) -> impl Iterator<Item = f32> + '_ {
         let cx = ((x - self.min[0]) / CELL).floor();
         let cz = ((z - self.min[1]) / CELL).floor();
         let cell = if self.dims[0] > 0

@@ -4,6 +4,7 @@
 //! Rendering interpolates between snapshots, so any display rate shows smooth motion while the logic keeps
 //! the original timing. This crate has no graphics, audio or window dependencies.
 
+pub mod control;
 pub mod field;
 pub mod save;
 pub mod snapshot;

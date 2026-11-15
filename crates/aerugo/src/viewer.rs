@@ -147,6 +147,12 @@ impl Viewer {
         }
     }
 
+    /// Show the field runner on an event.
+    pub fn open_field(&mut self, event: String) {
+        self.tab = Tab::Field;
+        self.field.open_later(event);
+    }
+
     /// The shown tab's settings name.
     pub fn tab_name(&self) -> &'static str {
         self.tab.name()

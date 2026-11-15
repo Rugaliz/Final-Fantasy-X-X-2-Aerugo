@@ -32,6 +32,8 @@ pub struct StartOptions {
     pub test_scene: bool,
     /// Open the asset viewer instead of the launcher.
     pub viewer: bool,
+    /// Open the viewer's field runner on this event.
+    pub field: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,7 @@ impl std::fmt::Debug for App {
 impl App {
     pub fn new(opts: StartOptions) -> Result<Self> {
         let start_in_viewer = opts.viewer;
+        let start_field = opts.field.clone();
         let settings = opts.settings;
         let platform = Platform::new(&WindowConfig {
             title: "Aerugo".into(),
@@ -158,6 +161,9 @@ impl App {
         };
         if start_in_viewer {
             app.open_viewer();
+            if let (Some(v), Some(event)) = (app.ui.viewer.as_mut(), start_field) {
+                v.open_field(event);
+            }
         }
         Ok(app)
     }

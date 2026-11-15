@@ -8,6 +8,7 @@ use aerugo_formats::script::Script;
 use aerugo_formats::text::{self, Charset};
 use aerugo_script::natives::{Native, World, wrap_angle};
 
+use crate::control::PlayerControl;
 use crate::trigger::{self, PlayerStep, Talk, Talker, Trigger};
 use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
@@ -376,6 +377,11 @@ pub struct Input {
     pub alt: bool,
     /// The stick moved from rest this tick (for menus and choices).
     pub stick_pressed: bool,
+    /// Cancel held: the player walks instead of running.
+    pub walk: bool,
+    /// Heading of the camera the player sees (towards where it looks on the ground plane, as `atan2(dz, dx)`);
+    /// the stick is relative to it. None: the camera looks along +Z.
+    pub camera_heading: Option<f32>,
 }
 
 /// The script random number stream: a multiply / xor generator with a 16-bit rotate.
@@ -425,6 +431,11 @@ pub struct FieldState {
     pub talk_reach: f32,
     /// The talk started this tick, while workers offer themselves.
     pub talk: Option<Talk>,
+    pub control: PlayerControl,
+    /// The event's entrance records (the save image says which one the party arrived by).
+    pub entrances: Vec<aerugo_formats::script::Entrance>,
+    /// The player's step for next tick (from this tick's push), on the ground plane.
+    player_step: Option<[f32; 2]>,
 }
 
 impl FieldState {
@@ -603,26 +614,40 @@ impl FieldState {
                 }
             }
         }
-        if let Some(p) = self.player {
-            let stick = self.input.stick;
-            if stick[0] != 0.0 || stick[1] != 0.0 {
-                let ground = self.ground.clone();
-                let a = self.actor(p);
-                // Screen-relative movement on the ground plane (the field camera looks along +Z).
-                let speed = 2.4;
-                let next = [a.pos[0] + stick[0] * speed, a.pos[1], a.pos[2] + stick[1] * speed];
-                let next = match &ground {
-                    Some(g) => g.slide(a.pos, next),
-                    None => Some(next),
+        // The player covers last tick's push, then this tick's input makes the next one (only while the
+        // player has control).
+        if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
+            // With no floor under the player (in water), the ground does not hold the step back.
+            let swimming =
+                self.ground.as_ref().is_some_and(|g| !g.is_empty() && g.floor(self.actors[p].pos).is_none());
+            if let Some([dx, dz]) = self.player_step.take() {
+                let a = &self.actors[p];
+                let next = [a.pos[0] + dx, a.pos[1], a.pos[2] + dz];
+                let next = match &self.ground {
+                    Some(g) if !swimming => g.slide(a.pos, next),
+                    _ => Some(next),
                 };
                 if let Some(n) = next {
+                    let a = &mut self.actors[p];
                     a.pos = n;
-                    a.yaw = stick[0].atan2(stick[1]);
+                    a.yaw = dz.atan2(dx);
                 }
+            }
+            let push = self.control.tick(self.input.stick, self.input.walk, swimming);
+            if let Some(push) = push.filter(|_| self.user_control) {
+                // Forward is where the camera looks; right is a quarter turn clockwise from it seen from above.
+                let h = self.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
+                let (fwd, right) = ([h.cos(), h.sin()], [h.sin(), -h.cos()]);
+                let [x, y] = push.dir;
+                self.player_step =
+                    Some([(right[0] * x + fwd[0] * y) * push.step, (right[1] * x + fwd[1] * y) * push.step]);
             }
         }
     }
 }
+
+/// Offset of the entrance the party arrived by in the save image.
+const ENTRANCE_INDEX: usize = 0xC;
 
 /// Offset of the three party slots in the save image.
 const PARTY_SLOTS: usize = 0x3D58;
@@ -744,7 +769,7 @@ impl Event {
                 ..Actor::default()
             })
             .collect();
-        let mut state = FieldState { actors, ..FieldState::default() };
+        let mut state = FieldState { actors, entrances: script.entrances(), ..FieldState::default() };
         if let Some(tp) = event_text_path(game, path, lang)
             && let Ok(bytes) = vfs.read(&tp)
             && let Ok(cs) = vfs.read(&text::charset_path(game, lang)).map(|b| Charset::parse(&b))
@@ -1126,6 +1151,45 @@ fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let id = c.stack.pop_int();
             g.actor(c.worker).model = Some(id as u16);
+            Value::Int(0)
+        }),
+    );
+    // The entrance the party arrived by (the save image's byte 0xC) or a given one (below 0: that one too):
+    // position, height, depth, heading, entry.
+    fn entrance(g: &FieldState, c: &NativeCall, index: Option<i32>) -> aerugo_formats::script::Entrance {
+        let current = i32::from(c.memory.global[0].get(ENTRANCE_INDEX).copied().unwrap_or(0));
+        let i = index.filter(|&i| i >= 0).unwrap_or(current);
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| g.entrances.get(i))
+            .or(g.entrances.first())
+            .copied()
+            .unwrap_or_default()
+    }
+    n.register(0x0080, Native::result(|g, c| Value::Float(entrance(g, c, None).pos[0])));
+    n.register(0x0081, Native::result(|g, c| Value::Float(entrance(g, c, None).pos[1])));
+    n.register(0x0082, Native::result(|g, c| Value::Float(entrance(g, c, None).pos[2])));
+    n.register(0x0083, Native::result(|g, c| Value::Float(entrance(g, c, None).yaw)));
+    fn indexed(g: &mut FieldState, c: &mut NativeCall) -> aerugo_formats::script::Entrance {
+        let i = c.stack.pop_int();
+        entrance(g, c, Some(i))
+    }
+    n.register(0x00BF, Native::result(|g, c| Value::Float(indexed(g, c).pos[0])));
+    n.register(0x00C0, Native::result(|g, c| Value::Float(indexed(g, c).pos[1])));
+    n.register(0x00C1, Native::result(|g, c| Value::Float(indexed(g, c).pos[2])));
+    n.register(0x00C2, Native::result(|g, c| Value::Float(indexed(g, c).yaw)));
+    n.register(0x00C9, Native::result(|g, c| Value::Int(i32::from(indexed(g, c).entry as i16))));
+    // Player speeds (1 walking, 2 running, 0x12 in water; others not used here).
+    n.register(
+        0x4016,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            match c.stack.pop_int() {
+                1 => g.control.walk_speed = v,
+                2 => g.control.run_speed = v,
+                0x12 => g.control.swim_speed = v,
+                _ => {}
+            }
             Value::Int(0)
         }),
     );
@@ -1734,10 +1798,12 @@ mod tests {
                 [[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0], [100.0, 0.0, 100.0]],
                 [[-100.0, 0.0, -100.0], [100.0, 0.0, 100.0], [-100.0, 0.0, 100.0]],
             ])),
+            user_control: true,
             ..FieldState::default()
         };
         state.input.stick = [0.0, 1.0];
-        for _ in 0..10 {
+        // The push ramps up over eight ticks to the run speed (1.9 a tick).
+        for _ in 0..20 {
             state.update();
         }
         assert!(state.actors[0].pos[2] > 20.0, "{:?}", state.actors[0].pos);

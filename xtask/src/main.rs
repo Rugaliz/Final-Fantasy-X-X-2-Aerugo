@@ -79,6 +79,30 @@ enum Command {
     /// List every message window a recording opens: the setup natives' arguments and how many frames until the
     /// window reports its text done.
     OracleWindows { dir: PathBuf },
+    /// Run an event headless with no recording to lean on: confirm every `--confirm-every` ticks and push the
+    /// stick forward, printing the player, control and windows now and then, and the natives Aerugo lacks.
+    FieldRun {
+        event: String,
+        #[arg(long, default_value_t = 3000)]
+        ticks: u32,
+        /// Save image to start from (a recording's `saves/*.img`).
+        #[arg(long)]
+        image: Option<PathBuf>,
+        #[arg(long, default_value_t = 60)]
+        confirm_every: u32,
+        /// Push the stick from this tick on.
+        #[arg(long, default_value_t = u32::MAX)]
+        walk_from: u32,
+        /// Stick direction while walking: x (right) and y (forward), −1..1.
+        #[arg(long, num_args = 2, default_values_t = [0.0, 1.0], allow_negative_numbers = true)]
+        stick: Vec<f32>,
+        /// Instead of a fixed stick, steer towards this ground point (x z) and press confirm once there.
+        #[arg(long, num_args = 2, allow_negative_numbers = true)]
+        goto: Option<Vec<f32>>,
+        /// How far from the point to let go of the stick (the walk slows down over a few more ticks).
+        #[arg(long, default_value_t = 4.0)]
+        stop: f32,
+    },
     /// Print the start of an archive file as hex.
     Hexdump {
         path: String,
@@ -143,6 +167,17 @@ fn main() -> Result<()> {
         Command::OracleInput { dir, run } => oracle_input(&dir, run),
         Command::OracleWindows { dir } => oracle_windows(&install, &dir),
         Command::ScriptDump { event, worker } => script_dump(&install, &event, worker),
+        Command::FieldRun { event, ticks, image, confirm_every, walk_from, stick, goto, stop } => {
+            let run = FieldRunPlan {
+                ticks,
+                image,
+                confirm_every,
+                walk_from,
+                stick: [stick[0], stick[1]],
+                goto: goto.map(|g| [g[0], g[1], stop]),
+            };
+            field_run(&install, &event, &run)
+        }
         Command::Hexdump { path, len } => {
             let mut vfs = aerugo_vfs::Vfs::new();
             vfs.mount_install(&install)?;
@@ -410,6 +445,105 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
 }
 
 /// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
+/// What a headless field run does (see `FieldRun`).
+struct FieldRunPlan {
+    ticks: u32,
+    image: Option<PathBuf>,
+    confirm_every: u32,
+    walk_from: u32,
+    stick: [f32; 2],
+    /// Point to steer to (x, z) and how far from it to let go.
+    goto: Option<[f32; 3]>,
+}
+
+fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> {
+    let FieldRunPlan { ticks, ref image, confirm_every, walk_from, stick, goto } = *plan;
+    use aerugo_formats::Game;
+    use aerugo_sim::field::{Event, Input};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let path = archive_event_path(event).unwrap_or_else(|| event.to_owned());
+    let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
+    let mut ev = Event::load(&vfs, game, &path, aerugo_vfs::Language::English).map_err(anyhow::Error::msg)?;
+    // Walkable ground from the map's triangles, as the field runner does.
+    if let Some(p) = &ev.map_model
+        && let Ok(d) = vfs.read(p)
+        && let Ok(c) = aerugo_formats::phyre::Cluster::parse(d)
+        && let Ok(model) = aerugo_formats::mesh::read_model(&c)
+    {
+        ev.state.ground = Some(aerugo_sim::field::collision::Ground::from_model(&c, &model));
+        println!("ground from {p}");
+        // FIELD_PROBE="x z;x z": floor heights there.
+        if let Ok(probe) = std::env::var("FIELD_PROBE") {
+            let g = ev.state.ground.as_ref().expect("just set");
+            for pt in probe.split(';') {
+                let v: Vec<f32> = pt.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if let [x, z] = v[..] {
+                    let hs: Vec<f32> = g.heights(x, z).collect();
+                    println!("floor at {x} {z}: {hs:?}");
+                }
+            }
+        }
+    }
+    if let Some(img) = image {
+        let img = std::fs::read(img)?;
+        let n = img.len().min(ev.vm.memory.global[0].len());
+        ev.vm.memory.global[0][..n].copy_from_slice(&img[..n]);
+    }
+    for t in 0..ticks {
+        if ev.state.player.is_none() && ev.initialized() {
+            ev.state.player = ev.state.actors.iter().position(|a| a.model.is_some_and(|m| m >> 12 == 0));
+        }
+        let mut input = Input {
+            confirm: confirm_every > 0 && t % confirm_every == confirm_every - 1,
+            stick: if t >= walk_from { stick } else { [0.0; 2] },
+            ..Input::default()
+        };
+        // Steering (no camera: forward is +Z, right is +X): head for the point, then stand and confirm.
+        if let (Some([gx, gz, stop]), true) = (goto, t >= walk_from)
+            && let Some(p) = ev.state.player.and_then(|p| ev.state.actors.get(p)).map(|a| a.pos)
+        {
+            let (dx, dz) = (gx - p[0], gz - p[2]);
+            let d = (dx * dx + dz * dz).sqrt();
+            if d > stop {
+                input.stick = [dx / d, dz / d];
+            } else {
+                input.stick = [0.0; 2];
+                input.confirm = t % 30 == 0;
+            }
+        }
+        ev.step(input);
+        if t % 100 == 0 || ev.state.jump.is_some() {
+            let p = ev.state.player.and_then(|p| ev.state.actors.get(p)).map(|a| a.pos);
+            let windows: Vec<String> = ev
+                .state
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| w.open)
+                .map(|(i, w)| format!("{i}:{:?} {}/{}", w.message, w.shown, w.reveal))
+                .collect();
+            let talking: Vec<String> = ev
+                .vm
+                .workers
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| w.active && w.level == 7 && w.kind == 1)
+                .map(|(i, w)| format!("w{i} l7 e{}", w.entry))
+                .collect();
+            println!(
+                "t{t} player {:?} {p:?} control {} windows {windows:?} level7 {talking:?} map {:?}",
+                ev.state.player, ev.state.user_control, ev.state.jump
+            );
+            if ev.state.jump.is_some() {
+                break;
+            }
+        }
+    }
+    println!("{}", ev.natives.coverage.report(game));
+    Ok(())
+}
+
 fn script_dump(install: &Install, event: &str, worker: usize) -> Result<()> {
     use aerugo_formats::Game;
     let mut vfs = aerugo_vfs::Vfs::new();
@@ -514,6 +648,14 @@ fn oracle_input(dir: &std::path::Path, only: Option<usize>) -> Result<()> {
         println!("run {i} {}", run.path);
         let word =
             |d: &[u8], at: usize| d.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        // INPUT_PAD: every frame's start of pad 0's state block instead.
+        if std::env::var("INPUT_PAD").is_ok() {
+            for (f, d) in run.inputs.iter().enumerate() {
+                let pad: Vec<String> = d.iter().skip(0x20).take(0x20).map(|b| format!("{b:02x}")).collect();
+                println!("  f{f}: {}", pad.join(""));
+            }
+            continue;
+        }
         for (f, d) in run.inputs.iter().enumerate() {
             let words: Vec<String> = (0..8).map(|k| format!("{:08x}", word(d, k * 4))).collect();
             if words.iter().skip(4).any(|w| w != "00000000") {
@@ -755,7 +897,34 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         // limit every frame, and its trace would not fit in memory.
         let mut ours = Vec::new();
         let mut found = None;
+        // PLAYER_SIM: run the player controller on the recorded pad and compare its steps with the recorded ones.
+        let mut control = aerugo_sim::control::PlayerControl::default();
+        let mut step_errors: Vec<f32> = Vec::new();
         for f in 0..run.frames.len() {
+            if std::env::var("PLAYER_SIM").is_ok()
+                && let Some(p) = ev.state.player
+                && let Some(d) = run.inputs.get(f).filter(|d| d.len() >= 0x30)
+            {
+                let held = u32::from_le_bytes(d[0..4].try_into().expect("four bytes"));
+                let stick =
+                    [(f32::from(d[0x2f]) * 2.0 - 256.0) / 256.0, (128.0 - f32::from(d[0x2e])) * 2.0 / 256.0];
+                let predicted = control.tick(stick, held & 0x40 != 0, false).map_or(0.0, |p| p.step);
+                let find = |k: usize| {
+                    run.positions
+                        .get(k)
+                        .and_then(|ps| ps.iter().find(|q| usize::from(q.worker) == p))
+                        .map(|q| q.pos)
+                };
+                if ev.state.user_control
+                    && let (Some(a), Some(b)) = (find(f + 1), find(f + 2))
+                {
+                    let got = ((b[0] - a[0]).powi(2) + (b[2] - a[2]).powi(2)).sqrt();
+                    step_errors.push(got - predicted);
+                    if (got - predicted).abs() > 0.05 {
+                        eprintln!("step f{f}: predicted {predicted:.4} recorded {got:.4}");
+                    }
+                }
+            }
             // The player goes where the original's went (the stick is not replayed). The original moves
             // the player in its own turn, before other workers' triggers test it: by the position recorded at the
             // start of the next frame.
@@ -780,6 +949,35 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 ..Input::default()
             };
             ev.step(input);
+            // PLAYER_DIR: the stick, the player's recorded step and the camera, per frame (for fitting the
+            // player controller).
+            if std::env::var("PLAYER_DIR").is_ok()
+                && let Some(p) = ev.state.player
+                && let Some(d) = run.inputs.get(f)
+                && d.len() >= 0x30
+            {
+                let find = |k: usize| {
+                    run.positions
+                        .get(k)
+                        .and_then(|ps| ps.iter().find(|q| usize::from(q.worker) == p))
+                        .map(|q| q.pos)
+                };
+                if let (Some(a), Some(b)) = (find(f + 1), find(f + 2)) {
+                    let cam = &ev.state.camera;
+                    eprintln!(
+                        "dir f{f} stick {} {} buttons {:02x}{:02x} step {:.4} {:.4} {:.4} eye {:?} focus {:?}",
+                        d[0x2f],
+                        d[0x2e],
+                        d[0x23],
+                        d[0x22],
+                        b[0] - a[0],
+                        b[1] - a[1],
+                        b[2] - a[2],
+                        cam.position,
+                        cam.focus
+                    );
+                }
+            }
             if let Ok(spec) = std::env::var("COMPARE_DEBUG")
                 && let Some((w, from, to)) = (|| {
                     let mut it = spec.split(',').map(|x| x.parse::<usize>().ok());
@@ -808,6 +1006,13 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 found = Some(aerugo_script::recording::Divergence { frame: f, ..d });
                 break;
             }
+        }
+        if !step_errors.is_empty() {
+            let close = step_errors.iter().filter(|e| e.abs() <= 0.005).count();
+            println!(
+                "run {i}: player steps within 0.005 of the controller: {close} of {}",
+                step_errors.len()
+            );
         }
         let total: usize = run.frames.iter().map(Vec::len).sum();
         match found {

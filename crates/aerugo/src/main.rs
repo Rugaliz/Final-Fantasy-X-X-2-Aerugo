@@ -88,7 +88,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         install,
         notice,
         test_scene: cli.test_scene,
-        viewer: cli.viewer,
+        viewer: cli.viewer || cli.field.is_some(),
+        field: cli.field,
     };
     let mut app = app::App::new(opts)?;
     app.run()?;

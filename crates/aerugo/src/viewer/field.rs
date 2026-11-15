@@ -63,7 +63,10 @@ pub struct FieldView {
     paused: bool,
     step_once: bool,
     confirm: bool,
+    alt: bool,
     last_stick: [f32; 2],
+    /// Heading of the camera drawn last (the stick is relative to it).
+    camera_heading: Option<f32>,
     orbit: OrbitCamera,
     follow_player: bool,
     camera_mode: CameraMode,
@@ -102,7 +105,9 @@ impl FieldView {
             paused: false,
             step_once: false,
             confirm: false,
+            alt: false,
             last_stick: [0.0, 0.0],
+            camera_heading: None,
             orbit: OrbitCamera::framing(Vec3::splat(-100.0), Vec3::splat(100.0)),
             follow_player: true,
             camera_mode: CameraMode::Follow,
@@ -198,6 +203,11 @@ impl FieldView {
         self.clock.reset();
     }
 
+    /// Open an event on the next frame.
+    pub fn open_later(&mut self, event: String) {
+        self.pending_open = Some(event);
+    }
+
     fn tick(&mut self, input: Input) {
         let Some(s) = &mut self.session else { return };
         // The player is the first party member with a body, until the scripts say otherwise.
@@ -221,16 +231,20 @@ impl FieldView {
             self.open(vfs, renderer, &p);
         }
         // Input and timing.
-        let (stick, confirm_now) = ui.input(|i| {
+        // WASD walks (Shift held: slower), Enter / Space confirms and talks, Q talks with the second button.
+        let (stick, confirm_now, alt_now, walk) = ui.input(|i| {
             let k = |a: egui::Key, b: egui::Key| {
                 f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
             };
             (
                 [k(egui::Key::D, egui::Key::A), k(egui::Key::W, egui::Key::S)],
                 i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Q),
+                i.modifiers.shift,
             )
         });
         self.confirm |= confirm_now;
+        self.alt |= alt_now;
         let now = Instant::now();
         let elapsed = self.last.map_or(std::time::Duration::ZERO, |t| now - t);
         self.last = Some(now);
@@ -246,8 +260,10 @@ impl FieldView {
                 stick,
                 confirm: std::mem::take(&mut self.confirm),
                 cancel: false,
-                alt: false,
+                alt: std::mem::take(&mut self.alt),
                 stick_pressed,
+                walk,
+                camera_heading: self.camera_heading,
             };
             self.tick(input);
         }
@@ -552,8 +568,22 @@ impl FieldView {
             let i = best_camera(&shapes);
             let f = fitted.get(i).copied().flatten()?;
             let d = (f[1] - f[0]) / (f[3] - f[2]);
-            Some(policy(camera_view_proj(&cams[i], d, Some(f)), d))
+            // The camera looks down its −Z axis; view space is game space turned half way round X.
+            let w = &cams[i].world;
+            Some((policy(camera_view_proj(&cams[i], d, Some(f)), d), w[10].atan2(-w[8])))
         });
+        // The heading the stick is relative to: where the drawn camera looks, on the ground plane.
+        self.camera_heading = match (self.camera_mode, st.camera.position, st.camera.focus, map_camera) {
+            (CameraMode::Script, Some(eye), Some(focus), _) => {
+                Some((focus[2] - eye[2]).atan2(focus[0] - eye[0]))
+            }
+            (CameraMode::Map, _, _, Some((_, h))) => Some(h),
+            _ => {
+                let d = self.orbit.target - self.orbit.eye();
+                Some((-d.z).atan2(d.x))
+            }
+        };
+        let map_camera = map_camera.map(|(vp, _)| vp);
         let view_proj = match (self.camera_mode, st.camera.position, st.camera.focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {
                 let r = game_to_view();

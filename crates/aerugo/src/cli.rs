@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long)]
     pub viewer: bool,
 
+    /// Open the viewer's field runner on this event script (an archive path ending in `.ebp`).
+    #[arg(long, value_name = "EVENT")]
+    pub field: Option<String>,
+
     /// Open the timing test scene.
     #[arg(long)]
     pub test_scene: bool,

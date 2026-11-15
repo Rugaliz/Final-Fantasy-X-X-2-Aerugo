@@ -83,6 +83,15 @@ impl VarType {
     }
 }
 
+/// An entrance record of an event script.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Entrance {
+    /// Entry the entrance worker runs on arrival (0: none).
+    pub entry: u16,
+    pub yaw: f32,
+    pub pos: [f32; 3],
+}
+
 /// A variable a worker can address: a storage area, an offset in it, an element type and an element count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Var {
@@ -383,6 +392,27 @@ impl Script {
         }
         let entry = u16_at(&self.data, at + 6).ok()?;
         (entry != 0).then_some((worker, entry))
+    }
+
+    /// The entrance records: where arriving by each entrance puts the party and which entry the entrance worker
+    /// runs.
+    pub fn entrances(&self) -> Vec<Entrance> {
+        let (Ok(table), Ok(end)) = (u32_at(&self.data, 4), u32_at(&self.data, 8)) else { return Vec::new() };
+        let (table, end) = (table as usize, (end as usize).min(self.data.len()));
+        if table == 0 {
+            return Vec::new();
+        }
+        let f =
+            |at: usize| self.data.get(at..at + 4).map_or(0.0, |b| f32::from_le_bytes(b.try_into().unwrap()));
+        (table..end)
+            .step_by(0x20)
+            .filter(|&at| at + 0x18 <= end)
+            .map(|at| Entrance {
+                entry: u16_at(&self.data, at + 6).unwrap_or(0),
+                yaw: f(at + 8),
+                pos: [f(at + 0xC), f(at + 0x10), f(at + 0x14)],
+            })
+            .collect()
     }
 
     /// The map number the script names in its header (event scripts), if any.
