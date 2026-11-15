@@ -521,12 +521,24 @@ fn oracle_track(dir: &std::path::Path, run: usize, worker: u16, frames: u32) -> 
                     );
                 }
             }
-            Record::Instruction { worker: w, op, operand, .. } if *w == worker => {
+            Record::Instruction { worker: w, op, operand, level, pc, .. }
+                if *w == worker || worker == 0xfffe =>
+            {
+                if worker == 0xfffe {
+                    line += &format!(" w{w}");
+                }
                 let m = aerugo_formats::script::op_info(*op).mnemonic;
-                line += &format!(" [{m}{}]", operand.map(|v| format!(" {v:#x}")).unwrap_or_default());
+                line += &format!(
+                    " [l{level} {pc:x} {m}{}]",
+                    operand.map(|v| format!(" {v:#x}")).unwrap_or_default()
+                );
             }
             Record::NativePoll { worker: w, native, flags } if *w == worker => {
                 line += &format!(" poll {native:#06x}={flags}");
+            }
+            // Worker 0xffff: camera natives of every worker.
+            Record::NativePoll { worker: w, native, flags } if worker == 0xffff && native >> 8 == 0x60 => {
+                line += &format!(" w{w}:poll {native:#06x}={flags}");
             }
             Record::NativeResult { worker: w, native, tag, value } if *w == worker => {
                 let v = if *tag == 2 {
@@ -667,6 +679,30 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                         println!("    f{f:<5} {}", show(Some(*e)));
                     }
                     describe_worker(&mut ev.vm, usize::from(t.worker), before);
+                    if let Some(g) = d.got {
+                        // Aerugo's side: the same worker's last instructions, with where they changed level.
+                        println!("  worker {} in aerugo before that:", g.worker);
+                        let mut history = Vec::new();
+                        'ours: for f in (0..=d.frame).rev() {
+                            let end = if f == d.frame { d.index } else { ours[f].len() };
+                            for e in ours[f][..end].iter().rev().filter(|e| e.worker == g.worker) {
+                                if history.last().is_none_or(|(_, l): &(usize, aerugo_script::TraceEvent)| {
+                                    l.level != e.level || history.len() < 12
+                                }) {
+                                    history.push((f, *e));
+                                }
+                                if history.len() == 40 {
+                                    break 'ours;
+                                }
+                            }
+                        }
+                        for (f, e) in history.iter().rev() {
+                            println!("    f{f:<5} {}", show(Some(*e)));
+                        }
+                        if d.expected.is_some_and(|e| e.worker != g.worker) {
+                            describe_worker(&mut ev.vm, usize::from(g.worker), &[]);
+                        }
+                    }
                 }
             }
         }
@@ -688,6 +724,16 @@ fn describe_worker(vm: &mut aerugo_script::Vm, w: usize, recent: &[aerugo_script
         let pcs: Vec<String> =
             state.contexts.iter().enumerate().map(|(l, c)| format!("l{l}:{:05x}", c.pc)).collect();
         println!("  aerugo level {} contexts {}", state.level, pcs.join(" "));
+        for r in &state.queue {
+            println!(
+                "    request from {:?} {:?} level {} entry {}{}",
+                r.from,
+                r.mode,
+                r.level,
+                r.entry,
+                if r.running { " running" } else { "" }
+            );
+        }
     }
     let mut seen = Vec::new();
     for t in recent {

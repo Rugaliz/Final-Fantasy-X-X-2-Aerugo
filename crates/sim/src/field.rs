@@ -180,8 +180,13 @@ pub struct CameraState {
     destination: Option<[f32; 3]>,
     move_frames: u32,
     moving: Option<Movement>,
-    /// Ticks left of a timed move (a camera wait lasts until it runs out).
-    timer: u32,
+    /// Ticks left of the timed moves of the camera's parts (bits of a part mask); a camera wait lasts until
+    /// all have run out.
+    timers: [u32; 8],
+    /// Parts the next move time applies to (all three of the usual ones until a script picks).
+    parts: Option<u8>,
+    /// Ticks left of the moves of the eye and the focus along a path.
+    path_timers: [u32; 2],
     /// A timed move whose destination may still be set this tick.
     pending: bool,
 }
@@ -194,15 +199,16 @@ impl CameraState {
     }
 
     pub fn is_moving(&self) -> bool {
-        self.moving.is_some() || self.timer > 0
+        self.moving.is_some() || self.timers.iter().chain(&self.path_timers).any(|&t| t > 0)
     }
 
     fn update(&mut self) {
         if std::mem::take(&mut self.pending) && self.destination.is_some() {
-            self.move_frames = self.timer.max(1);
             self.start_move();
         }
-        self.timer = self.timer.saturating_sub(1);
+        for t in self.timers.iter_mut().chain(&mut self.path_timers) {
+            *t = t.saturating_sub(1);
+        }
         if let Some(m) = &mut self.moving {
             m.done += 1;
             let t = (m.done as f32 / m.frames.max(1) as f32).min(1.0);
@@ -320,7 +326,8 @@ impl FieldState {
                 for k in 0..3 {
                     a.pos[k] = m.from[k] + (m.to[k] - m.from[k]) * t;
                 }
-                if m.done >= m.frames {
+                // The original reports the move as going on for one tick at the destination.
+                if m.done > m.frames {
                     a.moving = None;
                 }
             }
@@ -576,6 +583,23 @@ fn message_wait() -> Native<FieldState> {
         }),
         result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
     }
+}
+
+fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
+    let _mode = c.stack.pop_int();
+    let step = c.stack.pop_float();
+    let start = c.stack.pop_float();
+    let _path = c.stack.pop_int();
+    let mut ticks = 0u32;
+    if step > 0.0 {
+        let mut t = start;
+        while t < 1.0 && ticks < 100_000 {
+            t += step;
+            ticks += 1;
+        }
+    }
+    g.camera.path_timers[which] = ticks;
+    Value::Int(0)
 }
 
 /// Natives of the field slice: actors, movement, turning, messages, camera, worker queries.
@@ -920,10 +944,29 @@ fn register(n: &mut Natives<FieldState>) {
             let _d = c.stack.pop_int();
             let frames: i32 = (0..3).map(|_| c.stack.pop_int().max(0)).sum();
             let cam = &mut g.camera;
-            cam.move_frames = frames.max(1) as u32;
-            cam.timer = frames as u32 + 1;
-            cam.moving = None;
-            cam.pending = true;
+            let parts = cam.parts.unwrap_or(7);
+            for (bit, t) in cam.timers.iter_mut().enumerate() {
+                if parts & (1 << bit) != 0 {
+                    *t = frames as u32 + 1;
+                }
+            }
+            if parts & 7 != 0 {
+                cam.move_frames = frames.max(1) as u32;
+                cam.moving = None;
+                cam.pending = true;
+            }
+            Value::Int(0)
+        }),
+    );
+    // Eye and focus along a path: (path, start, step per tick, mode); the position on the path goes from the
+    // start to 1 by the step each tick.
+    n.register(0x6046, Native::result(|g, c| path_move(g, c, 0)));
+    n.register(0x6047, Native::result(|g, c| path_move(g, c, 1)));
+    // The camera parts the following move times apply to.
+    n.register(
+        0x6043,
+        Native::result(|g, c| {
+            g.camera.parts = Some(c.stack.pop_int() as u8);
             Value::Int(0)
         }),
     );
