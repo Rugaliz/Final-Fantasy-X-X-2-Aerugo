@@ -74,6 +74,18 @@ enum Command {
     },
     /// Measure native argument counts on a version-2 recording and list those that disagree with the table.
     OracleArity { dir: PathBuf },
+    /// List every turn in a recording: its speed arguments, mode, start and target yaw, and how long it took.
+    OracleTurns { dir: PathBuf },
+    /// Print one worker's recorded position and yaw, polls and results frame by frame in one event run.
+    OracleTrack {
+        dir: PathBuf,
+        #[arg(long)]
+        run: usize,
+        #[arg(long)]
+        worker: u16,
+        #[arg(long, default_value_t = 40)]
+        frames: u32,
+    },
     /// Run every script for a few seconds with the implemented natives and print native coverage.
     NativeCoverage {
         #[arg(long, default_value_t = 120)]
@@ -110,6 +122,8 @@ fn main() -> Result<()> {
         Command::NativeCoverage { frames } => native_coverage(&install, frames),
         Command::OracleCompare { dir, run } => oracle_compare(&install, &dir, run),
         Command::OracleArity { dir } => oracle_arity(&dir),
+        Command::OracleTurns { dir } => oracle_turns(&install, &dir),
+        Command::OracleTrack { dir, run, worker, frames } => oracle_track(&dir, run, worker, frames),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
         Command::FsbCompare { filter, every, samples } => {
@@ -364,6 +378,170 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
 }
 
 /// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
+fn oracle_turns(install: &Install, dir: &std::path::Path) -> Result<()> {
+    use aerugo_formats::script::{Operand, Script, op_info};
+    use aerugo_script::recording::{Record, parse};
+    use std::collections::HashMap;
+    #[derive(Default)]
+    struct Turn {
+        pushes: Vec<f64>,
+        speed: (f64, f64),
+        target: f32,
+        // (frame started, mode, yaw at the start, not-done polls)
+        active: Option<(u32, u32, f32, u32)>,
+        yaw: f32,
+        last_yaw: f32,
+        camera_time: Vec<f64>,
+        camera_wait: Option<(u32, u32)>,
+    }
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let (mut script, mut frame, mut name) = (None::<Script>, 0u32, String::new());
+    let mut turns: HashMap<u16, Turn> = HashMap::new();
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => {
+                turns.clear();
+                frame = 0;
+                script = archive_event_path(path).and_then(|p| {
+                    name = p.rsplit('/').next().unwrap_or_default().to_owned();
+                    Script::parse(&vfs.read(&p).ok()?).ok()
+                });
+            }
+            Record::Frame(_) => frame += 1,
+            Record::Positions(ps) => {
+                for p in ps {
+                    let t = turns.entry(p.worker).or_default();
+                    t.last_yaw = t.yaw;
+                    t.yaw = p.yaw;
+                }
+            }
+            Record::Instruction { worker, op, operand, .. } => {
+                let t = turns.entry(*worker).or_default();
+                let info = op_info(*op);
+                match (info.mnemonic, operand) {
+                    ("push.float", Some(v)) => {
+                        let f = script.as_ref().and_then(|s| {
+                            s.workers.get(usize::from(*worker))?.floats.get(usize::from(*v)).copied()
+                        });
+                        t.pushes.push(f64::from(f.unwrap_or(f32::NAN)));
+                    }
+                    (m, Some(v)) if m.starts_with("push.") && info.operand != Operand::Var => {
+                        t.pushes.push(f64::from(*v as i16));
+                    }
+                    (m, Some(0x1d)) if m.starts_with("call") => {
+                        let n = t.pushes.len();
+                        if n >= 2 {
+                            t.speed = (t.pushes[n - 2], t.pushes[n - 1]);
+                        }
+                    }
+                    (m, Some(0x6014)) if m.starts_with("call") => {
+                        t.camera_time = t.pushes[t.pushes.len().saturating_sub(4)..].to_vec();
+                    }
+                    (m, Some(0x19)) if m.starts_with("call") => {
+                        let n = t.pushes.len();
+                        let mode = if n >= 2 { t.pushes[n - 2] as i64 as u32 } else { u32::MAX };
+                        t.active = Some((frame, mode, t.yaw, 0));
+                    }
+                    _ => {}
+                }
+                if t.pushes.len() > 8 {
+                    t.pushes.remove(0);
+                }
+            }
+            Record::NativeResult { worker, native: 0x28, tag: 2, value } => {
+                turns.entry(*worker).or_default().target = f32::from_bits(*value);
+            }
+            Record::NativePoll { worker, native: 0x601a, flags } => {
+                let t = turns.entry(*worker).or_default();
+                let (start, polls) = t.camera_wait.get_or_insert((frame, 0));
+                if *flags == 0 {
+                    *polls += 1;
+                } else {
+                    println!(
+                        "{name:<10} w{worker:<3} f{start:<6} camera time {:?} not done {polls}",
+                        t.camera_time
+                    );
+                    t.camera_wait = None;
+                }
+            }
+            Record::NativePoll { worker, native: 0x1b, flags } => {
+                let t = turns.entry(*worker).or_default();
+                if let Some((start, mode, yaw0, polls)) = &mut t.active {
+                    if *flags == 0 {
+                        *polls += 1;
+                    } else {
+                        println!(
+                            "{name:<10} w{worker:<3} f{start:<6} speed ({}, {}) mode {mode:#06x} yaw {yaw0:.4} -> {:.4} \
+                             ({:.4}) not done {polls}; last step {:.5}",
+                            t.speed.0,
+                            t.speed.1,
+                            t.target,
+                            t.yaw,
+                            t.yaw - t.last_yaw
+                        );
+                        t.active = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn oracle_track(dir: &std::path::Path, run: usize, worker: u16, frames: u32) -> Result<()> {
+    use aerugo_script::recording::{Record, parse};
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let (mut current, mut frame) = (None::<usize>, 0u32);
+    let mut line = String::new();
+    for r in &records {
+        match r {
+            Record::Event { .. } => {
+                current = Some(current.map_or(0, |c| c + 1));
+                frame = 0;
+            }
+            Record::Frame(_) => {
+                if current == Some(run) && !line.is_empty() {
+                    println!("f{frame:<5}{line}");
+                }
+                line.clear();
+                frame += 1;
+                if current == Some(run) && frame > frames {
+                    break;
+                }
+            }
+            _ if current != Some(run) => {}
+            Record::Positions(ps) => {
+                for p in ps.iter().filter(|p| p.worker == worker) {
+                    line += &format!(
+                        " pos ({:.2} {:.2} {:.2}) pitch {:.4} yaw {:.4}",
+                        p.pos[0], p.pos[1], p.pos[2], p.pitch, p.yaw
+                    );
+                }
+            }
+            Record::Instruction { worker: w, op, operand, .. } if *w == worker => {
+                let m = aerugo_formats::script::op_info(*op).mnemonic;
+                line += &format!(" [{m}{}]", operand.map(|v| format!(" {v:#x}")).unwrap_or_default());
+            }
+            Record::NativePoll { worker: w, native, flags } if *w == worker => {
+                line += &format!(" poll {native:#06x}={flags}");
+            }
+            Record::NativeResult { worker: w, native, tag, value } if *w == worker => {
+                let v = if *tag == 2 {
+                    format!("{}", f32::from_bits(*value))
+                } else {
+                    format!("{}", *value as i32)
+                };
+                line += &format!(" {native:#06x}->{v}");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn archive_event_path(recorded: &str) -> Option<String> {
     let p = recorded.replace('\\', "/").to_ascii_lowercase();
     if let Some((_, rest)) = p.split_once("/master/") {
@@ -431,15 +609,20 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         match found {
             None => println!("run {i}: {name}: {} frames, {total} instructions: identical", run.frames.len()),
             Some(d) => {
+                let script = ev.vm.script.clone();
                 let show = |t: Option<aerugo_script::TraceEvent>| match t {
-                    Some(t) => format!(
-                        "w{} l{} {:05x} {} {}",
-                        t.worker,
-                        t.level,
-                        t.pc,
-                        aerugo_formats::script::op_info(t.op).mnemonic,
-                        t.operand.map(|v| format!("{v:#x}")).unwrap_or_default()
-                    ),
+                    Some(t) => {
+                        let mnemonic = aerugo_formats::script::op_info(t.op).mnemonic;
+                        let mut operand = t.operand.map(|v| format!("{v:#x}")).unwrap_or_default();
+                        if mnemonic == "push.float"
+                            && let Some(f) = t.operand.and_then(|v| {
+                                script.workers.get(usize::from(t.worker))?.floats.get(usize::from(v))
+                            })
+                        {
+                            operand += &format!(" ({f})");
+                        }
+                        format!("w{} l{} {:05x} {mnemonic} {operand}", t.worker, t.level, t.pc)
+                    }
                     None => "(nothing)".into(),
                 };
                 let matched: usize = run.frames[..d.frame].iter().map(Vec::len).sum::<usize>() + d.index;
@@ -457,6 +640,32 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     show(d.got)
                 );
                 if let Some(t) = d.expected.or(d.got) {
+                    // The same worker's recent instructions in the original, across frames.
+                    let mut history = Vec::new();
+                    'back: for f in (0..=d.frame).rev() {
+                        let end = if f == d.frame { d.index } else { run.frames[f].len() };
+                        for e in run.frames[f][..end].iter().rev().filter(|e| e.worker == t.worker) {
+                            history.push((f, *e));
+                            if history.len() == 24 {
+                                break 'back;
+                            }
+                        }
+                    }
+                    println!("  worker {} in the original before that:", t.worker);
+                    for (f, e) in history.iter().rev() {
+                        println!("    f{f:<5} {}", show(Some(*e)));
+                    }
+                    println!("  and after:");
+                    let after = (d.frame..run.frames.len())
+                        .flat_map(|f| {
+                            let start = if f == d.frame { d.index } else { 0 };
+                            run.frames[f][start..].iter().map(move |e| (f, e))
+                        })
+                        .filter(|(_, e)| e.worker == t.worker)
+                        .take(16);
+                    for (f, e) in after {
+                        println!("    f{f:<5} {}", show(Some(*e)));
+                    }
                     describe_worker(&mut ev.vm, usize::from(t.worker), before);
                 }
             }

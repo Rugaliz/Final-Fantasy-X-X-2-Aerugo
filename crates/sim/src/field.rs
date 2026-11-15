@@ -38,6 +38,8 @@ pub struct Actor {
     turn_target: f32,
     turn_speed: [f32; 2],
     turning: bool,
+    /// A turn over a set number of frames: the step per frame and the frames left.
+    turn_steps: Option<(f32, u32)>,
 }
 
 impl Default for Actor {
@@ -57,6 +59,7 @@ impl Default for Actor {
             turn_target: 0.0,
             turn_speed: [0.0; 2],
             turning: false,
+            turn_steps: None,
         }
     }
 }
@@ -113,10 +116,15 @@ pub struct Window {
     pub choice: usize,
     /// Ticks left of the opening animation (text appears once it is over).
     pub opening: u8,
+    /// Ticks left of the closing animation (a message wait ends once it is over).
+    pub closing: u8,
 }
 
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
 const OPEN_TICKS: u8 = 2;
+
+/// Ticks a window takes to close (a wait on it polls as not done on the frame it closes and the next).
+const CLOSE_TICKS: u8 = 2;
 
 /// Characters revealed per tick.
 const TEXT_SPEED: usize = 2;
@@ -144,6 +152,13 @@ impl Message {
 
 impl Window {
     /// The window's state as scripts see it: 0 closed, 1 opening, 2 showing.
+    pub fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            self.closing = CLOSE_TICKS;
+        }
+    }
+
     pub fn state(&self) -> i32 {
         match (self.open, self.opening) {
             (false, _) => 0,
@@ -165,6 +180,10 @@ pub struct CameraState {
     destination: Option<[f32; 3]>,
     move_frames: u32,
     moving: Option<Movement>,
+    /// Ticks left of a timed move (a camera wait lasts until it runs out).
+    timer: u32,
+    /// A timed move whose destination may still be set this tick.
+    pending: bool,
 }
 
 impl CameraState {
@@ -175,10 +194,15 @@ impl CameraState {
     }
 
     pub fn is_moving(&self) -> bool {
-        self.moving.is_some()
+        self.moving.is_some() || self.timer > 0
     }
 
     fn update(&mut self) {
+        if std::mem::take(&mut self.pending) && self.destination.is_some() {
+            self.move_frames = self.timer.max(1);
+            self.start_move();
+        }
+        self.timer = self.timer.saturating_sub(1);
         if let Some(m) = &mut self.moving {
             m.done += 1;
             let t = (m.done as f32 / m.frames.max(1) as f32).min(1.0);
@@ -278,6 +302,9 @@ impl FieldState {
     fn update(&mut self) {
         self.camera.update();
         let messages = &self.messages;
+        for w in &mut self.windows {
+            w.closing = w.closing.saturating_sub(1);
+        }
         for w in self.windows.iter_mut().filter(|w| w.open) {
             if w.opening > 0 {
                 w.opening -= 1;
@@ -297,7 +324,17 @@ impl FieldState {
                     a.moving = None;
                 }
             }
-            if a.turning {
+            if a.turning
+                && let Some((step, left)) = &mut a.turn_steps
+            {
+                a.yaw = wrap_angle(a.yaw + *step);
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    a.yaw = a.turn_target;
+                    a.turning = false;
+                    a.turn_steps = None;
+                }
+            } else if a.turning {
                 let step = if a.turn_speed[0] > 0.0 { a.turn_speed[0] } else { 0.2 };
                 let d = wrap_angle(a.turn_target - a.yaw);
                 if d.abs() <= step {
@@ -520,7 +557,7 @@ fn message_wait() -> Native<FieldState> {
             let msg = g.windows[w].message.and_then(|m| g.messages.get(m)).cloned().unwrap_or_default();
             let win = &mut g.windows[w];
             if !win.open {
-                return WAIT_DONE;
+                return if win.closing == 0 { WAIT_DONE } else { 0 };
             }
             if msg.choices > 0 && g.input.stick[1] != 0.0 && g.input.stick_pressed {
                 let n = usize::from(msg.choices);
@@ -531,8 +568,8 @@ fn message_wait() -> Native<FieldState> {
                 if win.shown < msg.len() {
                     win.shown = msg.len();
                 } else {
-                    win.open = false;
-                    return WAIT_DONE;
+                    win.close();
+                    return 0;
                 }
             }
             0
@@ -577,6 +614,7 @@ fn register(n: &mut Natives<FieldState>) {
             let a = g.actor(c.worker);
             a.yaw = yaw;
             a.turning = false;
+            a.turn_steps = None;
             Value::Float(yaw)
         }),
     );
@@ -765,9 +803,15 @@ fn register(n: &mut Natives<FieldState>) {
         0x0019,
         Native::result(|g, c| {
             c.stack.pop_int();
+            let mode = c.stack.pop_int() as u32;
             c.stack.pop_int();
-            c.stack.pop_int();
-            g.actor(c.worker).turning = true;
+            let a = g.actor(c.worker);
+            a.turning = true;
+            // Modes 3 and 4 without a speed turn at an even rate over the set number of frames, the short way.
+            a.turn_steps = (matches!(mode & 0xffff_001f, 3 | 4) && a.turn_speed[0] == 0.0).then(|| {
+                let frames = a.turn_speed[1].max(1.0) as u32;
+                (wrap_angle(a.turn_target - a.yaw) / frames as f32, frames)
+            });
             Value::Int(0)
         }),
     );
@@ -817,6 +861,7 @@ fn register(n: &mut Natives<FieldState>) {
             win.shown = 0;
             win.choice = 0;
             win.opening = OPEN_TICKS;
+            win.closing = 0;
             Value::Int(w as i32)
         }),
     );
@@ -838,7 +883,7 @@ fn register(n: &mut Natives<FieldState>) {
         0x006B,
         Native::result(|g, c| {
             let w = window(c);
-            g.windows[w].open = false;
+            g.windows[w].close();
             Value::Int(w as i32)
         }),
     );
@@ -870,10 +915,15 @@ fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6014,
         Native::result(|g, c| {
-            // Four frame counts (start and end of two phases); the longest is the move time.
-            let frames = (0..4).map(|_| c.stack.pop_int()).max().unwrap_or(1);
-            g.camera.move_frames = frames.max(1) as u32;
-            g.camera.start_move();
+            // Speeding up, steady and slowing down frame counts, then a fourth value; the move takes the first
+            // three together, and a camera wait polls as not done for one tick more.
+            let _d = c.stack.pop_int();
+            let frames: i32 = (0..3).map(|_| c.stack.pop_int().max(0)).sum();
+            let cam = &mut g.camera;
+            cam.move_frames = frames.max(1) as u32;
+            cam.timer = frames as u32 + 1;
+            cam.moving = None;
+            cam.pending = true;
             Value::Int(0)
         }),
     );
@@ -972,6 +1022,10 @@ mod tests {
         assert_eq!(state.windows[0].shown, 11);
         tick(&mut vm, &mut state, true);
         assert!(!state.windows[0].open);
+        // The wait ends once the window has finished closing, and the script goes on the tick after.
+        tick(&mut vm, &mut state, false);
+        tick(&mut vm, &mut state, false);
+        assert!(!done(&vm));
         tick(&mut vm, &mut state, false);
         assert!(done(&vm));
     }
