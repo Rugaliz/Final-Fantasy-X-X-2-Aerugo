@@ -661,13 +661,16 @@ impl FieldView {
                     }
                 }
             };
+        // The map model is in view space (game space turned half a turn about X); everything is drawn through the
+        // game-to-view turn, so the map takes the inverse first (the turn is its own inverse).
+        let map_place = game_to_view();
         if let Some(m) = &s.map {
-            add(m, Mat4::IDENTITY, None, &mut joints);
+            add(m, map_place, None, &mut joints);
         }
         if self.show_layers
             && let Some(m) = &s.layers
         {
-            add(m, Mat4::IDENTITY, None, &mut joints);
+            add(m, map_place, None, &mut joints);
         }
         for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible) {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
