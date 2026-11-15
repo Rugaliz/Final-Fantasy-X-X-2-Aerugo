@@ -36,9 +36,14 @@ pub struct Actor {
     /// bit n is set.
     pub flags: u32,
     pub trigger: Trigger,
-    move_target: [f32; 3],
-    move_speed: [f32; 2],
-    moving: Option<Movement>,
+    /// Collision radius set by a script (else the default).
+    pub radius: Option<f32>,
+    /// Another character walked into this one last tick.
+    bumped: bool,
+    /// The script level whose move advances (the worker's running level).
+    pub level: u8,
+    /// Move state per script level: a level's move waits while a higher level runs.
+    moves: [MoveState; MOVE_LEVELS],
     turn_target: f32,
     turn_speed: [f32; 2],
     turning: bool,
@@ -58,9 +63,10 @@ impl Default for Actor {
             character: None,
             flags: 0,
             trigger: Trigger::default(),
-            move_target: [0.0; 3],
-            move_speed: [0.0; 2],
-            moving: None,
+            radius: None,
+            bumped: false,
+            level: 0,
+            moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
             turn_speed: [0.0; 2],
             turning: false,
@@ -77,9 +83,101 @@ struct Movement {
     done: u32,
 }
 
+/// Collision radius of a character without a script-set one. The engine takes a per-model size times the model's
+/// scale; 4 is what the recordings show for the party leader (the only one measured so far).
+const DEFAULT_RADIUS: f32 = 4.0;
+
+/// How far past the sum of the radii two characters still touch.
+const CONTACT_SLACK: f32 = 1e-3;
+
+/// Script levels with their own move state.
+const MOVE_LEVELS: usize = 9;
+
+/// One script level's move settings and the move it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct MoveState {
+    target: [f32; 3],
+    /// Frame count of a timed move.
+    frames: f32,
+    /// Walking speed (a walk covers speed / 20 per tick) and arrival radius (0: none).
+    speed: f32,
+    radius: f32,
+    active: Option<ActorMove>,
+}
+
+/// A move under way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ActorMove {
+    /// From `from` to `to` over `frames` ticks; `count` ticks done.
+    Timed { from: [f32; 3], to: [f32; 3], count: f32, frames: f32 },
+    /// Towards `to` at a speed, on the ground plane only or in space.
+    Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32 },
+}
+
+/// One tick of a walk from `pos` to `to`: steps of speed / 20, ending (true) once within speed / 10 with a last
+/// step of half the rest.
+fn walk_step(pos: [f32; 3], to: [f32; 3], speed: f32, ground_only: bool, radius: f32) -> ([f32; 3], bool) {
+    let arrived = (to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2) < radius * radius;
+    let to = if ground_only { [to[0], pos[1], to[2]] } else { to };
+    let d = [to[0] - pos[0], to[1] - pos[1], to[2] - pos[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let (step, done) = if len <= speed / 10.0 { (len / 2.0, true) } else { (speed / 20.0, arrived) };
+    if len <= 0.0 {
+        return (pos, done);
+    }
+    (std::array::from_fn(|k| pos[k] + d[k] / len * step), done)
+}
+
 impl Actor {
+    /// Radius for collisions between characters.
+    pub fn collision_radius(&self) -> f32 {
+        self.radius.unwrap_or(DEFAULT_RADIUS)
+    }
+
+    /// Whether the running level's move is under way.
     pub fn is_moving(&self) -> bool {
-        self.moving.is_some()
+        self.move_state().active.is_some()
+    }
+
+    fn move_state(&self) -> &MoveState {
+        &self.moves[usize::from(self.level).min(MOVE_LEVELS - 1)]
+    }
+
+    fn move_at(&mut self, level: u8) -> &mut MoveState {
+        &mut self.moves[usize::from(level).min(MOVE_LEVELS - 1)]
+    }
+
+    /// One tick of the running level's move.
+    fn advance_move(&mut self, ground: Option<&Ground>) {
+        let pos = self.pos;
+        let level = self.level;
+        let m = self.move_at(level);
+        let Some(mv) = &mut m.active else { return };
+        let (next, done) = match mv {
+            ActorMove::Walk { to, speed, ground_only, radius } => {
+                let (mut next, done) = walk_step(pos, *to, *speed, *ground_only, *radius);
+                if *ground_only && let Some(y) = ground.and_then(|g| g.floor(next)) {
+                    next[1] = y;
+                }
+                (next, done)
+            }
+            // The share done is the count over the frames (before counting this tick); the move ends, at its
+            // target, once the count passes the frames.
+            ActorMove::Timed { from, to, count, frames } => {
+                let t =
+                    if *count == 0.0 && *frames == 0.0 { 1.0 } else { (*count / *frames).clamp(0.0, 1.0) };
+                *count += 1.0;
+                if *frames < *count {
+                    (*to, true)
+                } else {
+                    (std::array::from_fn(|k| from[k] + (to[k] - from[k]) * t), false)
+                }
+            }
+        };
+        if done {
+            m.active = None;
+        }
+        self.pos = next;
     }
 
     /// The model's archive path.
@@ -337,7 +435,9 @@ impl FieldState {
 }
 
 impl World for FieldState {
-    fn worker_ran(&mut self, w: usize, kind: u8) -> Vec<u8> {
+    fn worker_ran(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
+        // The level the worker's turn ended on is the one whose move advances this tick.
+        self.actor(w).level = level;
         let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
         let step = PlayerStep { prev: self.player_prev, cur: self.actors[p].pos };
         let Some(a) = self.actors.get_mut(w).filter(|a| a.trigger.active) else { return Vec::new() };
@@ -364,10 +464,15 @@ impl World for FieldState {
         out
     }
 
-    fn talk(&mut self) -> Option<(usize, u8)> {
-        let talk = self.talk.take()?;
-        let (w, _) = talk.best.filter(|_| self.user_control)?;
-        Some((w, talk.signal))
+    fn after_workers(&mut self) -> Vec<(usize, u8)> {
+        let mut out = Vec::new();
+        if let Some(talk) = self.talk.take()
+            && let Some((w, _)) = talk.best.filter(|_| self.user_control)
+        {
+            out.push((w, talk.signal));
+        }
+        out.extend(self.bumps().into_iter().map(|w| (w, trigger::BUMP)));
+        out
     }
 
     fn party_worker(&mut self, slot: i32) -> Option<usize> {
@@ -381,6 +486,65 @@ impl World for FieldState {
 }
 
 impl FieldState {
+    /// Characters collide on the ground plane within the sum of their radii: the player is pushed back out, and
+    /// one walking into another bumps it. Returns the workers bumped this tick that were not bumped the tick before.
+    fn bumps(&mut self) -> Vec<usize> {
+        let walking: Vec<bool> = self
+            .actors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if Some(i) == self.player {
+                    a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2]
+                } else {
+                    matches!(a.move_state().active, Some(ActorMove::Walk { speed, .. }) if speed != 0.0)
+                }
+            })
+            .collect();
+        let bodies: Vec<usize> = (0..self.actors.len())
+            .filter(|&i| self.actors[i].model.is_some() && self.actors[i].visible)
+            .collect();
+        let mut bumped = vec![false; self.actors.len()];
+        for (k, &i) in bodies.iter().enumerate() {
+            for &j in &bodies[k + 1..] {
+                let (a, b) = (&self.actors[i], &self.actors[j]);
+                let r = a.collision_radius() + b.collision_radius();
+                let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
+                let d = (dx * dx + dz * dz).sqrt();
+                // A character pushed back out stands at the contact distance, give or take rounding: that still
+                // counts as touching.
+                if d > r + CONTACT_SLACK {
+                    continue;
+                }
+                bumped[j] |= walking[i];
+                bumped[i] |= walking[j];
+                // The player does not walk through others.
+                let push = if Some(i) == self.player {
+                    Some((i, 1.0))
+                } else if Some(j) == self.player {
+                    Some((j, -1.0))
+                } else {
+                    None
+                };
+                if let Some((p, sign)) = push
+                    && d > 0.0
+                {
+                    let out = (r - d) / d * sign;
+                    self.actors[p].pos[0] += dx * out;
+                    self.actors[p].pos[2] += dz * out;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, (a, now)) in self.actors.iter_mut().zip(bumped).enumerate() {
+            if now && !a.bumped {
+                out.push(i);
+            }
+            a.bumped = now;
+        }
+        out
+    }
+
     /// Start a talk when a talk button is pressed while the player has control and no message window is open.
     fn begin_talk(&mut self) {
         let pressed = self.input.confirm || self.input.alt;
@@ -417,17 +581,7 @@ impl FieldState {
             w.shown = if w.flags & WINDOW_INSTANT != 0 { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
         for a in &mut self.actors {
-            if let Some(m) = &mut a.moving {
-                m.done += 1;
-                let t = (m.done as f32 / m.frames.max(1) as f32).min(1.0);
-                for k in 0..3 {
-                    a.pos[k] = m.from[k] + (m.to[k] - m.from[k]) * t;
-                }
-                // The original reports the move as going on for one tick at the destination.
-                if m.done > m.frames {
-                    a.moving = None;
-                }
-            }
+            a.advance_move(self.ground.as_ref());
             if a.turning
                 && let Some((step, left)) = &mut a.turn_steps
             {
@@ -975,16 +1129,30 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
+    // Collision radius (0 or below: back to the default); the result is the previous one.
     n.register(
-        0x0013,
+        0x5039,
         Native::result(|g, c| {
-            let p = pop3(c);
+            let v = c.stack.pop_float();
             let a = g.actor(c.worker);
-            a.pos = p;
-            a.moving = None;
-            Value::Int(0)
+            let old = a.collision_radius();
+            a.radius = (v > 0.0).then_some(v);
+            Value::Float(old)
         }),
     );
+    // Place the worker (0x126 is a variant with a flag the engine passes on).
+    for id in [0x0013u16, 0x0126] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let p = pop3(c);
+                let a = g.actor(c.worker);
+                a.pos = p;
+                a.move_at(c.level).active = None;
+                Value::Int(0)
+            }),
+        );
+    }
     n.register(
         0x0095,
         Native::result(|g, c| {
@@ -1106,21 +1274,49 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int((((g.random() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
         }),
     );
-    // Movement: target, speed (distance per tick, or a duration), start, wait.
+    // Movement (per script level): target, walking speed (0x6C sets every level's) and arrival radius, duration,
+    // start, wait.
     n.register(
         0x0015,
         Native::result(|g, c| {
             let p = pop3(c);
-            g.actor(c.worker).move_target = p;
+            g.actor(c.worker).move_at(c.level).target = p;
             Value::Int(0)
         }),
     );
     n.register(
+        0x0016,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            g.actor(c.worker).move_at(c.level).speed = v;
+            Value::Float(v)
+        }),
+    );
+    n.register(
+        0x006C,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            for m in &mut g.actor(c.worker).moves {
+                m.speed = v;
+            }
+            Value::Float(v)
+        }),
+    );
+    n.register(
+        0x0017,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            g.actor(c.worker).move_at(c.level).radius = v;
+            Value::Float(v)
+        }),
+    );
+    // A starting count (the start of a timed move sets it back to 0) and the frame count.
+    n.register(
         0x001C,
         Native::result(|g, c| {
-            let b = c.stack.pop_float();
-            let a = c.stack.pop_float();
-            g.actor(c.worker).move_speed = [a, b];
+            let frames = c.stack.pop_float();
+            let _count = c.stack.pop_float();
+            g.actor(c.worker).move_at(c.level).frames = frames;
             Value::Float(0.0)
         }),
     );
@@ -1128,16 +1324,22 @@ fn register(n: &mut Natives<FieldState>) {
         0x0018,
         Native::result(|g, c| {
             let _b = c.stack.pop_int();
-            let _mode = c.stack.pop_int();
+            let mode = c.stack.pop_int();
             let _a = c.stack.pop_int();
             let a = g.actor(c.worker);
-            let d = (0..3).map(|k| (a.move_target[k] - a.pos[k]).powi(2)).sum::<f32>().sqrt();
-            let frames = if a.move_speed[0] > 0.0 {
-                (d / a.move_speed[0]).ceil() as u32
-            } else {
-                a.move_speed[1].max(1.0) as u32
-            };
-            a.moving = Some(Movement { from: a.pos, to: a.move_target, frames: frames.max(1), done: 0 });
+            let from = a.pos;
+            let m = a.move_at(c.level);
+            // Modes 1 and 2 walk at the set speed (1 on the ground plane, 2 in space); the others run over the
+            // frame count.
+            m.active = Some(match mode & 0x7F {
+                1 | 2 if m.speed > 0.0 => ActorMove::Walk {
+                    to: m.target,
+                    speed: m.speed,
+                    ground_only: mode & 0x7F == 1,
+                    radius: m.radius,
+                },
+                _ => ActorMove::Timed { from, to: m.target, count: 0.0, frames: m.frames },
+            });
             Value::Int(0)
         }),
     );
@@ -1145,7 +1347,7 @@ fn register(n: &mut Natives<FieldState>) {
         0x001A,
         Native {
             init: None,
-            wait: Some(|g, c| if g.actor(c.worker).is_moving() { 0 } else { 5 }),
+            wait: Some(|g, c| if g.actor(c.worker).move_at(c.level).active.is_some() { 0 } else { 5 }),
             result: None,
         },
     );
@@ -1153,8 +1355,10 @@ fn register(n: &mut Natives<FieldState>) {
         0x0077,
         Native::result(|g, c| {
             let w = c.stack.pop_int();
+            // Ends the move of the worker's current level (other levels keep theirs).
             if let Ok(w) = usize::try_from(w) {
-                g.actor(w).moving = None;
+                let level = if w == c.worker { c.level } else { g.actor(w).level };
+                g.actor(w).move_at(level).active = None;
             }
             Value::Int(0)
         }),
@@ -1378,6 +1582,56 @@ fn register(n: &mut Natives<FieldState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_walk_steps_a_twentieth_of_its_speed_and_ends_with_half_the_rest() {
+        let (mut pos, to) = ([0.0, 0.0, 0.0], [10.0, 5.0, 0.0]);
+        let mut ticks = 0;
+        loop {
+            let (next, done) = walk_step(pos, to, 34.0, true, 0.0);
+            ticks += 1;
+            if done {
+                // Within 3.4 of the target: half the remaining distance, on the ground plane.
+                assert!((next[0] - (pos[0] + (10.0 - pos[0]) / 2.0)).abs() < 1e-5);
+                assert_eq!(next[1], 0.0);
+                break;
+            }
+            assert!((next[0] - pos[0] - 1.7).abs() < 1e-5);
+            pos = next;
+        }
+        assert_eq!(ticks, 5);
+    }
+
+    #[test]
+    fn a_levels_move_waits_while_a_higher_level_runs() {
+        let mut a = Actor::default();
+        a.moves[1].active =
+            Some(ActorMove::Timed { from: [0.0; 3], to: [10.0, 0.0, 0.0], count: 0.0, frames: 10.0 });
+        a.level = 1;
+        a.advance_move(None);
+        a.advance_move(None);
+        assert_eq!(a.pos[0], 1.0);
+        a.level = 2;
+        a.advance_move(None);
+        assert_eq!(a.pos[0], 1.0);
+        a.level = 1;
+        a.advance_move(None);
+        assert_eq!(a.pos[0], 2.0);
+    }
+
+    #[test]
+    fn walking_into_a_character_bumps_it_once_and_stops_at_contact() {
+        let body = |x: f32| Actor { model: Some(0x2001), pos: [x, 0.0, 0.0], ..Actor::default() };
+        let mut state =
+            FieldState { actors: vec![body(0.0), body(7.0)], player: Some(0), ..FieldState::default() };
+        state.player_prev = [-1.0, 0.0, 0.0];
+        // Radii 4 + 4: the player is pushed back to 8 from the other.
+        assert_eq!(state.bumps(), vec![1]);
+        assert!((state.actors[0].pos[0] + 1.0).abs() < 1e-5);
+        state.player_prev = state.actors[0].pos;
+        state.actors[0].pos[0] += 0.5;
+        assert!(state.bumps().is_empty());
+    }
+
     use super::*;
 
     #[test]

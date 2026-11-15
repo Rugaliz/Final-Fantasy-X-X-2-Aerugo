@@ -255,12 +255,12 @@ pub trait Host {
         None
     }
     /// Worker `w` finished its turn this frame: the engine signal types its trigger raises.
-    fn worker_ran(&mut self, _w: usize, _kind: u8) -> Vec<u8> {
+    fn worker_ran(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
         Vec::new()
     }
-    /// After every worker ran: who the player talks to, and the signal type.
-    fn talk(&mut self) -> Option<(usize, u8)> {
-        None
+    /// After every worker ran: engine signals (worker, type) from the whole frame (talking, bumping).
+    fn after_workers(&mut self) -> Vec<(usize, u8)> {
+        Vec::new()
     }
 }
 
@@ -430,12 +430,12 @@ impl Vm {
                 for w in 0..self.workers.len() {
                     self.run_worker(w, host);
                     if self.workers[w].active && self.workers[w].enabled {
-                        for t in host.worker_ran(w, self.workers[w].kind) {
+                        for t in host.worker_ran(w, self.workers[w].kind, self.workers[w].level) {
                             self.engine_signal(w, t);
                         }
                     }
                 }
-                if let Some((w, t)) = host.talk() {
+                for (w, t) in host.after_workers() {
                     self.engine_signal(w, t);
                 }
                 for w in 0..self.workers.len() {
@@ -620,10 +620,8 @@ impl Vm {
                 }
             }
         }
-        // Back to the main entry (level 0) unless a request takes over; one with no main entry stays put.
-        if self.script.workers[w].entries.len() > 1 {
-            self.workers[w].level = 0;
-        }
+        // The next request takes over (the main entry's, when it is still running); with none, the level stays and
+        // the worker re-runs the END every frame.
         self.decode(w, Some(()));
         if restart {
             let pc = self.script.workers[w].entries.get(1).copied().unwrap_or(0);

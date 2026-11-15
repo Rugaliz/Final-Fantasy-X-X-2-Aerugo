@@ -210,12 +210,12 @@ impl<G: World> Host for Bound<'_, G> {
         self.game.party_worker(slot)
     }
 
-    fn worker_ran(&mut self, w: usize, kind: u8) -> Vec<u8> {
-        self.game.worker_ran(w, kind)
+    fn worker_ran(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
+        self.game.worker_ran(w, kind, level)
     }
 
-    fn talk(&mut self) -> Option<(usize, u8)> {
-        self.game.talk()
+    fn after_workers(&mut self) -> Vec<(usize, u8)> {
+        self.game.after_workers()
     }
 }
 
@@ -225,14 +225,15 @@ pub trait World {
     fn party_worker(&mut self, _slot: i32) -> Option<usize> {
         None
     }
-    /// Worker `w` (of `kind`) finished its turn this frame: test its trigger against the player and return the
-    /// signal types it raises, in order.
-    fn worker_ran(&mut self, _w: usize, _kind: u8) -> Vec<u8> {
+    /// Worker `w` (of `kind`) finished its turn this frame on script level `level`: test its trigger against the
+    /// player and return the signal types it raises, in order.
+    fn worker_ran(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
         Vec::new()
     }
-    /// After every worker ran: the worker the player talks to, and the signal type.
-    fn talk(&mut self) -> Option<(usize, u8)> {
-        None
+    /// After every worker ran: engine signals (worker, type) from the whole frame, such as the worker the player
+    /// talks to and characters bumped into.
+    fn after_workers(&mut self) -> Vec<(usize, u8)> {
+        Vec::new()
     }
 }
 

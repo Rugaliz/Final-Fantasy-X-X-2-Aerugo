@@ -8,6 +8,8 @@ use aerugo_script::natives::{heading, wrap_angle};
 pub const TALK: u8 = 0;
 /// Talking with the second talk button.
 pub const TALK_ALT: u8 = 1;
+/// Another character walked into this one.
+pub const BUMP: u8 = 2;
 pub const TOUCH: u8 = 3;
 pub const CROSS: u8 = 4;
 pub const ENTER: u8 = 5;
@@ -139,15 +141,16 @@ impl PlayerStep {
     }
 }
 
-/// Zone signals from whether the player is inside now, was inside, and crossed the edge this tick.
-fn zone_signals(inside: bool, was_inside: bool, crossed: bool, out: &mut Vec<u8>) {
+/// Zone signals from whether the player is inside now, was inside, and crossed the edge this tick. Leaving across
+/// the line of a line zone also reports an enter (`enter_on_cross`); a box only does when the player was outside.
+fn zone_signals(inside: bool, was_inside: bool, crossed: bool, enter_on_cross: bool, out: &mut Vec<u8>) {
     if inside {
         out.push(INSIDE);
         if !was_inside {
             out.push(ENTER);
         }
     } else {
-        if crossed && !was_inside {
+        if crossed && (enter_on_cross || !was_inside) {
             out.push(ENTER);
         }
         if crossed || was_inside {
@@ -209,7 +212,7 @@ pub fn test_line_zone(t: &mut Trigger, a: [f32; 3], step: PlayerStep, out: &mut 
         t.radius * t.radius < d2 || (t.height > 0.0 && (p[1] > q[1] + t.height || p[1] < q[1] - t.height));
     let was_inside = t.inside;
     t.inside = !outside;
-    zone_signals(t.inside, was_inside, crossed, out);
+    zone_signals(t.inside, was_inside, crossed, true, out);
 }
 
 /// Where `p` lies against a box of half sizes `hw`, `hd` (and half height `h` when above 0), in box space:
@@ -271,7 +274,7 @@ pub fn test_box(t: &mut Trigger, centre: [f32; 3], yaw: f32, step: PlayerStep, o
     };
     let was_inside = t.inside;
     t.inside = inside;
-    zone_signals(inside, was_inside, crossed, out);
+    zone_signals(inside, was_inside, crossed, false, out);
 }
 
 /// A talk the player started this tick: the signal type and the nearest entity offered so far.

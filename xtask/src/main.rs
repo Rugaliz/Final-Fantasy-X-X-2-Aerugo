@@ -79,6 +79,14 @@ enum Command {
     /// List every message window a recording opens: the setup natives' arguments and how many frames until the
     /// window reports its text done.
     OracleWindows { dir: PathBuf },
+    /// Print the start of an archive file as hex.
+    Hexdump {
+        path: String,
+        #[arg(long, default_value_t = 256)]
+        len: usize,
+    },
+    /// Disassemble one worker of an event script (event as the recordings name it, e.g. `zn/znkd0900`).
+    ScriptDump { event: String, worker: usize },
     /// Print the frames of a recording where the scripts' pressed pad word is not zero.
     OracleInput {
         dir: PathBuf,
@@ -134,6 +142,19 @@ fn main() -> Result<()> {
         Command::OracleTurns { dir } => oracle_turns(&install, &dir),
         Command::OracleInput { dir, run } => oracle_input(&dir, run),
         Command::OracleWindows { dir } => oracle_windows(&install, &dir),
+        Command::ScriptDump { event, worker } => script_dump(&install, &event, worker),
+        Command::Hexdump { path, len } => {
+            let mut vfs = aerugo_vfs::Vfs::new();
+            vfs.mount_install(&install)?;
+            let data = vfs.read(&path)?;
+            for (i, row) in data[..len.min(data.len())].chunks(16).enumerate() {
+                let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+                let text: String =
+                    row.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+                println!("{:06x}  {:<48} {text}", i * 16, hex.join(" "));
+            }
+            Ok(())
+        }
         Command::OracleTrack { dir, run, worker, frames } => oracle_track(&dir, run, worker, frames),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
@@ -389,6 +410,17 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
 }
 
 /// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
+fn script_dump(install: &Install, event: &str, worker: usize) -> Result<()> {
+    use aerugo_formats::Game;
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let path = archive_event_path(event).ok_or_else(|| anyhow::anyhow!("event path not understood"))?;
+    let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
+    let script = aerugo_formats::script::Script::parse(&vfs.read(&path)?)?;
+    print!("{}", script.disassemble(worker, game));
+    Ok(())
+}
+
 fn oracle_windows(install: &Install, dir: &std::path::Path) -> Result<()> {
     use aerugo_formats::Game;
     use aerugo_formats::script::op_info;
