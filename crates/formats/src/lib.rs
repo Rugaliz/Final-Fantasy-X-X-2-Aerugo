@@ -8,6 +8,7 @@ pub mod kernel;
 pub mod mesh;
 pub mod motion;
 pub mod phyre;
+pub mod script;
 pub mod skeleton;
 pub mod text;
 pub mod texture;

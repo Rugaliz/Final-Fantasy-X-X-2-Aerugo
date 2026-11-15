@@ -4,6 +4,7 @@ mod filelist;
 mod maps;
 mod models;
 mod movies;
+mod scripts;
 mod sounds;
 mod tables;
 mod textures;
@@ -17,6 +18,7 @@ use aerugo_vfs::{Install, Language, Vfs};
 use maps::MapBrowser;
 use models::ModelBrowser;
 use movies::MoviePlayer;
+use scripts::ScriptBrowser;
 use sounds::SoundBrowser;
 use tables::TableBrowser;
 use textures::TextureBrowser;
@@ -29,6 +31,7 @@ enum Tab {
     Maps,
     Sounds,
     Movies,
+    Scripts,
 }
 
 #[derive(Debug)]
@@ -42,6 +45,7 @@ pub struct Viewer {
     maps: MapBrowser,
     sounds: SoundBrowser,
     movies: MoviePlayer,
+    scripts: ScriptBrowser,
     audio: Option<aerugo_audio::AudioOutput>,
 }
 
@@ -91,6 +95,7 @@ impl Viewer {
             maps: MapBrowser::new(),
             sounds: SoundBrowser::with_languages(japanese_voices, original_music),
             movies: MoviePlayer::new(),
+            scripts: ScriptBrowser::new(),
             audio,
         }
     }
@@ -118,6 +123,7 @@ impl Viewer {
                 ui.selectable_value(&mut self.tab, Tab::Maps, "Maps");
                 ui.selectable_value(&mut self.tab, Tab::Sounds, "Sounds");
                 ui.selectable_value(&mut self.tab, Tab::Movies, "Movies");
+                ui.selectable_value(&mut self.tab, Tab::Scripts, "Scripts");
             });
         });
         match (&self.vfs, &self.error) {
@@ -128,6 +134,7 @@ impl Viewer {
                 Tab::Maps => self.maps.ui(ui, vfs, renderer),
                 Tab::Sounds => self.sounds.ui(ui, vfs, self.audio.as_ref()),
                 Tab::Movies => self.movies.ui(ui, vfs, renderer, self.audio.as_ref()),
+                Tab::Scripts => self.scripts.ui(ui, vfs),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

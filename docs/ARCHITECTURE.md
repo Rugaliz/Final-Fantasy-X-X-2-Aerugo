@@ -8,7 +8,7 @@
 | `aerugo-platform` | SDL3 window and events, user directories, frame limiter |
 | `aerugo-vfs` | Finding the game installation, reading the VBF archives, the virtual file system |
 | `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
-| `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures |
+| `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures, models, motions, sound banks and events, scripts |
 | `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation |
 | `aerugo-audio` | Float mixer with windowed-sinc resampling and a limiter, SDL3 playback |
 | `aerugo-video` | WebM movies: Matroska demuxing, VP8 through libvpx (loaded at run time), Vorbis through lewton |
