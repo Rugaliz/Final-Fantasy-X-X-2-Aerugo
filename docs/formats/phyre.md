@@ -96,3 +96,22 @@ declaring class; fixups still name members by their declared offsets. Cameras ar
 - Maps with pre-rendered backgrounds have a `2d` model: layered quads and a scene camera (`CameraNodeScene*`)
   placed in front of them. The viewer fits the camera's field of view so the farthest layer fills the frame;
   the frame comes out at about 8:7, the PS2's 512 × 448.
+
+## Materials and effects
+
+A material (`PMaterial`) points to an effect variant through an asset import (`PS3Data/Shaders/<name>.fx#<hash>`),
+which lives in `<game>_data/gamedata/ps3data/shaders/d3d11/<name>.fx#<hash>.phyre`. The material's parameter
+buffer holds the values of the variant's tweakable parameters (colours, UV scroll speeds, texture bindings).
+
+An effect cluster holds compiled Direct3D 11 shaders and, per variant, a list of scene passes (`PSceneRenderPass`,
+named `Opaque`, `Transparent`, `ZPrePass`, `Shadow`, …). Each scene pass has shaders, each with passes
+(`PShaderPass`) whose `m_state` is a Direct3D 11 rasterizer, depth-stencil and blend description with the usual
+enumerations (`CullMode` 1 none, 2 front, 3 back; blend factors 1 zero, 2 one, 5 source alpha, 6 inverse source
+alpha, …; blend operations 1 add, 2 subtract, 3 reverse subtract, 4 min, 5 max).
+
+Aerugo draws a material with the state of the first shader pass of its `Opaque` or `Transparent` scene pass: opaque
+parts first, blended parts after. Almost every model material culls front faces with clockwise fronts, i.e. it draws
+counter-clockwise triangles as the original sees them; the renderer derives the winding on screen from the
+handedness of the view, so stored game cameras and the viewers' own cameras both cull the right side. 786 effect
+variants are used by models; the two most used families (`PhyreDefaultLitShader`, `PhyrePrerenderedShader`) cover
+most segments. Lighting and the per-material parameters are not applied yet.

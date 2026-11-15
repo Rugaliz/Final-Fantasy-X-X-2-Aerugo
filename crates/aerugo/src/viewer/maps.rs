@@ -69,6 +69,7 @@ pub struct MapBrowser {
     ratio: Ratio,
     follow: [f32; 2],
     lit: bool,
+    culling: bool,
 }
 
 impl MapBrowser {
@@ -89,6 +90,7 @@ impl MapBrowser {
             ratio: Ratio::Window,
             follow: [0.0, 0.0],
             lit: false,
+            culling: true,
         }
     }
 
@@ -244,6 +246,7 @@ impl MapBrowser {
         ui.checkbox(&mut self.show_model, "3D model").on_disabled_hover_text("none");
         ui.checkbox(&mut self.show_layers, "2D layers");
         ui.checkbox(&mut self.lit, "Viewer lighting");
+        ui.checkbox(&mut self.culling, "Face culling");
         ui.separator();
         ui.label("View");
         ui.radio_value(&mut self.view, View::Orbit, "Orbit (drag, right-drag, scroll)");
@@ -376,6 +379,8 @@ impl MapBrowser {
             clear: [0.0, 0.0, 0.0, 1.0],
             draws,
             joints: Vec::new(),
+            culling: self.culling,
+            mirrored: false,
         });
     }
 

@@ -58,3 +58,7 @@ layered on top for development overrides. The archive format is described in
 Vulkan 1.3 through `ash`: dynamic rendering, synchronization2, two frames in flight. Shaders are written in
 GLSL and compiled to SPIR-V at build time. The renderer never waits on the simulation; it only reads
 snapshots.
+
+Mesh parts carry a material state read from the game's effect clusters (blending, culling, depth); pipelines are
+built per blend state and the rest is Vulkan 1.3 dynamic state. A headless renderer draws scenes offscreen with
+CPU readback for golden-image tests.

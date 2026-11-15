@@ -33,9 +33,14 @@ pub fn texture_desc<'a>(t: &'a Texture, data: &'a [u8]) -> Option<TextureDesc<'a
 
 use std::collections::HashMap;
 
+use aerugo_formats::effect::{self, Effect};
 use aerugo_formats::mesh::{self, Model, VertexFormat};
 use aerugo_formats::phyre::Cluster;
-use aerugo_gfx::{MeshDesc, MeshHandle, MeshPart, Renderer, SceneVertex, TextureHandle};
+use aerugo_formats::{Game, effect::PassState};
+use aerugo_gfx::{
+    BlendFactor, BlendOp, BlendState, CompareOp, CullMode, MaterialState, MeshDesc, MeshHandle, MeshPart,
+    Renderer, SceneVertex, TextureHandle,
+};
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
 
@@ -62,6 +67,8 @@ pub struct GpuMeshInstance {
     pub parts: Vec<String>,
     /// Format segment index of each GPU part.
     pub part_segments: Vec<usize>,
+    /// Effect asset id of each GPU part's material.
+    pub part_effects: Vec<String>,
     /// Index into the model's meshes (skeleton and segments live there).
     pub source: usize,
     pub skeleton: Option<aerugo_formats::skeleton::Skeleton>,
@@ -104,15 +111,93 @@ fn read_vec<const N: usize>(
         .collect()
 }
 
+fn blend_factor(f: effect::BlendFactor) -> BlendFactor {
+    use effect::BlendFactor as F;
+    match f {
+        F::Zero => BlendFactor::Zero,
+        F::One => BlendFactor::One,
+        F::SrcColor => BlendFactor::SrcColor,
+        F::InvSrcColor => BlendFactor::OneMinusSrcColor,
+        F::SrcAlpha => BlendFactor::SrcAlpha,
+        F::InvSrcAlpha => BlendFactor::OneMinusSrcAlpha,
+        F::DstAlpha => BlendFactor::DstAlpha,
+        F::InvDstAlpha => BlendFactor::OneMinusDstAlpha,
+        F::DstColor => BlendFactor::DstColor,
+        F::InvDstColor => BlendFactor::OneMinusDstColor,
+        F::SrcAlphaSat => BlendFactor::SrcAlphaSaturate,
+        F::Constant => BlendFactor::Constant,
+        F::InvConstant => BlendFactor::OneMinusConstant,
+    }
+}
+
+fn blend_op(o: effect::BlendOp) -> BlendOp {
+    match o {
+        effect::BlendOp::Add => BlendOp::Add,
+        effect::BlendOp::Subtract => BlendOp::Subtract,
+        effect::BlendOp::ReverseSubtract => BlendOp::ReverseSubtract,
+        effect::BlendOp::Min => BlendOp::Min,
+        effect::BlendOp::Max => BlendOp::Max,
+    }
+}
+
+/// The renderer state for a material's main pass.
+pub fn material_state(p: &PassState) -> MaterialState {
+    use effect::{Compare, Cull};
+    MaterialState {
+        blend: p.blend.map(|b| BlendState {
+            src: blend_factor(b.src),
+            dst: blend_factor(b.dst),
+            op: blend_op(b.op),
+            src_alpha: blend_factor(b.src_alpha),
+            dst_alpha: blend_factor(b.dst_alpha),
+            op_alpha: blend_op(b.op_alpha),
+        }),
+        write_mask: p.write_mask,
+        cull: match p.cull {
+            Cull::None => CullMode::None,
+            Cull::Front => CullMode::Front,
+            Cull::Back => CullMode::Back,
+        },
+        front_ccw: p.front_ccw,
+        depth_test: p.depth_test,
+        depth_write: p.depth_write,
+        depth_compare: match p.depth_compare {
+            Compare::Never => CompareOp::Never,
+            Compare::Less => CompareOp::Less,
+            Compare::Equal => CompareOp::Equal,
+            Compare::LessEqual => CompareOp::LessOrEqual,
+            Compare::Greater => CompareOp::Greater,
+            Compare::NotEqual => CompareOp::NotEqual,
+            Compare::GreaterEqual => CompareOp::GreaterOrEqual,
+            Compare::Always => CompareOp::Always,
+        },
+    }
+}
+
+/// The game a data path belongs to.
+pub fn game_of_path(path: &str) -> Game {
+    if path.to_ascii_lowercase().starts_with("ffx-2_data") { Game::Ffx2 } else { Game::Ffx }
+}
+
+/// Read an effect cluster by its asset id.
+pub fn load_effect(vfs: &Vfs, game: Game, id: &str) -> Option<Effect> {
+    let path = effect::effect_cluster_path(game, id)?;
+    let cluster = Cluster::parse(vfs.read(&path).ok()?).ok()?;
+    effect::read_effect(&cluster)
+}
+
 /// Load a model cluster and everything it references.
 pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
     let cluster = Cluster::parse(vfs.read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
     let mut texture_cache: HashMap<String, Option<TextureHandle>> = HashMap::new();
+    let mut effect_cache: HashMap<String, Option<MaterialState>> = HashMap::new();
+    let game = game_of_path(path);
     for (source, m) in model.meshes.iter().enumerate() {
         let world = Mat4::from_cols_array(&m.world);
         let mut part_segments = Vec::new();
+        let mut part_effects = Vec::new();
         let mut vertices: Vec<SceneVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut parts = Vec::new();
@@ -170,13 +255,25 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
                 seg.material,
                 material.and_then(|mat| mat.base_texture()).map(|t| format!(", {t}")).unwrap_or_default()
             ));
+            let effect_id = material.map(|m| m.effect.clone()).unwrap_or_default();
+            let state = *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
+                let state = load_effect(vfs, game, &effect_id)
+                    .and_then(|fx| fx.main_state())
+                    .map(|p| material_state(&p));
+                if state.is_none() && !effect_id.is_empty() {
+                    out.warnings.push(format!("effect {effect_id} not found; drawing with default state"));
+                }
+                state
+            });
             parts.push(MeshPart {
                 first_index: first,
                 index_count: idx.len() as u32,
                 texture,
                 alpha_cutoff: 0.3,
+                material: state.unwrap_or_default(),
             });
             part_segments.push(si);
+            part_effects.push(effect_id);
         }
         if vertices.is_empty() {
             continue;
@@ -194,6 +291,7 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
             skinned: skinned && skeleton.is_some(),
             parts: names,
             part_segments,
+            part_effects,
             source,
             skeleton,
         });

@@ -35,6 +35,14 @@ Without the variable those tests print a notice and pass.
 `aerugo-gfx` contains a headless rendering test. It needs a Vulkan driver; a software implementation such as
 Mesa's lavapipe works. It skips itself when no Vulkan device is present.
 
+### Golden images
+
+`cargo test -p aerugo golden` renders, for each of the 20 effects most used by models, the parts that use them
+from a fixed camera and compares the result with reference PNGs in `AERUGO_GOLDEN_DIR` (needs `AERUGO_GAME_DIR`
+and a Vulkan device). The references are game imagery: keep them outside the repository. Create or refresh them
+with `AERUGO_GOLDEN_UPDATE=1`; failing cases leave a `*.actual.png` next to the reference. The test also checks
+that face culling keeps the visible side of every case.
+
 ## Platform notes
 
 - **Linux**: install SDL3 from your distribution (`sdl3` / `libsdl3-dev`), and the Vulkan loader.

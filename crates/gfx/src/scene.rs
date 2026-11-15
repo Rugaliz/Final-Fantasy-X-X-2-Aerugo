@@ -258,13 +258,173 @@ impl Target {
     }
 }
 
-/// The mesh pipeline and its descriptor layouts.
+/// Blend factors of a material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstAlpha,
+    OneMinusDstAlpha,
+    DstColor,
+    OneMinusDstColor,
+    SrcAlphaSaturate,
+    Constant,
+    OneMinusConstant,
+}
+
+impl BlendFactor {
+    fn vk(self) -> vk::BlendFactor {
+        match self {
+            BlendFactor::Zero => vk::BlendFactor::ZERO,
+            BlendFactor::One => vk::BlendFactor::ONE,
+            BlendFactor::SrcColor => vk::BlendFactor::SRC_COLOR,
+            BlendFactor::OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+            BlendFactor::SrcAlpha => vk::BlendFactor::SRC_ALPHA,
+            BlendFactor::OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            BlendFactor::DstAlpha => vk::BlendFactor::DST_ALPHA,
+            BlendFactor::OneMinusDstAlpha => vk::BlendFactor::ONE_MINUS_DST_ALPHA,
+            BlendFactor::DstColor => vk::BlendFactor::DST_COLOR,
+            BlendFactor::OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+            BlendFactor::SrcAlphaSaturate => vk::BlendFactor::SRC_ALPHA_SATURATE,
+            BlendFactor::Constant => vk::BlendFactor::CONSTANT_COLOR,
+            BlendFactor::OneMinusConstant => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+impl BlendOp {
+    fn vk(self) -> vk::BlendOp {
+        match self {
+            BlendOp::Add => vk::BlendOp::ADD,
+            BlendOp::Subtract => vk::BlendOp::SUBTRACT,
+            BlendOp::ReverseSubtract => vk::BlendOp::REVERSE_SUBTRACT,
+            BlendOp::Min => vk::BlendOp::MIN,
+            BlendOp::Max => vk::BlendOp::MAX,
+        }
+    }
+}
+
+/// Colour and alpha blend equations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlendState {
+    pub src: BlendFactor,
+    pub dst: BlendFactor,
+    pub op: BlendOp,
+    pub src_alpha: BlendFactor,
+    pub dst_alpha: BlendFactor,
+    pub op_alpha: BlendOp,
+}
+
+impl BlendState {
+    pub const ALPHA: BlendState = BlendState {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::OneMinusSrcAlpha,
+        op: BlendOp::Add,
+        src_alpha: BlendFactor::One,
+        dst_alpha: BlendFactor::OneMinusSrcAlpha,
+        op_alpha: BlendOp::Add,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CullMode {
+    None,
+    Front,
+    Back,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompareOp {
+    Never,
+    Less,
+    Equal,
+    LessOrEqual,
+    Greater,
+    NotEqual,
+    GreaterOrEqual,
+    Always,
+}
+
+impl CompareOp {
+    fn vk(self) -> vk::CompareOp {
+        match self {
+            CompareOp::Never => vk::CompareOp::NEVER,
+            CompareOp::Less => vk::CompareOp::LESS,
+            CompareOp::Equal => vk::CompareOp::EQUAL,
+            CompareOp::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
+            CompareOp::Greater => vk::CompareOp::GREATER,
+            CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
+            CompareOp::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
+            CompareOp::Always => vk::CompareOp::ALWAYS,
+        }
+    }
+}
+
+/// How a mesh part is drawn: the fixed-function state its material asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MaterialState {
+    /// `None` draws opaque (in the first pass, before every blended part).
+    pub blend: Option<BlendState>,
+    /// RGBA write mask (bit 0 = red).
+    pub write_mask: u8,
+    pub cull: CullMode,
+    /// Counter-clockwise triangles (on screen) are front faces.
+    pub front_ccw: bool,
+    pub depth_test: bool,
+    pub depth_write: bool,
+    pub depth_compare: CompareOp,
+}
+
+impl Default for MaterialState {
+    /// What the viewers used before materials: alpha blending, no culling, depth test and write.
+    fn default() -> MaterialState {
+        MaterialState {
+            blend: Some(BlendState::ALPHA),
+            write_mask: 0xF,
+            cull: CullMode::None,
+            front_ccw: false,
+            depth_test: true,
+            depth_write: true,
+            depth_compare: CompareOp::LessOrEqual,
+        }
+    }
+}
+
+/// What a pipeline is built for; everything else in [`MaterialState`] is dynamic state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PipelineKey {
+    blend: Option<BlendState>,
+    write_mask: u8,
+}
+
+impl From<&MaterialState> for PipelineKey {
+    fn from(m: &MaterialState) -> PipelineKey {
+        PipelineKey { blend: m.blend, write_mask: m.write_mask }
+    }
+}
+
+/// The mesh pipelines (one per blend state) and their descriptor layouts.
 #[derive(Debug)]
 pub(crate) struct ScenePipeline {
     pub material_layout: vk::DescriptorSetLayout,
     pub joints_layout: vk::DescriptorSetLayout,
     pub layout: vk::PipelineLayout,
-    pub pipeline: vk::Pipeline,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+    pipelines: std::collections::HashMap<PipelineKey, vk::Pipeline>,
 }
 
 impl ScenePipeline {
@@ -315,6 +475,25 @@ impl ScenePipeline {
         }?;
         let vert = crate::quad::shader_module(device, VERT_SPV)?;
         let frag = crate::quad::shader_module(device, FRAG_SPV)?;
+        let mut p = ScenePipeline {
+            material_layout,
+            joints_layout,
+            layout,
+            vert,
+            frag,
+            pipelines: Default::default(),
+        };
+        p.get(device, &MaterialState::default())?;
+        Ok(p)
+    }
+
+    /// The pipeline for a material's blend state (built on first use).
+    pub fn get(&mut self, device: &ash::Device, m: &MaterialState) -> Result<vk::Pipeline> {
+        let key = PipelineKey::from(m);
+        if let Some(&p) = self.pipelines.get(&key) {
+            return Ok(p);
+        }
+        let (vert, frag, layout) = (self.vert, self.frag, self.layout);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -360,17 +539,27 @@ impl ScenePipeline {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let b = key.blend.unwrap_or(BlendState::ALPHA);
         let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            .blend_enable(key.blend.is_some())
+            .src_color_blend_factor(b.src.vk())
+            .dst_color_blend_factor(b.dst.vk())
+            .color_blend_op(b.op.vk())
+            .src_alpha_blend_factor(b.src_alpha.vk())
+            .dst_alpha_blend_factor(b.dst_alpha.vk())
+            .alpha_blend_op(b.op_alpha.vk())
+            .color_write_mask(vk::ColorComponentFlags::from_raw(u32::from(key.write_mask & 0xF)))];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // Culling, winding and depth state vary per part without new pipelines (core in Vulkan 1.3).
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+            vk::DynamicState::DEPTH_TEST_ENABLE,
+            vk::DynamicState::DEPTH_WRITE_ENABLE,
+            vk::DynamicState::DEPTH_COMPARE_OP,
+        ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let formats = [VIEWPORT_FORMAT];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
@@ -391,12 +580,8 @@ impl ScenePipeline {
         // SAFETY: all referenced objects are valid for the call.
         let pipeline = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
             .map_err(|(_, e)| e)?[0];
-        // SAFETY: modules are no longer needed once the pipeline exists.
-        unsafe {
-            device.destroy_shader_module(vert, None);
-            device.destroy_shader_module(frag, None);
-        }
-        Ok(ScenePipeline { material_layout, joints_layout, layout, pipeline })
+        self.pipelines.insert(key, pipeline);
+        Ok(pipeline)
     }
 
     /// # Safety
@@ -404,7 +589,11 @@ impl ScenePipeline {
     pub unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: guaranteed by the caller.
         unsafe {
-            device.destroy_pipeline(self.pipeline, None);
+            for &p in self.pipelines.values() {
+                device.destroy_pipeline(p, None);
+            }
+            device.destroy_shader_module(self.vert, None);
+            device.destroy_shader_module(self.frag, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_set_layout(self.material_layout, None);
             device.destroy_descriptor_set_layout(self.joints_layout, None);
@@ -425,6 +614,7 @@ pub struct MeshPart {
     pub texture: Option<crate::renderer::TextureHandle>,
     /// Fragments with lower alpha are discarded.
     pub alpha_cutoff: f32,
+    pub material: MaterialState,
 }
 
 #[derive(Debug)]
@@ -456,6 +646,11 @@ pub struct SceneView {
     pub draws: Vec<Draw>,
     /// Column-major joint matrices for skinned draws.
     pub joints: Vec<[f32; 16]>,
+    /// Apply the materials' face culling (off draws both sides of everything).
+    pub culling: bool,
+    /// Reverse the triangle winding the view matrix implies (front faces follow the handedness of
+    /// `view_proj` on their own; this is for tests and special views).
+    pub mirrored: bool,
 }
 
 #[derive(Debug)]
@@ -618,6 +813,9 @@ impl SceneState {
                 return Err(e);
             }
         };
+        for part in &desc.parts {
+            self.pipeline.get(&ctx.device, &part.material)?;
+        }
         let id = self.next_mesh;
         self.next_mesh += 1;
         let parts = desc.parts.iter().copied().zip(sets).collect();
@@ -719,7 +917,6 @@ impl SceneState {
                 .color_attachments(&color)
                 .depth_attachment(&depth);
             device.cmd_begin_rendering(cmd, &rendering);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
             device.cmd_set_viewport(
                 cmd,
                 0,
@@ -741,49 +938,84 @@ impl SceneState {
                 &[self.joints[frame].set],
                 &[],
             );
-            for d in &view.draws {
-                let Some(mesh) = self.meshes.get(&d.mesh.0) else { continue };
-                device.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertices.buffer], &[0]);
-                device.cmd_bind_index_buffer(cmd, mesh.indices.buffer, 0, vk::IndexType::UINT32);
-                let m = d.model;
-                for (pi, (part, set)) in mesh.parts.iter().enumerate() {
-                    if d.part.is_some_and(|p| p != pi) || part.index_count == 0 {
-                        continue;
+            // Opaque parts first, then blended parts in submission order.
+            let mut bound = vk::Pipeline::null();
+            // Materials state winding as the original renderer sees it; a view whose linear part has a positive
+            // determinant (in Vulkan clip space) shows it the other way round.
+            let flip = (det3(&view.view_proj) > 0.0) != view.mirrored;
+            for blended in [false, true] {
+                for d in &view.draws {
+                    let Some(mesh) = self.meshes.get(&d.mesh.0) else { continue };
+                    device.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertices.buffer], &[0]);
+                    device.cmd_bind_index_buffer(cmd, mesh.indices.buffer, 0, vk::IndexType::UINT32);
+                    let m = d.model;
+                    for (pi, (part, set)) in mesh.parts.iter().enumerate() {
+                        if d.part.is_some_and(|p| p != pi)
+                            || part.index_count == 0
+                            || part.material.blend.is_some() != blended
+                        {
+                            continue;
+                        }
+                        let mat = &part.material;
+                        let Some(&pipeline) = self.pipeline.pipelines.get(&PipelineKey::from(mat)) else {
+                            continue;
+                        };
+                        if pipeline != bound {
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                            bound = pipeline;
+                        }
+                        let cull = match (view.culling, mat.cull) {
+                            (false, _) | (_, CullMode::None) => vk::CullModeFlags::NONE,
+                            (true, CullMode::Front) => vk::CullModeFlags::FRONT,
+                            (true, CullMode::Back) => vk::CullModeFlags::BACK,
+                        };
+                        device.cmd_set_cull_mode(cmd, cull);
+                        device.cmd_set_front_face(
+                            cmd,
+                            if mat.front_ccw != flip {
+                                vk::FrontFace::COUNTER_CLOCKWISE
+                            } else {
+                                vk::FrontFace::CLOCKWISE
+                            },
+                        );
+                        device.cmd_set_depth_test_enable(cmd, mat.depth_test);
+                        device.cmd_set_depth_write_enable(cmd, mat.depth_write);
+                        device.cmd_set_depth_compare_op(cmd, mat.depth_compare.vk());
+                        let push = ScenePush {
+                            view_proj: view.view_proj,
+                            model: [
+                                [m[0], m[4], m[8], m[12]],
+                                [m[1], m[5], m[9], m[13]],
+                                [m[2], m[6], m[10], m[14]],
+                            ],
+                            params: [
+                                d.joint_base.unwrap_or(0) as f32,
+                                if d.joint_base.is_some() { 1.0 } else { 0.0 },
+                                part.alpha_cutoff,
+                                if d.lit { 1.0 } else { 0.0 },
+                            ],
+                        };
+                        let bytes = std::slice::from_raw_parts(
+                            (&push as *const ScenePush).cast::<u8>(),
+                            size_of::<ScenePush>(),
+                        );
+                        device.cmd_push_constants(
+                            cmd,
+                            self.pipeline.layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            bytes,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.pipeline.layout,
+                            0,
+                            &[*set],
+                            &[],
+                        );
+                        device.cmd_draw_indexed(cmd, part.index_count, 1, part.first_index, 0, 0);
                     }
-                    let push = ScenePush {
-                        view_proj: view.view_proj,
-                        model: [
-                            [m[0], m[4], m[8], m[12]],
-                            [m[1], m[5], m[9], m[13]],
-                            [m[2], m[6], m[10], m[14]],
-                        ],
-                        params: [
-                            d.joint_base.unwrap_or(0) as f32,
-                            if d.joint_base.is_some() { 1.0 } else { 0.0 },
-                            part.alpha_cutoff,
-                            if d.lit { 1.0 } else { 0.0 },
-                        ],
-                    };
-                    let bytes = std::slice::from_raw_parts(
-                        (&push as *const ScenePush).cast::<u8>(),
-                        size_of::<ScenePush>(),
-                    );
-                    device.cmd_push_constants(
-                        cmd,
-                        self.pipeline.layout,
-                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                        0,
-                        bytes,
-                    );
-                    device.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline.layout,
-                        0,
-                        &[*set],
-                        &[],
-                    );
-                    device.cmd_draw_indexed(cmd, part.index_count, 1, part.first_index, 0, 0);
                 }
             }
             device.cmd_end_rendering(cmd);
@@ -868,6 +1100,13 @@ impl SceneStateRef<'_> {
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
         Ok(JointSlot { buffer, set })
     }
+}
+
+/// Determinant of the upper-left 3×3 of a column-major 4×4 matrix.
+fn det3(m: &[f32; 16]) -> f32 {
+    let (a, b, c) = ([m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]);
+    a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
+        + c[0] * (a[1] * b[2] - a[2] * b[1])
 }
 
 pub const IDENTITY: [f32; 16] =

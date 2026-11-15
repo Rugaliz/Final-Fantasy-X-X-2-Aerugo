@@ -64,6 +64,12 @@ enum Command {
     FsbExport { bank: String, index: usize, out: PathBuf },
     /// Count vertex stream layouts, primitive and index types over all model clusters.
     ModelCensus,
+    /// Rank effects by how many model segments use them, with their main pass state.
+    EffectCensus {
+        /// How many effects to list.
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+    },
     /// Print a Phyre cluster: header, instance lists and every object's fields.
     DumpPhyre {
         /// Archive path (as printed by `list`).
@@ -85,6 +91,7 @@ fn main() -> Result<()> {
             check_phyre(&install, every.max(1), verbose, threads)
         }
         Command::ModelCensus => model_census(&install),
+        Command::EffectCensus { top } => effect_census(&install, top),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
         Command::FsbCompare { filter, every, samples } => {
@@ -334,6 +341,62 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
                 println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, f.value);
             }
         }
+    }
+    Ok(())
+}
+
+fn effect_census(install: &Install, top: usize) -> Result<()> {
+    use aerugo_formats::effect::{self, read_effect};
+    use aerugo_formats::phyre::Cluster;
+    use std::collections::HashMap;
+    let mut uses: HashMap<(aerugo_formats::Game, String), (usize, String)> = HashMap::new();
+    let (mut models, mut segments) = (0usize, 0usize);
+    for archive in open_all(install)? {
+        for e in archive.entries().iter().filter(|e| e.path.ends_with(".dae.phyre")) {
+            let game = if e.path.starts_with("ffx-2_data") {
+                aerugo_formats::Game::Ffx2
+            } else {
+                aerugo_formats::Game::Ffx
+            };
+            let Ok(c) = Cluster::parse(archive.read(e)?) else { continue };
+            let Ok(m) = aerugo_formats::mesh::read_model(&c) else { continue };
+            models += 1;
+            for mesh in &m.meshes {
+                for s in &mesh.segments {
+                    let Some(mat) = mesh.materials.get(s.material as usize) else { continue };
+                    segments += 1;
+                    let entry = uses.entry((game, mat.effect.clone())).or_insert((0, e.path.clone()));
+                    entry.0 += 1;
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<_> = uses.into_iter().collect();
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1.0));
+    println!("{models} models, {segments} segments, {} effects", ranked.len());
+    let vfs = {
+        let mut v = aerugo_vfs::Vfs::new();
+        v.mount_install(install)?;
+        v
+    };
+    for ((game, id), (n, example)) in ranked.iter().take(top) {
+        let state = effect::effect_cluster_path(*game, id)
+            .and_then(|p| vfs.read(&p).ok())
+            .and_then(|d| Cluster::parse(d).ok())
+            .and_then(|c| read_effect(&c));
+        let summary = match &state {
+            Some(fx) => {
+                let kinds: Vec<&str> = fx.scene_passes.iter().map(|p| p.kind.as_str()).collect();
+                format!(
+                    "{:?} main={:?} [{}]",
+                    fx.main_state(),
+                    fx.main_pass().map(|p| &p.kind),
+                    kinds.join(",")
+                )
+            }
+            None => "unresolved".into(),
+        };
+        println!("{n:7} {} {id}  e.g. {example}\n        {summary}", game.name());
     }
     Ok(())
 }

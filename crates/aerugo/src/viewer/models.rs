@@ -86,6 +86,7 @@ pub struct ModelBrowser {
     loaded: Option<(String, Result<GpuModel, String>)>,
     camera: OrbitCamera,
     lit: bool,
+    culling: bool,
     background: [f32; 3],
     /// Draw skinned meshes through their skeleton (default pose) instead of the stored bind pose.
     skinning: bool,
@@ -111,6 +112,7 @@ impl ModelBrowser {
             loaded: None,
             camera: OrbitCamera::framing(Vec3::splat(-1.0), Vec3::splat(1.0)),
             lit: true,
+            culling: true,
             background: [0.18, 0.19, 0.22],
             skinning: true,
             show_bones: false,
@@ -231,6 +233,8 @@ impl ModelBrowser {
                 clear: [r, g, b, 1.0],
                 draws,
                 joints,
+                culling: self.culling,
+                mirrored: false,
             });
             if self.show_bones {
                 self.draw_bones(ui, &response, view_proj, &overlay);
@@ -400,6 +404,7 @@ impl ModelBrowser {
         self.motion_ui(ui);
         ui.separator();
         ui.checkbox(&mut self.lit, "Lighting");
+        ui.checkbox(&mut self.culling, "Face culling");
         ui.checkbox(&mut self.skinning, "Skinning (default pose)").on_hover_text(
             "Off: the stored bind-pose vertices. On: vertices moved by the skeleton in its default pose.",
         );
@@ -468,8 +473,8 @@ impl ModelBrowser {
                     ))
                     .id_salt(mesh.mesh)
                     .show(ui, |ui| {
-                        for p in &mesh.parts {
-                            ui.label(p);
+                        for (p, fx) in mesh.parts.iter().zip(&mesh.part_effects) {
+                            ui.label(p).on_hover_text(format!("effect {fx}"));
                         }
                     });
                 }

@@ -46,6 +46,7 @@ flate2 = "1.1"
 glam = "0.30"
 lewton = { version = "0.10", default-features = false }
 libloading = "0.8"
+png = "0.17"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
 log = "0.4"
 proptest = "1.12"

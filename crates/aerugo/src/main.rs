@@ -3,6 +3,8 @@
 mod app;
 mod assets;
 mod cli;
+#[cfg(test)]
+mod golden;
 mod launcher;
 mod scene;
 mod settings;

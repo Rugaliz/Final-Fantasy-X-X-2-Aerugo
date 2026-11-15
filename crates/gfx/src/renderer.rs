@@ -158,7 +158,23 @@ impl Renderer {
     ) -> Result<Self> {
         let ctx = Context::new_windowed(window, instance_extensions, options)?;
         let swapchain = Swapchain::new(&ctx, size, present_mode, None)?;
+        Self::with_context(ctx, Some(swapchain), size, present_mode)
+    }
+
+    /// A renderer without a window, for offscreen rendering ([`Renderer::render_offscreen`]) in tests and tools.
+    pub fn new_headless(options: &ContextOptions) -> Result<Self> {
+        let ctx = Context::new_headless(options)?;
+        Self::with_context(ctx, None, (1, 1), PresentMode::Fifo)
+    }
+
+    fn with_context(
+        ctx: Context,
+        swapchain: Option<Swapchain>,
+        size: (u32, u32),
+        present_mode: PresentMode,
+    ) -> Result<Self> {
         let device = &ctx.device;
+        let color_format = swapchain.as_ref().map_or(crate::offscreen::OFFSCREEN_FORMAT, |s| s.format);
 
         let mut frames = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
@@ -188,12 +204,12 @@ impl Renderer {
         // SAFETY: valid device.
         let upload_pool = unsafe { device.create_command_pool(&upload_info, None) }?;
 
-        let quad = QuadPipeline::new(device, swapchain.format)?;
+        let quad = QuadPipeline::new(device, color_format)?;
         let egui = egui_ash_renderer::Renderer::with_gpu_allocator(
             ctx.allocator().clone(),
             device.clone(),
             egui_ash_renderer::RenderMode::DynamicRendering(egui_ash_renderer::DynamicRendering {
-                color_attachment_format: swapchain.format,
+                color_attachment_format: color_format,
                 depth_attachment_format: None,
                 stencil_attachment_format: None,
             }),
@@ -210,7 +226,7 @@ impl Renderer {
         let scene = SceneState::new(&ctx, FRAMES_IN_FLIGHT)?;
 
         let mut renderer = Self {
-            swapchain: Some(swapchain),
+            swapchain,
             frames,
             frame_index: 0,
             upload_pool,
@@ -356,7 +372,9 @@ impl Renderer {
             ctx,
             VIEWPORT_FORMAT,
             extent,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
         )?;
         let depth = match Target::new(
@@ -444,6 +462,84 @@ impl Renderer {
         }
     }
 
+    /// Draw `view` at `size` pixels right away (no window needed) and return the RGBA8 pixels, rows top to
+    /// bottom. Uses (and resizes) the viewport target.
+    pub fn render_offscreen(&mut self, view: SceneView, size: (u32, u32)) -> Result<Vec<u8>> {
+        self.viewport_texture(size)?;
+        self.ctx.wait_idle();
+        let extent = self.scene.viewport.as_ref().expect("viewport was just created").extent;
+        let bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
+        let mut buffer = crate::scene::Buffer::new(
+            &self.ctx,
+            bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::GpuToCpu,
+        )?;
+        self.scene.pending = Some(view);
+        let (ctx, scene) = (&self.ctx, &mut self.scene);
+        let mut recorded = Ok(());
+        let submitted = crate::scene::one_time_submit(ctx, |cmd| {
+            recorded = scene.record(ctx, cmd, 0);
+            let image = scene.viewport.as_ref().expect("viewport exists").color.image;
+            let device = &ctx.device;
+            // SAFETY: recording outside a render pass; the image and buffer belong to this device and the buffer
+            // holds the whole image.
+            unsafe {
+                image_barrier(
+                    device,
+                    cmd,
+                    image,
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    ),
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer.buffer,
+                    &[region],
+                );
+                image_barrier(
+                    device,
+                    cmd,
+                    image,
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    ),
+                );
+            }
+        });
+        let pixels = buffer.mapped().map(|m| m[..bytes as usize].to_vec());
+        // SAFETY: the submission has completed (one_time_submit waits).
+        unsafe { buffer.destroy(&self.ctx) };
+        submitted?;
+        recorded?;
+        pixels.context("readback buffer is not host visible")
+    }
+
     /// Draw `view` into the viewport this frame.
     pub fn submit_scene(&mut self, view: SceneView) {
         self.scene.pending = Some(view);
@@ -500,6 +596,9 @@ impl Renderer {
     /// Draw one frame. Returns `false` when nothing was presented (minimized window, swapchain rebuilt).
     /// egui texture changes are always applied, even when the frame is skipped.
     pub fn render(&mut self, input: &FrameInput<'_>) -> Result<bool> {
+        if self.swapchain.is_none() {
+            anyhow::bail!("a headless renderer has no window to draw to");
+        }
         let minimized = self.wanted_size.0 == 0 || self.wanted_size.1 == 0;
         if self.needs_recreate && !minimized {
             self.recreate_swapchain()?;
