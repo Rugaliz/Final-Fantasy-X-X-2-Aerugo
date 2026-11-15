@@ -7,6 +7,8 @@ use aerugo_formats::phyre::Cluster;
 
 /// Highest step a character climbs or drops in one move (map units; Y points down).
 const STEP: f32 = 12.0;
+/// The same for a walk mesh, where steep slopes are still walkable.
+const WALK_MESH_STEP: f32 = 40.0;
 const CELL: f32 = 64.0;
 
 /// Triangles bucketed on a grid over X/Z.
@@ -16,6 +18,8 @@ pub struct Ground {
     min: [f32; 2],
     dims: [usize; 2],
     cells: Vec<Vec<u32>>,
+    /// How far above or below the current height a floor still counts as the one to walk on.
+    step: f32,
 }
 
 impl Ground {
@@ -50,7 +54,7 @@ impl Ground {
                 }
             }
         }
-        Ground { tris, min: lo, dims, cells }
+        Ground { tris, min: lo, dims, cells, step: STEP }
     }
 
     /// Triangles of every mesh of a map model, placed in game space (the model is in view space, turned half a
@@ -91,6 +95,52 @@ impl Ground {
         Ground::new(tris)
     }
 
+    /// The walk mesh of a PS2 map package (`mapout.vpa`): the section the `MAP1` header names at +0x18 holds a
+    /// scale (+0xC, tenths), int16 vertices (offset at +0x18; x, y, z, pad) and triangle groups (offset at +0x1C,
+    /// count at +6; each 0x10 bytes with a triangle count at +8 and the triangles' offset at +0xC; triangles are
+    /// 0x10 bytes starting with three vertex indices). Positions are vertices divided by the scale.
+    pub fn from_walk_mesh(vpa: &[u8]) -> Option<Ground> {
+        let u32_at =
+            |d: &[u8], at: usize| d.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let i16_at =
+            |d: &[u8], at: usize| d.get(at..at + 2).map(|b| i16::from_le_bytes(b.try_into().unwrap()));
+        if !vpa.starts_with(b"MAP1") {
+            return None;
+        }
+        let d = vpa.get(u32_at(vpa, 0x18)? as usize..)?;
+        let scale = f32::from_bits(u32_at(d, 0xC)?) / 10.0;
+        if scale <= 0.0 || !scale.is_finite() {
+            return None;
+        }
+        let verts = u32_at(d, 0x18)? as usize;
+        let groups = u32_at(d, 0x1C)? as usize;
+        let count = i16_at(d, 6)?.max(0) as usize;
+        let vertex = |i: i16| -> Option<[f32; 3]> {
+            let at = verts + usize::try_from(i).ok()? * 8;
+            Some([
+                f32::from(i16_at(d, at)?) / scale,
+                f32::from(i16_at(d, at + 2)?) / scale,
+                f32::from(i16_at(d, at + 4)?) / scale,
+            ])
+        };
+        let mut tris = Vec::new();
+        for g in 0..count {
+            let at = groups + g * 0x10;
+            let n = i16_at(d, at + 8)?.max(0) as usize;
+            let base = u32_at(d, at + 0xC)? as usize;
+            for t in 0..n {
+                let at = base + t * 0x10;
+                tris.push([
+                    vertex(i16_at(d, at)?)?,
+                    vertex(i16_at(d, at + 2)?)?,
+                    vertex(i16_at(d, at + 4)?)?,
+                ]);
+            }
+        }
+        // Every triangle of a walk mesh is walkable (only its open edges are walls), steep slopes too.
+        (!tris.is_empty()).then(|| Ground { step: WALK_MESH_STEP, ..Ground::new(tris) })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tris.is_empty()
     }
@@ -112,10 +162,15 @@ impl Ground {
         cell.iter().filter_map(move |&i| height_at(&self.tris[i as usize], x, z))
     }
 
+    /// Whether `p` stands on a floor (one within an ordinary step of its height).
+    pub fn standing(&self, p: [f32; 3]) -> bool {
+        self.heights(p[0], p[2]).any(|h| (h - p[1]).abs() <= STEP)
+    }
+
     /// The floor under `p` within a step of its height.
     pub fn floor(&self, p: [f32; 3]) -> Option<f32> {
         self.heights(p[0], p[2])
-            .filter(|&h| (h - p[1]).abs() <= STEP)
+            .filter(|&h| (h - p[1]).abs() <= self.step)
             .min_by(|a, b| (a - p[1]).abs().total_cmp(&(b - p[1]).abs()))
     }
 

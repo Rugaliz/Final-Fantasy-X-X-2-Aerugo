@@ -161,8 +161,9 @@ impl FieldView {
         if event.map_model.is_none() {
             notes.push("No map found for this event name.".into());
         }
-        // Walkable ground from the map's triangles.
-        if let Some(p) = &event.map_model
+        // Walkable ground: the walk mesh (read with the event), else the map's triangles.
+        if event.state.ground.is_none()
+            && let Some(p) = &event.map_model
             && let Ok(c) = vfs
                 .read(p)
                 .map_err(|e| e.to_string())

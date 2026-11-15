@@ -96,9 +96,9 @@ enum Command {
         /// Stick direction while walking: x (right) and y (forward), −1..1.
         #[arg(long, num_args = 2, default_values_t = [0.0, 1.0], allow_negative_numbers = true)]
         stick: Vec<f32>,
-        /// Instead of a fixed stick, steer towards this ground point (x z) and press confirm once there.
-        #[arg(long, num_args = 2, allow_negative_numbers = true)]
-        goto: Option<Vec<f32>>,
+        /// Instead of a fixed stick, steer through these ground points ("x,z;x,z;…") and confirm at the last.
+        #[arg(long, allow_hyphen_values = true)]
+        goto: Option<String>,
         /// How far from the point to let go of the stick (the walk slows down over a few more ticks).
         #[arg(long, default_value_t = 4.0)]
         stop: f32,
@@ -174,7 +174,15 @@ fn main() -> Result<()> {
                 confirm_every,
                 walk_from,
                 stick: [stick[0], stick[1]],
-                goto: goto.map(|g| [g[0], g[1], stop]),
+                goto: goto
+                    .unwrap_or_default()
+                    .split(';')
+                    .filter_map(|p| {
+                        let v: Vec<f32> = p.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        (v.len() == 2).then(|| [v[0], v[1]])
+                    })
+                    .collect(),
+                stop,
             };
             field_run(&install, &event, &run)
         }
@@ -452,12 +460,14 @@ struct FieldRunPlan {
     confirm_every: u32,
     walk_from: u32,
     stick: [f32; 2],
-    /// Point to steer to (x, z) and how far from it to let go.
-    goto: Option<[f32; 3]>,
+    /// Points to steer through (x, z), and how far from the last to let go.
+    goto: Vec<[f32; 2]>,
+    stop: f32,
 }
 
 fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> {
-    let FieldRunPlan { ticks, ref image, confirm_every, walk_from, stick, goto } = *plan;
+    let FieldRunPlan { ticks, ref image, confirm_every, walk_from, stick, ref goto, stop } = *plan;
+    let mut leg = 0usize;
     use aerugo_formats::Game;
     use aerugo_sim::field::{Event, Input};
     let mut vfs = aerugo_vfs::Vfs::new();
@@ -465,23 +475,24 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
     let path = archive_event_path(event).unwrap_or_else(|| event.to_owned());
     let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
     let mut ev = Event::load(&vfs, game, &path, aerugo_vfs::Language::English).map_err(anyhow::Error::msg)?;
-    // Walkable ground from the map's triangles, as the field runner does.
-    if let Some(p) = &ev.map_model
+    // Event::load reads the walk mesh; without one, the drawn map's triangles.
+    if ev.state.ground.is_some() {
+        println!("ground from the walk mesh");
+    } else if let Some(p) = &ev.map_model
         && let Ok(d) = vfs.read(p)
         && let Ok(c) = aerugo_formats::phyre::Cluster::parse(d)
         && let Ok(model) = aerugo_formats::mesh::read_model(&c)
     {
         ev.state.ground = Some(aerugo_sim::field::collision::Ground::from_model(&c, &model));
         println!("ground from {p}");
-        // FIELD_PROBE="x z;x z": floor heights there.
-        if let Ok(probe) = std::env::var("FIELD_PROBE") {
-            let g = ev.state.ground.as_ref().expect("just set");
-            for pt in probe.split(';') {
-                let v: Vec<f32> = pt.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-                if let [x, z] = v[..] {
-                    let hs: Vec<f32> = g.heights(x, z).collect();
-                    println!("floor at {x} {z}: {hs:?}");
-                }
+    }
+    // FIELD_PROBE="x z;x z": floor heights there.
+    if let (Ok(probe), Some(g)) = (std::env::var("FIELD_PROBE"), ev.state.ground.as_ref()) {
+        for pt in probe.split(';') {
+            let v: Vec<f32> = pt.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if let [x, z] = v[..] {
+                let hs: Vec<f32> = g.heights(x, z).collect();
+                println!("floor at {x} {z}: {hs:?}");
             }
         }
     }
@@ -500,12 +511,16 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
             ..Input::default()
         };
         // Steering (no camera: forward is +Z, right is +X): head for the point, then stand and confirm.
-        if let (Some([gx, gz, stop]), true) = (goto, t >= walk_from)
+        if let (Some(&[gx, gz]), true) = (goto.get(leg), t >= walk_from)
             && let Some(p) = ev.state.player.and_then(|p| ev.state.actors.get(p)).map(|a| a.pos)
         {
             let (dx, dz) = (gx - p[0], gz - p[2]);
             let d = (dx * dx + dz * dz).sqrt();
-            if d > stop {
+            let last = leg + 1 == goto.len();
+            if !last && d < 3.0 {
+                leg += 1;
+            }
+            if !last || d > stop {
                 input.stick = [dx / d, dz / d];
             } else {
                 input.stick = [0.0; 2];

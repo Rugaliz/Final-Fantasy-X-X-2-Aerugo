@@ -307,7 +307,7 @@ impl Window {
 }
 
 /// The camera the scripts set (map space).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CameraState {
     pub position: Option<[f32; 3]>,
     pub focus: Option<[f32; 3]>,
@@ -434,6 +434,8 @@ pub struct FieldState {
     /// The talk started this tick, while workers offer themselves.
     pub talk: Option<Talk>,
     pub control: PlayerControl,
+    /// Each worker's three data areas in the script (for natives that take tables there).
+    pub data_areas: Vec<[u32; 3]>,
     /// The event's entrance records (the save image says which one the party arrived by).
     pub entrances: Vec<aerugo_formats::script::Entrance>,
     /// The player's step for next tick (from this tick's push), on the ground plane.
@@ -628,12 +630,16 @@ impl FieldState {
         if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
             // With no floor under the player (in water), the ground does not hold the step back.
             let swimming =
-                self.ground.as_ref().is_some_and(|g| !g.is_empty() && g.floor(self.actors[p].pos).is_none());
+                self.ground.as_ref().is_some_and(|g| !g.is_empty() && !g.standing(self.actors[p].pos));
             if let Some([dx, dz]) = self.player_step.take() {
                 let a = &self.actors[p];
                 let next = [a.pos[0] + dx, a.pos[1], a.pos[2] + dz];
                 let next = match &self.ground {
-                    Some(g) if !swimming => g.slide(a.pos, next),
+                    // Blocked: slide along the wall on one axis.
+                    Some(g) if !swimming => g
+                        .slide(a.pos, next)
+                        .or_else(|| g.slide(a.pos, [next[0], a.pos[1], a.pos[2]]))
+                        .or_else(|| g.slide(a.pos, [a.pos[0], a.pos[1], next[2]])),
                     _ => Some(next),
                 };
                 if let Some(n) = next {
@@ -717,6 +723,14 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
         .collect()
 }
 
+/// The PS2 map package holding the walk mesh for a drawn map (`…/map/<area>/<map>/…`).
+pub fn walk_mesh_path(map_model: &str) -> Option<String> {
+    let rest = map_model.split("/map/").nth(1)?;
+    let mut parts = rest.split('/');
+    let (area, map) = (parts.next()?, parts.next()?);
+    Some(format!("ffx_ps2/ffx/master/jppc/map/{area}/{map}/bin/mapout.vpa"))
+}
+
 /// Name code: the character's name (argument 0x30 + character id).
 const NAME_CODE: u8 = 0x13;
 
@@ -778,7 +792,12 @@ impl Event {
                 ..Actor::default()
             })
             .collect();
-        let mut state = FieldState { actors, entrances: script.entrances(), ..FieldState::default() };
+        let mut state = FieldState {
+            actors,
+            entrances: script.entrances(),
+            data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
+            ..FieldState::default()
+        };
         if let Some(tp) = event_text_path(game, path, lang)
             && let Ok(bytes) = vfs.read(&tp)
             && let Ok(cs) = vfs.read(&text::charset_path(game, lang)).map(|b| Charset::parse(&b))
@@ -787,6 +806,10 @@ impl Event {
             state.messages = decode_event_text(&bytes, &cs);
         }
         let (map_model, map_layers) = map_paths(vfs, game, &name);
+        // The walk mesh from the PS2 map package next to the drawn map.
+        if let Some(vpa) = map_model.as_deref().and_then(walk_mesh_path) {
+            state.ground = vfs.read(&vpa).ok().and_then(|d| Ground::from_walk_mesh(&d));
+        }
         let mut natives = Natives::new(game);
         register(&mut natives);
         Ok(Event {
@@ -1569,7 +1592,7 @@ fn register(n: &mut Natives<FieldState>) {
         0x6002,
         Native::result(|g, c| {
             g.camera.position = Some(pop3(c));
-            g.camera.follow.orbit = None;
+            g.camera.follow.clear_eye();
             g.camera.moving = None;
             Value::Int(0)
         }),
@@ -1585,8 +1608,23 @@ fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6010,
         Native::result(|g, c| {
-            g.camera.move_frames = c.stack.pop_int().max(1) as u32;
+            let frames = c.stack.pop_int().max(1) as u32;
+            g.camera.move_frames = frames;
             g.camera.start_move();
+            // The following camera's eye moves there from where it is over the frames.
+            if let Some(from) = g.camera.position {
+                g.camera.follow.eye_move = Some((from, frames, 0));
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x602E,
+        Native::result(|g, c| {
+            let frames = c.stack.pop_int().max(1) as u32;
+            if let Some(from) = g.camera.focus {
+                g.camera.follow.focus_move = Some((from, frames, 0));
+            }
             Value::Int(0)
         }),
     );
@@ -1657,6 +1695,7 @@ fn register(n: &mut Natives<FieldState>) {
         0x602D,
         Native::result(|g, _| {
             g.camera.follow.clear_limits();
+            g.camera.follow.rail = None;
             Value::Int(0)
         }),
     );
@@ -1704,8 +1743,64 @@ fn register(n: &mut Natives<FieldState>) {
             let pitch = c.stack.pop_float().to_radians();
             let b = c.stack.pop_float();
             let a = c.stack.pop_float();
+            g.camera.follow.clear_eye();
             g.camera.follow.orbit =
                 Some(crate::follow_camera::Orbit { anchor: [a, b], pitch, pitch_div, dist, dist_div });
+            Value::Int(0)
+        }),
+    );
+    // The eye from a table in the worker's data (a variable naming it), a heading change in degrees and the
+    // anchor point.
+    n.register(
+        0x601F,
+        Native::result(|g, c| {
+            let z = c.stack.pop_float();
+            let x = c.stack.pop_float();
+            let yaw = c.stack.pop_float().to_radians();
+            let var = c.stack.pop_int() as u32;
+            let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+            let area = ((var >> 25) & 7) as usize;
+            if (2..=4).contains(&area) {
+                let at = areas[area - 2] as usize + (var & 0xFF_FFFF) as usize;
+                let table = c.memory.script.get(at..).unwrap_or_default();
+                g.camera.follow.clear_eye();
+                g.camera.follow.path = crate::follow_camera::EyePath::read(table, [x, z], yaw);
+            }
+            Value::Int(0)
+        }),
+    );
+    // Rails: the focus held near a path (605A: table, share kept, 3 for the cubic path) and the eye on a path at
+    // the focus's place along it (605B: table, 3 for cubic).
+    fn table<'a>(g: &FieldState, c: &'a NativeCall, var: u32) -> Option<&'a [u8]> {
+        let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+        let area = ((var >> 25) & 7) as usize;
+        if !(2..=4).contains(&area) {
+            return None;
+        }
+        c.memory.script.get(areas[area - 2] as usize + (var & 0xFF_FFFF) as usize..)
+    }
+    n.register(
+        0x605A,
+        Native::result(|g, c| {
+            let mode = c.stack.pop_int();
+            let k = c.stack.pop_float();
+            let var = c.stack.pop_int() as u32;
+            let rail = table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3));
+            if let Some(r) = rail {
+                g.camera.follow.rail = Some((r, k));
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x605B,
+        Native::result(|g, c| {
+            let mode = c.stack.pop_int();
+            let var = c.stack.pop_int() as u32;
+            if let Some(r) = table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3)) {
+                g.camera.follow.clear_eye();
+                g.camera.follow.eye_rail = Some(r);
+            }
             Value::Int(0)
         }),
     );
