@@ -148,7 +148,7 @@ impl<G> std::fmt::Debug for Bound<'_, G> {
     }
 }
 
-impl<G: PartyLookup> Host for Bound<'_, G> {
+impl<G: World> Host for Bound<'_, G> {
     fn native_init(&mut self, id: u16, call: &mut NativeCall<'_>) {
         *self.natives.coverage.calls.entry(id).or_default() += 1;
         match self.natives.table.get(&id).copied() {
@@ -209,17 +209,34 @@ impl<G: PartyLookup> Host for Bound<'_, G> {
     fn party_worker(&mut self, slot: i32) -> Option<usize> {
         self.game.party_worker(slot)
     }
+
+    fn worker_ran(&mut self, w: usize, kind: u8) -> Vec<u8> {
+        self.game.worker_ran(w, kind)
+    }
+
+    fn talk(&mut self) -> Option<(usize, u8)> {
+        self.game.talk()
+    }
 }
 
-/// Game-state lookups the machine needs.
-pub trait PartyLookup {
+/// What the machine asks of the game state beyond natives.
+pub trait World {
     /// The worker standing for party slot 0–2.
     fn party_worker(&mut self, _slot: i32) -> Option<usize> {
         None
     }
+    /// Worker `w` (of `kind`) finished its turn this frame: test its trigger against the player and return the
+    /// signal types it raises, in order.
+    fn worker_ran(&mut self, _w: usize, _kind: u8) -> Vec<u8> {
+        Vec::new()
+    }
+    /// After every worker ran: the worker the player talks to, and the signal type.
+    fn talk(&mut self) -> Option<(usize, u8)> {
+        None
+    }
 }
 
-impl PartyLookup for () {}
+impl World for () {}
 
 /// Wrap an angle into [−π, π].
 pub fn wrap_angle(mut a: f32) -> f32 {

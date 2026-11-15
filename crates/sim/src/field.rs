@@ -6,7 +6,9 @@ use std::sync::Arc;
 use aerugo_formats::Game;
 use aerugo_formats::script::Script;
 use aerugo_formats::text::{self, Charset};
-use aerugo_script::natives::{Native, PartyLookup, wrap_angle};
+use aerugo_script::natives::{Native, World, wrap_angle};
+
+use crate::trigger::{self, PlayerStep, Trigger};
 use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
@@ -30,8 +32,10 @@ pub struct Actor {
     pub params: [i32; 4],
     /// The party character this worker plays (set by scripts), which party requests resolve to.
     pub character: Option<u8>,
-    /// Flag bits scripts set and clear per worker.
+    /// Signal bits scripts set and clear per worker: an engine signal of type n reaches the worker only while
+    /// bit n is set.
     pub flags: u32,
+    pub trigger: Trigger,
     move_target: [f32; 3],
     move_speed: [f32; 2],
     moving: Option<Movement>,
@@ -53,6 +57,7 @@ impl Default for Actor {
             params: [0; 4],
             character: None,
             flags: 0,
+            trigger: Trigger::default(),
             move_target: [0.0; 3],
             move_speed: [0.0; 2],
             moving: None,
@@ -276,6 +281,10 @@ pub struct FieldState {
     pub party: [u8; 3],
     /// Random values to hand out instead of the generator's (replaying a recording of the original).
     pub rng_replay: std::collections::VecDeque<u32>,
+    /// Where the player stood at the start of the last tick and of this one (what triggers test the step
+    /// between).
+    pub player_prev: [f32; 3],
+    player_start: Option<[f32; 3]>,
 }
 
 impl FieldState {
@@ -285,7 +294,24 @@ impl FieldState {
     }
 }
 
-impl PartyLookup for FieldState {
+impl World for FieldState {
+    fn worker_ran(&mut self, w: usize, kind: u8) -> Vec<u8> {
+        let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
+        let step = PlayerStep { prev: self.player_prev, cur: self.actors[p].pos };
+        let Some(a) = self.actors.get_mut(w).filter(|a| a.trigger.active) else { return Vec::new() };
+        let mut out = Vec::new();
+        match kind {
+            1 if a.model.is_some() => trigger::test_character(&mut a.trigger, a.pos, step, &mut out),
+            2 => trigger::test_line_zone(&mut a.trigger, a.pos, step, &mut out),
+            3 => trigger::test_box(&mut a.trigger, a.pos, a.yaw, step, &mut out),
+            5 => trigger::test_line(&mut a.trigger, a.pos, step, &mut out),
+            _ => {}
+        }
+        let bits = a.flags;
+        out.retain(|&t| bits & (1 << t) != 0);
+        out
+    }
+
     fn party_worker(&mut self, slot: i32) -> Option<usize> {
         // The party's three slots hold character ids (0xFF empty); the worker playing that character answers.
         let chr = *self.party.get(usize::try_from(slot).ok()?)?;
@@ -454,8 +480,16 @@ impl Event {
         let data = vfs.read(path).map_err(|e| e.to_string())?;
         let script = Script::parse(&data).map_err(|e| e.to_string())?;
         let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".ebp").to_owned();
-        let mut state = FieldState::default();
-        state.actors.resize(script.workers.len(), Actor::default());
+        let actors = script
+            .workers
+            .iter()
+            .map(|w| Actor {
+                flags: trigger::default_signal_bits(w.kind),
+                trigger: Trigger::for_kind(w.kind),
+                ..Actor::default()
+            })
+            .collect();
+        let mut state = FieldState { actors, ..FieldState::default() };
         if let Some(tp) = event_text_path(game, path, lang)
             && let Ok(bytes) = vfs.read(&tp)
             && let Ok(cs) = vfs.read(&text::charset_path(game, lang)).map(|b| Charset::parse(&b))
@@ -489,6 +523,9 @@ impl Event {
         let image = &self.vm.memory.global[0];
         if let Some(p) = image.get(PARTY_SLOTS..PARTY_SLOTS + 3) {
             self.state.party = [p[0], p[1], p[2]];
+        }
+        if let Some(pos) = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos) {
+            self.state.player_prev = self.state.player_start.replace(pos).unwrap_or(pos);
         }
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
@@ -583,6 +620,165 @@ fn message_wait() -> Native<FieldState> {
         }),
         result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
     }
+}
+
+/// Trigger shapes: lines (kinds 2 and 5), boxes (3 and 6), and the touch and talk sizes of characters.
+fn register_triggers(n: &mut Natives<FieldState>) {
+    // A line: two points; no height limit.
+    n.register(
+        0x0054,
+        Native::result(|g, c| {
+            let b = pop3(c);
+            let a = pop3(c);
+            let kind = c.kind;
+            let actor = g.actor(c.worker);
+            if !matches!(kind, 2 | 5) {
+                return Value::Int(0);
+            }
+            actor.pos = a;
+            actor.trigger.b = b;
+            actor.trigger.height = -1.0;
+            actor.trigger.active = true;
+            actor.trigger.dirty = true;
+            Value::Int(1)
+        }),
+    );
+    // Height limit of a line or box.
+    n.register(
+        0x0055,
+        Native::result(|g, c| {
+            let h = c.stack.pop_float();
+            let kind = c.kind;
+            let t = &mut g.actor(c.worker).trigger;
+            if !matches!(kind, 2 | 3 | 5 | 6) {
+                return Value::Int(0);
+            }
+            t.height = h;
+            t.dirty = true;
+            Value::Int(1)
+        }),
+    );
+    // Trigger on or off (two natives do the same).
+    for id in [0x0056u16, 0x005C] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let on = c.stack.pop_int() != 0;
+                let kind = c.kind;
+                let t = &mut g.actor(c.worker).trigger;
+                if !matches!(kind, 2 | 3 | 5 | 6) {
+                    return Value::Int(0);
+                }
+                t.active = on;
+                t.dirty = true;
+                Value::Int(1)
+            }),
+        );
+    }
+    // A box's centre.
+    n.register(
+        0x0057,
+        Native::result(|g, c| {
+            let p = pop3(c);
+            let kind = c.kind;
+            let a = g.actor(c.worker);
+            if !matches!(kind, 3 | 6) {
+                return Value::Int(0);
+            }
+            a.pos = p;
+            a.trigger.active = true;
+            a.trigger.dirty = true;
+            Value::Int(1)
+        }),
+    );
+    // A box's half width and depth, with (0x59) or without (0x58) a half height.
+    n.register(0x0058, Native::result(|g, c| box_size(g, c, -1.0)));
+    n.register(
+        0x0059,
+        Native::result(|g, c| {
+            let h = c.stack.pop_float();
+            box_size(g, c, h)
+        }),
+    );
+    // Lengthen a line at both ends.
+    n.register(
+        0x007A,
+        Native::result(|g, c| {
+            let after = c.stack.pop_float();
+            let before = c.stack.pop_float();
+            let kind = c.kind;
+            let a = g.actor(c.worker);
+            if !matches!(kind, 2 | 5) {
+                return Value::Int(0);
+            }
+            a.trigger.dirty = true;
+            let d: [f32; 3] = std::array::from_fn(|k| a.trigger.b[k] - a.pos[k]);
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if len <= 0.0 {
+                return Value::Int(0);
+            }
+            for (k, dk) in d.iter().enumerate() {
+                a.pos[k] -= dk * before / len;
+                a.trigger.b[k] += dk * after / len;
+            }
+            Value::Int(1)
+        }),
+    );
+    // Talk radius (whole units), talk facing half angle, touch radius; two values not used here yet.
+    n.register(
+        0x0061,
+        Native::result(|g, c| {
+            let r = c.stack.pop_float().trunc();
+            let t = &mut g.actor(c.worker).trigger;
+            t.talk_radius = r;
+            t.dirty = true;
+            Value::Float(r)
+        }),
+    );
+    n.register(
+        0x0063,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            let t = &mut g.actor(c.worker).trigger;
+            t.talk_angle = v;
+            t.dirty = true;
+            Value::Float(v)
+        }),
+    );
+    n.register(
+        0x0085,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            let t = &mut g.actor(c.worker).trigger;
+            t.radius = v;
+            t.dirty = true;
+            Value::Int(0)
+        }),
+    );
+    for id in [0x0062u16, 0x008D] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let v = c.stack.pop_float();
+                g.actor(c.worker).trigger.dirty = true;
+                Value::Float(v)
+            }),
+        );
+    }
+}
+
+fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
+    let hd = c.stack.pop_float();
+    let hw = c.stack.pop_float();
+    let kind = c.kind;
+    let t = &mut g.actor(c.worker).trigger;
+    if !matches!(kind, 3 | 6) {
+        return Value::Int(0);
+    }
+    t.b = [hw, 0.0, hd];
+    t.height = h;
+    t.dirty = true;
+    Value::Int(1)
 }
 
 fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
@@ -730,16 +926,16 @@ fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x0034,
         Native::result(|g, c| {
-            let bits = c.stack.pop_int() as u32;
-            g.actor(c.worker).flags |= bits;
+            let bit = c.stack.pop_int() as u32 & 31;
+            g.actor(c.worker).flags |= 1 << bit;
             Value::Int(0)
         }),
     );
     n.register(
         0x0035,
         Native::result(|g, c| {
-            let bits = c.stack.pop_int() as u32;
-            g.actor(c.worker).flags &= !bits;
+            let bit = c.stack.pop_int() as u32 & 31;
+            g.actor(c.worker).flags &= !(1 << bit);
             Value::Int(0)
         }),
     );
@@ -962,6 +1158,18 @@ fn register(n: &mut Natives<FieldState>) {
     // start to 1 by the step each tick.
     n.register(0x6046, Native::result(|g, c| path_move(g, c, 0)));
     n.register(0x6047, Native::result(|g, c| path_move(g, c, 1)));
+    register_triggers(n);
+    // Mark a worker for an extra pass this frame.
+    n.register(
+        0x0117,
+        Native::result(|_, c| {
+            let w = c.stack.pop_int();
+            if let Ok(w) = usize::try_from(w) {
+                c.effects.push(aerugo_script::vm::Effect::ExtraPass(w));
+            }
+            Value::Int(0)
+        }),
+    );
     // The camera parts the following move times apply to.
     n.register(
         0x6043,

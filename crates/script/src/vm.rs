@@ -185,6 +185,9 @@ pub struct Worker {
     active_request: Option<u32>,
     pub rate: f32,
     rate_acc: f32,
+    /// Extra-pass marks: a two-bit count of extra passes this frame (bits 7–8), marks that become a count at
+    /// the end of the pass (bits 9–10), and "requests from this worker mark their target" (bit 12).
+    pub pass_marks: u16,
 }
 
 impl Worker {
@@ -227,6 +230,8 @@ pub struct NativeCall<'a> {
     pub stack: &'a mut Stack,
     pub memory: &'a mut Memory,
     pub frame: u64,
+    /// Requests to the machine, applied when the call returns.
+    pub effects: &'a mut Vec<Effect>,
 }
 
 impl std::fmt::Debug for NativeCall<'_> {
@@ -247,7 +252,25 @@ pub trait Host {
     fn party_worker(&mut self, _slot: i32) -> Option<usize> {
         None
     }
+    /// Worker `w` finished its turn this frame: the engine signal types its trigger raises.
+    fn worker_ran(&mut self, _w: usize, _kind: u8) -> Vec<u8> {
+        Vec::new()
+    }
+    /// After every worker ran: who the player talks to, and the signal type.
+    fn talk(&mut self) -> Option<(usize, u8)> {
+        None
+    }
 }
+
+/// Engine signal defaults per worker kind and signal type: the level, and the entry (255 / -1: none).
+const SIGNAL_LEVELS: [[u8; 8]; 3] =
+    [[7, 7, 6, 5, 255, 255, 255, 255], [7, 7, 255, 3, 5, 4, 2, 255], [1, 1, 255, 1, 1, 1, 1, 255]];
+const SIGNAL_ENTRIES: [[i16; 8]; 4] = [
+    [2, 3, 4, 5, -1, -1, -1, 1],
+    [2, 3, -1, 5, 4, 6, 7, 1],
+    [2, 2, -1, 2, 2, 2, 2, 1],
+    [2, 2, -1, 2, 2, 2, 3, 1],
+];
 
 /// Phase of an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +293,24 @@ pub struct Vm {
     pub trace: Option<Vec<TraceEvent>>,
     /// Faults with the worker and pc they happened at.
     pub faults: Vec<(usize, u32, Fault)>,
+    effects: Vec<Effect>,
+}
+
+/// When a request is refused: the plain request opcodes refuse a second request at the same level; variants
+/// refuse one for an entry already asked for, or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refuse {
+    SameLevel,
+    SameEntry,
+    Never,
+}
+
+/// What a native asks of the machine itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Run this worker again in an extra pass after this one, and let its requests mark their targets the same
+    /// way.
+    ExtraPass(usize),
 }
 
 impl Vm {
@@ -303,6 +344,7 @@ impl Vm {
                     active_request: None,
                     rate: 1.0,
                     rate_acc: 0.0,
+                    pass_marks: 0,
                 }
             })
             .collect();
@@ -316,6 +358,7 @@ impl Vm {
             next_request: 1,
             trace: None,
             faults: Vec::new(),
+            effects: Vec::new(),
         };
         // Each runnable worker starts with its setup entry running and entry 1 (its main code) queued at level
         // 0; ending the setup entry starts entry 1.
@@ -381,13 +424,65 @@ impl Vm {
             Phase::Running => {
                 for w in 0..self.workers.len() {
                     self.run_worker(w, host);
+                    if self.workers[w].active {
+                        for t in host.worker_ran(w, self.workers[w].kind) {
+                            self.engine_signal(w, t);
+                        }
+                    }
+                }
+                if let Some((w, t)) = host.talk() {
+                    self.engine_signal(w, t);
                 }
                 for w in 0..self.workers.len() {
                     self.decode(w, None);
+                    let m = &mut self.workers[w].pass_marks;
+                    *m = ((*m >> 2) & 0x180 | *m & 0xF87F) & !0x1000;
+                }
+                // Extra passes: marked workers run again in the same frame (a worker asked by one that is marked
+                // starts its new entry now rather than next frame).
+                for _ in 0..4 {
+                    if !self.workers.iter().any(|w| w.pass_marks & 0x180 != 0) {
+                        break;
+                    }
+                    for w in 0..self.workers.len() {
+                        if self.workers[w].pass_marks & 0x180 != 0 {
+                            self.run_worker(w, host);
+                        }
+                    }
+                    for w in 0..self.workers.len() {
+                        let m = self.workers[w].pass_marks;
+                        let m = if m & 0x600 != 0 { (m >> 2) & 0x180 | m & 0xF87F } else { m };
+                        self.workers[w].pass_marks = m;
+                        if m & 0x180 != 0 {
+                            self.decode(w, None);
+                            let count = ((m >> 7) & 3).saturating_sub(1);
+                            self.workers[w].pass_marks = m & !0x180 | count << 7;
+                        }
+                    }
                 }
             }
         }
         self.frame += 1;
+    }
+
+    /// An engine signal (touch, talk, a line crossed, a zone entered or left) on worker `w`: a request for the
+    /// entry the worker's kind runs for that signal type, at its level. Gating by the worker's signal bits is
+    /// the caller's.
+    pub fn engine_signal(&mut self, w: usize, signal: u8) -> bool {
+        let Some(kind) = self.workers.get(w).map(|x| x.kind) else { return false };
+        let (levels, entries) = match kind {
+            1 => (0, 0),
+            2 | 3 => (1, 1),
+            5 => (2, 2),
+            6 => (2, 3),
+            _ => return false,
+        };
+        let t = usize::from(signal & 7);
+        let (level, entry) = (SIGNAL_LEVELS[levels][t], SIGNAL_ENTRIES[entries][t]);
+        if level == 255 || entry < 0 {
+            return false;
+        }
+        self.request(None, w, RequestMode::Plain, level, entry as u16)
     }
 
     /// Queue a request on `target` from `from`. Refused (false) for entry 0, unknown targets, or when the target
@@ -400,12 +495,34 @@ impl Vm {
         level: u8,
         entry: u16,
     ) -> bool {
+        self.request_with(from, target, mode, level, entry, Refuse::SameLevel)
+    }
+
+    /// [`Vm::request`] with the request variant's refusal rule.
+    pub fn request_with(
+        &mut self,
+        from: Option<u16>,
+        target: usize,
+        mode: RequestMode,
+        level: u8,
+        entry: u16,
+        refuse: Refuse,
+    ) -> bool {
         if entry == 0 || target >= self.workers.len() {
             return false;
         }
+        // A worker marked for an extra pass marks the workers it asks too.
+        if from.and_then(|f| self.workers.get(usize::from(f))).is_some_and(|f| f.pass_marks & 0x1000 != 0) {
+            self.workers[target].pass_marks |= 0x200;
+        }
         let t = &mut self.workers[target];
         let level = level.min(t.max_level());
-        if t.queue.iter().any(|r| r.mode != RequestMode::Signal && r.level == level) {
+        let taken = |r: &Request| match refuse {
+            Refuse::SameLevel => r.level == level,
+            Refuse::SameEntry => r.entry == entry,
+            Refuse::Never => false,
+        };
+        if t.queue.iter().any(|r| r.mode != RequestMode::Signal && taken(r)) {
             return false;
         }
         let id = self.next_request;
@@ -823,6 +940,7 @@ impl Vm {
                     stack: &mut worker.stack,
                     memory: &mut self.memory,
                     frame: self.frame,
+                    effects: &mut self.effects,
                 };
                 if first {
                     host.native_init(arg, &mut call);
@@ -840,6 +958,15 @@ impl Vm {
                         worker.stack.push(v);
                     }
                 }
+                for e in std::mem::take(&mut self.effects) {
+                    match e {
+                        Effect::ExtraPass(t) => {
+                            if let Some(t) = self.workers.get_mut(t) {
+                                t.pass_marks = t.pass_marks & !0x400 | 0x1200;
+                            }
+                        }
+                    }
+                }
             }
             0x36 | 0x45..=0x49 | 0x37 | 0x4A..=0x4E | 0x38 | 0x4F..=0x53 => {
                 let entry = s.pop_int();
@@ -850,13 +977,24 @@ impl Vm {
                     0x37 | 0x4A..=0x4E => RequestMode::WaitStart,
                     _ => RequestMode::WaitEnd,
                 };
+                // Per family: the base opcode, then variants without a refusal, refusing the same entry, and
+                // three gated ones (the gate is not ported; they follow the same rules).
+                let refuse = match insn.op {
+                    0x36..=0x38 => Refuse::SameLevel,
+                    o => match (o - 0x45) % 5 {
+                        0 | 3 => Refuse::Never,
+                        1 | 4 => Refuse::SameEntry,
+                        _ => Refuse::SameLevel,
+                    },
+                };
                 let ok = target >= 0
-                    && self.request(
+                    && self.request_with(
                         Some(w as u16),
                         target as usize,
                         mode,
                         lvl.clamp(0, 15) as u8,
                         entry as u16,
+                        refuse,
                     );
                 let worker = &mut self.workers[w];
                 worker.stack.push(Value::Int(i32::from(ok)));

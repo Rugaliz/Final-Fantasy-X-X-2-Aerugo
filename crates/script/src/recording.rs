@@ -231,6 +231,8 @@ pub struct EventRun {
     pub map_changes: Vec<(u32, i32, i32)>,
     /// What the original's natives reported, per (worker, native), in order.
     pub replay: crate::natives::Replay,
+    /// Worker positions recorded in each frame (version 3; empty before).
+    pub positions: Vec<Vec<WorkerPosition>>,
 }
 
 /// Split a recording into event runs. Each frame record starts a frame (the recorder writes it when the frame
@@ -285,7 +287,16 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                     run.replay.polls.entry((*worker, *native)).or_default().push_back(*flags);
                 }
             }
-            Record::Input(_) | Record::Positions(_) => {}
+            Record::Input(_) => {}
+            Record::Positions(p) => {
+                if let Some(run) = runs.last_mut() {
+                    let f = run.frames.len().saturating_sub(1);
+                    if run.positions.len() <= f {
+                        run.positions.resize(f + 1, Vec::new());
+                    }
+                    run.positions[f] = p.clone();
+                }
+            }
             Record::MapChange { target, entrance } => {
                 if let Some(run) = runs.last_mut() {
                     run.map_changes.push((frame, *target, *entrance));

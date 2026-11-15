@@ -9,6 +9,7 @@ pub mod save;
 pub mod snapshot;
 pub mod test_scene;
 pub mod tick;
+pub mod trigger;
 
 pub use snapshot::{Item, Snapshot, Transform, interpolate};
 pub use tick::{FixedTimestep, GAME_TICK_HZ, Steps};

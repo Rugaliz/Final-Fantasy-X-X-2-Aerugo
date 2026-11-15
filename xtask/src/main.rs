@@ -610,7 +610,37 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         let mut ours = Vec::new();
         let mut found = None;
         for f in 0..run.frames.len() {
+            // The player goes where the original's went (Aerugo does not replay the pad yet). The original moves
+            // the player in its own turn, before other workers' triggers test it: by the position recorded at the
+            // start of the next frame.
+            if let Some(p) = ev.state.player
+                && let Some(rec) =
+                    run.positions.get(f + 1).and_then(|ps| ps.iter().find(|q| usize::from(q.worker) == p))
+                && let Some(a) = ev.state.actors.get_mut(p)
+            {
+                a.pos = rec.pos;
+                a.yaw = rec.yaw;
+            }
             ev.step(Input::default());
+            if let Ok(spec) = std::env::var("COMPARE_DEBUG")
+                && let Some((w, from, to)) = (|| {
+                    let mut it = spec.split(',').map(|x| x.parse::<usize>().ok());
+                    Some((it.next()??, it.next()??, it.next()??))
+                })()
+                && (from..=to).contains(&f)
+            {
+                let a = &ev.state.actors[w];
+                eprintln!(
+                    "f{f} player {:?} prev {:?} pos {:?}; w{w} pos {:?} yaw {} flags {:#x} {:?}",
+                    ev.state.player,
+                    ev.state.player_prev,
+                    ev.state.player.map(|p| ev.state.actors[p].pos),
+                    a.pos,
+                    a.yaw,
+                    a.flags,
+                    a.trigger
+                );
+            }
             ours.push(std::mem::take(ev.vm.trace.as_mut().expect("tracing")));
             if let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {
                 found = Some(aerugo_script::recording::Divergence { frame: f, ..d });
