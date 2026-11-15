@@ -223,6 +223,10 @@ impl<G: World> Host for Bound<'_, G> {
     fn after_workers(&mut self) -> Vec<(usize, u8)> {
         self.game.after_workers()
     }
+
+    fn start_signals(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
+        self.game.start_signals(w, kind, level)
+    }
 }
 
 /// What the machine asks of the game state beyond natives.
@@ -239,6 +243,10 @@ pub trait World {
     /// After every worker ran: engine signals (worker, type) from the whole frame, such as the worker the player
     /// talks to and characters bumped into.
     fn after_workers(&mut self) -> Vec<(usize, u8)> {
+        Vec::new()
+    }
+    /// The event starts: worker `w`'s trigger tested with the player standing still.
+    fn start_signals(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
         Vec::new()
     }
 }

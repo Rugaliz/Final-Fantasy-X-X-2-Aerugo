@@ -262,6 +262,11 @@ pub trait Host {
     fn after_workers(&mut self) -> Vec<(usize, u8)> {
         Vec::new()
     }
+    /// The event starts (all init entries ended): the trigger signals of every worker with the player standing
+    /// where it is, before the first requests start.
+    fn start_signals(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// Engine signal defaults per worker kind and signal type: the level, and the entry (255 / -1: none).
@@ -315,6 +320,8 @@ pub enum Effect {
     /// Run this worker again in an extra pass after this one, and let its requests mark their targets the same
     /// way.
     ExtraPass(usize),
+    /// Mark a worker to run again at the end of this frame (flags2 0x200).
+    PassAgain(usize),
     /// Turn a worker on or off.
     Enable(usize, bool),
 }
@@ -423,6 +430,13 @@ impl Vm {
                     }
                 }
                 if self.workers.iter().all(|w| w.ended_entry || !w.active) {
+                    for w in 0..self.workers.len() {
+                        if self.workers[w].active && self.workers[w].enabled {
+                            for t in host.start_signals(w, self.workers[w].kind, self.workers[w].level) {
+                                self.engine_signal(w, t);
+                            }
+                        }
+                    }
                     for w in 0..self.workers.len() {
                         self.decode(w, None);
                     }
@@ -971,6 +985,11 @@ impl Vm {
                         Effect::ExtraPass(t) => {
                             if let Some(t) = self.workers.get_mut(t) {
                                 t.pass_marks = t.pass_marks & !0x400 | 0x1200;
+                            }
+                        }
+                        Effect::PassAgain(t) => {
+                            if let Some(t) = self.workers.get_mut(t) {
+                                t.pass_marks = t.pass_marks & !0x400 | 0x200;
                             }
                         }
                         Effect::Enable(t, on) => {

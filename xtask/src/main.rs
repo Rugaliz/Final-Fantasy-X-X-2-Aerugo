@@ -1041,10 +1041,26 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 .get(f)
                 .and_then(|d| d.get(0x10..0x14))
                 .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four bytes")));
+            // The d-pad (up 0x1000, down 0x4000) moves choice cursors on the frame it is first pressed.
+            let pressed_before = f
+                .checked_sub(1)
+                .and_then(|p| run.inputs.get(p))
+                .and_then(|d| d.get(0x10..0x14))
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four bytes")));
+            let fresh = pressed & !pressed_before;
+            let dpad = if fresh & 0x1000 != 0 {
+                1.0
+            } else if fresh & 0x4000 != 0 {
+                -1.0
+            } else {
+                0.0
+            };
             let input = Input {
                 confirm: pressed & 0x20 != 0,
                 cancel: pressed & 0x40 != 0,
                 alt: pressed & 0x80 != 0,
+                stick: [0.0, dpad],
+                stick_pressed: dpad != 0.0,
                 ..Input::default()
             };
             ev.load_motion_frames(&vfs);
@@ -1113,6 +1129,34 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     a.flags,
                     a.trigger
                 );
+                if let Some(ps) = run.positions.get(f)
+                    && let Some(me) = ps.iter().find(|q| usize::from(q.worker) == w)
+                {
+                    eprintln!("  recorded w{w} at {:?}", me.pos);
+                    for q in ps.iter().filter(|q| usize::from(q.worker) != w) {
+                        let (dx, dz) = (q.pos[0] - me.pos[0], q.pos[2] - me.pos[2]);
+                        if dx * dx + dz * dz < 100.0 {
+                            eprintln!("  recorded near w{} kind {} at {:?}", q.worker, q.kind, q.pos);
+                        }
+                    }
+                }
+                for (k, b) in ev.state.actors.iter().enumerate() {
+                    let (dx, dz) = (b.pos[0] - a.pos[0], b.pos[2] - a.pos[2]);
+                    if k != w && b.model.is_some() && dx * dx + dz * dz < 64.0 {
+                        let rec = run
+                            .positions
+                            .get(f)
+                            .and_then(|ps| ps.iter().find(|q| usize::from(q.worker) == k));
+                        eprintln!(
+                            "  near w{k}: model {:?} pos {:?} recorded {:?} visible {} no hit {}",
+                            b.model,
+                            b.pos,
+                            rec.map(|q| q.pos),
+                            b.visible,
+                            b.no_body_hit
+                        );
+                    }
+                }
                 for (k, win) in ev.state.windows.iter().enumerate().filter(|(_, w)| w.open || w.closing > 0) {
                     let len = win.message.and_then(|m| ev.state.messages.get(m)).map_or(0, |m| m.len());
                     eprintln!("  window {k}: {win:?} length {len}");

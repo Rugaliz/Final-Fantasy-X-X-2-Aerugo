@@ -41,6 +41,8 @@ pub struct Actor {
     pub radius: Option<f32>,
     /// Another character walked into this one last tick.
     bumped: bool,
+    /// Body hit turned off (500f): neither blocks nor bumps.
+    pub no_body_hit: bool,
     /// The motion playing: motion id, first frame, last frame (−1: its end), ticks played, loops left (0xFF:
     /// for ever).
     pub motion_play: Option<(i32, i32, i32, u32, u8)>,
@@ -71,6 +73,7 @@ impl Default for Actor {
             trigger: Trigger::default(),
             radius: None,
             bumped: false,
+            no_body_hit: false,
             motion_play: None,
             motion_speed: 0x100,
             level: 0,
@@ -240,6 +243,8 @@ pub struct Window {
     /// The choice highlighted when the window opens, and the one cancel picks.
     pub first_choice: u8,
     pub cancel_choice: u8,
+    /// Ticks the taken choice stays readable after a choice window starts closing.
+    pub choice_live: u8,
 }
 
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
@@ -503,12 +508,13 @@ impl World for FieldState {
         match kind {
             1 if a.model.is_some() => trigger::test_character(&mut a.trigger, a.pos, step, &mut out),
             2 => trigger::test_line_zone(&mut a.trigger, a.pos, step, &mut out),
-            3 => trigger::test_box(&mut a.trigger, a.pos, a.yaw, step, &mut out),
+            3 | 6 => trigger::test_box(&mut a.trigger, a.pos, a.yaw, step, &mut out),
             5 => trigger::test_line(&mut a.trigger, a.pos, step, &mut out),
             _ => {}
         }
         let bits = a.flags;
-        out.retain(|&t| bits & (1 << t) != 0);
+        // Kind 6 zones raise enter and leave, not "inside" every tick.
+        out.retain(|&t| bits & (1 << t) != 0 && !(kind == 6 && t == trigger::INSIDE));
         if let Some(talk) = self.talk.as_mut().filter(|_| bits & 1 != 0 && w != p) {
             let talker = Talker { pos: step.cur, yaw: self.actors[p].yaw, reach: self.talk_reach };
             let a = &self.actors[w];
@@ -519,6 +525,16 @@ impl World for FieldState {
                 _ => {}
             }
         }
+        out
+    }
+
+    fn start_signals(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
+        let Some(p) = self.player.and_then(|p| self.actors.get(p)).map(|a| a.pos) else { return Vec::new() };
+        let prev = std::mem::replace(&mut self.player_prev, p);
+        let talk = self.talk.take();
+        let out = self.worker_ran(w, kind, level);
+        self.player_prev = prev;
+        self.talk = talk;
         out
     }
 
@@ -553,14 +569,17 @@ impl FieldState {
             .enumerate()
             .map(|(i, a)| {
                 if Some(i) == self.player {
-                    a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2]
+                    // Walking under the player's control (a script placing the player is not a walk).
+                    self.user_control && (a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2])
                 } else {
                     matches!(a.move_state().active, Some(ActorMove::Walk { speed, .. }) if speed != 0.0)
                 }
             })
             .collect();
         let bodies: Vec<usize> = (0..self.actors.len())
-            .filter(|&i| self.actors[i].model.is_some() && self.actors[i].visible)
+            .filter(|&i| {
+                self.actors[i].model.is_some() && self.actors[i].visible && !self.actors[i].no_body_hit
+            })
             .collect();
         let mut bumped = vec![false; self.actors.len()];
         for (k, &i) in bodies.iter().enumerate() {
@@ -671,6 +690,7 @@ impl FieldState {
         }
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
+            w.choice_live = w.choice_live.saturating_sub(1);
         }
         for w in self.windows.iter_mut().filter(|w| w.open) {
             if w.opening > 0 {
@@ -1227,8 +1247,8 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    int_back!(0x0074, 0x00BB, 0x00BC, 0x00F3, 0x0116, 0x017A);
-    // One float kept, nothing useful returned (actor heights and radii: 0025, 002e, 002f, 0030).
+    int_back!(0x0074, 0x00BB, 0x00BC, 0x00F3, 0x017A);
+    // One float kept, nothing useful returned (per-level move settings: 002e, 002f, 0030).
     macro_rules! float_set {
         ($($id:expr),*) => {$(
             n.register($id, Native::result(|g, c| {
@@ -1238,7 +1258,16 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    float_set!(0x0025, 0x002E, 0x002F, 0x0030);
+    float_set!(0x002E, 0x002F, 0x0030);
+    // The calling worker's facing (wrapped).
+    n.register(
+        0x0025,
+        Native::result(|g, c| {
+            let v = wrap_angle(c.stack.pop_float());
+            g.actor(c.worker).yaw = v;
+            Value::Int(0)
+        }),
+    );
     // One int kept, 1 returned (0007, 0151).
     macro_rules! int_one {
         ($($id:expr),*) => {$(
@@ -1329,8 +1358,18 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x500E, 0x500F, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x4013,
-        0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x6032, 0x5001, 0x5010
+        0x500B, 0x500E, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x4013, 0x400A,
+        0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x6032, 0x5001, 0x5010
+    );
+    // Body hit off (1) or on (0): characters without it neither block nor bump.
+    n.register(
+        0x500F,
+        Native::result(|g, c| {
+            let off = c.stack.pop_int() != 0;
+            let w = c.worker;
+            g.actor(w).no_body_hit = off;
+            Value::Int(0)
+        }),
     );
     n.register(
         0x4034,
@@ -1392,6 +1431,47 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
         )*};
     }
     fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x00E3, 0x0119, 0x0004);
+    // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
+    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D, 0x6011, 0x00A3);
+    fixed!(1; 0x801D, 0x801E, 0x801F);
+    fixed!(1; 0x8010, 0x8030);
+    // A message variable (window, slot, kind, value) for the window's text; returns the window.
+    n.register(0x009E, Native::result(|g, c| Value::Int(int(&take(g, c, 0x009E), 0))));
+    // Play a sound (returns the first argument).
+    n.register(0x00FD, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00FD), 0))));
+    // The calling worker's facing.
+    n.register(0x0091, Native::result(|g, c| Value::Float(g.actor(c.worker).yaw)));
+    // A zone or line worker's mode bits (other kinds: nothing, 0).
+    n.register(
+        0x007F,
+        Native::result(|g, c| {
+            take(g, c, 0x007F);
+            Value::Int(i32::from(matches!(c.kind, 2 | 3 | 5 | 6)))
+        }),
+    );
+    // The highlighted choice of a choice window whose text is all shown (or that is closing), else -1.
+    n.register(
+        0x00FB,
+        Native::result(|g, c| {
+            let w = window(c);
+            let win = &g.windows[w];
+            let choices = win.message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.choices);
+            let ready = (win.open && win.opening == 0 && win.shown >= win.reveal) || win.choice_live > 0;
+            Value::Int(if ready && choices > 0 { win.choice as i32 } else { -1 })
+        }),
+    );
+    // The ground distance (x, z) between two workers.
+    n.register(
+        0x00A5,
+        Native::result(|g, c| {
+            let b = target(c);
+            let a = target(c);
+            let pos = |w: usize| g.actors.get(w).map_or([0.0; 3], |x| x.pos);
+            let (p, q) = (pos(a), pos(b));
+            let (dx, dz) = (f64::from(q[0] - p[0]), f64::from(q[2] - p[2]));
+            Value::Float((dx * dx + dz * dz).sqrt() as f32)
+        }),
+    );
     fixed!(1; 0x019C, 0x01EB, 0x0103, 0x0104, 0x01CE, 0x01CF, 0x0205, 0x0209, 0x01D0, 0x022E);
     // Switches that return whether they were turned on: the only argument (013e), the second (01d4), the int of
     // (int, float) (c02f).
@@ -1564,6 +1644,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
                 open_window(g, &c.memory.global[0], w, true);
                 c.scratch[0] = w as i32;
                 c.scratch[1] = 0;
+                c.scratch[2] = 0;
             }),
             wait: Some(choice_wait),
             ..message_wait()
@@ -1575,6 +1656,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
             init: Some(|_, c| {
                 c.scratch[0] = window(c) as i32;
                 c.scratch[1] = 0;
+                c.scratch[2] = 0;
             }),
             wait: Some(choice_wait),
             ..message_wait()
@@ -1743,19 +1825,38 @@ fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
     if c.scratch[1] == 1 {
         c.scratch[1] = 2;
         g.windows[w].close();
+        // Scripts still read the choice until the wait ends.
+        g.windows[w].choice_live = CLOSE_TICKS + 2;
         return 0;
     }
+    // Cursor moves take effect on the tick after the press.
+    let n = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| usize::from(m.choices));
     let win = &mut g.windows[w];
-    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal && (g.input.confirm || g.input.cancel) {
-        if !g.input.confirm {
-            win.choice = usize::from(win.cancel_choice);
+    if c.scratch[2] != 0 && n > 0 {
+        win.choice = if c.scratch[2] > 0 { (win.choice + n - 1) % n } else { (win.choice + 1) % n };
+    }
+    c.scratch[2] = 0;
+    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal {
+        if g.input.stick_pressed && g.input.stick[1] != 0.0 {
+            c.scratch[2] = if g.input.stick[1] > 0.0 { 1 } else { -1 };
         }
-        c.scratch[1] = 1;
+        if g.input.confirm || g.input.cancel {
+            if !g.input.confirm {
+                win.choice = usize::from(win.cancel_choice);
+            }
+            c.scratch[1] = 1;
+        }
         return 0;
     }
-    message_wait()
-        .wait
-        .map_or(WAIT_DONE, |f| if c.scratch[1] == 0 || !g.windows[w].open { f(g, c) } else { 0 })
+    if c.scratch[1] == 0 && win.open {
+        // Still revealing: confirm shows the rest, as in message waits (no cursor moves yet).
+        let stick = std::mem::take(&mut g.input.stick_pressed);
+        let r = message_wait().wait.map_or(0, |f| f(g, c));
+        g.input.stick_pressed = stick;
+        return r;
+    }
+    let win = &g.windows[w];
+    if !win.open && win.closing == 0 { WAIT_DONE } else { 0 }
 }
 
 /// Workers turned off (they stop running, but keep their requests) and on again.
@@ -2557,6 +2658,16 @@ pub fn register(n: &mut Natives<FieldState>) {
     register_triggers(n);
     register_control(n);
     register_workers(n);
+    // Have a worker run again at the end of this frame (its new requests start then); returns the worker.
+    n.register(
+        0x0116,
+        Native::result(|_, c| {
+            let w = c.stack.pop_int();
+            let t = if w < 0 { c.worker } else { w as usize };
+            c.effects.push(aerugo_script::vm::Effect::PassAgain(t));
+            Value::Int(w)
+        }),
+    );
     // Mark a worker for an extra pass this frame.
     n.register(
         0x0117,
@@ -2780,12 +2891,18 @@ mod tests {
         let body = |x: f32| Actor { model: Some(0x2001), pos: [x, 0.0, 0.0], ..Actor::default() };
         let mut state =
             FieldState { actors: vec![body(0.0), body(7.0)], player: Some(0), ..FieldState::default() };
+        state.user_control = true;
         state.player_prev = [-1.0, 0.0, 0.0];
         // Radii 4 + 4: the player is pushed back to 8 from the other.
         assert_eq!(state.bumps(), vec![1]);
         assert!((state.actors[0].pos[0] + 1.0).abs() < 1e-5);
         state.player_prev = state.actors[0].pos;
         state.actors[0].pos[0] += 0.5;
+        assert!(state.bumps().is_empty());
+        // Placed onto a character by a script (no player control): no bump.
+        state.user_control = false;
+        state.actors[1].bumped = false;
+        state.player_prev = [-1.0, 0.0, 0.0];
         assert!(state.bumps().is_empty());
     }
 
