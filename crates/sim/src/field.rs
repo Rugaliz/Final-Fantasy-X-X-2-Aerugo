@@ -28,6 +28,8 @@ pub struct Actor {
     pub motion: Option<i32>,
     /// Four values scripts keep per worker.
     pub params: [i32; 4],
+    /// The party character this worker plays (set by scripts), which party requests resolve to.
+    pub character: Option<u8>,
     /// Flag bits scripts set and clear per worker.
     pub flags: u32,
     move_target: [f32; 3],
@@ -47,6 +49,7 @@ impl Default for Actor {
             visible: true,
             motion: None,
             params: [0; 4],
+            character: None,
             flags: 0,
             move_target: [0.0; 3],
             move_speed: [0.0; 2],
@@ -230,6 +233,8 @@ pub struct FieldState {
     /// A map change the scripts asked for: target and entrance, for the session to carry out.
     pub jump: Option<(i32, i32)>,
     pub rng: Rng,
+    /// Character ids in the three party slots (from the save image, refreshed every tick).
+    pub party: [u8; 3],
     /// Random values to hand out instead of the generator's (replaying a recording of the original).
     pub rng_replay: std::collections::VecDeque<u32>,
 }
@@ -243,8 +248,12 @@ impl FieldState {
 
 impl PartyLookup for FieldState {
     fn party_worker(&mut self, slot: i32) -> Option<usize> {
-        // Party slot 0 is the player character; the others are not tracked yet.
-        (slot == 0).then_some(self.player).flatten()
+        // The party's three slots hold character ids (0xFF empty); the worker playing that character answers.
+        let chr = *self.party.get(usize::try_from(slot).ok()?)?;
+        if chr == 0xFF {
+            return None;
+        }
+        self.actors.iter().position(|a| a.character == Some(chr))
     }
 }
 
@@ -306,6 +315,9 @@ impl FieldState {
         }
     }
 }
+
+/// Offset of the three party slots in the save image.
+const PARTY_SLOTS: usize = 0x3D58;
 
 /// A running field event.
 pub struct Event {
@@ -413,6 +425,10 @@ impl Event {
     /// One 30 Hz tick: scripts first, then movement and player control.
     pub fn step(&mut self, input: Input) {
         self.state.input = input;
+        let image = &self.vm.memory.global[0];
+        if let Some(p) = image.get(PARTY_SLOTS..PARTY_SLOTS + 3) {
+            self.state.party = [p[0], p[1], p[2]];
+        }
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
         self.tick += 1;
@@ -596,6 +612,21 @@ fn register(n: &mut Natives<FieldState>) {
             let m = c.stack.pop_int();
             g.actor(c.worker).motion = Some(m);
             Value::Int(0)
+        }),
+    );
+    // The party character a worker plays (actors only); character 0 is taken as the player until the
+    // native that names the player is known.
+    n.register(
+        0x0042,
+        Native::result(|g, c| {
+            let chr = c.stack.pop_int();
+            if c.kind == 1 {
+                g.actor(c.worker).character = u8::try_from(chr).ok();
+                if chr == 0 && g.player.is_none() {
+                    g.player = Some(c.worker);
+                }
+            }
+            Value::Int(chr)
         }),
     );
     // Per-worker values and flags.

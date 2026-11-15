@@ -51,6 +51,16 @@ impl<G> Native<G> {
     }
 }
 
+/// What the original game's natives reported (from a recording), handed out in order to natives Aerugo does not
+/// implement, so a comparison isolates the machine and the implemented natives.
+#[derive(Debug, Default, Clone)]
+pub struct Replay {
+    /// Poll flags per (worker, native).
+    pub polls: HashMap<(u16, u16), std::collections::VecDeque<u8>>,
+    /// Results (tag 1 int, 2 float; raw bits) per (worker, native).
+    pub results: HashMap<(u16, u16), std::collections::VecDeque<(u8, u32)>>,
+}
+
 /// Which natives scripts called, and which of those Aerugo lacks.
 #[derive(Debug, Default, Clone)]
 pub struct Coverage {
@@ -86,6 +96,8 @@ pub struct Natives<G> {
     pub game: Game,
     table: HashMap<u16, Native<G>>,
     pub coverage: Coverage,
+    /// Recorded native behaviour used for natives without an implementation.
+    pub replay: Option<Replay>,
 }
 
 impl<G> std::fmt::Debug for Natives<G> {
@@ -97,7 +109,7 @@ impl<G> std::fmt::Debug for Natives<G> {
 impl<G> Natives<G> {
     /// An empty registry with the state-free groups (math, debug, waits) registered.
     pub fn new(game: Game) -> Natives<G> {
-        let mut n = Natives { game, table: HashMap::new(), coverage: Coverage::default() };
+        let mut n = Natives { game, table: HashMap::new(), coverage: Coverage::default(), replay: None };
         register_common(&mut n);
         n
     }
@@ -163,6 +175,12 @@ impl<G: PartyLookup> Host for Bound<'_, G> {
     }
 
     fn native_wait(&mut self, id: u16, call: &mut NativeCall<'_>) -> u32 {
+        if !self.natives.table.contains_key(&id)
+            && let Some(r) = &mut self.natives.replay
+            && let Some(f) = r.polls.get_mut(&(call.worker as u16, id)).and_then(|q| q.pop_front())
+        {
+            return u32::from(f);
+        }
         match self.natives.table.get(&id).and_then(|n| n.wait) {
             Some(wait) => wait(self.game, call),
             None => WAIT_DONE | WAIT_CONTINUE,
@@ -170,6 +188,12 @@ impl<G: PartyLookup> Host for Bound<'_, G> {
     }
 
     fn native_result(&mut self, id: u16, call: &mut NativeCall<'_>) -> Value {
+        if !self.natives.table.contains_key(&id)
+            && let Some(r) = &mut self.natives.replay
+            && let Some((tag, v)) = r.results.get_mut(&(call.worker as u16, id)).and_then(|q| q.pop_front())
+        {
+            return if tag == 2 { Value::Float(f32::from_bits(v)) } else { Value::Int(v as i32) };
+        }
         match self.natives.table.get(&id).and_then(|n| n.result) {
             Some(f) => f(self.game, call),
             None if !self.natives.table.contains_key(&id) => {

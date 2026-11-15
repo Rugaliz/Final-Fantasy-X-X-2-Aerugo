@@ -412,6 +412,8 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             ev.vm.memory.global[0][..n].copy_from_slice(&img[..n]);
         }
         ev.state.rng_replay = run.random.iter().copied().collect();
+        // Natives Aerugo lacks report what the original's did.
+        ev.natives.replay = Some(run.replay.clone());
         ev.vm.trace = Some(Vec::new());
         // Compare as we go and stop at the first difference: a run that has gone astray can loop at the run
         // limit every frame, and its trace would not fit in memory.

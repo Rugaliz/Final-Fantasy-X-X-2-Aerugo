@@ -219,7 +219,7 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
 }
 
 /// One event's stretch of a recording: its start, then per frame the instructions and random numbers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct EventRun {
     pub index: i32,
     pub path: String,
@@ -229,6 +229,8 @@ pub struct EventRun {
     /// Values of random stream 2 (the scripts' stream), in order.
     pub random: Vec<u32>,
     pub map_changes: Vec<(u32, i32, i32)>,
+    /// What the original's natives reported, per (worker, native), in order.
+    pub replay: crate::natives::Replay,
 }
 
 /// Split a recording into event runs. Each frame record starts a frame (the recorder writes it when the frame
@@ -273,10 +275,17 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                     run.random.push(*value);
                 }
             }
-            Record::NativeResult { .. }
-            | Record::NativePoll { .. }
-            | Record::Input(_)
-            | Record::Positions(_) => {}
+            Record::NativeResult { worker, native, tag, value } => {
+                if let Some(run) = runs.last_mut() {
+                    run.replay.results.entry((*worker, *native)).or_default().push_back((*tag, *value));
+                }
+            }
+            Record::NativePoll { worker, native, flags } => {
+                if let Some(run) = runs.last_mut() {
+                    run.replay.polls.entry((*worker, *native)).or_default().push_back(*flags);
+                }
+            }
+            Record::Input(_) | Record::Positions(_) => {}
             Record::MapChange { target, entrance } => {
                 if let Some(run) = runs.last_mut() {
                     run.map_changes.push((frame, *target, *entrance));
