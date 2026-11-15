@@ -111,6 +111,7 @@ fn record_own_run() {
                 pc: t.pc,
                 op: t.op,
                 operand: t.operand,
+                depth: None,
             });
         }
     }

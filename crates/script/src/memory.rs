@@ -5,6 +5,8 @@ use aerugo_formats::script::{Var, VarType};
 
 /// Size of each global block.
 pub const GLOBAL_SIZE: usize = 0x1_0000;
+/// Global block 0 is the save image; variables in area 0 start this far into it.
+pub const AREA0_OFFSET: usize = 0x1EC;
 
 /// Where a variable's bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl Memory {
         let index = index.clamp(0, i32::from(var.count.max(1)) - 1) as usize;
         let off = var.offset as usize + index * size;
         match var.area {
-            0 => Place::Global(0, off),
+            0 => Place::Global(0, AREA0_OFFSET + off),
             1 => Place::Global(1, off),
             2..=4 => Place::Script(areas[usize::from(var.area - 2)] as usize + off),
             5 => Place::Registers(worker, off),
@@ -164,7 +166,7 @@ mod tests {
     #[test]
     fn typed_round_trips_and_saturation() {
         let mut m = Memory::new(vec![0; 64], 2);
-        let v = var(VarType::I8, 0, 4, 1);
+        let v = var(VarType::I8, 1, 4, 1);
         let p = m.place(&v, 0, 0, [0; 3], 0);
         m.store_int(p, v.ty, 300, false);
         assert_eq!(m.load_int(p, v.ty), 44); // 300 truncated to a byte

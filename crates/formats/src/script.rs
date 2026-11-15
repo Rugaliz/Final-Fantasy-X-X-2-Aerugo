@@ -171,12 +171,12 @@ pub const OPS: [OpInfo; 0x7B] = [
     op("eq", O::None),
     op("ne", O::None),
     op("gt.u", O::None),
-    op("ge.u", O::None),
-    op("gt", O::None),
-    op("ge", O::None),
     op("lt.u", O::None),
-    op("le.u", O::None),
+    op("gt", O::None),
     op("lt", O::None),
+    op("ge.u", O::None),
+    op("le.u", O::None),
+    op("ge", O::None),
     op("le", O::None),
     op("bit", O::None),
     op("bit.not", O::None),
@@ -602,12 +602,17 @@ pub fn native(game: Game, id: u16) -> Native {
 
 /// How many ints and floats a native takes and what it returns, for every native of the game.
 pub fn arity(game: Game, id: u16) -> Option<(u8, u8, Ret)> {
+    let corrections: &[arity::Arity] = match game {
+        Game::Ffx => arity::FFX_CORRECTIONS,
+        Game::Ffx2 => &[],
+    };
     let table = match game {
         Game::Ffx => arity::FFX,
         Game::Ffx2 => arity::FFX2,
     };
-    table.binary_search_by_key(&id, |a| a.0).ok().map(|i| {
-        let (_, ints, floats, ret) = table[i];
+    let found = corrections.iter().find(|a| a.0 == id).copied();
+    found.or_else(|| table.binary_search_by_key(&id, |a| a.0).ok().map(|i| table[i])).map(|a| {
+        let (_, ints, floats, ret) = a;
         (ints, floats, [Ret::None, Ret::Int, Ret::Float][usize::from(ret.min(2))])
     })
 }

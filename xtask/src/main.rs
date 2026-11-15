@@ -72,6 +72,8 @@ enum Command {
         #[arg(long)]
         run: Option<usize>,
     },
+    /// Measure native argument counts on a version-2 recording and list those that disagree with the table.
+    OracleArity { dir: PathBuf },
     /// Run every script for a few seconds with the implemented natives and print native coverage.
     NativeCoverage {
         #[arg(long, default_value_t = 120)]
@@ -107,6 +109,7 @@ fn main() -> Result<()> {
         Command::EffectCensus { top } => effect_census(&install, top),
         Command::NativeCoverage { frames } => native_coverage(&install, frames),
         Command::OracleCompare { dir, run } => oracle_compare(&install, &dir, run),
+        Command::OracleArity { dir } => oracle_arity(&dir),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
         Command::FsbCompare { filter, every, samples } => {
@@ -410,13 +413,20 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         }
         ev.state.rng_replay = run.random.iter().copied().collect();
         ev.vm.trace = Some(Vec::new());
+        // Compare as we go and stop at the first difference: a run that has gone astray can loop at the run
+        // limit every frame, and its trace would not fit in memory.
         let mut ours = Vec::new();
-        for _ in 0..run.frames.len() {
+        let mut found = None;
+        for f in 0..run.frames.len() {
             ev.step(Input::default());
             ours.push(std::mem::take(ev.vm.trace.as_mut().expect("tracing")));
+            if let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {
+                found = Some(aerugo_script::recording::Divergence { frame: f, ..d });
+                break;
+            }
         }
         let total: usize = run.frames.iter().map(Vec::len).sum();
-        match first_divergence(&run.frames, &ours) {
+        match found {
             None => println!("run {i}: {name}: {} frames, {total} instructions: identical", run.frames.len()),
             Some(d) => {
                 let show = |t: Option<aerugo_script::TraceEvent>| match t {
@@ -444,12 +454,74 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     show(d.expected),
                     show(d.got)
                 );
+                if let Some(t) = d.expected.or(d.got) {
+                    describe_worker(&mut ev.vm, usize::from(t.worker), before);
+                }
             }
         }
         for (f, t, e) in &run.map_changes {
             println!("  map change at frame {f}: target {t} entrance {e}");
         }
     }
+    Ok(())
+}
+
+/// Entries of worker `w` and the variables `recent` instructions touched, with their values in Aerugo now.
+fn describe_worker(vm: &mut aerugo_script::Vm, w: usize, recent: &[aerugo_script::TraceEvent]) {
+    use aerugo_formats::script::{Operand, op_info};
+    let script = vm.script.clone();
+    let Some(desc) = script.workers.get(w) else { return };
+    let entries: Vec<String> = desc.entries.iter().map(|e| format!("{e:05x}")).collect();
+    println!("  worker {w}: kind {} entries [{}]", desc.kind, entries.join(" "));
+    if let Some(state) = vm.workers.get(w) {
+        let pcs: Vec<String> =
+            state.contexts.iter().enumerate().map(|(l, c)| format!("l{l}:{:05x}", c.pc)).collect();
+        println!("  aerugo level {} contexts {}", state.level, pcs.join(" "));
+    }
+    let mut seen = Vec::new();
+    for t in recent {
+        if op_info(t.op).operand != Operand::Var {
+            continue;
+        }
+        let Some(idx) = t.operand.map(usize::from) else { continue };
+        if seen.contains(&idx) {
+            continue;
+        }
+        seen.push(idx);
+        let Some(var) = desc.vars.get(idx) else { continue };
+        let place = vm.memory.place(var, 0, w, desc.data_areas, script.shared_data());
+        let value = vm.memory.load_int(place, var.ty);
+        println!(
+            "  var {idx:#x}: area {} offset {:#x} {} x{} = {value} ({value:#x}) at {place:?}",
+            var.area,
+            var.offset,
+            var.ty.name(),
+            var.count
+        );
+    }
+}
+
+fn oracle_arity(dir: &std::path::Path) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_formats::script::{arity, native};
+    let records = aerugo_script::recording::parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let measured = aerugo_script::recording::measured_arity(&records);
+    let (mut agree, mut differ) = (0, 0);
+    for (id, counts) in &measured {
+        let table = arity(Game::Ffx, *id).map(|(i, f, _)| i32::from(i) + i32::from(f));
+        let best = counts.iter().max_by_key(|(_, n)| **n).map(|(c, _)| *c);
+        if table == best && counts.len() == 1 {
+            agree += 1;
+        } else {
+            differ += 1;
+            println!(
+                "{:04x} {:<32} table {table:?} measured {counts:?}",
+                id,
+                native(Game::Ffx, *id).display(*id)
+            );
+        }
+    }
+    println!("{} natives measured: {agree} agree with the table, {differ} differ", measured.len());
     Ok(())
 }
 

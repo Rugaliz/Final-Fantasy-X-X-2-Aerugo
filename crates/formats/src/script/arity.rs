@@ -3501,3 +3501,7 @@ pub(super) const FFX2: &[Arity] = &[
     (0xe0bb, 0, 1, 1),
     (0xe0bc, 2, 1, 1),
 ];
+
+/// Corrections to the inferred counts: natives whose arguments are taken by a shared helper, confirmed by reading
+/// the helper or measured on recordings of the original (`xtask oracle-arity`). Searched first.
+pub(super) const FFX_CORRECTIONS: &[Arity] = &[(0x501a, 5, 0, 1), (0x5042, 5, 0, 1), (0x5044, 6, 0, 1)];

@@ -282,9 +282,11 @@ impl Vm {
             .enumerate()
             .map(|(i, w)| {
                 let mut contexts = vec![Context::default(); 9];
-                // Entry 0 (setup) runs at level 7 (the highest a two-level worker has is 1).
+                // Entry 0 (setup) runs at level 7 (the highest a two-level worker has is 1); level 0 holds entry 1,
+                // which runs once setup ends.
                 let start = if matches!(w.kind, 5 | 6) { 1 } else { INIT_LEVEL };
                 contexts[usize::from(start)].pc = w.entries.first().copied().unwrap_or(0);
+                contexts[0].pc = w.entries.get(1).copied().unwrap_or(0);
                 // Kind 0 workers hold subroutines other workers call into; they never run on their own.
                 let runs = w.kind != 0;
                 Worker {
@@ -305,7 +307,7 @@ impl Vm {
             })
             .collect();
         let memory = Memory::new(script.data().to_vec(), n);
-        Vm {
+        let mut vm = Vm {
             script,
             workers,
             memory,
@@ -314,7 +316,41 @@ impl Vm {
             next_request: 1,
             trace: None,
             faults: Vec::new(),
+        };
+        // Each runnable worker starts with its setup entry running and entry 1 (its main code) queued at level
+        // 0; ending the setup entry starts entry 1.
+        for w in 0..vm.workers.len() {
+            if !vm.workers[w].active {
+                continue;
+            }
+            let level = vm.workers[w].level;
+            let id = vm.next_request;
+            vm.next_request += 1;
+            vm.workers[w].queue.push(Request {
+                id,
+                from: None,
+                mode: RequestMode::Plain,
+                level,
+                entry: 0,
+                running: true,
+                fresh: false,
+            });
+            vm.workers[w].active_request = Some(id);
+            if vm.script.workers[w].entries.len() > 1 {
+                let id = vm.next_request;
+                vm.next_request += 1;
+                vm.workers[w].queue.push(Request {
+                    id,
+                    from: None,
+                    mode: RequestMode::Plain,
+                    level: 0,
+                    entry: 1,
+                    running: false,
+                    fresh: false,
+                });
+            }
         }
+        vm
     }
 
     /// Run one frame (1/30 s of game time).
@@ -452,6 +488,10 @@ impl Vm {
                     self.signal(w, r.from, r.level, r.entry);
                 }
             }
+        }
+        // Back to the main entry (level 0) unless a request takes over; one with no main entry stays put.
+        if self.script.workers[w].entries.len() > 1 {
+            self.workers[w].level = 0;
         }
         self.decode(w, Some(()));
         if restart {
@@ -606,13 +646,15 @@ impl Vm {
             0x05 => int2!(|l: i32, r: i32| l & r),
             0x06 => compare!(|l, r| l == r, |l: f32, r: f32| l == r),
             0x07 => compare!(|l, r| l != r, |l: f32, r: f32| l != r),
+            // Pairs share one handler in the original, the second negating the first: 08/0D, 0A/0F (gt, le) and
+            // 0C/09, 0E/0B (ge, lt).
             0x08 => compare!(|l: i32, r: i32| (l as u32) > (r as u32), |l: f32, r: f32| l > r),
-            0x09 => compare!(|l: i32, r: i32| (l as u32) >= (r as u32), |l: f32, r: f32| l >= r),
+            0x09 => compare!(|l: i32, r: i32| (l as u32) < (r as u32), not_ge),
             0x0A => compare!(|l, r| l > r, |l: f32, r: f32| l > r),
-            0x0B => compare!(|l, r| l >= r, |l: f32, r: f32| l >= r),
-            0x0C => compare!(|l: i32, r: i32| (l as u32) < (r as u32), not_ge),
+            0x0B => compare!(|l, r| l < r, not_ge),
+            0x0C => compare!(|l: i32, r: i32| (l as u32) >= (r as u32), |l: f32, r: f32| l >= r),
             0x0D => compare!(|l: i32, r: i32| (l as u32) <= (r as u32), not_gt),
-            0x0E => compare!(|l, r| l < r, not_ge),
+            0x0E => compare!(|l, r| l >= r, |l: f32, r: f32| l >= r),
             0x0F => compare!(|l, r| l <= r, not_gt),
             0x10 => int2!(|l: i32, r: i32| (l >> (r & 31)) & 1),
             0x11 => int2!(|l: i32, r: i32| i32::from((l >> (r & 31)) & 1 == 0)),

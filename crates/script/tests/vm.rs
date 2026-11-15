@@ -27,6 +27,7 @@ fn vm(workers: &[WorkerSrc]) -> Vm {
 }
 
 fn global(vm: &Vm, off: usize) -> i32 {
+    let off = off + aerugo_script::memory::AREA0_OFFSET;
     i32::from_le_bytes(vm.memory.global[0][off..off + 4].try_into().unwrap())
 }
 
@@ -79,7 +80,7 @@ fn branches_loop_until_done() {
             Op(POPV, Some(0)),
             Op(PUSHV, Some(0)),
             imm(10),
-            op(0x0E),
+            op(0x0B),
             Op(0x56, Some(0)), // pop into A, jump if non-zero
             op(END),
         ]],
@@ -116,7 +117,8 @@ fn frame_wait_spans_frames() {
 
 #[test]
 fn requests_wait_for_the_end() {
-    // Worker 0's entry 1 asks worker 1 to run entry 2 at level 3, waits for it to end, then writes 1.
+    // Worker 0's entry 1 (level 0, once setup is done) asks worker 1 to run entry 2 at level 3, waits for it to
+    // end, then writes 1.
     // Worker 1's entry 2 waits two frames and writes 7.
     let requester = WorkerSrc {
         entries: vec![
@@ -141,7 +143,6 @@ fn requests_wait_for_the_end() {
     let mut n = Natives::<()>::new(Game::Ffx);
     m.frame(&mut n.host(&mut ()));
     assert_eq!(m.phase, Phase::Running);
-    assert!(m.request(None, 0, RequestMode::Plain, 1, 1));
     let mut seen = Vec::new();
     for _ in 0..8 {
         m.frame(&mut n.host(&mut ()));
@@ -159,8 +160,8 @@ fn requests_wait_for_the_end() {
 
 #[test]
 fn higher_levels_preempt_and_resume() {
-    // Worker 0: entry 1 (level 1) counts frames into global[0] forever; entry 2 (level 5) writes 99 to global[4]
-    // and ends; then entry 1 resumes counting.
+    // Worker 0: entry 1 (level 0) counts frames into global[0] forever; entry 2 (level 5) writes 99 to global[4]
+    // and ends; then entry 1 resumes counting at level 0.
     let w = WorkerSrc {
         entries: vec![
             vec![op(END)],
@@ -183,7 +184,6 @@ fn higher_levels_preempt_and_resume() {
     let mut m = vm(&[w]);
     let mut n = Natives::<()>::new(Game::Ffx);
     m.frame(&mut n.host(&mut ()));
-    m.request(None, 0, RequestMode::Plain, 1, 1);
     for _ in 0..5 {
         m.frame(&mut n.host(&mut ()));
     }
@@ -195,7 +195,7 @@ fn higher_levels_preempt_and_resume() {
     }
     assert_eq!(global(&m, 4), 99);
     assert!(global(&m, 0) > before + 2, "resumed counting: {} vs {before}", global(&m, 0));
-    assert_eq!(m.workers[0].level, 1);
+    assert_eq!(m.workers[0].level, 0);
     assert!(m.faults.is_empty(), "{:?}", m.faults);
 }
 

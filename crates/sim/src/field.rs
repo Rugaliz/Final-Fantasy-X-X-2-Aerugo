@@ -907,7 +907,7 @@ mod tests {
             messages: vec![Message { text: "Hello there".into(), raw: String::new(), choices: 0 }],
             ..FieldState::default()
         };
-        let done = |vm: &Vm| vm.memory.global[0][0] == 1;
+        let done = |vm: &Vm| vm.memory.global[0][aerugo_script::memory::AREA0_OFFSET] == 1;
         let mut tick = |vm: &mut Vm, state: &mut FieldState, confirm: bool| {
             state.input.confirm = confirm;
             vm.frame(&mut natives.host(state));

@@ -12,11 +12,13 @@
 use crate::vm::TraceEvent;
 
 pub const MAGIC: &[u8; 8] = b"AEORACL1";
+/// Version 2 adds the worker's stack depth (before the instruction) to instruction records.
+pub const MAGIC_V2: &[u8; 8] = b"AEORACL2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Frame(u32),
-    Instruction { worker: u16, level: u8, pc: u32, op: u8, operand: Option<u16> },
+    Instruction { worker: u16, level: u8, pc: u32, op: u8, operand: Option<u16>, depth: Option<u8> },
     Random { stream: u8, value: u32 },
     Event { index: i32, path: String },
     MapChange { target: i32, entrance: i32 },
@@ -32,7 +34,8 @@ pub enum RecordingError {
 
 /// Parse a recording. A record cut off at the end (the game was closed mid-write) ends the list.
 pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
-    if !d.starts_with(MAGIC) {
+    let v2 = d.starts_with(MAGIC_V2);
+    if !d.starts_with(MAGIC) && !v2 {
         return Err(RecordingError::NotARecording);
     }
     let mut out = Vec::new();
@@ -46,13 +49,18 @@ pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
             2 => (|| {
                 let worker = u16_at(at + 1)?;
                 let level = *d.get(at + 3)?;
+                let (depth, at) = if v2 { (Some(*d.get(at + 4)?), at + 1) } else { (None, at) };
+                let extra = usize::from(v2);
                 let pc = u32_at(at + 4)?;
                 let op = *d.get(at + 8)?;
                 if op & 0x80 != 0 {
                     let v = u16_at(at + 9)?;
-                    Some((Record::Instruction { worker, level, pc, op: op & 0x7F, operand: Some(v) }, 11))
+                    Some((
+                        Record::Instruction { worker, level, pc, op: op & 0x7F, operand: Some(v), depth },
+                        11 + extra,
+                    ))
                 } else {
-                    Some((Record::Instruction { worker, level, pc, op, operand: None }, 9))
+                    Some((Record::Instruction { worker, level, pc, op, operand: None, depth }, 9 + extra))
                 }
             })(),
             3 => (|| Some((Record::Random { stream: *d.get(at + 1)?, value: u32_at(at + 2)? }, 6)))(),
@@ -86,7 +94,7 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
                 d.push(1);
                 d.extend(f.to_le_bytes());
             }
-            Record::Instruction { worker, level, pc, op, operand } => {
+            Record::Instruction { worker, level, pc, op, operand, .. } => {
                 d.push(2);
                 d.extend(worker.to_le_bytes());
                 d.push(*level);
@@ -152,7 +160,7 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                 start_frame: frame,
                 ..EventRun::default()
             }),
-            Record::Instruction { worker, level, pc, op, operand } => {
+            Record::Instruction { worker, level, pc, op, operand, .. } => {
                 if let Some(run) = runs.last_mut() {
                     if run.frames.is_empty() {
                         run.frames.push(Vec::new());
@@ -183,6 +191,38 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
         }
     }
     runs
+}
+
+/// Argument counts of natives measured from a version-2 recording: for each native call that finished, the
+/// stack depth before the call minus the depth before the worker's next instruction (plus the pushed result).
+/// Returns, per native id, every distinct count seen and how often.
+pub fn measured_arity(
+    records: &[Record],
+) -> std::collections::BTreeMap<u16, std::collections::BTreeMap<i32, u32>> {
+    use std::collections::{BTreeMap, HashMap};
+    let mut out: BTreeMap<u16, BTreeMap<i32, u32>> = BTreeMap::new();
+    // Last native call per (worker, level): id, opcode, depth before, pc.
+    let mut pending: HashMap<(u16, u8), (u16, u8, u8, u32)> = HashMap::new();
+    for r in records {
+        let Record::Instruction { worker, level, pc, op, operand, depth: Some(depth) } = *r else { continue };
+        let key = (worker, level);
+        if let Some((id, call_op, before, call_pc)) = pending.remove(&key) {
+            // A call still polling repeats at the same pc; count only once the worker moved on.
+            if pc == call_pc && op == call_op {
+                pending.insert(key, (id, call_op, before, call_pc));
+                continue;
+            }
+            let pushed = i32::from(call_op == 0x35);
+            *out.entry(id).or_default().entry(i32::from(before) - i32::from(depth) + pushed).or_default() +=
+                1;
+        }
+        if matches!(op, 0x35 | 0x58)
+            && let Some(id) = operand
+        {
+            pending.insert(key, (id, op, depth, pc));
+        }
+    }
+    out
 }
 
 /// Where two instruction streams first differ.
@@ -244,5 +284,12 @@ mod tests {
         assert_eq!((d.frame, d.index), (0, 1));
         assert!(parse(b"nope").is_err());
         assert_eq!(parse(&encode(&recs)).unwrap(), recs);
+        // Version 2: depth before each instruction; a call taking 2 and pushing a result leaves depth 2 -> 1.
+        let mut d = MAGIC_V2.to_vec();
+        d.extend([2, 0, 0, 0, 2, 0, 0, 0, 0, 0xB5, 0x01, 0x10]); // depth 2, call 0x1001
+        d.extend([2, 0, 0, 0, 1, 3, 0, 0, 0, 0xA0, 0, 0]); // depth 1 after
+        let recs = parse(&d).unwrap();
+        let m = measured_arity(&recs);
+        assert_eq!(m[&0x1001].keys().copied().collect::<Vec<_>>(), vec![2]);
     }
 }
