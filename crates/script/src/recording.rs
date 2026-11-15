@@ -66,6 +66,8 @@ pub enum Record {
     /// Input at the start of a frame: the scripts' pad words, then pad 0's state block.
     Input(Vec<u8>),
     Positions(Vec<WorkerPosition>),
+    /// The active camera's two points (the pair the player's heading comes from) at the start of a frame.
+    Camera([f32; 4], [f32; 4]),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -162,6 +164,10 @@ pub fn parse(d: &[u8]) -> Result<Vec<Record>, RecordingError> {
                 }
                 Some((Record::Positions(v), 3 + n * 23))
             })(),
+            0x0A => (|| {
+                let f = |i: usize| u32_at(at + 1 + 4 * i).map(f32::from_bits);
+                Some((Record::Camera([f(0)?, f(1)?, f(2)?, f(3)?], [f(4)?, f(5)?, f(6)?, f(7)?]), 33))
+            })(),
             t => return Err(RecordingError::UnknownRecord(t, at)),
         };
         let Some((r, n)) = rec else { break };
@@ -207,7 +213,8 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
             Record::NativeResult { .. }
             | Record::NativePoll { .. }
             | Record::Input(_)
-            | Record::Positions(_) => {}
+            | Record::Positions(_)
+            | Record::Camera(..) => {}
             Record::MapChange { target, entrance } => {
                 d.push(5);
                 d.extend(target.to_le_bytes());
@@ -235,6 +242,8 @@ pub struct EventRun {
     pub positions: Vec<Vec<WorkerPosition>>,
     /// Input recorded at the start of each frame (version 3; empty before): the scripts' pad words, then pad 0.
     pub inputs: Vec<Vec<u8>>,
+    /// The active camera's two points per frame (recordings that have them).
+    pub cameras: Vec<Option<([f32; 4], [f32; 4])>>,
 }
 
 /// Split a recording into event runs. Each frame record starts a frame (the recorder writes it when the frame
@@ -296,6 +305,15 @@ pub fn event_runs(records: &[Record]) -> Vec<EventRun> {
                         run.inputs.resize(f + 1, Vec::new());
                     }
                     run.inputs[f] = d.clone();
+                }
+            }
+            Record::Camera(a, b) => {
+                if let Some(run) = runs.last_mut() {
+                    let f = run.frames.len().saturating_sub(1);
+                    if run.cameras.len() <= f {
+                        run.cameras.resize(f + 1, None);
+                    }
+                    run.cameras[f] = Some((*a, *b));
                 }
             }
             Record::Positions(p) => {
@@ -377,6 +395,16 @@ pub fn first_divergence(expected: &[Vec<TraceEvent>], got: &[Vec<TraceEvent>]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_records_parse() {
+        let mut d = MAGIC_V3.to_vec();
+        d.push(0x0A);
+        for v in [1.0f32, 2.0, 3.0, 1.0, 4.0, 5.0, 6.0, 1.0] {
+            d.extend(v.to_le_bytes());
+        }
+        assert_eq!(parse(&d).unwrap(), vec![Record::Camera([1.0, 2.0, 3.0, 1.0], [4.0, 5.0, 6.0, 1.0])]);
+    }
 
     #[test]
     fn parses_version_3_records() {
