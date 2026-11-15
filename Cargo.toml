@@ -10,6 +10,7 @@ members = [
     "crates/audio",
     "crates/video",
     "crates/formats",
+    "crates/script",
     "xtask",
 ]
 default-members = ["crates/aerugo"]
@@ -32,6 +33,7 @@ aerugo-debug-ui = { path = "crates/debug-ui" }
 aerugo-audio = { path = "crates/audio" }
 aerugo-video = { path = "crates/video" }
 aerugo-formats = { path = "crates/formats" }
+aerugo-script = { path = "crates/script" }
 
 # external (licences checked by deny.toml)
 anyhow = "1.0"

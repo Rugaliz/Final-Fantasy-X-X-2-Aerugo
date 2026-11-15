@@ -37,8 +37,8 @@ A worker is one script entity (a character, the camera, a battle actor, a contro
 | 0x24 | `u32` | jump labels (`u32` code offsets) |
 
 A variable entry is a `u32` and a `u16` element count. The `u32` holds the element type in bits 28–31 (0 `u8`, 1
-`i8`, 2 `u16`, 3 `i16`, 4 `u32`, 5 `i32`, 6 `f32`, 7 single bytes used as flags), the storage area in bits 24–27,
-and the byte offset in that area in bits 0–23. Indexed accesses clamp the index to the element count.
+`i8`, 2 `u16`, 3 `i16`, 4 `u32`, 5 `i32`, 6 `f32`, 7 single bytes used as flags), the storage area in bits 25–27 (0 and 1 global blocks, 2–4 the worker's data areas, 5 its registers, 6 the script's shared data),
+and the byte offset in that area in bits 0–23 (bit 24 is unused). Indexed accesses clamp the index to the element count.
 
 ## Instructions
 

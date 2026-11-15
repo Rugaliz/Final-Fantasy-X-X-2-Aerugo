@@ -1,0 +1,191 @@
+//! The memory scripts address by variable descriptors: two global blocks (the first is the save image), the
+//! script's own data (worker areas 2–4 and the shared area 6) and each worker's registers (area 5).
+
+use aerugo_formats::script::{Var, VarType};
+
+/// Size of each global block.
+pub const GLOBAL_SIZE: usize = 0x1_0000;
+
+/// Where a variable's bytes are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Global(usize, usize),
+    Script(usize),
+    Registers(usize, usize),
+}
+
+/// Addresses handed to natives (`push.addr`): `area << 24 | offset`, with the worker in bits 12–23 for area 5.
+pub fn encode_address(place: Place) -> i32 {
+    match place {
+        Place::Global(b, off) => ((b as i32) << 24) | (off as i32 & 0xFF_FFFF),
+        Place::Script(off) => (6 << 24) | (off as i32 & 0xFF_FFFF),
+        Place::Registers(w, off) => (5 << 24) | ((w as i32 & 0xFFF) << 12) | (off as i32 & 0xFFF),
+    }
+}
+
+pub fn decode_address(a: i32) -> Place {
+    let off = (a & 0xFF_FFFF) as usize;
+    match (a >> 24) & 0x7 {
+        0 => Place::Global(0, off),
+        1 => Place::Global(1, off),
+        5 => Place::Registers((off >> 12) & 0xFFF, off & 0xFFF),
+        _ => Place::Script(off),
+    }
+}
+
+/// All script-visible memory of a running event.
+#[derive(Debug, Clone)]
+pub struct Memory {
+    pub global: [Vec<u8>; 2],
+    /// A writable copy of the script (data areas live inside it).
+    pub script: Vec<u8>,
+    /// Each worker's 14 registers as bytes (4 int, 10 float).
+    pub registers: Vec<[u8; 56]>,
+}
+
+impl Memory {
+    pub fn new(script: Vec<u8>, workers: usize) -> Memory {
+        Memory {
+            global: [vec![0; GLOBAL_SIZE], vec![0; GLOBAL_SIZE]],
+            script,
+            registers: vec![[0; 56]; workers],
+        }
+    }
+
+    /// The bytes of element `index` of `var` as seen by `worker` (with its data areas).
+    pub fn place(&self, var: &Var, index: i32, worker: usize, areas: [u32; 3], shared: u32) -> Place {
+        let size = var.ty.size().max(1) as usize;
+        let index = index.clamp(0, i32::from(var.count.max(1)) - 1) as usize;
+        let off = var.offset as usize + index * size;
+        match var.area {
+            0 => Place::Global(0, off),
+            1 => Place::Global(1, off),
+            2..=4 => Place::Script(areas[usize::from(var.area - 2)] as usize + off),
+            5 => Place::Registers(worker, off),
+            _ => Place::Script(shared as usize + off),
+        }
+    }
+
+    fn bytes(&mut self, p: Place, n: usize) -> Option<&mut [u8]> {
+        match p {
+            Place::Global(b, off) => self.global[b].get_mut(off..off + n),
+            Place::Script(off) => self.script.get_mut(off..off + n),
+            Place::Registers(w, off) => self.registers.get_mut(w)?.get_mut(off..off + n),
+        }
+    }
+
+    pub fn read_u32(&mut self, p: Place) -> u32 {
+        self.bytes(p, 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn write_u32(&mut self, p: Place, v: u32) {
+        if let Some(b) = self.bytes(p, 4) {
+            b.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    fn read(&mut self, p: Place, n: usize) -> u32 {
+        match self.bytes(p, n) {
+            Some(b) => b.iter().rev().fold(0u32, |acc, &x| (acc << 8) | u32::from(x)),
+            None => 0,
+        }
+    }
+
+    fn write(&mut self, p: Place, n: usize, v: u32) {
+        if let Some(b) = self.bytes(p, n) {
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (v >> (8 * i)) as u8;
+            }
+        }
+    }
+
+    /// Load as an integer (the int path of `push.var`).
+    pub fn load_int(&mut self, p: Place, ty: VarType) -> i32 {
+        match ty {
+            VarType::U8 => self.read(p, 1) as i32,
+            VarType::I8 => self.read(p, 1) as u8 as i8 as i32,
+            VarType::U16 => self.read(p, 2) as i32,
+            VarType::I16 => self.read(p, 2) as u16 as i16 as i32,
+            VarType::U32 | VarType::I32 => self.read(p, 4) as i32,
+            VarType::F32 => f32::from_bits(self.read(p, 4)) as i32,
+            VarType::Bits | VarType::Other(_) => 0,
+        }
+    }
+
+    /// Load as a float.
+    pub fn load_float(&mut self, p: Place, ty: VarType) -> f32 {
+        match ty {
+            VarType::U8 => self.read(p, 1) as f32,
+            VarType::I8 => f32::from(self.read(p, 1) as u8 as i8),
+            VarType::U16 => self.read(p, 2) as f32,
+            VarType::I16 => f32::from(self.read(p, 2) as u16 as i16),
+            // Unsigned 32-bit values convert through a signed int plus 2^32 when negative.
+            VarType::U32 => {
+                let v = self.read(p, 4) as i32;
+                if v < 0 { v as f32 + 4_294_967_296.0 } else { v as f32 }
+            }
+            VarType::I32 => self.read(p, 4) as i32 as f32,
+            VarType::F32 => f32::from_bits(self.read(p, 4)),
+            VarType::Bits | VarType::Other(_) => 0.0,
+        }
+    }
+
+    /// Store an integer; `saturate` clamps to the type's range (the `.b` store variants).
+    pub fn store_int(&mut self, p: Place, ty: VarType, v: i32, saturate: bool) {
+        let clamp = |lo: i32, hi: i32| if saturate { v.clamp(lo, hi) } else { v };
+        match ty {
+            VarType::U8 | VarType::Bits => self.write(p, 1, clamp(0, 0xFF) as u32),
+            VarType::I8 => self.write(p, 1, clamp(-0x80, 0x7F) as u32),
+            VarType::U16 => self.write(p, 2, clamp(0, 0xFFFF) as u32),
+            VarType::I16 => self.write(p, 2, clamp(-0x8000, 0x7FFF) as u32),
+            VarType::U32 | VarType::I32 => self.write(p, 4, v as u32),
+            VarType::F32 => self.write(p, 4, (v as f32).to_bits()),
+            VarType::Other(_) => {}
+        }
+    }
+
+    /// Store a float: converted to an integer first except into float variables.
+    pub fn store_float(&mut self, p: Place, ty: VarType, v: f32, saturate: bool) {
+        match ty {
+            VarType::F32 => self.write(p, 4, v.to_bits()),
+            _ => self.store_int(p, ty, v as i32, saturate),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn var(ty: VarType, area: u8, offset: u32, count: u16) -> Var {
+        Var { ty, area, offset, count }
+    }
+
+    #[test]
+    fn typed_round_trips_and_saturation() {
+        let mut m = Memory::new(vec![0; 64], 2);
+        let v = var(VarType::I8, 0, 4, 1);
+        let p = m.place(&v, 0, 0, [0; 3], 0);
+        m.store_int(p, v.ty, 300, false);
+        assert_eq!(m.load_int(p, v.ty), 44); // 300 truncated to a byte
+        m.store_int(p, v.ty, 300, true);
+        assert_eq!(m.load_int(p, v.ty), 127);
+        let f = var(VarType::F32, 6, 8, 4);
+        let p = m.place(&f, 9, 0, [0; 3], 16); // index clamps to 3
+        assert_eq!(p, Place::Script(16 + 8 + 12));
+        m.store_float(p, f.ty, 1.5, false);
+        assert_eq!(m.load_float(p, f.ty), 1.5);
+        assert_eq!(m.load_int(p, f.ty), 1);
+        let u = var(VarType::U32, 1, 0, 1);
+        let p = m.place(&u, 0, 0, [0; 3], 0);
+        m.store_int(p, u.ty, -1, false);
+        assert_eq!(m.load_float(p, u.ty), 4_294_967_295.0);
+    }
+
+    #[test]
+    fn addresses_round_trip() {
+        for p in [Place::Global(1, 0x1234), Place::Script(0x40), Place::Registers(7, 0x10)] {
+            assert_eq!(decode_address(encode_address(p)), p);
+        }
+    }
+}

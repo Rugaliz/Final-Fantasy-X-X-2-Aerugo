@@ -64,6 +64,11 @@ enum Command {
     FsbExport { bank: String, index: usize, out: PathBuf },
     /// Count vertex stream layouts, primitive and index types over all model clusters.
     ModelCensus,
+    /// Run every script for a few seconds with the implemented natives and print native coverage.
+    NativeCoverage {
+        #[arg(long, default_value_t = 120)]
+        frames: u64,
+    },
     /// Rank effects by how many model segments use them, with their main pass state.
     EffectCensus {
         /// How many effects to list.
@@ -92,6 +97,7 @@ fn main() -> Result<()> {
         }
         Command::ModelCensus => model_census(&install),
         Command::EffectCensus { top } => effect_census(&install, top),
+        Command::NativeCoverage { frames } => native_coverage(&install, frames),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
         Command::FsbCompare { filter, every, samples } => {
@@ -341,6 +347,31 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
                 println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, f.value);
             }
         }
+    }
+    Ok(())
+}
+
+fn native_coverage(install: &Install, frames: u64) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_formats::script::{self, Script};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    for (archive, game) in [(ArchiveId::Ffx, Game::Ffx), (ArchiveId::Ffx2, Game::Ffx2)] {
+        let paths: Vec<String> = vfs
+            .archives()
+            .filter(|(id, _)| *id == Some(archive))
+            .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
+            .filter(|p| script::is_script_path(p))
+            .collect();
+        let mut natives = aerugo_script::Natives::<()>::new(game);
+        for path in &paths {
+            let Ok(s) = Script::parse(&vfs.read(path)?) else { continue };
+            let mut vm = aerugo_script::Vm::new(std::sync::Arc::new(s));
+            for _ in 0..frames {
+                vm.frame(&mut natives.host(&mut ()));
+            }
+        }
+        println!("{}: {} scripts\n{}", game.name(), paths.len(), natives.coverage.report(game));
     }
     Ok(())
 }

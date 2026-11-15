@@ -3,6 +3,7 @@
 //! chunk is the script. This module reads the script header and its workers and disassembles them by following
 //! control flow from every entry point and label. See `docs/formats/script.md`.
 
+mod arity;
 mod natives;
 
 use std::collections::BTreeMap;
@@ -86,7 +87,8 @@ impl VarType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Var {
     pub ty: VarType,
-    /// Which memory the variable lives in (bits 24–27): the save image, map data, the worker's own block, ...
+    /// Which memory the variable lives in (bits 25–27): 0/1 global blocks, 2–4 the worker's data areas, 5 the
+    /// worker's registers, 6 the script's shared data.
     pub area: u8,
     pub offset: u32,
     pub count: u16,
@@ -103,6 +105,8 @@ pub struct Worker {
     pub entries: Vec<u32>,
     /// Jump-label offsets, relative to the start of the code.
     pub labels: Vec<u32>,
+    /// Offsets (from the script start) of the worker's three private data areas (variable areas 2, 3 and 4).
+    pub data_areas: [u32; 3],
 }
 
 /// A parsed script.
@@ -111,6 +115,8 @@ pub struct Script {
     data: Vec<u8>,
     code: usize,
     code_end: usize,
+    /// Offset of the data shared by all workers (variable area 6).
+    shared_data: u32,
     pub workers: Vec<Worker>,
 }
 
@@ -217,9 +223,9 @@ pub const OPS: [OpInfo; 0x7B] = [
     op("request.id.wait_start", O::None),
     op("request.id.wait_end", O::None),
     end("end"),
-    end("end.then"),
-    end("restart"),
-    end("restart.then"),
+    end("end.cancel"),
+    end("end.restart"),
+    end("end.restart.cancel"),
     op("sync", O::None),
     BAD,
     BAD,
@@ -240,7 +246,7 @@ pub const OPS: [OpInfo; 0x7B] = [
     op("request.wait_end.51", O::None),
     op("request.wait_end.52", O::None),
     op("request.wait_end.53", O::None),
-    end("end.main"),
+    end("end.cancel0"),
     jump("pop.ar.jump", true),
     jump("pop.ar.jump.if", false),
     jump("pop.ar.jump.unless", false),
@@ -344,7 +350,23 @@ impl Script {
                 return Err(ScriptError::NotAScript);
             }
         }
-        Ok(Script { data: d.to_vec(), code, code_end, workers })
+        let shared_data = u32_at(d, 0x20)?;
+        Ok(Script { data: d.to_vec(), code, code_end, shared_data, workers })
+    }
+
+    /// The script's bytes, from its header (offsets in the script are relative to this).
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Offset of the code from the script start.
+    pub fn code_start(&self) -> u32 {
+        self.code as u32
+    }
+
+    /// Offset of the data shared by all workers.
+    pub fn shared_data(&self) -> u32 {
+        self.shared_data
     }
 
     /// Size of the code in bytes.
@@ -473,13 +495,15 @@ fn read_worker(d: &[u8], at: usize) -> Result<Worker> {
             let word = u32_at(d, vars_at + 8 * i)?;
             Ok(Var {
                 ty: VarType::from_nibble((word >> 28) as u8),
-                area: ((word >> 24) & 0xF) as u8,
+                area: ((word >> 25) & 0x7) as u8,
                 offset: word & 0x00FF_FFFF,
                 count: u16_at(d, vars_at + 8 * i + 4)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let data_areas = [u32_at(d, at + 0x28)?, u32_at(d, at + 0x2C)?, u32_at(d, at + 0x30)?];
     Ok(Worker {
+        data_areas,
         kind,
         vars,
         ints: table(0x18, n_ints)?.into_iter().map(|v| v as i32).collect(),
@@ -567,6 +591,18 @@ pub fn native(game: Game, id: u16) -> Native {
     Native { info, group: native_group(game, id) }
 }
 
+/// How many ints and floats a native takes and what it returns, for every native of the game.
+pub fn arity(game: Game, id: u16) -> Option<(u8, u8, Ret)> {
+    let table = match game {
+        Game::Ffx => arity::FFX,
+        Game::Ffx2 => arity::FFX2,
+    };
+    table.binary_search_by_key(&id, |a| a.0).ok().map(|i| {
+        let (_, ints, floats, ret) = table[i];
+        (ints, floats, [Ret::None, Ret::Int, Ret::Float][usize::from(ret.min(2))])
+    })
+}
+
 /// All named natives of a game.
 pub fn named_natives(game: Game) -> &'static [NativeInfo] {
     match game {
@@ -640,7 +676,7 @@ mod tests {
         let s = Script::parse(&sample()).unwrap();
         assert_eq!(s.workers.len(), 1);
         let w = &s.workers[0];
-        assert_eq!(w.vars[0], Var { ty: VarType::F32, area: 1, offset: 0x10, count: 3 });
+        assert_eq!(w.vars[0], Var { ty: VarType::F32, area: 0, offset: 0x10, count: 3 });
         let pcs: Vec<u32> = s.walk(0).iter().map(|i| i.pc).collect();
         // The call at 6 is skipped by the jump; label 0 at 9 is reached.
         assert_eq!(pcs, vec![0, 3, 9]);
