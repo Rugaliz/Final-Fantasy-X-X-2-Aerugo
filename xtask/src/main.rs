@@ -510,6 +510,9 @@ fn oracle_arity(dir: &std::path::Path) -> Result<()> {
     for (id, counts) in &measured {
         let table = arity(Game::Ffx, *id).map(|(i, f, _)| i32::from(i) + i32::from(f));
         let best = counts.iter().max_by_key(|(_, n)| **n).map(|(c, _)| *c);
+        if std::env::var_os("ARITY_ALL").is_some() {
+            println!("all {id:04x} {counts:?}");
+        }
         if table == best && counts.len() == 1 {
             agree += 1;
         } else {

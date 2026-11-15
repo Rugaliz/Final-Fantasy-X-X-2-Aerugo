@@ -772,7 +772,8 @@ fn register(n: &mut Natives<FieldState>) {
         }),
     );
     n.register(0x0084, message_wait());
-    n.register(0x007C, message_wait());
+    // The other wait takes only the window.
+    n.register(0x007C, Native { init: Some(|_, c| c.scratch[0] = window(c) as i32), ..message_wait() });
     // Window state queries: done when closed or fully shown; the raw state.
     n.register(
         0x008F,
