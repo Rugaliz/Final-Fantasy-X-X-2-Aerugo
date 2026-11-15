@@ -67,6 +67,11 @@ pub struct FieldView {
     last_stick: [f32; 2],
     /// Heading of the camera drawn last (the stick is relative to it).
     camera_heading: Option<f32>,
+    /// Draw between the last two ticks (smooth above 30 Hz); the share of the next tick elapsed.
+    interpolate: bool,
+    alpha: f32,
+    /// What was on screen at the tick before the current one.
+    prev_view: Option<View>,
     orbit: OrbitCamera,
     follow_player: bool,
     camera_mode: CameraMode,
@@ -108,6 +113,9 @@ impl FieldView {
             alt: false,
             last_stick: [0.0, 0.0],
             camera_heading: None,
+            interpolate: true,
+            alpha: 1.0,
+            prev_view: None,
             orbit: OrbitCamera::framing(Vec3::splat(-100.0), Vec3::splat(100.0)),
             follow_player: true,
             camera_mode: CameraMode::Follow,
@@ -250,11 +258,17 @@ impl FieldView {
         let elapsed = self.last.map_or(std::time::Duration::ZERO, |t| now - t);
         self.last = Some(now);
         let steps = if self.paused {
+            self.alpha = 1.0;
             u32::from(std::mem::take(&mut self.step_once))
         } else {
-            self.clock.advance(elapsed).ticks
+            let s = self.clock.advance(elapsed);
+            self.alpha = s.alpha;
+            s.ticks
         };
         for _ in 0..steps {
+            if let Some(s) = &self.session {
+                self.prev_view = Some(View::of(&s.event.state));
+            }
             let stick_pressed = stick != [0.0, 0.0] && self.last_stick == [0.0, 0.0];
             self.last_stick = stick;
             let input = Input {
@@ -341,6 +355,8 @@ impl FieldView {
     fn info_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.paused, "Pause");
+            ui.checkbox(&mut self.interpolate, "Smooth")
+                .on_hover_text("Draw between the last two 30 Hz ticks (the simulation is unchanged)");
             if ui.button("Step").clicked() {
                 self.paused = true;
                 self.step_once = true;
@@ -574,7 +590,12 @@ impl FieldView {
             Some((policy(camera_view_proj(&cams[i], d, Some(f)), d), w[10].atan2(-w[8])))
         });
         // The heading the stick is relative to: where the drawn camera looks, on the ground plane.
-        self.camera_heading = match (self.camera_mode, st.camera.position, st.camera.focus, map_camera) {
+        // Between the last two ticks: positions, headings and the camera blend by the share of the next tick
+        // elapsed, except across jumps (teleports, camera cuts, new actors).
+        let alpha = if self.interpolate { self.alpha } else { 1.0 };
+        let view = View::of(st).blended_from(self.prev_view.as_ref(), alpha);
+        let (cam_eye, cam_focus) = (view.eye, view.focus);
+        self.camera_heading = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {
                 Some((focus[2] - eye[2]).atan2(focus[0] - eye[0]))
             }
@@ -585,7 +606,7 @@ impl FieldView {
             }
         };
         let map_camera = map_camera.map(|(vp, _)| vp);
-        let view_proj = match (self.camera_mode, st.camera.position, st.camera.focus, map_camera) {
+        let view_proj = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {
                 let r = game_to_view();
                 let (eye, focus) =
@@ -651,7 +672,8 @@ impl FieldView {
         for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible) {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
                 // Y points down in the map, so a turn about Y is negated to look right after the viewer's flip.
-                let place = Mat4::from_translation(Vec3::from(a.pos)) * Mat4::from_rotation_y(-a.yaw);
+                let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
+                let place = Mat4::from_translation(Vec3::from(pos)) * Mat4::from_rotation_y(-yaw);
                 let pose = a
                     .model
                     .and_then(|id| s.motions.get(&id))
@@ -699,5 +721,66 @@ impl FieldView {
                 });
             });
         }
+    }
+}
+
+/// What the field shows at one tick: each actor's position and heading, and the camera.
+#[derive(Debug, Clone, Default)]
+struct View {
+    actors: Vec<([f32; 3], f32)>,
+    eye: Option<[f32; 3]>,
+    focus: Option<[f32; 3]>,
+}
+
+/// Moves longer than these in one tick are jumps (teleports, camera cuts) and are not blended.
+const ACTOR_JUMP: f32 = 30.0;
+const CAMERA_JUMP: f32 = 60.0;
+
+impl View {
+    fn of(st: &aerugo_sim::field::FieldState) -> View {
+        View {
+            actors: st.actors.iter().map(|a| (a.pos, a.yaw)).collect(),
+            eye: st.camera.position,
+            focus: st.camera.focus,
+        }
+    }
+
+    /// This view drawn `alpha` of the way from `prev` (1: as it is).
+    fn blended_from(mut self, prev: Option<&View>, alpha: f32) -> View {
+        let Some(prev) = prev.filter(|_| alpha < 1.0) else { return self };
+        let mix = |a: [f32; 3], b: [f32; 3], jump: f32| {
+            let d = (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f32>().sqrt();
+            if d > jump { b } else { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * alpha) }
+        };
+        for (cur, old) in self.actors.iter_mut().zip(&prev.actors) {
+            let turn = aerugo_script::natives::wrap_angle(cur.1 - old.1);
+            *cur = (mix(old.0, cur.0, ACTOR_JUMP), old.1 + turn * alpha);
+        }
+        if let (Some(a), Some(b)) = (prev.eye, self.eye) {
+            self.eye = Some(mix(a, b, CAMERA_JUMP));
+        }
+        if let (Some(a), Some(b)) = (prev.focus, self.focus) {
+            self.focus = Some(mix(a, b, CAMERA_JUMP));
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn views_blend_but_not_across_jumps() {
+        let prev = View { actors: vec![([0.0; 3], 0.0), ([0.0; 3], 0.0)], eye: Some([0.0; 3]), focus: None };
+        let cur = View {
+            actors: vec![([2.0, 0.0, 0.0], 1.0), ([100.0, 0.0, 0.0], 0.0)],
+            eye: Some([10.0, 0.0, 0.0]),
+            focus: None,
+        };
+        let v = cur.blended_from(Some(&prev), 0.25);
+        assert_eq!(v.actors[0], ([0.5, 0.0, 0.0], 0.25));
+        assert_eq!(v.actors[1].0, [100.0, 0.0, 0.0]);
+        assert_eq!(v.eye, Some([2.5, 0.0, 0.0]));
     }
 }
