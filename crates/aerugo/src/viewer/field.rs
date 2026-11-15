@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use aerugo_debug_ui::egui;
 use aerugo_formats::Game;
+use aerugo_formats::motion::{Motion, fit_translation_scale, ps2_joint};
 use aerugo_formats::phyre::Cluster;
 use aerugo_gfx::{Draw, Renderer, SceneView};
 use aerugo_script::Wait;
@@ -17,7 +18,7 @@ use aerugo_vfs::{Language, Vfs};
 use glam::{Mat4, Vec3};
 
 use super::filelist::FileList;
-use super::models::{OrbitCamera, game_to_view};
+use super::models::{OrbitCamera, game_to_view, load_motions};
 use crate::assets::{GpuModel, load_model};
 
 struct Session {
@@ -26,6 +27,10 @@ struct Session {
     layers: Option<GpuModel>,
     /// Character models by model id (None when missing).
     actors: HashMap<u16, Option<GpuModel>>,
+    /// PS2 motions of each character model.
+    motions: HashMap<u16, Vec<Motion>>,
+    /// Per worker: motion index, time in frames, translation scale.
+    anim: HashMap<usize, (usize, f32, f32)>,
     notes: Vec<String>,
 }
 
@@ -127,7 +132,15 @@ impl FieldView {
         if let Some(m) = &map {
             self.orbit = OrbitCamera::framing(m.min, m.max);
         }
-        self.session = Some(Session { event, map, layers, actors: HashMap::new(), notes });
+        self.session = Some(Session {
+            event,
+            map,
+            layers,
+            actors: HashMap::new(),
+            motions: HashMap::new(),
+            anim: HashMap::new(),
+            notes,
+        });
         self.last = None;
         self.clock.reset();
     }
@@ -286,9 +299,42 @@ impl FieldView {
             if let Some(id) = a.model
                 && !s.actors.contains_key(&id)
             {
-                let m = a.model_path(s.event.game).and_then(|p| load_model(vfs, renderer, &p).ok());
+                let path = a.model_path(s.event.game);
+                let m = path.as_ref().and_then(|p| load_model(vfs, renderer, p).ok());
                 s.actors.insert(id, m);
+                s.motions.insert(
+                    id,
+                    path.map(|p| load_motions(vfs, &p).into_iter().map(|(_, m)| m).collect())
+                        .unwrap_or_default(),
+                );
             }
+        }
+        // Advance each body's motion: the one the script asked for when it exists, else the first (idle).
+        let dt = if self.paused { 0.0 } else { ui.input(|i| i.stable_dt).min(0.1) };
+        for (w, a) in s.event.state.actors.iter().enumerate() {
+            let (Some(id), Some(Some(model))) = (a.model, a.model.and_then(|id| s.actors.get(&id))) else {
+                continue;
+            };
+            let Some(motions) = s.motions.get(&id).filter(|m| !m.is_empty()) else { continue };
+            let want = a
+                .motion
+                .and_then(|m| usize::try_from(m & 0xFFF).ok())
+                .filter(|&m| m < motions.len())
+                .unwrap_or(0);
+            let entry = s.anim.entry(w).or_insert((usize::MAX, 0.0, 1.0));
+            if entry.0 != want {
+                let scale = model
+                    .meshes
+                    .iter()
+                    .filter_map(|m| m.skeleton.as_ref())
+                    .max_by_key(|sk| sk.len())
+                    .map_or(1.0, |sk| fit_translation_scale(&sk.names, &sk.default_pose, &motions[want]));
+                *entry = (want, 0.0, scale);
+            }
+            let motion = &motions[want];
+            let rate = f32::from(motion.rate.max(1)) / f32::from(0x1E00u16);
+            let last = (motion.frames.max(1) as f32 - 1.0).max(1.0);
+            entry.1 = (entry.1 + dt * 30.0 * rate) % last;
         }
         let size = ui.available_size();
         let ppp = ui.ctx().pixels_per_point();
@@ -324,47 +370,61 @@ impl FieldView {
         };
         let mut draws = Vec::new();
         let mut joints = Vec::new();
-        let mut add = |m: &GpuModel, place: Mat4, joints: &mut Vec<[f32; 16]>| {
-            for mesh in &m.meshes {
-                match (&mesh.skeleton, mesh.skinned) {
-                    (Some(sk), true) => {
-                        let world = sk.world(&sk.default_pose);
-                        for (pi, &si) in mesh.part_segments.iter().enumerate() {
-                            let seg = &m.model.meshes[mesh.source].segments[si];
-                            let base = joints.len() as u32;
-                            joints.extend(sk.palette(&world, seg));
-                            draws.push(Draw {
-                                mesh: mesh.mesh,
-                                model: (place * mesh.world).to_cols_array(),
-                                joint_base: Some(base),
-                                lit: true,
-                                part: Some(pi),
-                            });
+        let mut add =
+            |m: &GpuModel, place: Mat4, pose: Option<(&Motion, f32, f32)>, joints: &mut Vec<[f32; 16]>| {
+                for mesh in &m.meshes {
+                    match (&mesh.skeleton, mesh.skinned) {
+                        (Some(sk), true) => {
+                            let mut local = sk.default_pose.clone();
+                            if let Some((motion, time, scale)) = pose {
+                                for (i, name) in sk.names.iter().enumerate() {
+                                    if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
+                                        local[i] = motion.joint_at(j, time).matrix(scale);
+                                    }
+                                }
+                            }
+                            let world = sk.world(&local);
+                            for (pi, &si) in mesh.part_segments.iter().enumerate() {
+                                let seg = &m.model.meshes[mesh.source].segments[si];
+                                let base = joints.len() as u32;
+                                joints.extend(sk.palette(&world, seg));
+                                draws.push(Draw {
+                                    mesh: mesh.mesh,
+                                    model: (place * mesh.world).to_cols_array(),
+                                    joint_base: Some(base),
+                                    lit: true,
+                                    part: Some(pi),
+                                });
+                            }
                         }
+                        _ => draws.push(Draw {
+                            mesh: mesh.mesh,
+                            model: (place * mesh.world).to_cols_array(),
+                            joint_base: None,
+                            lit: false,
+                            part: None,
+                        }),
                     }
-                    _ => draws.push(Draw {
-                        mesh: mesh.mesh,
-                        model: (place * mesh.world).to_cols_array(),
-                        joint_base: None,
-                        lit: false,
-                        part: None,
-                    }),
                 }
-            }
-        };
+            };
         if let Some(m) = &s.map {
-            add(m, Mat4::IDENTITY, &mut joints);
+            add(m, Mat4::IDENTITY, None, &mut joints);
         }
         if self.show_layers
             && let Some(m) = &s.layers
         {
-            add(m, Mat4::IDENTITY, &mut joints);
+            add(m, Mat4::IDENTITY, None, &mut joints);
         }
-        for a in st.actors.iter().filter(|a| a.visible) {
+        for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible) {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
                 // Y points down in the map, so a turn about Y is negated to look right after the viewer's flip.
                 let place = Mat4::from_translation(Vec3::from(a.pos)) * Mat4::from_rotation_y(-a.yaw);
-                add(m, place, &mut joints);
+                let pose = a
+                    .model
+                    .and_then(|id| s.motions.get(&id))
+                    .zip(s.anim.get(&w))
+                    .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
+                add(m, place, pose, &mut joints);
             }
         }
         renderer.submit_scene(SceneView {

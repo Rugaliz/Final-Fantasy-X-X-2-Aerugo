@@ -26,6 +26,10 @@ pub struct Actor {
     pub visible: bool,
     /// Motion id requested by the script (played by the renderer when it has the motion).
     pub motion: Option<i32>,
+    /// Four values scripts keep per worker.
+    pub params: [i32; 4],
+    /// Flag bits scripts set and clear per worker.
+    pub flags: u32,
     move_target: [f32; 3],
     move_speed: [f32; 2],
     moving: Option<Movement>,
@@ -42,6 +46,8 @@ impl Default for Actor {
             yaw: 0.0,
             visible: true,
             motion: None,
+            params: [0; 4],
+            flags: 0,
             move_target: [0.0; 3],
             move_speed: [0.0; 2],
             moving: None,
@@ -118,6 +124,24 @@ pub struct Input {
     pub cancel: bool,
 }
 
+/// The script random number stream: a multiply / xor generator with a 16-bit rotate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rng {
+    pub state: u32,
+}
+
+impl Rng {
+    const MUL: u32 = 0x0EBB_6BD7;
+    const XOR: u32 = 0x2BA9;
+
+    pub fn next_value(&mut self) -> u32 {
+        let s = Self::MUL.wrapping_mul(self.state) ^ Self::XOR;
+        let s = (((s as i32) >> 16) as u32).wrapping_add(s << 16);
+        self.state = s;
+        s & 0x7FFF_FFFF
+    }
+}
+
 /// Everything natives act on.
 #[derive(Debug, Clone, Default)]
 pub struct FieldState {
@@ -132,6 +156,7 @@ pub struct FieldState {
     pub ground: Option<Ground>,
     /// A map change the scripts asked for (event jump), for the session to carry out.
     pub jump: Option<i32>,
+    pub rng: Rng,
 }
 
 impl PartyLookup for FieldState {
@@ -381,6 +406,79 @@ fn register(n: &mut Natives<FieldState>) {
     n.register(0x0038, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[0])));
     n.register(0x0039, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[1])));
     n.register(0x003A, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[2])));
+    // Motions: the motion a body plays (the renderer picks it from the body's motion groups).
+    for id in [0x501Bu16, 0x5040] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let m = c.stack.pop_int();
+                g.actor(c.worker).motion = Some(m);
+                Value::Int(0)
+            }),
+        );
+    }
+    n.register(
+        0x5047,
+        Native::result(|g, c| {
+            let m = c.stack.pop_int();
+            let w = target(c);
+            g.actor(w).motion = Some(m);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5025,
+        Native::result(|g, c| {
+            let _b = c.stack.pop_int();
+            let m = c.stack.pop_int();
+            g.actor(c.worker).motion = Some(m);
+            Value::Int(0)
+        }),
+    );
+    // Per-worker values and flags.
+    n.register(
+        0x00C5,
+        Native::result(|g, c| {
+            let mut v = [0; 4];
+            for k in (0..4).rev() {
+                v[k] = c.stack.pop_int();
+            }
+            g.actor(c.worker).params = v;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x00C7,
+        Native::result(|g, c| {
+            let i = c.stack.pop_int().clamp(0, 3) as usize;
+            Value::Int(g.actor(c.worker).params[i])
+        }),
+    );
+    n.register(
+        0x0034,
+        Native::result(|g, c| {
+            let bits = c.stack.pop_int() as u32;
+            g.actor(c.worker).flags |= bits;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x0035,
+        Native::result(|g, c| {
+            let bits = c.stack.pop_int() as u32;
+            g.actor(c.worker).flags &= !bits;
+            Value::Int(0)
+        }),
+    );
+    // Random numbers from the script stream.
+    n.register(0x00A9, Native::result(|g, _| Value::Int((g.rng.next_value() & 0xFFFF) as i32)));
+    n.register(
+        0x00A6,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int().max(1);
+            Value::Int((((g.rng.next_value() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
+        }),
+    );
     // Movement: target, speed (distance per tick, or a duration), start, wait.
     n.register(
         0x0015,
@@ -546,4 +644,28 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rng_is_deterministic_and_positive() {
+        let mut a = Rng { state: 1 };
+        let mut b = Rng { state: 1 };
+        let xs: Vec<u32> = (0..100).map(|_| a.next_value()).collect();
+        assert!(xs.iter().all(|&x| x <= 0x7FFF_FFFF));
+        assert_eq!(xs, (0..100).map(|_| b.next_value()).collect::<Vec<_>>());
+        assert!(xs.windows(2).any(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn model_paths() {
+        assert_eq!(
+            model_path(Game::Ffx, 0x2023).as_deref(),
+            Some("ffx_data/gamedata/ps3data/chr/npc/n035/mdl/d3d11/n035.dae.phyre")
+        );
+        assert_eq!(model_path(Game::Ffx, 0x9000), None);
+    }
 }

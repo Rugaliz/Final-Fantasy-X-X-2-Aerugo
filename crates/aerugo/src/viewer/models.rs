@@ -484,7 +484,7 @@ impl ModelBrowser {
 }
 
 /// Every motion in the PS2 motion groups that belong to a character model.
-fn load_motions(vfs: &Vfs, model_path: &str) -> Vec<(String, aerugo_formats::motion::Motion)> {
+pub(super) fn load_motions(vfs: &Vfs, model_path: &str) -> Vec<(String, aerugo_formats::motion::Motion)> {
     use aerugo_formats::motion::{MotionGroup, motion_dir};
     let Some(dir) = motion_dir(model_path) else { return Vec::new() };
     let mut paths: Vec<String> = vfs
