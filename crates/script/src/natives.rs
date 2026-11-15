@@ -118,6 +118,12 @@ impl<G> Natives<G> {
         self.table.insert(id, native);
     }
 
+    /// Drop a native (comparisons replay the original's results for natives whose timing is the player's, such
+    /// as menus).
+    pub fn remove(&mut self, id: u16) {
+        self.table.remove(&id);
+    }
+
     pub fn implemented(&self, id: u16) -> bool {
         self.table.contains_key(&id)
     }

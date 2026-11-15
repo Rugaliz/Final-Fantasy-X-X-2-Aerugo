@@ -41,8 +41,11 @@ pub struct Actor {
     pub radius: Option<f32>,
     /// Another character walked into this one last tick.
     bumped: bool,
-    /// A motion played over a frame range: motion id, first frame, last frame (−1: its end), ticks played.
-    pub motion_play: Option<(i32, i32, i32, u32)>,
+    /// The motion playing: motion id, first frame, last frame (−1: its end), ticks played, loops left (0xFF:
+    /// for ever).
+    pub motion_play: Option<(i32, i32, i32, u32, u8)>,
+    /// Motion speed (0x100 normal).
+    pub motion_speed: u16,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
     /// Move state per script level: a level's move waits while a higher level runs.
@@ -69,6 +72,7 @@ impl Default for Actor {
             radius: None,
             bumped: false,
             motion_play: None,
+            motion_speed: 0x100,
             level: 0,
             moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
@@ -231,6 +235,11 @@ pub struct Window {
     pub stops: Vec<usize>,
     /// Flags a script set for the window; 0x1000 shows the text at once.
     pub flags: u16,
+    /// Opened to show its text at once (choice windows).
+    pub instant: bool,
+    /// The choice highlighted when the window opens, and the one cancel picks.
+    pub first_choice: u8,
+    pub cancel_choice: u8,
 }
 
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
@@ -415,6 +424,8 @@ pub struct FieldState {
     pub camera: CameraState,
     /// The event's messages, decoded.
     pub messages: Vec<Message>,
+    /// Item, treasure and equipment tables (FFX).
+    pub items: Option<Arc<crate::items::ItemTables>>,
     pub input: Input,
     /// Worker the player controls.
     pub player: Option<usize>,
@@ -437,8 +448,33 @@ pub struct FieldState {
     /// The talk started this tick, while workers offer themselves.
     pub talk: Option<Talk>,
     pub control: PlayerControl,
-    /// Frame counts of each model's motions (in motion-group order), as the host loads them.
-    pub motion_frames: std::collections::HashMap<u16, Vec<u32>>,
+    /// Frame counts of each model's motions by motion number, as the host loads them.
+    pub motion_frames: std::collections::HashMap<u16, std::collections::HashMap<u16, u32>>,
+    /// Movie files by number (the game's video list).
+    pub videos: std::collections::HashMap<u32, String>,
+    /// The movie playing, if any.
+    pub movie: Option<Movie>,
+    /// A menu the scripts asked for (save, shop, name entry, ... by mode) and whether it is open; scripts stop
+    /// while it is open. The result scripts read afterwards.
+    pub menu: Option<MenuRequest>,
+    pub menu_result: i32,
+    /// The screen fade: 0 clear, 1 black, moving towards `fade_target` by `fade_step` a tick.
+    pub fade: f32,
+    pub fade_target: f32,
+    pub fade_step: f32,
+    /// Encounter areas (btl.bin), the walking counters, battle random streams, an area scripts set in place
+    /// of the save image's, and encounters switched off by the host.
+    pub encounters: Option<Arc<crate::encounter::EncounterTable>>,
+    pub encounter_counters: crate::encounter::Counters,
+    pub battle_random: crate::encounter::BattleRandom,
+    pub encounter_area: i32,
+    pub encounters_off: bool,
+    /// A battle about to start or running (scripts hold while it runs), and whether it has started.
+    pub battle: Option<(crate::encounter::Battle, bool)>,
+    /// The shop price rate in percent, when scripts changed it from 100.
+    pub shop_rate: Option<i32>,
+    /// A switch scripts turn off around menus they open (0241).
+    pub menu_switch_off: bool,
     /// Each worker's three data areas in the script (for natives that take tables there).
     pub data_areas: Vec<[u32; 3]>,
     /// The event's entrance records (the save image says which one the party arrived by).
@@ -579,22 +615,26 @@ impl FieldState {
         &mut self.actors[w]
     }
 
-    /// Ticks still to play of an actor's ranged motion (0 when none or unknown).
+    /// Whether an actor's motion still plays (a looping one always does; one with an unknown length does not).
     #[allow(dead_code)]
-    fn motion_left(&self, a: &Actor) -> u32 {
-        let Some((motion, start, end, done)) = a.motion_play else { return 0 };
-        let total = if end >= 0 {
+    fn motion_playing(&self, a: &Actor) -> bool {
+        let Some((motion, start, end, done, loops)) = a.motion_play else { return false };
+        if loops != 0 {
+            return true;
+        }
+        let frames = if end >= 0 {
             (end - start).max(0) as u32
         } else {
             let len = a
                 .model
                 .and_then(|m| self.motion_frames.get(&m))
-                .and_then(|f| f.get((motion & 0xFFF) as usize))
+                .and_then(|f| f.get(&(motion as u32 as u16)))
                 .copied()
                 .unwrap_or(0);
             len.saturating_sub(start.max(0) as u32)
         };
-        total.saturating_sub(done)
+        let ticks = frames * 0x100 / u32::from(a.motion_speed.max(1));
+        done < ticks
     }
 
     /// Advance movements and turns by one tick, then player control.
@@ -602,6 +642,21 @@ impl FieldState {
         for a in &mut self.actors {
             if let Some(p) = &mut a.motion_play {
                 p.3 += 1;
+            }
+        }
+        if self.fade != self.fade_target {
+            let d = self.fade_target - self.fade;
+            self.fade = if d.abs() <= self.fade_step {
+                self.fade_target
+            } else {
+                self.fade + self.fade_step * d.signum()
+            };
+        }
+        if let Some(m) = self.movie.as_mut().filter(|m| m.playing) {
+            m.elapsed += 1;
+            if let Some(f) = m.frames.filter(|&f| !m.looping && m.elapsed > f) {
+                m.elapsed = f;
+                m.playing = false;
             }
         }
         self.camera.update();
@@ -628,7 +683,11 @@ impl FieldState {
                 }
                 continue;
             }
-            w.shown = if w.flags & WINDOW_INSTANT != 0 { stop } else { (w.shown + TEXT_SPEED).min(stop) };
+            w.shown = if w.instant || w.flags & WINDOW_INSTANT != 0 {
+                stop
+            } else {
+                (w.shown + TEXT_SPEED).min(stop)
+            };
         }
         for a in &mut self.actors {
             a.advance_move(self.ground.as_ref());
@@ -751,10 +810,10 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
         .collect()
 }
 
-/// Frame counts of a model's motions, in the order of its motion groups (by file name) and their entries.
-pub fn motion_frames(vfs: &Vfs, model_path: &str) -> Vec<u32> {
+/// Frame counts of a model's motions by motion number (each group entry's first motion record).
+pub fn motion_frames(vfs: &Vfs, model_path: &str) -> std::collections::HashMap<u16, u32> {
     use aerugo_formats::motion::{MotionGroup, motion_dir};
-    let Some(dir) = motion_dir(model_path) else { return Vec::new() };
+    let Some(dir) = motion_dir(model_path) else { return Default::default() };
     let mut paths: Vec<String> = vfs
         .archives()
         .flat_map(|(_, a)| {
@@ -767,11 +826,15 @@ pub fn motion_frames(vfs: &Vfs, model_path: &str) -> Vec<u32> {
         .collect();
     paths.sort();
     paths.dedup();
-    let mut out = Vec::new();
+    let mut out = std::collections::HashMap::new();
     for path in paths {
         let Ok(bytes) = vfs.read(&path) else { continue };
         let Ok(group) = MotionGroup::parse(&bytes) else { continue };
-        out.extend(group.motions.iter().map(|m| u32::from(m.frames)));
+        for (&(number, _), record) in group.entries.iter().zip(&group.entry_motion) {
+            if let Some(m) = record.and_then(|r| group.motions.get(r)) {
+                out.entry(number).or_insert(u32::from(m.frames));
+            }
+        }
     }
     out
 }
@@ -782,6 +845,60 @@ pub fn walk_mesh_path(map_model: &str) -> Option<String> {
     let mut parts = rest.split('/');
     let (area, map) = (parts.next()?, parts.next()?);
     Some(format!("ffx_ps2/ffx/master/jppc/map/{area}/{map}/bin/mapout.vpa"))
+}
+
+/// A menu request: the mode (0x40200000 save, 0x40100000 load, 0x4002_00nn item shop nn, 0x4004_00nn
+/// weapon shop nn, 0x4001_xxxx name entry, ...) and whether the host has opened it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuRequest {
+    pub mode: u32,
+    pub open: bool,
+}
+
+pub mod menu_mode {
+    pub const SAVE: u32 = 0x4020_0000;
+    pub const LOAD: u32 = 0x4010_0000;
+    pub const ITEM_SHOP: u32 = 0x4002_0000;
+    pub const WEAPON_SHOP: u32 = 0x4004_0000;
+    pub const NAME_ENTRY: u32 = 0x4001_0000;
+    /// The kind of a mode (its high half).
+    pub fn kind(mode: u32) -> u32 {
+        mode & 0xFFFF_0000
+    }
+}
+
+/// A movie the scripts opened: its number and file, whether it plays (and loops), video frames shown so far
+/// (one per tick while playing), and its length in frames once the host has read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Movie {
+    pub number: u32,
+    pub path: Option<String>,
+    pub playing: bool,
+    pub looping: bool,
+    pub elapsed: u32,
+    pub frames: Option<u32>,
+}
+
+/// Open a movie (pops flags, then the number): paused unless `playing`; flag 0x2000 loops it.
+fn open_movie(g: &mut FieldState, c: &mut NativeCall<'_>, playing: bool) {
+    let flags = c.stack.pop_int();
+    let number = c.stack.pop_int().max(0) as u32;
+    let path = g.videos.get(&number).cloned();
+    let looping = flags & 0x2000 != 0;
+    // A movie missing from the list counts as already over.
+    let frames = if path.is_none() { Some(0) } else { None };
+    g.movie = Some(Movie { number, path, playing, looping, elapsed: u32::from(playing), frames });
+}
+
+/// The game's video list (`N:,file,file` lines) as movie number → file name.
+pub fn parse_video_list(text: &str) -> std::collections::HashMap<u32, String> {
+    text.lines()
+        .filter_map(|l| {
+            let (n, rest) = l.split_once(':')?;
+            let file = rest.trim_start_matches(',').split(',').next()?.trim();
+            Some((n.trim().parse().ok()?, file.to_owned()))
+        })
+        .collect()
 }
 
 /// Name code: the character's name (argument 0x30 + character id).
@@ -859,6 +976,22 @@ impl Event {
             state.messages = decode_event_text(&bytes, &cs);
         }
         let (map_model, map_layers) = map_paths(vfs, game, &name);
+        if game == Game::Ffx {
+            state.items = crate::items::ItemTables::load(vfs, lang);
+            state.encounters = vfs
+                .read("ffx_ps2/ffx/master/jppc/battle/kernel/btl.bin")
+                .ok()
+                .and_then(|d| crate::encounter::EncounterTable::parse(&d))
+                .map(Arc::new);
+        }
+        // The video list (movie numbers to files).
+        let region = if lang == Language::Japanese { "jp" } else { "us" };
+        if let Ok(list) = vfs.read(&format!("ffx_data/gamedata/ps3data/video/{region}/ffx_videolist.txt")) {
+            state.videos = parse_video_list(&String::from_utf8_lossy(&list))
+                .into_iter()
+                .map(|(n, f)| (n, format!("ffx_data/gamedata/ps3data/video/{}", f.to_lowercase())))
+                .collect();
+        }
         // The walk mesh from the PS2 map package next to the drawn map.
         if let Some(vpa) = map_model.as_deref().and_then(walk_mesh_path) {
             state.ground = vfs.read(&vpa).ok().and_then(|d| Ground::from_walk_mesh(&d));
@@ -894,10 +1027,106 @@ impl Event {
         if let Some(pos) = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos) {
             self.state.player_prev = self.state.player_start.replace(pos).unwrap_or(pos);
         }
+        // A battle starts at the start of the next frame and holds the field's scripts until the host ends it
+        // (the original runs the battle's own script meanwhile; one field worker keeps going for the first four
+        // frames, which is not modelled).
+        if let Some((_, started)) = &mut self.state.battle {
+            *started = true;
+            return;
+        }
+        // A requested menu opens at the start of the next frame and holds the scripts until the host closes it.
+        if let Some(m) = &mut self.state.menu {
+            if !m.open {
+                m.open = true;
+                self.state.menu_result = 0;
+            }
+            return;
+        }
         self.state.begin_talk();
+        let before = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
+        self.walk_encounters(before);
         self.tick += 1;
+    }
+
+    /// Stop the playing movie (the player skipped it); scripts waiting for its end go on.
+    pub fn skip_movie(&mut self) {
+        if let Some(m) = &mut self.state.movie {
+            m.playing = false;
+        }
+    }
+
+    /// Random encounters: the player's walk this tick, when the area allows them (save image byte 0x13 bits 1–2,
+    /// the area id at 4 or the one scripts set, the group at 0x10).
+    fn walk_encounters(&mut self, before: Option<[f32; 3]>) {
+        let s = &mut self.state;
+        let image = &self.vm.memory.global[0];
+        if s.battle.is_some()
+            || s.encounters_off
+            || !s.user_control
+            || image.len() < 0x14
+            || image[0x13] & 6 == 0
+        {
+            return;
+        }
+        let (Some(table), Some(before), Some(after)) =
+            (s.encounters.clone(), before, s.player.and_then(|p| s.actors.get(p)).map(|a| a.pos))
+        else {
+            return;
+        };
+        let id = if s.encounter_area > 0 {
+            s.encounter_area
+        } else {
+            i32::from(u16::from_le_bytes([image[4], image[5]]))
+        };
+        let Some(area) = table.area(id) else { return };
+        let distance = before.iter().zip(after).map(|(a, b)| (b - a) * (b - a)).sum::<f32>().sqrt();
+        let random = &mut s.battle_random;
+        if let Some(b) =
+            s.encounter_counters.walk(&table, area, usize::from(image[0x10]), distance, |k| random.next(k))
+        {
+            s.battle = Some((b, false));
+        }
+    }
+
+    /// The battle the scripts are waiting on, once started.
+    pub fn running_battle(&self) -> Option<crate::encounter::Battle> {
+        self.state.battle.filter(|b| b.1).map(|b| b.0)
+    }
+
+    /// The name of a battle's scene ("area name" and formation, as the battle files are named).
+    pub fn battle_name(&self, b: &crate::encounter::Battle) -> String {
+        let area =
+            self.state.encounters.as_ref().and_then(|t| t.areas.get(b.area)).map_or("?", |a| a.name.as_str());
+        format!("{area}_{:02}", b.formation_id)
+    }
+
+    /// End the running battle (won); scripts go on with the next tick.
+    pub fn finish_battle(&mut self) {
+        self.state.battle = None;
+        self.state.encounter_counters = Default::default();
+    }
+
+    /// The menu the scripts are waiting on (its mode), once open.
+    pub fn open_menu(&self) -> Option<u32> {
+        self.state.menu.filter(|m| m.open).map(|m| m.mode)
+    }
+
+    /// Close the open menu; scripts go on with the next tick.
+    pub fn close_menu(&mut self) {
+        self.state.menu = None;
+    }
+
+    /// The file of a started movie whose length the host still has to give (with `set_movie_frames`).
+    pub fn movie_needing_length(&self) -> Option<&str> {
+        self.state.movie.as_ref().filter(|m| m.frames.is_none()).and_then(|m| m.path.as_deref())
+    }
+
+    pub fn set_movie_frames(&mut self, frames: u32) {
+        if let Some(m) = &mut self.state.movie {
+            m.frames = Some(frames);
+        }
     }
 
     /// Load the frame counts of the motions of models that appeared since the last call (hosts call it before each
@@ -969,6 +1198,261 @@ fn window(c: &mut NativeCall<'_>) -> usize {
     c.stack.pop_int().clamp(0, 7) as usize
 }
 
+/// Open a window on its message: the text reveal starts over.
+fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
+    let (mut reveal, mut stops) = (0, Vec::new());
+    for part in g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(&[][..], |m| &m.reveal) {
+        match *part {
+            RevealPart::Chars(n) => reveal += n,
+            RevealPart::Name(chr) => reveal += name_chars(image, chr),
+            RevealPart::Pause => stops.push(reveal),
+        }
+    }
+    let win = &mut g.windows[w];
+    win.reveal = reveal;
+    win.stops = stops;
+    win.open = true;
+    win.shown = 0;
+    win.choice = usize::from(win.first_choice);
+    win.opening = OPEN_TICKS;
+    win.closing = 0;
+    win.instant = instant;
+}
+
+/// A message made at run time (not from the event's text).
+fn runtime_message(text: &str) -> Message {
+    let tokens: Vec<text::Token> =
+        text.chars().map(|c| if c == '\n' { text::Token::LineBreak } else { text::Token::Char(c) }).collect();
+    Message { text: text.to_owned(), raw: text.to_owned(), choices: 0, reveal: reveal_parts(&tokens) }
+}
+
+/// Treasure: give treasure `index` (the item, key item, equipment or gil) into the save image. Returns whether
+/// the equipment it held did not fit.
+fn give_treasure(g: &FieldState, image: &mut [u8], index: i32) -> (crate::items::Treasure, bool) {
+    use crate::items::{Treasure, give};
+    let got = g.items.as_ref().map_or(Treasure::Gil(0), |t| t.treasure(index.max(0) as u16));
+    let full = !give(image, &got);
+    (got, full)
+}
+
+/// Menus, the save sphere's record of where the player saved, screen fades, choice windows.
+fn register_menus(n: &mut Natives<FieldState>) {
+    // Ask for a menu by mode; the call returns two ticks later (after the menu, which holds the scripts) with
+    // the menu's result.
+    n.register(
+        0x401D,
+        Native {
+            init: Some(|g, c| {
+                let mode = c.stack.pop_int() as u32;
+                g.menu = Some(MenuRequest { mode, open: false });
+                g.menu_result = -1;
+                c.scratch[0] = 1;
+            }),
+            wait: Some(|_, c| {
+                if c.scratch[0] == 0 {
+                    return WAIT_DONE;
+                }
+                c.scratch[0] -= 1;
+                0
+            }),
+            result: Some(|g, _| Value::Int(g.menu_result)),
+        },
+    );
+    // Save sphere: note its number and the place (the first 14 bytes of the save image: map, entrance, ...)
+    // that loading a save made here returns to.
+    n.register(
+        0x016F,
+        Native::result(|_, c| {
+            let number = c.stack.pop_int();
+            let image = &mut c.memory.global[0];
+            if image.len() >= 0xD0 {
+                let room = [image[0], image[1]];
+                image[0xB8..0xBA].copy_from_slice(&(number as u16).to_le_bytes());
+                image[0xBA..0xBC].copy_from_slice(&room);
+                let (words, b12, b13) = (image[0..12].to_vec(), image[12], image[13]);
+                image[0xC0..0xCC].copy_from_slice(&words);
+                image[0xCC..0xCE].copy_from_slice(&u16::from(b12).to_le_bytes());
+                image[0xCE..0xD0].copy_from_slice(&u16::from(b13).to_le_bytes());
+            }
+            Value::Int(number)
+        }),
+    );
+    // The switch scripts turn off around their menus.
+    n.register(
+        0x0241,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            g.menu_switch_off = !on;
+            Value::Int(i32::from(on))
+        }),
+    );
+    // Fade the screen in (4004) or out to black (4005) over n ticks.
+    fn fade(g: &mut FieldState, c: &mut NativeCall<'_>, target: f32) -> Value {
+        let ticks = c.stack.pop_int().max(1) as f32;
+        g.fade_target = target;
+        g.fade_step = 1.0 / ticks;
+        Value::Int(0)
+    }
+    n.register(0x4004, Native::result(|g, c| fade(g, c, 0.0)));
+    n.register(0x4005, Native::result(|g, c| fade(g, c, 1.0)));
+    // A choice window in one call (window, message, ?, ?, x, y, alignment): placed, opened, and waited on; the
+    // result is the choice.
+    n.register(
+        0x013B,
+        Native {
+            init: Some(|g, c| {
+                let _align = c.stack.pop_int();
+                let y = c.stack.pop_int();
+                let x = c.stack.pop_int();
+                let cancel = c.stack.pop_int();
+                let first = c.stack.pop_int();
+                let msg = c.stack.pop_int();
+                let w = window(c);
+                g.windows[w].first_choice = first as u8;
+                g.windows[w].cancel_choice = cancel as u8;
+                g.windows[w].message = usize::try_from(msg).ok();
+                g.windows[w].x = x;
+                g.windows[w].y = y;
+                g.windows[w].flags = 0;
+                open_window(g, &c.memory.global[0], w, true);
+                c.scratch[0] = w as i32;
+                c.scratch[1] = 0;
+            }),
+            wait: Some(choice_wait),
+            ..message_wait()
+        },
+    );
+    n.register(
+        0x007D,
+        Native {
+            init: Some(|_, c| {
+                c.scratch[0] = window(c) as i32;
+                c.scratch[1] = 0;
+            }),
+            wait: Some(choice_wait),
+            ..message_wait()
+        },
+    );
+    // Battles: a scripted battle by label (area id << 16 | formation), starting when the frame ends; the
+    // encounter area scripts set in place of the save image's (the walking counters start over); whether the
+    // save image allows encounters.
+    // (The call ends the worker's turn.)
+    n.register(
+        0x7002,
+        Native {
+            init: Some(|g, c| {
+                let _flag = c.stack.pop_int();
+                let label = c.stack.pop_int() as u32;
+                if let Some(b) = g.encounters.as_ref().and_then(|t| t.label(label)) {
+                    g.battle = Some((b, false));
+                }
+            }),
+            wait: Some(|_, _| WAIT_DONE),
+            result: None,
+        },
+    );
+    n.register(
+        0x020F,
+        Native::result(|g, c| {
+            g.encounter_area = c.stack.pop_int();
+            g.encounter_counters = Default::default();
+            let image = &c.memory.global[0];
+            let saved = image.get(4..6).map_or(0, |b| i32::from(u16::from_le_bytes([b[0], b[1]])));
+            Value::Int(if g.encounter_area > 0 { g.encounter_area } else { saved })
+        }),
+    );
+    n.register(
+        0x00E1,
+        Native::result(|_, c| {
+            Value::Int(i32::from(c.memory.global[0].get(0x13).copied().unwrap_or(0) >> 1 & 1))
+        }),
+    );
+    // Gil: receive, pay (false when there is not enough), the shops' price rate.
+    n.register(
+        0x0136,
+        Native::result(|_, c| {
+            let n = c.stack.pop_int();
+            Value::Int(i32::from(crate::items::add_gil(&mut c.memory.global[0], n)))
+        }),
+    );
+    n.register(
+        0x0137,
+        Native::result(|_, c| {
+            let n = c.stack.pop_int();
+            Value::Int(i32::from(crate::items::add_gil(&mut c.memory.global[0], -n)))
+        }),
+    );
+    n.register(
+        0x0225,
+        Native::result(|g, c| {
+            let rate = c.stack.pop_int();
+            g.shop_rate = Some(rate);
+            Value::Int(rate)
+        }),
+    );
+}
+
+fn register_treasure(n: &mut Natives<FieldState>) {
+    // Open a chest (window, treasure): give it, then show "Obtained ..." in the window and wait for the player
+    // to close it. Scratch: window, step, equipment did not fit.
+    n.register(
+        0x015B,
+        Native {
+            init: Some(|g, c| {
+                let index = c.stack.pop_int();
+                let w = window(c);
+                let image = &mut c.memory.global[0];
+                let (got, full) = give_treasure(g, image, index);
+                let variant = crate::items::text_variant(image);
+                let text = g.items.as_ref().map(|t| t.pickup_message(&got, variant)).unwrap_or_default();
+                g.messages.push(runtime_message(&text));
+                g.windows[w].message = Some(g.messages.len() - 1);
+                g.windows[w].x = 0x100;
+                g.windows[w].y = 0xD0;
+                open_window(g, image, w, false);
+                c.scratch[0] = w as i32;
+                c.scratch[1] = 0;
+                c.scratch[2] = i32::from(full);
+            }),
+            wait: Some(|g, c| match c.scratch[1] {
+                // The message, then a tick (with the "full" sound when the equipment did not fit), then done.
+                0 => {
+                    if message_wait().wait.is_some_and(|w| w(g, c) & WAIT_DONE != 0) {
+                        c.scratch[1] = 1;
+                    }
+                    0
+                }
+                1 => {
+                    c.scratch[1] = 2;
+                    0
+                }
+                _ => WAIT_DONE,
+            }),
+            result: Some(|_, _| Value::Int(1)),
+        },
+    );
+    // The same without a message (a tick's wait when the equipment did not fit).
+    n.register(
+        0x01A7,
+        Native {
+            init: Some(|g, c| {
+                let index = c.stack.pop_int();
+                let (_, full) = give_treasure(g, &mut c.memory.global[0], index);
+                c.scratch[1] = 0;
+                c.scratch[2] = i32::from(full);
+            }),
+            wait: Some(|_, c| {
+                if c.scratch[2] == 0 || c.scratch[1] == 1 {
+                    return WAIT_DONE;
+                }
+                c.scratch[1] = 1;
+                0
+            }),
+            result: Some(|_, _| Value::Int(1)),
+        },
+    );
+}
+
 /// The message wait: the init takes the window (and a flag), the wait reveals the text and closes the window on
 /// confirm (moving between choices with the stick), the result is the chosen choice.
 fn message_wait() -> Native<FieldState> {
@@ -1003,6 +1487,28 @@ fn message_wait() -> Native<FieldState> {
         }),
         result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
     }
+}
+
+/// The choice window wait (007D, 013B): like the message wait, but the window takes the choice on the tick
+/// after the press and closes then. Scratch 1: 1 once chosen.
+fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
+    let w = c.scratch[0] as usize;
+    if c.scratch[1] == 1 {
+        c.scratch[1] = 2;
+        g.windows[w].close();
+        return 0;
+    }
+    let win = &mut g.windows[w];
+    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal && (g.input.confirm || g.input.cancel) {
+        if !g.input.confirm {
+            win.choice = usize::from(win.cancel_choice);
+        }
+        c.scratch[1] = 1;
+        return 0;
+    }
+    message_wait()
+        .wait
+        .map_or(WAIT_DONE, |f| if c.scratch[1] == 0 || !g.windows[w].open { f(g, c) } else { 0 })
 }
 
 /// Workers turned off (they stop running, but keep their requests) and on again.
@@ -1236,7 +1742,10 @@ fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
 }
 
 /// Natives of the field slice: actors, movement, turning, messages, camera, worker queries.
-fn register(n: &mut Natives<FieldState>) {
+/// Register every field native Aerugo implements.
+pub fn register(n: &mut Natives<FieldState>) {
+    register_treasure(n);
+    register_menus(n);
     // Worker ids: the own id for a negative argument.
     n.register(
         0x0033,
@@ -1350,17 +1859,90 @@ fn register(n: &mut Natives<FieldState>) {
             let motion = c.stack.pop_int();
             let a = g.actor(c.worker);
             a.motion = Some(motion);
-            a.motion_play = Some((motion, start, end, 0));
+            a.motion_play = Some((motion, start, end, 0, 0));
             Value::Int(0)
         }),
     );
-    // The motion waits (0x5003, 0x501E) stay unported until every way of starting a motion keeps its timing
-    // (0x5022 and others start motions too; a wait after them lasts the motion's length): `motion_left` is
-    // what they will return.
+    // Movies. Open (number, flags): loaded paused, flag 0x2000 loops it; open and play at once (b00a).
+    n.register(
+        0xB000,
+        Native { init: Some(|g, c| open_movie(g, c, false)), ..Native::result(|_, _| Value::Int(0)) },
+    );
+    n.register(
+        0xB00A,
+        Native { init: Some(|g, c| open_movie(g, c, true)), ..Native::result(|_, _| Value::Int(0)) },
+    );
+    // Play the opened movie; its first frame shows this tick.
+    n.register(
+        0xB009,
+        Native::result(|g, _| {
+            if let Some(m) = &mut g.movie {
+                m.playing = true;
+                m.elapsed = 1;
+            }
+            Value::Int(0)
+        }),
+    );
+    // Wait for the end, then close.
+    n.register(
+        0xB001,
+        Native {
+            init: None,
+            wait: Some(|g, _| if g.movie.as_ref().is_some_and(|m| m.playing) { 0 } else { 5 }),
+            result: Some(|g, _| {
+                g.movie = None;
+                Value::Int(0)
+            }),
+        },
+    );
+    // Stop and close; force close.
+    for id in [0xB004, 0xB00B] {
+        n.register(
+            id,
+            Native::result(|g, _| {
+                g.movie = None;
+                Value::Int(0)
+            }),
+        );
+    }
+    // Frames shown so far; the movie's length.
+    n.register(0xB003, Native::result(|g, _| Value::Int(g.movie.as_ref().map_or(0, |m| m.elapsed as i32))));
+    n.register(
+        0xB00C,
+        Native::result(|g, _| Value::Int(g.movie.as_ref().and_then(|m| m.frames).map_or(0, |f| f as i32))),
+    );
+    // Calls the original leaves empty (status, pause, channel, volume, debug start, overlay, palette) or that
+    // only switch drawing off.
+    for id in [0xB002, 0xB005, 0xB006, 0xB007, 0xB008, 0xB00D, 0xB00E, 0xB00F] {
+        n.register(id, Native::result(|_, _| Value::Int(0)));
+    }
+    // How many more times the motion plays (0: once; 0xFF: for ever), and its speed (0x100 normal).
+    n.register(
+        0x5022,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            if let Some(p) = &mut g.actor(c.worker).motion_play {
+                p.4 = n as u8;
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5021,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            g.actor(c.worker).motion_speed = v as u16;
+            Value::Int(0)
+        }),
+    );
+    // The waits for a motion (0x5003, 0x501E) stay with the recordings: after 0x5022(0) the original waits out
+    // the rest of the motion the character engine was already playing (walk, idle), so they need the engine's
+    // own motion state. `motion_playing` is what they will use.
     n.register(
         0x5000,
         Native::result(|g, c| {
             let m = c.stack.pop_int();
+            g.actor(c.worker).motion_play = Some((m, 0, -1, 0, 0xFF));
             g.actor(c.worker).motion = Some(m);
             Value::Int(0)
         }),
@@ -1375,6 +1957,7 @@ fn register(n: &mut Natives<FieldState>) {
             id,
             Native::result(|g, c| {
                 let m = c.stack.pop_int();
+                g.actor(c.worker).motion_play = Some((m, 0, -1, 0, 0xFF));
                 g.actor(c.worker).motion = Some(m);
                 Value::Int(0)
             }),
@@ -1616,28 +2199,25 @@ fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
+    // A choice window's first highlighted choice and the choice cancel picks.
+    n.register(
+        0x0069,
+        Native::result(|g, c| {
+            let cancel = c.stack.pop_int();
+            let first = c.stack.pop_int();
+            let w = window(c);
+            g.windows[w].first_choice = first as u8;
+            g.windows[w].cancel_choice = cancel as u8;
+            Value::Int(w as i32)
+        }),
+    );
     n.register(
         0x006A,
         Native::result(|g, c| {
-            let _mode = c.stack.pop_int();
+            // Mode bit 2 shows the text at once (choice windows).
+            let mode = c.stack.pop_int();
             let w = window(c);
-            let image = &c.memory.global[0];
-            let (mut reveal, mut stops) = (0, Vec::new());
-            for part in g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(&[][..], |m| &m.reveal) {
-                match *part {
-                    RevealPart::Chars(n) => reveal += n,
-                    RevealPart::Name(chr) => reveal += name_chars(image, chr),
-                    RevealPart::Pause => stops.push(reveal),
-                }
-            }
-            let win = &mut g.windows[w];
-            win.reveal = reveal;
-            win.stops = stops;
-            win.open = true;
-            win.shown = 0;
-            win.choice = 0;
-            win.opening = OPEN_TICKS;
-            win.closing = 0;
+            open_window(g, &c.memory.global[0], w, mode & 2 != 0);
             Value::Int(w as i32)
         }),
     );
@@ -2028,6 +2608,56 @@ mod tests {
         assert!(!done(&vm));
         tick(&mut vm, &mut state, false);
         assert!(done(&vm));
+    }
+
+    #[test]
+    fn a_movie_plays_one_frame_a_tick_and_its_wait_ends_with_it() {
+        use aerugo_script::asm::{Op, WorkerSrc, assemble};
+        // open(84, 0x500); play; wait for the end; global[0] = 1
+        let w = WorkerSrc {
+            kind: 1,
+            entries: vec![vec![
+                Op(0x2E, Some(84)),
+                Op(0x2E, Some(0x500)),
+                Op(0x58, Some(0xB000)),
+                Op(0x58, Some(0xB009)),
+                Op(0x58, Some(0xB001)),
+                Op(0x2E, Some(1)),
+                Op(0x20, Some(0)),
+                Op(0x3C, None),
+            ]],
+            vars: vec![(5 << 28, 1)],
+            ..Default::default()
+        };
+        let mut vm = Vm::new(Arc::new(Script::parse(&assemble(&[w])).unwrap()));
+        let mut natives = Natives::new(Game::Ffx);
+        register(&mut natives);
+        let mut state = FieldState {
+            videos: [(84, "movie.webm".to_owned())].into_iter().collect(),
+            ..FieldState::default()
+        };
+        let done = |vm: &Vm| vm.memory.global[0][aerugo_script::memory::AREA0_OFFSET] == 1;
+        let mut ticks = 0;
+        while !done(&vm) && ticks < 20 {
+            vm.frame(&mut natives.host(&mut state));
+            // The host reads the length once the movie is open.
+            if let Some(m) = state.movie.as_mut().filter(|m| m.frames.is_none()) {
+                assert_eq!(m.path.as_deref(), Some("movie.webm"));
+                m.frames = Some(4);
+            }
+            state.update();
+            ticks += 1;
+        }
+        assert!(done(&vm));
+        assert!(state.movie.is_none());
+        assert!((5..=8).contains(&ticks), "{ticks}");
+    }
+
+    #[test]
+    fn video_list_lines() {
+        let list = parse_video_list("0:,OPN_us.webm,OPN_us.webm\r\n84:,opp_us.webm,opp_us.webm\r\n");
+        assert_eq!(list.get(&84).map(String::as_str), Some("opp_us.webm"));
+        assert_eq!(list.len(), 2);
     }
 
     #[test]

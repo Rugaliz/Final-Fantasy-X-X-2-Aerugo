@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use aerugo_audio::AudioOutput;
 use aerugo_debug_ui::egui;
 use aerugo_formats::Game;
 use aerugo_formats::motion::{Motion, fit_translation_scale, ps2_joint};
@@ -21,6 +22,7 @@ use glam::{Mat4, Vec3};
 use super::filelist::FileList;
 use super::maps::{best_camera, camera_view_proj, fit_layers};
 use super::models::{OrbitCamera, game_to_view, load_motions};
+use super::movies::{MoviePlayer, movie_ticks};
 use crate::assets::{GpuModel, load_model};
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 
@@ -86,6 +88,8 @@ pub struct FieldView {
     pending_restore: Option<SaveGame>,
     slot: u32,
     import_path: String,
+    /// The movie the scripts play, drawn over the field.
+    movie: MoviePlayer,
 }
 
 impl std::fmt::Debug for FieldView {
@@ -128,10 +132,12 @@ impl FieldView {
             pending_restore: None,
             slot: 1,
             import_path: String::new(),
+            movie: MoviePlayer::new(),
         }
     }
 
-    pub fn close(&mut self, renderer: &mut Renderer) {
+    pub fn close(&mut self, renderer: &mut Renderer, audio: Option<&AudioOutput>) {
+        self.movie.close(renderer, audio);
         if let Some(s) = self.session.take() {
             for m in [s.map, s.layers].into_iter().flatten() {
                 m.destroy(renderer);
@@ -142,8 +148,8 @@ impl FieldView {
         }
     }
 
-    fn open(&mut self, vfs: &Vfs, renderer: &mut Renderer, path: &str) {
-        self.close(renderer);
+    fn open(&mut self, vfs: &Vfs, renderer: &mut Renderer, audio: Option<&AudioOutput>, path: &str) {
+        self.close(renderer, audio);
         self.error = None;
         let game = game_of(path);
         let mut event = match Event::load(vfs, game, path, self.lang) {
@@ -228,20 +234,145 @@ impl FieldView {
             }
         }
         s.event.load_motion_frames(vfs);
+        if let Some(path) = s.event.movie_needing_length() {
+            let ticks = movie_ticks(vfs, path).unwrap_or(0);
+            s.event.set_movie_frames(ticks);
+        }
         s.event.step(input);
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, vfs: &Arc<Vfs>, renderer: &mut Renderer) {
+    /// The menu the scripts asked for: saving (save spheres), shops; others just close.
+    fn menu_window(&mut self, ui: &mut egui::Ui, mode: u32) {
+        use aerugo_sim::field::menu_mode;
+        use aerugo_sim::items;
+        let slot = &mut self.slot;
+        let Some(s) = &mut self.session else { return };
+        let mut close = false;
+        egui::Window::new("Menu").collapsible(false).resizable(true).show(ui.ctx(), |ui| {
+            let ev = &mut s.event;
+            let tables = ev.state.items.clone();
+            let rate = ev.state.shop_rate.unwrap_or(100);
+            let image = &mut ev.vm.memory.global[0];
+            ui.label(format!("Gil: {}", items::gil(image)));
+            match menu_mode::kind(mode) {
+                menu_mode::SAVE => {
+                    ui.label("Save sphere");
+                    ui.horizontal(|ui| {
+                        ui.label("Slot");
+                        ui.add(egui::DragValue::new(slot).range(1..=9));
+                        if ui.button("Save").clicked() {
+                            let dir = aerugo_platform::user_dir(false).join("saves");
+                            let path = dir.join(format!("slot{slot}.aesv"));
+                            let msg = match write_atomically(&path, &ev.save().to_bytes()) {
+                                Ok(()) => format!("saved to {}", path.display()),
+                                Err(e) => format!("save failed: {e}"),
+                            };
+                            s.notes.push(msg);
+                        }
+                    });
+                }
+                menu_mode::ITEM_SHOP => {
+                    let Some(t) = tables else { return };
+                    let variant = items::text_variant(image);
+                    ui.label("Buy");
+                    for id in t.item_shop((mode & 0xFFFF) as u16) {
+                        ui.horizontal(|ui| {
+                            let price = t.item_buy_price(id, rate);
+                            ui.label(format!(
+                                "{} — {price} gil (have {})",
+                                t.item_name(id, variant),
+                                items::item_count(image, id)
+                            ));
+                            if ui.button("Buy").clicked() && !t.buy_item(image, id, 1, rate) {
+                                s.notes.push("cannot buy".into());
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.label("Sell");
+                    let held: Vec<u16> = (0..items::ITEM_SLOTS)
+                        .map(|i| {
+                            let at = items::offset::ITEM_IDS + i * 2;
+                            u16::from_le_bytes([image[at], image[at + 1]])
+                        })
+                        .filter(|&id| id != 0xFF && id != 0 && items::item_count(image, id) > 0)
+                        .collect();
+                    for id in held {
+                        ui.horizontal(|ui| {
+                            let price = t.item_sell_price(id);
+                            ui.label(format!(
+                                "{} ×{} — {price} gil",
+                                t.item_name(id, variant),
+                                items::item_count(image, id)
+                            ));
+                            if ui.button("Sell").clicked() {
+                                t.sell_item(image, id, 1);
+                            }
+                        });
+                    }
+                }
+                menu_mode::WEAPON_SHOP => {
+                    let Some(t) = tables else { return };
+                    let variant = items::text_variant(image);
+                    for e in t.weapon_shop((mode & 0xFFFF) as u16) {
+                        ui.horizontal(|ui| {
+                            let name = t.equipment_name(u16::from_le_bytes([e[0], e[1]]), e[4], variant);
+                            let price = t.equipment_buy_price(&e, rate);
+                            ui.label(format!("{name} — {price} gil"));
+                            if ui.button("Buy").clicked() && !t.buy_equipment(image, &e, rate) {
+                                s.notes.push("cannot buy".into());
+                            }
+                        });
+                    }
+                }
+                menu_mode::NAME_ENTRY => {
+                    ui.label("Name entry: the default name is kept.");
+                }
+                _ => {
+                    ui.label(format!("Menu {mode:#010x} is not implemented yet."));
+                }
+            }
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            s.event.close_menu();
+        }
+    }
+
+    /// Start or stop the movie player to follow the scripts' movie.
+    fn sync_movie(&mut self, vfs: &Arc<Vfs>, renderer: &mut Renderer, audio: Option<&AudioOutput>) {
+        let want = self
+            .session
+            .as_ref()
+            .and_then(|s| s.event.state.movie.as_ref().filter(|m| m.playing).and_then(|m| m.path.clone()));
+        if want.as_deref() != self.movie.playing_path() {
+            match want {
+                Some(path) => self.movie.open(vfs, renderer, audio, path),
+                None => self.movie.close(renderer, audio),
+            }
+        }
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        vfs: &Arc<Vfs>,
+        renderer: &mut Renderer,
+        audio: Option<&AudioOutput>,
+    ) {
         let files = self.files.get_or_insert_with(|| FileList::new(vfs, |p| p.ends_with(".ebp")));
         let mut picked = None;
         egui::Panel::left("field-files").resizable(true).default_size(260.0).show(ui, |ui| {
             picked = files.ui(ui);
         });
         if let Some(p) = picked.or_else(|| self.pending_open.take()) {
-            self.open(vfs, renderer, &p);
+            self.open(vfs, renderer, audio, &p);
         }
         // Input and timing.
-        // WASD walks (Shift held: slower), Enter / Space confirms and talks, Q talks with the second button.
+        // WASD walks (Shift held: slower), Enter / Space confirms and talks, Q talks with the second button,
+        // Escape skips a movie.
         let (stick, confirm_now, alt_now, walk) = ui.input(|i| {
             let k = |a: egui::Key, b: egui::Key| {
                 f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
@@ -283,6 +414,34 @@ impl FieldView {
             };
             self.tick(input, vfs);
         }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && let Some(s) = &mut self.session
+        {
+            s.event.skip_movie();
+        }
+        self.sync_movie(vfs, renderer, audio);
+        if let Some(mode) = self.session.as_ref().and_then(|s| s.event.open_menu()) {
+            self.menu_window(ui, mode);
+        }
+        // Battles are not ported yet: a placeholder that ends them as won.
+        if let Some(s) = &mut self.session
+            && let Some(b) = s.event.running_battle()
+        {
+            let name = s.event.battle_name(&b);
+            let mut won = false;
+            egui::Window::new("Battle").collapsible(false).show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} battle {name} (group {}, formation {}).",
+                    if b.scripted { "Scripted" } else { "Random" },
+                    b.group,
+                    b.formation
+                ));
+                won = ui.button("Win").clicked();
+            });
+            if won {
+                s.event.finish_battle();
+            }
+        }
         self.handle_jump(vfs);
         egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.info_ui(ui));
@@ -295,7 +454,10 @@ impl FieldView {
                 ui.label("Pick an event on the left. WASD walks the player, Enter confirms messages.");
                 return;
             }
-            self.viewport(ui, vfs, renderer);
+            let rect = ui.available_rect_before_wrap();
+            if !self.movie.show(ui, renderer, rect) {
+                self.viewport(ui, vfs, renderer);
+            }
         });
         ui.ctx().request_repaint();
     }

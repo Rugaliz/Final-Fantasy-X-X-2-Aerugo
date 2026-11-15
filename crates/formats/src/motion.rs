@@ -248,6 +248,9 @@ pub struct MotionGroup {
     /// (motion number, sequence offset) pairs.
     pub entries: Vec<(u16, u32)>,
     pub motions: Vec<Motion>,
+    /// For each entry, the motion record its sequence plays first (sequence code 1 and a 16-bit record index;
+    /// codes 2, 3 and 6 skip ahead).
+    pub entry_motion: Vec<Option<usize>>,
 }
 
 impl MotionGroup {
@@ -271,7 +274,22 @@ impl MotionGroup {
             let header = u32_at(d, records_at + i * 16 + 0xC)? as usize;
             motions.push(Motion::parse(d, header)?);
         }
-        Ok(MotionGroup { chr_id, entries, motions })
+        let entry_motion = entries
+            .iter()
+            .map(|&(_, seq)| {
+                let mut at = seq as usize;
+                for _ in 0..16 {
+                    match *d.get(at)? {
+                        1 => return Some(i16_at(d, at + 1).ok()?.max(0) as usize),
+                        2 => at += 5,
+                        3 | 6 => at += 4,
+                        _ => return None,
+                    }
+                }
+                None
+            })
+            .collect();
+        Ok(MotionGroup { chr_id, entries, motions, entry_motion })
     }
 }
 

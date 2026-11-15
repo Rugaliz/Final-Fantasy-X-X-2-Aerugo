@@ -2017,6 +2017,7 @@ dependencies = [
  "aerugo-script",
  "aerugo-sim",
  "aerugo-vfs",
+ "aerugo-video",
  "anyhow",
  "clap",
  "glam",

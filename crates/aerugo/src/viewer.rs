@@ -165,7 +165,7 @@ impl Viewer {
         self.maps.close(renderer);
         self.sounds.close(self.audio.as_ref());
         self.movies.close(renderer, self.audio.as_ref());
-        self.field.close(renderer);
+        self.field.close(renderer, self.audio.as_ref());
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -213,7 +213,7 @@ impl Viewer {
                 Tab::Sounds => self.sounds.ui(ui, vfs, self.audio.as_ref()),
                 Tab::Movies => self.movies.ui(ui, vfs, renderer, self.audio.as_ref()),
                 Tab::Scripts => self.scripts.ui(ui, vfs),
-                Tab::Field => self.field.ui(ui, vfs, renderer),
+                Tab::Field => self.field.ui(ui, vfs, renderer, self.audio.as_ref()),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {

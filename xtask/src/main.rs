@@ -112,6 +112,34 @@ enum Command {
     /// List the motions scripts play with a frame range (native 0x501A) and how many ticks the next motion
     /// wait polls as not done.
     OracleMotions { dir: PathBuf },
+    /// List each call of the given natives (hex ids) in a recording: event, frame, worker, the pushed values
+    /// before the call, the result and how many polls it waited.
+    OracleNatives {
+        dir: PathBuf,
+        #[arg(value_parser = parse_hex_u16)]
+        natives: Vec<u16>,
+    },
+    /// Count the calls of natives the field runner lacks in a recording, per event and in all.
+    OracleMissing { dir: PathBuf },
+    /// Print the text fields of kernel table records (English): `kernel-text btlend_txt 0x16 0x1d`.
+    KernelText {
+        table: String,
+        #[arg(value_parser = parse_hex_u16)]
+        first: u16,
+        #[arg(value_parser = parse_hex_u16)]
+        last: u16,
+    },
+    /// Every call of a native in FFX event scripts with the constants pushed right before it, counted.
+    NativeArgs {
+        #[arg(value_parser = parse_hex_u16)]
+        native: u16,
+    },
+    /// The workers (worker:level, in order) that ran in each frame of a range of one event run.
+    OracleFrames { dir: PathBuf, run: usize, from: u32, to: u32 },
+    /// Count random numbers per event and stream in a recording (first values shown).
+    OracleRandom { dir: PathBuf },
+    /// Print a movie's length and its first video frame times (number from the video list, or a path).
+    MovieInfo { movie: String },
     /// Print the start of an archive file as hex.
     Hexdump {
         path: String,
@@ -197,6 +225,13 @@ fn main() -> Result<()> {
         }
         Command::FieldCoverage { frames } => field_coverage(&install, frames),
         Command::OracleMotions { dir } => oracle_motions(&dir),
+        Command::MovieInfo { movie } => movie_info(&install, &movie),
+        Command::NativeArgs { native } => native_args(&install, native),
+        Command::KernelText { table, first, last } => kernel_text(&install, &table, first, last),
+        Command::OracleMissing { dir } => oracle_missing(&dir),
+        Command::OracleRandom { dir } => oracle_random(&dir),
+        Command::OracleFrames { dir, run, from, to } => oracle_frames(&dir, run, from, to),
+        Command::OracleNatives { dir, natives } => oracle_natives(&dir, &natives),
         Command::Hexdump { path, len } => {
             let mut vfs = aerugo_vfs::Vfs::new();
             vfs.mount_install(&install)?;
@@ -539,7 +574,18 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
             }
         }
         ev.load_motion_frames(&vfs);
+        if let Some(path) = ev.movie_needing_length() {
+            let ticks = movie_ticks(&vfs, path).unwrap_or(0);
+            ev.set_movie_frames(ticks);
+        }
         ev.step(input);
+        if ev.open_menu().is_some() {
+            ev.close_menu();
+        }
+        if let Some(b) = ev.running_battle() {
+            println!("t{t}: battle {} — won (placeholder)", ev.battle_name(&b));
+            ev.finish_battle();
+        }
         if t % 100 == 0 || ev.state.jump.is_some() {
             let p = ev.state.player.and_then(|p| ev.state.actors.get(p)).map(|a| a.pos);
             let windows: Vec<String> = ev
@@ -928,6 +974,8 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         ev.state.rng_replay = run.random.iter().copied().collect();
         // Natives Aerugo lacks report what the original's did.
         ev.natives.replay = Some(run.replay.clone());
+        // Menus last as long as the player keeps them open: replay them.
+        ev.natives.remove(0x401D);
         ev.vm.trace = Some(Vec::new());
         // Compare as we go and stop at the first difference: a run that has gone astray can loop at the run
         // limit every frame, and its trace would not fit in memory.
@@ -990,6 +1038,10 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 ..Input::default()
             };
             ev.load_motion_frames(&vfs);
+            if let Some(path) = ev.movie_needing_length() {
+                let ticks = movie_ticks(&vfs, path).unwrap_or(0);
+                ev.set_movie_frames(ticks);
+            }
             ev.step(input);
             // PLAYER_DIR: the stick, the player's recorded step and the camera, per frame (for fitting the
             // player controller).
@@ -1296,6 +1348,323 @@ fn oracle_motions(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// A movie's length in field ticks (30 a second).
+fn movie_ticks(vfs: &aerugo_vfs::Vfs, path: &str) -> Option<u32> {
+    let demux = movie_demuxer(vfs, path).ok()?;
+    Some((demux.duration_s * 30.0).round() as u32)
+}
+
+type ArchiveRead<'a> = Box<dyn FnMut(u64, usize) -> std::result::Result<Vec<u8>, String> + 'a>;
+
+/// A movie file's demuxer, reading through the archives in 1 MiB chunks.
+fn movie_demuxer<'a>(
+    vfs: &'a aerugo_vfs::Vfs,
+    path: &'a str,
+) -> Result<aerugo_video::Demuxer<aerugo_video::Chunked<ArchiveRead<'a>>>> {
+    let len = vfs.size(path).context("missing")?;
+    let read: ArchiveRead<'a> =
+        Box::new(move |at, n| vfs.read_range(path, at, n as u64).map_err(|e| e.to_string()));
+    aerugo_video::Demuxer::open(aerugo_video::Chunked::new(len, 1 << 20, read))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn movie_info(install: &Install, movie: &str) -> Result<()> {
+    use aerugo_formats::Game;
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let path = match movie.parse::<u32>() {
+        Ok(n) => {
+            let ev = aerugo_sim::field::Event::load(
+                &vfs,
+                Game::Ffx,
+                "ffx_ps2/ffx/master/jppc/event/obj/bj/bjyt0000/bjyt0000.ebp",
+                aerugo_vfs::Language::English,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            ev.state.videos.get(&n).cloned().ok_or_else(|| anyhow::anyhow!("movie {n} is not in the list"))?
+        }
+        Err(_) => movie.to_owned(),
+    };
+    let mut demux = movie_demuxer(&vfs, &path)?;
+    println!("{path}: {:.3} s, {} ticks", demux.duration_s, movie_ticks(&vfs, &path).unwrap_or(0));
+    let video = demux.tracks.iter().find(|t| t.kind == 1).map(|t| t.number);
+    let mut shown = 0;
+    while let Some(p) = demux.next_packet().map_err(|e| anyhow::anyhow!("{e}"))? {
+        if Some(p.track) == video {
+            println!("  frame at {:.4} s", p.time_ns as f64 / 1e9);
+            shown += 1;
+            if shown == 6 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn oracle_frames(dir: &std::path::Path, run: usize, from: u32, to: u32) -> Result<()> {
+    use aerugo_script::recording::{Record, parse};
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let (mut index, mut frame) = (None::<usize>, 0u32);
+    let mut line: Vec<String> = Vec::new();
+    let flush = |frame: u32, line: &mut Vec<String>| {
+        if (from..=to).contains(&frame) {
+            println!("f{frame}: {}", line.join(" "));
+        }
+        line.clear();
+    };
+    for r in &records {
+        match r {
+            Record::Event { .. } => {
+                index = Some(index.map_or(0, |i| i + 1));
+                frame = 0;
+                line.clear();
+            }
+            Record::Frame(_) if index == Some(run) => {
+                flush(frame, &mut line);
+                frame += 1;
+            }
+            Record::Instruction { worker, level, pc, op, operand, .. } if index == Some(run) => {
+                // OPS: also print instructions whose mnemonic contains this text.
+                if let Ok(filter) = std::env::var("OPS")
+                    && (from..=to).contains(&frame)
+                    && aerugo_formats::script::op_info(*op).mnemonic.contains(filter.as_str())
+                {
+                    println!(
+                        "  f{frame} w{worker} l{level} {pc:05x} {} {operand:?}",
+                        aerugo_formats::script::op_info(*op).mnemonic
+                    );
+                }
+                let w = format!("{worker}:{level}");
+                if line.last() != Some(&w) {
+                    line.push(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn oracle_random(dir: &std::path::Path) -> Result<()> {
+    use aerugo_script::recording::{Record, parse};
+    use std::collections::BTreeMap;
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let (mut name, mut frame) = (String::new(), 0u32);
+    let mut per: BTreeMap<(String, u8), (u32, Vec<String>)> = BTreeMap::new();
+    let mut order = Vec::new();
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => {
+                name = format!("{}#{}", path.rsplit('/').next().unwrap_or(path), order.len());
+                order.push(name.clone());
+                frame = 0;
+            }
+            Record::Frame(_) => frame += 1,
+            Record::Random { stream, value } => {
+                let e = per.entry((name.clone(), *stream)).or_default();
+                e.0 += 1;
+                if e.1.len() < 4 {
+                    e.1.push(format!("f{frame}:{value:#x}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    for ((event, stream), (n, first)) in per {
+        println!("{event} stream {stream}: {n} ({})", first.join(" "));
+    }
+    Ok(())
+}
+
+fn oracle_missing(dir: &std::path::Path) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_formats::script::op_info;
+    use aerugo_script::recording::{Record, parse};
+    use std::collections::BTreeMap;
+    let mut natives = aerugo_script::Natives::<aerugo_sim::field::FieldState>::new(Game::Ffx);
+    aerugo_sim::field::register(&mut natives);
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let mut name = String::new();
+    let mut per_event: BTreeMap<String, BTreeMap<u16, u32>> = BTreeMap::new();
+    let mut all: BTreeMap<u16, (u32, std::collections::BTreeSet<String>)> = BTreeMap::new();
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => name = path.rsplit('/').next().unwrap_or(path).to_owned(),
+            Record::Instruction { op, operand: Some(id), .. }
+                if op_info(*op).mnemonic.starts_with("call") && !natives.implemented(*id) =>
+            {
+                *per_event.entry(name.clone()).or_default().entry(*id).or_default() += 1;
+                let e = all.entry(*id).or_default();
+                e.0 += 1;
+                e.1.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    for (event, ids) in &per_event {
+        let list: Vec<String> = ids.iter().map(|(id, n)| format!("{id:04x}x{n}")).collect();
+        println!("{event}: {}", list.join(" "));
+    }
+    let mut v: Vec<_> = all.into_iter().collect();
+    v.sort_by_key(|(id, (n, _))| (std::cmp::Reverse(*n), *id));
+    for (id, (n, events)) in v {
+        println!("{id:04x} {n:>8} {}", events.into_iter().collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
+fn kernel_text(install: &Install, table: &str, first: u16, last: u16) -> Result<()> {
+    use aerugo_formats::text::{Charset, charset_path, decode, string_at, to_display};
+    use aerugo_formats::{Game, KernelTable};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let lang = aerugo_vfs::Language::English;
+    let path = format!("ffx_ps2/ffx/master/jppc/battle/kernel/{table}.bin");
+    let t = KernelTable::parse(vfs.read_localized(&path, lang)?)?;
+    let cs = Charset::parse(&vfs.read(&charset_path(Game::Ffx, lang))?)?;
+    println!("{} records of {} bytes", t.len(), t.record_size());
+    for id in first..=last {
+        let Some(r) = t.record(u32::from(id)) else { continue };
+        let hex: Vec<String> = r.bytes.iter().map(|b| format!("{b:02x}")).collect();
+        println!("{id:#06x}: {}", hex.join(" "));
+        for off in (0..r.bytes.len().min(0x40)).step_by(4) {
+            if let Some(s) = t.text(&r, off).filter(|s| !s.is_empty()) {
+                let _ = string_at;
+                println!("  +{off:#04x}: {}", to_display(&decode(s, &cs)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_args(install: &Install, native: u16) -> Result<()> {
+    use aerugo_formats::script::{Script, is_script_path};
+    use std::collections::BTreeMap;
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let paths: Vec<String> = vfs
+        .archives()
+        .filter(|(id, _)| *id == Some(ArchiveId::Ffx))
+        .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
+        .filter(|p| p.ends_with(".ebp") && is_script_path(p) && p.contains("/jppc/event/obj/"))
+        .collect();
+    let mut seen: BTreeMap<String, (u32, std::collections::BTreeSet<String>)> = BTreeMap::new();
+    for path in &paths {
+        let Ok(script) = Script::parse(&vfs.read(path)?) else { continue };
+        let event = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".ebp").to_owned();
+        for (wi, w) in script.workers.iter().enumerate() {
+            let mut pushes: Vec<String> = Vec::new();
+            for insn in script.walk(wi) {
+                let m = insn.info().mnemonic;
+                let arg = insn.operand.unwrap_or(0);
+                match m {
+                    "push.imm" => pushes.push((arg as i16).to_string()),
+                    "push.int" => {
+                        pushes.push(w.ints.get(usize::from(arg)).map_or("?".into(), |v| format!("{v:#x}")))
+                    }
+                    "push.float" => {
+                        pushes.push(w.floats.get(usize::from(arg)).map_or("?".into(), |v| format!("{v}")))
+                    }
+                    _ if m.starts_with("push") => pushes.push(m.to_owned()),
+                    _ if m.starts_with("call") && arg == native => {
+                        let key = pushes.iter().rev().take(4).rev().cloned().collect::<Vec<_>>().join(", ");
+                        let e = seen.entry(key).or_default();
+                        e.0 += 1;
+                        e.1.insert(event.clone());
+                        pushes.clear();
+                    }
+                    _ => pushes.clear(),
+                }
+            }
+        }
+    }
+    let mut v: Vec<_> = seen.into_iter().collect();
+    v.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    for (args, (n, events)) in v {
+        let list: Vec<_> = events.iter().take(8).cloned().collect();
+        println!("{n:>5}  [{args}]  {}{}", list.join(","), if events.len() > 8 { ",…" } else { "" });
+    }
+    Ok(())
+}
+
+fn parse_hex_u16(s: &str) -> std::result::Result<u16, String> {
+    u16::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+}
+
+fn oracle_natives(dir: &std::path::Path, natives: &[u16]) -> Result<()> {
+    use aerugo_formats::script::op_info;
+    use aerugo_script::recording::{Record, parse};
+    use std::collections::HashMap;
+    // Per worker: values pushed since the last call, and the call waiting for a result (native, frame, args,
+    // polls).
+    #[derive(Default)]
+    struct W {
+        pushes: Vec<i64>,
+        pending: Option<(u16, u32, Vec<i64>, u32)>,
+    }
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let (mut frame, mut name) = (0u32, String::new());
+    let mut ws: HashMap<u16, W> = HashMap::new();
+    let report = |name: &str, worker: u16, p: &(u16, u32, Vec<i64>, u32), result: &str| {
+        println!("{name} f{} w{worker} {:04x}({:?}) polls {} -> {result}", p.1, p.0, p.2, p.3);
+    };
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => {
+                ws.clear();
+                frame = 0;
+                name = path.rsplit('/').next().unwrap_or(path).to_owned();
+            }
+            Record::Frame(_) => frame += 1,
+            Record::Instruction { worker, op, operand, .. } => {
+                let w = ws.entry(*worker).or_default();
+                let m = op_info(*op).mnemonic;
+                if m == "push.imm" {
+                    w.pushes.push(i64::from(operand.unwrap_or(0) as i16));
+                } else if m == "push.int" {
+                    // Pushed from the int table: shown as -1000000 - index.
+                    w.pushes.push(-1_000_000 - i64::from(operand.unwrap_or(0)));
+                } else if m.starts_with("call") {
+                    if let Some(p) = w.pending.take() {
+                        report(&name, *worker, &p, "?");
+                    }
+                    if let Some(id) = operand.filter(|id| natives.contains(id)) {
+                        w.pending = Some((id, frame, std::mem::take(&mut w.pushes), 0));
+                    }
+                    w.pushes.clear();
+                } else if !m.starts_with("push") {
+                    w.pushes.clear();
+                }
+            }
+            Record::NativePoll { worker, native, flags } if natives.contains(native) => {
+                let w = ws.entry(*worker).or_default();
+                if let Some(p) = &mut w.pending {
+                    if *flags == 0 {
+                        p.3 += 1;
+                    } else if *flags & 1 == 0 {
+                        // Done without a result.
+                        let p = w.pending.take().unwrap();
+                        report(&name, *worker, &p, &format!("poll {flags}"));
+                    }
+                }
+            }
+            Record::NativeResult { worker, native, tag, value } if natives.contains(native) => {
+                let w = ws.entry(*worker).or_default();
+                if let Some(p) = w.pending.take() {
+                    let v = if *tag == 2 {
+                        format!("{}", f32::from_bits(*value))
+                    } else {
+                        format!("{}", *value as i32)
+                    };
+                    report(&name, *worker, &p, &v);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn field_coverage(install: &Install, frames: u32) -> Result<()> {
     use aerugo_formats::Game;
     use aerugo_sim::field::{Event, Input};
@@ -1315,7 +1684,17 @@ fn field_coverage(install: &Install, frames: u32) -> Result<()> {
                 ev.state.player = ev.state.actors.iter().position(|a| a.model.is_some_and(|m| m >> 12 == 0));
             }
             ev.load_motion_frames(&vfs);
+            if let Some(path) = ev.movie_needing_length() {
+                let ticks = movie_ticks(&vfs, path).unwrap_or(0);
+                ev.set_movie_frames(ticks);
+            }
             ev.step(Input { confirm: t % 30 == 29, ..Input::default() });
+            if ev.open_menu().is_some() {
+                ev.close_menu();
+            }
+            if ev.running_battle().is_some() {
+                ev.finish_battle();
+            }
         }
         for (id, n) in &ev.natives.coverage.calls {
             *total.calls.entry(*id).or_default() += n;
