@@ -58,6 +58,7 @@ pub struct FieldView {
     paused: bool,
     step_once: bool,
     confirm: bool,
+    last_stick: [f32; 2],
     orbit: OrbitCamera,
     follow_player: bool,
     camera_mode: CameraMode,
@@ -88,6 +89,7 @@ impl FieldView {
             paused: false,
             step_once: false,
             confirm: false,
+            last_stick: [0.0, 0.0],
             orbit: OrbitCamera::framing(Vec3::splat(-100.0), Vec3::splat(100.0)),
             follow_player: true,
             camera_mode: CameraMode::Follow,
@@ -208,7 +210,10 @@ impl FieldView {
             self.clock.advance(elapsed).ticks
         };
         for _ in 0..steps {
-            let input = Input { stick, confirm: std::mem::take(&mut self.confirm), cancel: false };
+            let stick_pressed = stick != [0.0, 0.0] && self.last_stick == [0.0, 0.0];
+            self.last_stick = stick;
+            let input =
+                Input { stick, confirm: std::mem::take(&mut self.confirm), cancel: false, stick_pressed };
             self.tick(input);
         }
         egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {
@@ -283,7 +288,8 @@ impl FieldView {
         ui.separator();
         ui.strong("Message windows");
         for (i, w) in ev.state.windows.iter().enumerate().filter(|(_, w)| w.open || w.message.is_some()) {
-            let text = w.message.and_then(|m| ev.state.messages.get(m)).cloned().unwrap_or_default();
+            let text =
+                w.message.and_then(|m| ev.state.messages.get(m)).map(|m| m.raw.clone()).unwrap_or_default();
             ui.label(format!("{i}{} #{:?}: {text}", if w.open { " (open)" } else { "" }, w.message));
         }
         ui.separator();
@@ -491,7 +497,24 @@ impl FieldView {
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;
         for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {
-            let Some(text) = w.message.and_then(|m| st.messages.get(m)) else { continue };
+            let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
+            // Revealed so far; the last lines of a choice message are its choices.
+            let shown: String = msg.text.chars().take(w.shown).collect();
+            let lines: Vec<&str> = shown.lines().collect();
+            let total = msg.text.lines().count();
+            let first_choice = total.saturating_sub(usize::from(msg.choices));
+            let text = lines
+                .iter()
+                .enumerate()
+                .map(|(k, l)| {
+                    if msg.choices > 0 && k >= first_choice {
+                        format!("{} {l}", if k - first_choice == w.choice { "▸" } else { "  " })
+                    } else {
+                        (*l).to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let pos =
                 rect.min + egui::vec2(w.x as f32 / 512.0 * rect.width(), w.y as f32 / 448.0 * rect.height());
             egui::Area::new(egui::Id::new(("field-window", i))).fixed_pos(pos).show(ui.ctx(), |ui| {

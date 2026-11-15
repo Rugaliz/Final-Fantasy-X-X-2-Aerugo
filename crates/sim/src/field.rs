@@ -104,6 +104,41 @@ pub struct Window {
     pub x: i32,
     pub y: i32,
     pub open: bool,
+    /// Characters revealed so far (text appears over a few ticks).
+    pub shown: usize,
+    /// Highlighted choice for messages that offer choices.
+    pub choice: usize,
+}
+
+/// Characters revealed per tick.
+const TEXT_SPEED: usize = 2;
+
+/// One event message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Message {
+    /// What the player reads: characters and line breaks (control codes left out).
+    pub text: String,
+    /// With control codes shown as `{xx}` / `{xx:yy}`.
+    pub raw: String,
+    /// How many of the last lines are choices.
+    pub choices: u8,
+}
+
+impl Message {
+    pub fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+impl Window {
+    /// The window's state as scripts see it: 0 closed, 2 showing.
+    pub fn state(&self) -> i32 {
+        if self.open { 2 } else { 0 }
+    }
 }
 
 /// The camera the scripts set (map space).
@@ -158,6 +193,8 @@ pub struct Input {
     /// Confirm pressed this tick (advances messages, talks).
     pub confirm: bool,
     pub cancel: bool,
+    /// The stick moved from rest this tick (for menus and choices).
+    pub stick_pressed: bool,
 }
 
 /// The script random number stream: a multiply / xor generator with a 16-bit rotate.
@@ -185,7 +222,7 @@ pub struct FieldState {
     pub windows: [Window; 8],
     pub camera: CameraState,
     /// The event's messages, decoded.
-    pub messages: Vec<String>,
+    pub messages: Vec<Message>,
     pub input: Input,
     /// Worker the player controls.
     pub player: Option<usize>,
@@ -213,6 +250,11 @@ impl FieldState {
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
         self.camera.update();
+        let messages = &self.messages;
+        for w in self.windows.iter_mut().filter(|w| w.open) {
+            let len = w.message.and_then(|m| messages.get(m)).map_or(0, Message::len);
+            w.shown = (w.shown + TEXT_SPEED).min(len);
+        }
         for a in &mut self.actors {
             if let Some(m) = &mut a.moving {
                 m.done += 1;
@@ -287,15 +329,26 @@ pub fn event_text_path(game: Game, ebp_path: &str, lang: Language) -> Option<Str
     Some(format!("{root}/new_{}pc/event/obj_ps3/{rest}.bin", lang.master_code()))
 }
 
-/// Decode an event text table: 8-byte entries (u16 offset, u16 flags, twice), strings after the table.
-pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<String> {
+/// Decode an event text table: 8-byte entries (u16 offset, u16 flags with the choice count in the high byte,
+/// twice), strings after the table.
+pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
     let Some(first) = data.get(0..2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]]))) else {
         return Vec::new();
     };
     (0..first / 8)
         .map(|i| {
-            let off = data.get(i * 8..i * 8 + 2).map_or(0, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
-            text::string_at(data, off).map(|s| text::decode_display(s, charset)).unwrap_or_default()
+            let word = |k: usize| data.get(k..k + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            let off = usize::from(word(i * 8));
+            let tokens = text::string_at(data, off).map(|s| text::decode(s, charset)).unwrap_or_default();
+            let text = tokens
+                .iter()
+                .filter_map(|t| match *t {
+                    text::Token::Char(c) => Some(c),
+                    text::Token::LineBreak => Some('\n'),
+                    _ => None,
+                })
+                .collect();
+            Message { text, raw: text::to_display(&tokens), choices: (word(i * 8 + 2) >> 8) as u8 }
         })
         .collect()
 }
@@ -380,6 +433,40 @@ fn target(c: &mut NativeCall<'_>) -> usize {
 
 fn window(c: &mut NativeCall<'_>) -> usize {
     c.stack.pop_int().clamp(0, 7) as usize
+}
+
+/// The message wait: the init takes the window (and a flag), the wait reveals the text and closes the window on
+/// confirm (moving between choices with the stick), the result is the chosen choice.
+fn message_wait() -> Native<FieldState> {
+    Native {
+        init: Some(|_, c| {
+            let _b = c.stack.pop_int();
+            c.scratch[0] = window(c) as i32;
+        }),
+        wait: Some(|g, c| {
+            let w = c.scratch[0] as usize;
+            let msg = g.windows[w].message.and_then(|m| g.messages.get(m)).cloned().unwrap_or_default();
+            let win = &mut g.windows[w];
+            if !win.open {
+                return WAIT_DONE;
+            }
+            if msg.choices > 0 && g.input.stick[1] != 0.0 && g.input.stick_pressed {
+                let n = usize::from(msg.choices);
+                win.choice =
+                    if g.input.stick[1] > 0.0 { (win.choice + n - 1) % n } else { (win.choice + 1) % n };
+            }
+            if g.input.confirm {
+                if win.shown < msg.len() {
+                    win.shown = msg.len();
+                } else {
+                    win.open = false;
+                    return WAIT_DONE;
+                }
+            }
+            0
+        }),
+        result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
+    }
 }
 
 /// Natives of the field slice: actors, movement, turning, messages, camera, worker queries.
@@ -628,29 +715,26 @@ fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let _mode = c.stack.pop_int();
             let w = window(c);
-            g.windows[w].open = true;
+            let win = &mut g.windows[w];
+            win.open = true;
+            win.shown = 0;
+            win.choice = 0;
             Value::Int(w as i32)
         }),
     );
+    n.register(0x0084, message_wait());
+    n.register(0x007C, message_wait());
+    // Window state queries: done when closed or fully shown; the raw state.
     n.register(
-        0x0084,
-        Native {
-            init: Some(|_, c| {
-                let _b = c.stack.pop_int();
-                c.scratch[0] = window(c) as i32;
-            }),
-            wait: Some(|g, c| {
-                let w = c.scratch[0] as usize;
-                if !g.windows[w].open || g.input.confirm {
-                    g.windows[w].open = false;
-                    WAIT_DONE
-                } else {
-                    0
-                }
-            }),
-            result: Some(|_, _| Value::Int(0)),
-        },
+        0x008F,
+        Native::result(|g, c| {
+            let w = window(c);
+            let win = &g.windows[w];
+            let len = win.message.and_then(|m| g.messages.get(m)).map_or(0, Message::len);
+            Value::Int(i32::from(!win.open || win.shown >= len))
+        }),
     );
+    n.register(0x0097, Native::result(|g, c| Value::Int(g.windows[window(c)].state())));
     n.register(
         0x006B,
         Native::result(|g, c| {
@@ -740,6 +824,57 @@ mod tests {
         assert!(xs.iter().all(|&x| x <= 0x7FFF_FFFF));
         assert_eq!(xs, (0..100).map(|_| b.next_value()).collect::<Vec<_>>());
         assert!(xs.windows(2).any(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn message_window_reveals_and_closes_on_confirm() {
+        use aerugo_script::asm::{Op, WorkerSrc, assemble};
+        let imm = |v: i16| Op(0x2E, Some(v as u16));
+        // set_text(0, 0); open(0, 0); wait(0, 0); global[0] = 1
+        let w = WorkerSrc {
+            kind: 1,
+            entries: vec![vec![
+                imm(0),
+                imm(0),
+                Op(0x58, Some(0x0064)),
+                imm(0),
+                imm(0),
+                Op(0x58, Some(0x006A)),
+                imm(0),
+                imm(0),
+                Op(0x58, Some(0x0084)),
+                imm(1),
+                Op(0x20, Some(0)),
+                Op(0x3C, None),
+            ]],
+            vars: vec![(5 << 28, 1)],
+            ..Default::default()
+        };
+        let script = Script::parse(&assemble(&[w])).unwrap();
+        let mut vm = Vm::new(Arc::new(script));
+        let mut natives = Natives::new(Game::Ffx);
+        register(&mut natives);
+        let mut state = FieldState {
+            messages: vec![Message { text: "Hello there".into(), raw: String::new(), choices: 0 }],
+            ..FieldState::default()
+        };
+        let done = |vm: &Vm| vm.memory.global[0][0] == 1;
+        let mut tick = |vm: &mut Vm, state: &mut FieldState, confirm: bool| {
+            state.input.confirm = confirm;
+            vm.frame(&mut natives.host(state));
+            state.update();
+        };
+        tick(&mut vm, &mut state, false);
+        assert!(state.windows[0].open);
+        assert!(state.windows[0].shown < 11);
+        // The first confirm reveals the rest, the second closes the window and resumes the script.
+        tick(&mut vm, &mut state, true);
+        assert!(state.windows[0].open);
+        assert_eq!(state.windows[0].shown, 11);
+        tick(&mut vm, &mut state, true);
+        assert!(!state.windows[0].open);
+        tick(&mut vm, &mut state, false);
+        assert!(done(&vm));
     }
 
     #[test]
