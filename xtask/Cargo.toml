@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 aerugo-formats.workspace = true
 aerugo-script.workspace = true
+aerugo-sim.workspace = true
 aerugo-vfs.workspace = true
 anyhow.workspace = true
 clap.workspace = true

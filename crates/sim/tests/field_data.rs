@@ -82,3 +82,39 @@ fn save_round_trips_through_an_event() {
     assert_eq!(&fresh.vm.memory.global[0][..FFX_IMAGE_SIZE], &save.image[..]);
     assert_eq!(fresh.tick, save.ticks);
 }
+
+/// With `AERUGO_RECORD_OUT` set, writes Aerugo's own run of an event as a recording (for checking the comparison
+/// tool: comparing it must report no difference).
+#[test]
+fn record_own_run() {
+    use aerugo_script::recording::{Record, encode};
+    let (Some(inst), Some(out)) = (install_from_env(), std::env::var_os("AERUGO_RECORD_OUT")) else {
+        eprintln!("skipped: needs {GAME_DIR_ENV} and AERUGO_RECORD_OUT");
+        return;
+    };
+    let mut vfs = Vfs::new();
+    vfs.mount_install(&inst).unwrap();
+    let path = "ffx_ps2/ffx/master/jppc/event/obj/bs/bsyt0000/bsyt0000.ebp";
+    let mut ev = Event::load(&vfs, Game::Ffx, path, Language::English).unwrap();
+    ev.vm.trace = Some(Vec::new());
+    let mut recs = vec![Record::Event {
+        index: 1,
+        path: "host0:/ffx/master/jppc/event/obj/bs/bsyt0000/bsyt0000.ebp".to_owned(),
+    }];
+    for f in 0..120u32 {
+        recs.push(Record::Frame(f + 1));
+        ev.step(Input::default());
+        for t in ev.vm.trace.as_mut().unwrap().drain(..) {
+            recs.push(Record::Instruction {
+                worker: t.worker,
+                level: t.level,
+                pc: t.pc,
+                op: t.op,
+                operand: t.operand,
+            });
+        }
+    }
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("trace.bin"), encode(&recs)).unwrap();
+}

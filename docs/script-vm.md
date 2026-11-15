@@ -42,6 +42,11 @@ type requires. `push.addr` hands natives an encoded address of a variable elemen
 
 ## Checking against the original
 
-Every executed instruction can be traced (frame, worker, level, pc, opcode). Comparing traces with recordings of
-the original game needs the oracle tooling, which does not exist yet; until then the machine is checked with
+Every executed instruction can be traced (frame, worker, level, pc, opcode) and compared with recordings of the
+original game (below); without recordings the machine is checked with
 assembled test scripts and by running every script of both games.
+
+`aerugo-script::recording` reads recordings of the original game (instructions per frame, the scripts' random
+numbers, event starts, map changes). `cargo run -p xtask -- oracle-compare <folder>` replays each recorded event in
+Aerugo from the recorded save image with the recorded random numbers, and reports the first instruction where the
+two differ. Player input is not replayed yet, so comparisons hold until the player acts.

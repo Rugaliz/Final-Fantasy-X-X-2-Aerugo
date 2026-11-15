@@ -5,6 +5,7 @@
 pub mod asm;
 pub mod memory;
 pub mod natives;
+pub mod recording;
 pub mod vm;
 
 pub use memory::Memory;

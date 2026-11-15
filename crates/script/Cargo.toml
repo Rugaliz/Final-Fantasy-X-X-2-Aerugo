@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 aerugo-formats.workspace = true
 log.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 aerugo-vfs.workspace = true

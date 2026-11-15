@@ -64,6 +64,14 @@ enum Command {
     FsbExport { bank: String, index: usize, out: PathBuf },
     /// Count vertex stream layouts, primitive and index types over all model clusters.
     ModelCensus,
+    /// Compare a recording of the original game (the oracle's output folder) with Aerugo, event by event.
+    OracleCompare {
+        /// Folder with `trace.bin` and `saves/`.
+        dir: PathBuf,
+        /// Only the event run with this index in the recording (0 = first).
+        #[arg(long)]
+        run: Option<usize>,
+    },
     /// Run every script for a few seconds with the implemented natives and print native coverage.
     NativeCoverage {
         #[arg(long, default_value_t = 120)]
@@ -98,6 +106,7 @@ fn main() -> Result<()> {
         Command::ModelCensus => model_census(&install),
         Command::EffectCensus { top } => effect_census(&install, top),
         Command::NativeCoverage { frames } => native_coverage(&install, frames),
+        Command::OracleCompare { dir, run } => oracle_compare(&install, &dir, run),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
         Command::FsbCompare { filter, every, samples } => {
@@ -346,6 +355,88 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
             for f in c.describe(id) {
                 println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, f.value);
             }
+        }
+    }
+    Ok(())
+}
+
+/// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
+fn archive_event_path(recorded: &str) -> Option<String> {
+    let p = recorded.replace('\\', "/").to_ascii_lowercase();
+    let (_, rest) = p.split_once("/master/")?;
+    let game = if p.contains("/ffx2/") { "ffx2" } else { "ffx" };
+    Some(format!("ffx_ps2/{game}/master/{rest}"))
+}
+
+fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_script::recording::{event_runs, first_divergence, parse};
+    use aerugo_sim::field::{Event, Input};
+    let data = std::fs::read(dir.join("trace.bin"))?;
+    let records = parse(&data)?;
+    let runs = event_runs(&records);
+    println!("{} records, {} event runs", records.len(), runs.len());
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    for (i, run) in runs.iter().enumerate() {
+        if only.is_some_and(|o| o != i) {
+            continue;
+        }
+        let Some(path) = archive_event_path(&run.path) else {
+            println!("run {i}: event {} {:?}: path not understood", run.index, run.path);
+            continue;
+        };
+        let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
+        let mut ev = match Event::load(&vfs, game, &path, aerugo_vfs::Language::English) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("run {i}: {path}: {e}");
+                continue;
+            }
+        };
+        // Start from the save image the original had and hand out its random numbers.
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let image = dir.join("saves").join(format!("{:08}-{name}", run.start_frame));
+        if let Ok(img) = std::fs::read(&image) {
+            let n = img.len().min(ev.vm.memory.global[0].len());
+            ev.vm.memory.global[0][..n].copy_from_slice(&img[..n]);
+        }
+        ev.state.rng_replay = run.random.iter().copied().collect();
+        ev.vm.trace = Some(Vec::new());
+        let mut ours = Vec::new();
+        for _ in 0..run.frames.len() {
+            ev.step(Input::default());
+            ours.push(std::mem::take(ev.vm.trace.as_mut().expect("tracing")));
+        }
+        let total: usize = run.frames.iter().map(Vec::len).sum();
+        match first_divergence(&run.frames, &ours) {
+            None => println!("run {i}: {name}: {} frames, {total} instructions: identical", run.frames.len()),
+            Some(d) => {
+                let show = |t: Option<aerugo_script::TraceEvent>| match t {
+                    Some(t) => format!(
+                        "w{} l{} {:05x} {} {}",
+                        t.worker,
+                        t.level,
+                        t.pc,
+                        aerugo_formats::script::op_info(t.op).mnemonic,
+                        t.operand.map(|v| format!("{v:#x}")).unwrap_or_default()
+                    ),
+                    None => "(nothing)".into(),
+                };
+                let matched: usize = run.frames[..d.frame].iter().map(Vec::len).sum::<usize>() + d.index;
+                println!(
+                    "run {i}: {name}: {} frames, {total} instructions; first difference at frame {} \
+                     instruction {} ({matched} matched)\n  original: {}\n  aerugo:   {}",
+                    run.frames.len(),
+                    d.frame,
+                    d.index,
+                    show(d.expected),
+                    show(d.got)
+                );
+            }
+        }
+        for (f, t, e) in &run.map_changes {
+            println!("  map change at frame {f}: target {t} entrance {e}");
         }
     }
     Ok(())

@@ -230,6 +230,15 @@ pub struct FieldState {
     /// A map change the scripts asked for: target and entrance, for the session to carry out.
     pub jump: Option<(i32, i32)>,
     pub rng: Rng,
+    /// Random values to hand out instead of the generator's (replaying a recording of the original).
+    pub rng_replay: std::collections::VecDeque<u32>,
+}
+
+impl FieldState {
+    /// The next script random number: a replayed one, else the generator's.
+    pub fn random(&mut self) -> u32 {
+        self.rng_replay.pop_front().unwrap_or_else(|| self.rng.next_value())
+    }
 }
 
 impl PartyLookup for FieldState {
@@ -625,12 +634,12 @@ fn register(n: &mut Natives<FieldState>) {
         }),
     );
     // Random numbers from the script stream.
-    n.register(0x00A9, Native::result(|g, _| Value::Int((g.rng.next_value() & 0xFFFF) as i32)));
+    n.register(0x00A9, Native::result(|g, _| Value::Int((g.random() & 0xFFFF) as i32)));
     n.register(
         0x00A6,
         Native::result(|g, c| {
             let n = c.stack.pop_int().max(1);
-            Value::Int((((g.rng.next_value() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
+            Value::Int((((g.random() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
         }),
     );
     // Movement: target, speed (distance per tick, or a duration), start, wait.
