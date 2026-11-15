@@ -58,3 +58,27 @@ fn ffx_events_load_and_run() {
     assert!(with_text * 2 >= events, "{with_text} of {events} have text");
     assert!(models_found * 10 >= bound * 9, "{models_found} of {bound} models found");
 }
+
+#[test]
+fn save_round_trips_through_an_event() {
+    use aerugo_sim::save::{FFX_IMAGE_SIZE, SaveGame};
+    let Some(inst) = install_from_env() else {
+        eprintln!("skipped: set {GAME_DIR_ENV} to a game installation to run this test");
+        return;
+    };
+    let mut vfs = Vfs::new();
+    vfs.mount_install(&inst).unwrap();
+    let path = "ffx_ps2/ffx/master/jppc/event/obj/bs/bsyt0000/bsyt0000.ebp";
+    let mut ev = Event::load(&vfs, Game::Ffx, path, Language::English).unwrap();
+    for _ in 0..90 {
+        ev.step(Input::default());
+    }
+    let save = ev.save();
+    assert_eq!(save.image.len(), FFX_IMAGE_SIZE);
+    let back = SaveGame::from_bytes(&save.to_bytes()).unwrap();
+    assert_eq!(back, save);
+    let mut fresh = Event::load(&vfs, Game::Ffx, path, Language::English).unwrap();
+    fresh.restore(&back);
+    assert_eq!(&fresh.vm.memory.global[0][..FFX_IMAGE_SIZE], &save.image[..]);
+    assert_eq!(fresh.tick, save.ticks);
+}

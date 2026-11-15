@@ -112,6 +112,7 @@ dependencies = [
  "aerugo-script",
  "aerugo-vfs",
  "log",
+ "thiserror",
 ]
 
 [[package]]

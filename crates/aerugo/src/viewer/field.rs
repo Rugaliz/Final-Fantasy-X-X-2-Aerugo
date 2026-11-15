@@ -14,6 +14,7 @@ use aerugo_script::Wait;
 use aerugo_sim::FixedTimestep;
 use aerugo_sim::field::collision::Ground;
 use aerugo_sim::field::{Event, Input};
+use aerugo_sim::save::{SaveGame, write_atomically};
 use aerugo_vfs::{Language, Vfs};
 use glam::{Mat4, Vec3};
 
@@ -37,6 +38,8 @@ struct Session {
     event: Event,
     map: Option<GpuModel>,
     layers: Option<GpuModel>,
+    /// Where a loaded save had the player, applied once the player is known.
+    restore_position: Option<[f32; 3]>,
     /// Events a map change could lead to (when more than one).
     jump_choices: Vec<String>,
     /// Stored cameras of the map's 2D layers.
@@ -71,6 +74,10 @@ pub struct FieldView {
     map_index: HashMap<Game, HashMap<i16, Vec<String>>>,
     follow_jumps: bool,
     pending_open: Option<String>,
+    /// A save to put in place once its event is open.
+    pending_restore: Option<SaveGame>,
+    slot: u32,
+    import_path: String,
 }
 
 impl std::fmt::Debug for FieldView {
@@ -105,6 +112,9 @@ impl FieldView {
             map_index: HashMap::new(),
             follow_jumps: true,
             pending_open: None,
+            pending_restore: None,
+            slot: 1,
+            import_path: String::new(),
         }
     }
 
@@ -159,6 +169,12 @@ impl FieldView {
         if let Some(m) = &map {
             self.orbit = OrbitCamera::framing(m.min, m.max);
         }
+        let mut restore_position = None;
+        if let Some(save) = self.pending_restore.take() {
+            event.restore(&save);
+            restore_position = save.position;
+            notes.push("save image restored".into());
+        }
         let map_cameras = event
             .map_layers
             .as_ref()
@@ -167,6 +183,7 @@ impl FieldView {
             .map(|c| aerugo_formats::camera::read_cameras(&c))
             .filter(|c| !c.is_empty());
         self.session = Some(Session {
+            restore_position,
             jump_choices: Vec::new(),
             map_cameras,
             event,
@@ -187,6 +204,9 @@ impl FieldView {
         if s.event.state.player.is_none() && s.event.initialized() {
             s.event.state.player =
                 s.event.state.actors.iter().position(|a| a.model.is_some_and(|m| m >> 12 == 0));
+            if let (Some(p), Some(pos)) = (s.event.state.player, s.restore_position.take()) {
+                s.event.state.actors[p].pos = pos;
+            }
         }
         s.event.step(input);
     }
@@ -331,6 +351,51 @@ impl FieldView {
             ui.weak(n);
         }
         ui.checkbox(&mut self.follow_jumps, "Follow map changes");
+        // Saves: own container per slot; import of a Steam release save's image.
+        let dir = aerugo_platform::user_dir(false).join("saves");
+        let path = dir.join(format!("slot{}.aesv", self.slot));
+        ui.horizontal(|ui| {
+            ui.label("Slot");
+            ui.add(egui::DragValue::new(&mut self.slot).range(1..=9));
+            if ui.button("Save").clicked() {
+                let bytes = ev.save().to_bytes();
+                let msg = match write_atomically(&path, &bytes) {
+                    Ok(()) => format!("saved to {}", path.display()),
+                    Err(e) => format!("save failed: {e}"),
+                };
+                s.notes.push(msg);
+            }
+            if ui.button("Load").clicked() {
+                let loaded = std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| SaveGame::from_bytes(&b).map_err(|e| e.to_string()));
+                match loaded {
+                    Ok(save) => {
+                        if let Some(ev) = save.event.clone() {
+                            self.pending_open = Some(ev);
+                        }
+                        self.pending_restore = Some(save);
+                    }
+                    Err(e) => s.notes.push(format!("load failed: {e}")),
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Steam save");
+            ui.text_edit_singleline(&mut self.import_path);
+            if ui.button("Import").clicked() {
+                let imported = std::fs::read(&self.import_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| SaveGame::import_steam(ev.game, &b).map_err(|e| e.to_string()));
+                match imported {
+                    Ok(save) => {
+                        ev.restore(&save);
+                        s.notes.push("Steam save image put in place".into());
+                    }
+                    Err(e) => s.notes.push(format!("import failed: {e}")),
+                }
+            }
+        });
         if !s.jump_choices.is_empty() {
             ui.label("Map change to one of:");
             for p in &s.jump_choices {

@@ -12,6 +12,7 @@ aerugo-formats.workspace = true
 aerugo-script.workspace = true
 aerugo-vfs.workspace = true
 log.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

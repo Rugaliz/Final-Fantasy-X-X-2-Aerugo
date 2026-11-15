@@ -409,6 +409,31 @@ impl Event {
         self.tick += 1;
     }
 
+    /// Capture a save: the save image (global block 0), this event and the player's position.
+    pub fn save(&self) -> crate::save::SaveGame {
+        let size = crate::save::FFX_IMAGE_SIZE.min(self.vm.memory.global[0].len());
+        crate::save::SaveGame {
+            game: self.game,
+            event: Some(self.path.clone()),
+            position: self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos),
+            ticks: self.tick,
+            image: self.vm.memory.global[0][..size].to_vec(),
+        }
+    }
+
+    /// Put a save's image in place (and the player where it stood) before the event runs.
+    pub fn restore(&mut self, save: &crate::save::SaveGame) {
+        let g = &mut self.vm.memory.global[0];
+        let n = save.image.len().min(g.len());
+        g[..n].copy_from_slice(&save.image[..n]);
+        self.tick = save.ticks;
+        if let (Some(p), Some(pos)) = (self.state.player, save.position)
+            && let Some(a) = self.state.actors.get_mut(p)
+        {
+            a.pos = pos;
+        }
+    }
+
     /// The map number in the script's header.
     pub fn map_number(&self) -> Option<i16> {
         self.vm.script.map_number()

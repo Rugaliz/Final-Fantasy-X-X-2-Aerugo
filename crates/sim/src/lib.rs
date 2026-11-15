@@ -5,6 +5,7 @@
 //! the original timing. This crate has no graphics, audio or window dependencies.
 
 pub mod field;
+pub mod save;
 pub mod snapshot;
 pub mod test_scene;
 pub mod tick;

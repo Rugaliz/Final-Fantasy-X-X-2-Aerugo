@@ -10,7 +10,7 @@
 | `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
 | `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures, models, motions, sound banks and events, scripts |
 | `aerugo-script` | The script machine: workers, priority levels, requests, natives with a coverage tracker |
-| `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation |
+| `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation; field events (script, actors, messages, camera, player), saves |
 | `aerugo-audio` | Float mixer with windowed-sinc resampling and a limiter, SDL3 playback |
 | `aerugo-video` | WebM movies: Matroska demuxing, VP8 through libvpx (loaded at run time), Vorbis through lewton |
 | `aerugo-debug-ui` | egui integration with SDL3 input, debug panels |
