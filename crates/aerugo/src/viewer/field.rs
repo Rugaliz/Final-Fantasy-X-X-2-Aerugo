@@ -18,13 +18,27 @@ use aerugo_vfs::{Language, Vfs};
 use glam::{Mat4, Vec3};
 
 use super::filelist::FileList;
+use super::maps::{best_camera, camera_view_proj, fit_layers};
 use super::models::{OrbitCamera, game_to_view, load_motions};
 use crate::assets::{GpuModel, load_model};
+use aerugo_gfx::aspect::{AspectMode, clip_transform};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraMode {
+    /// Orbit around the player (or freely).
+    Follow,
+    /// The camera the scripts set.
+    Script,
+    /// The map's stored camera, framing its pre-rendered background.
+    Map,
+}
 
 struct Session {
     event: Event,
     map: Option<GpuModel>,
     layers: Option<GpuModel>,
+    /// Stored cameras of the map's 2D layers.
+    map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
     /// Character models by model id (None when missing).
     actors: HashMap<u16, Option<GpuModel>>,
     /// PS2 motions of each character model.
@@ -46,7 +60,8 @@ pub struct FieldView {
     confirm: bool,
     orbit: OrbitCamera,
     follow_player: bool,
-    script_camera: bool,
+    camera_mode: CameraMode,
+    aspect: AspectMode,
     show_layers: bool,
     request: (usize, u16, u8),
 }
@@ -75,7 +90,8 @@ impl FieldView {
             confirm: false,
             orbit: OrbitCamera::framing(Vec3::splat(-100.0), Vec3::splat(100.0)),
             follow_player: true,
-            script_camera: false,
+            camera_mode: CameraMode::Follow,
+            aspect: AspectMode::Crop,
             show_layers: false,
             request: (0, 2, 3),
         }
@@ -132,7 +148,15 @@ impl FieldView {
         if let Some(m) = &map {
             self.orbit = OrbitCamera::framing(m.min, m.max);
         }
+        let map_cameras = event
+            .map_layers
+            .as_ref()
+            .and_then(|p| vfs.read(p).ok())
+            .and_then(|d| Cluster::parse(d).ok())
+            .map(|c| aerugo_formats::camera::read_cameras(&c))
+            .filter(|c| !c.is_empty());
         self.session = Some(Session {
+            map_cameras,
             event,
             map,
             layers,
@@ -210,9 +234,19 @@ impl FieldView {
                 self.paused = true;
                 self.step_once = true;
             }
-            ui.checkbox(&mut self.follow_player, "Follow player");
-            ui.checkbox(&mut self.script_camera, "Script camera");
             ui.checkbox(&mut self.show_layers, "2D layers");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Camera");
+            ui.radio_value(&mut self.camera_mode, CameraMode::Follow, "follow");
+            ui.radio_value(&mut self.camera_mode, CameraMode::Script, "script");
+            ui.radio_value(&mut self.camera_mode, CameraMode::Map, "map");
+            ui.checkbox(&mut self.follow_player, "track player");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Aspect");
+            ui.radio_value(&mut self.aspect, AspectMode::Crop, "crop");
+            ui.radio_value(&mut self.aspect, AspectMode::Fit, "fit");
         });
         let Some(s) = &mut self.session else { return };
         let ev = &mut s.event;
@@ -355,17 +389,36 @@ impl FieldView {
             self.orbit.target = game_to_view().transform_point3(Vec3::from(p.pos));
         }
         let aspect = size.x / size.y.max(1.0);
-        let view_proj = match (self.script_camera, st.camera.position, st.camera.focus) {
-            (true, Some(eye), Some(focus)) => {
+        // The original frame is 512 × 448; the script and map cameras follow the aspect policy around it.
+        let design = 512.0 / 448.0;
+        let mode = self.aspect;
+        let policy = |base: Mat4, design: f32| {
+            Mat4::from_cols_array(&clip_transform(design, aspect, mode, [0.0, 0.0]).matrix()) * base
+        };
+        let map_camera = s.layers.as_ref().and_then(|layers| {
+            let cams = s.map_cameras.as_ref()?;
+            let fitted: Vec<_> = cams.iter().map(|c| fit_layers(c, Some(layers))).collect();
+            let shapes: Vec<_> =
+                fitted.iter().map(|f| f.map(|[l, r, t, b]| (0.0, (r - l) / (b - t)))).collect();
+            let i = best_camera(&shapes);
+            let f = fitted.get(i).copied().flatten()?;
+            let d = (f[1] - f[0]) / (f[3] - f[2]);
+            Some(policy(camera_view_proj(&cams[i], d, Some(f)), d))
+        });
+        let view_proj = match (self.camera_mode, st.camera.position, st.camera.focus, map_camera) {
+            (CameraMode::Script, Some(eye), Some(focus), _) => {
                 let r = game_to_view();
                 let (eye, focus) =
                     (r.transform_point3(Vec3::from(eye)), r.transform_point3(Vec3::from(focus)));
                 let d = (focus - eye).length().max(1.0);
-                Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                    * Mat4::perspective_rh(40f32.to_radians(), aspect, d * 0.01, d * 200.0)
+                let base = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                    * Mat4::perspective_rh(st.camera.fov_y(), design, d * 0.01, d * 200.0)
+                    * Mat4::from_rotation_z(st.camera.roll)
                     * Mat4::look_at_rh(eye, focus, Vec3::Y)
-                    * r
+                    * r;
+                policy(base, design)
             }
+            (CameraMode::Map, _, _, Some(vp)) => vp,
             _ => self.orbit.view_proj(aspect),
         };
         let mut draws = Vec::new();

@@ -423,14 +423,14 @@ impl MapBrowser {
 /// View-projection of a stored camera for its design aspect (Vulkan clip space). Cameras look down −Z.
 /// The camera that frames the layers best: its fitted frame is closest to the PS2's 512 × 448. Maps keep
 /// cameras for other shots too, which may not face the background at all.
-fn best_camera(fitted: &[Option<(f32, f32)>]) -> usize {
+pub(super) fn best_camera(fitted: &[Option<(f32, f32)>]) -> usize {
     let score = |f: &Option<(f32, f32)>| f.map_or(f32::MAX, |(_, a)| (a - 512.0 / 448.0).abs());
     (0..fitted.len()).min_by(|&a, &b| score(&fitted[a]).total_cmp(&score(&fitted[b]))).unwrap_or(0)
 }
 
 /// A camera's view-projection. With a fitted frustum the frame is exactly the background (which may sit off
 /// the camera's axis); otherwise the camera's own field of view at the `design` aspect.
-fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 4]>) -> Mat4 {
+pub(super) fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 4]>) -> Mat4 {
     let world = Mat4::from_cols_array(&cam.world);
     let view = world.inverse();
     let (near, far) = (cam.near.max(0.001), cam.far.max(cam.near + 1.0));
@@ -473,7 +473,7 @@ fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 4]>) -> Mat
 /// Field of view and frame shape that make the 2D background exactly fill a camera's frame. The background is
 /// the layer farthest from the camera (foreground layers may reach past the frame); the fit is a perspective
 /// from the camera's position, looking down its −Z axis.
-fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<[f32; 4]> {
+pub(super) fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<[f32; 4]> {
     let layers = layers?;
     let view = Mat4::from_cols_array(&cam.world).inverse();
     // Half-height tangent of the camera's own view.

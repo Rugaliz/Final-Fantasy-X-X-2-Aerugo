@@ -112,6 +112,42 @@ pub struct CameraState {
     pub position: Option<[f32; 3]>,
     pub focus: Option<[f32; 3]>,
     pub roll: f32,
+    /// Distance from the eye to the screen plane in the original's 512 × 448 frame (sets the field of view);
+    /// zero until a script sets it.
+    pub screen_distance: f32,
+    destination: Option<[f32; 3]>,
+    move_frames: u32,
+    moving: Option<Movement>,
+}
+
+impl CameraState {
+    /// Vertical field of view from the screen distance (the frame is 448 high).
+    pub fn fov_y(&self) -> f32 {
+        let d = if self.screen_distance > 1.0 { self.screen_distance } else { 400.0 };
+        2.0 * (224.0 / d).atan()
+    }
+
+    pub fn is_moving(&self) -> bool {
+        self.moving.is_some()
+    }
+
+    fn update(&mut self) {
+        if let Some(m) = &mut self.moving {
+            m.done += 1;
+            let t = (m.done as f32 / m.frames.max(1) as f32).min(1.0);
+            self.position = Some(std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t));
+            if m.done >= m.frames {
+                self.moving = None;
+            }
+        }
+    }
+
+    /// Start moving to the destination over the set number of frames.
+    fn start_move(&mut self) {
+        if let (Some(to), Some(from)) = (self.destination, self.position.or(self.destination)) {
+            self.moving = Some(Movement { from, to, frames: self.move_frames.max(1), done: 0 });
+        }
+    }
 }
 
 /// Player input for one tick.
@@ -176,6 +212,7 @@ impl FieldState {
 
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
+        self.camera.update();
         for a in &mut self.actors {
             if let Some(m) = &mut a.moving {
                 m.done += 1;
@@ -627,6 +664,51 @@ fn register(n: &mut Natives<FieldState>) {
         0x6002,
         Native::result(|g, c| {
             g.camera.position = Some(pop3(c));
+            g.camera.moving = None;
+            Value::Int(0)
+        }),
+    );
+    // Destination, then a move time in frames starts the move; wait until it arrives; stop.
+    n.register(
+        0x6004,
+        Native::result(|g, c| {
+            g.camera.destination = Some(pop3(c));
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6010,
+        Native::result(|g, c| {
+            g.camera.move_frames = c.stack.pop_int().max(1) as u32;
+            g.camera.start_move();
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6014,
+        Native::result(|g, c| {
+            // Four frame counts (start and end of two phases); the longest is the move time.
+            let frames = (0..4).map(|_| c.stack.pop_int()).max().unwrap_or(1);
+            g.camera.move_frames = frames.max(1) as u32;
+            g.camera.start_move();
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x601A,
+        Native { init: None, wait: Some(|g, _| if g.camera.is_moving() { 0 } else { 5 }), result: None },
+    );
+    n.register(
+        0x6016,
+        Native::result(|g, _| {
+            g.camera.moving = None;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x603B,
+        Native::result(|g, c| {
+            g.camera.screen_distance = c.stack.pop_float();
             Value::Int(0)
         }),
     );
