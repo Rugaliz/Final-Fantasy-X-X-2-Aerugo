@@ -1,0 +1,60 @@
+//! Field events of a real installation load with their map and text, initialize, and run (needs `AERUGO_GAME_DIR`).
+
+use aerugo_formats::Game;
+use aerugo_formats::script;
+use aerugo_sim::field::{Event, Input, model_path};
+use aerugo_vfs::{ArchiveId, GAME_DIR_ENV, Language, Vfs, install_from_env};
+
+#[test]
+fn ffx_events_load_and_run() {
+    let Some(inst) = install_from_env() else {
+        eprintln!("skipped: set {GAME_DIR_ENV} to a game installation to run this test");
+        return;
+    };
+    let mut vfs = Vfs::new();
+    vfs.mount_install(&inst).unwrap();
+    let paths: Vec<String> = vfs
+        .archives()
+        .filter(|(id, _)| *id == Some(ArchiveId::Ffx))
+        .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
+        .filter(|p| p.ends_with(".ebp") && script::is_script_path(p))
+        .collect();
+    let (mut events, mut with_map, mut initialized, mut with_text, mut bound, mut models_found, mut opened) =
+        (0, 0, 0, 0, 0, 0, 0);
+    let mut missing_models = std::collections::BTreeSet::new();
+    for path in &paths {
+        let mut ev =
+            Event::load(&vfs, Game::Ffx, path, Language::English).unwrap_or_else(|e| panic!("{path}: {e}"));
+        events += 1;
+        with_map += usize::from(ev.map_model.is_some());
+        with_text += usize::from(!ev.state.messages.is_empty());
+        let mut window_opened = false;
+        for _ in 0..300 {
+            ev.step(Input { confirm: true, ..Input::default() });
+            window_opened |= ev.state.windows.iter().any(|w| w.open);
+        }
+        initialized += usize::from(ev.initialized());
+        opened += usize::from(window_opened);
+        for a in &ev.state.actors {
+            if let Some(id) = a.model {
+                bound += 1;
+                match model_path(Game::Ffx, id) {
+                    Some(p) if vfs.size(&p).is_some() => models_found += 1,
+                    _ => {
+                        missing_models.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{events} events: {with_map} with a map, {with_text} with English text, {initialized} initialized in 10 s, \
+         {opened} opened a message window; {bound} actors bound a model, {models_found} of those models found \
+         (missing ids: {:x?})",
+        missing_models.iter().take(20).collect::<Vec<_>>()
+    );
+    assert!(events > 300);
+    assert!(initialized * 10 >= events * 9, "{initialized} of {events} initialized");
+    assert!(with_text * 2 >= events, "{with_text} of {events} have text");
+    assert!(models_found * 10 >= bound * 9, "{models_found} of {bound} models found");
+}

@@ -8,6 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aerugo-formats.workspace = true
+aerugo-script.workspace = true
+aerugo-vfs.workspace = true
+log.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]

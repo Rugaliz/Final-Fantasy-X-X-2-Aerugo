@@ -26,6 +26,7 @@ dependencies = [
  "aerugo-formats",
  "aerugo-gfx",
  "aerugo-platform",
+ "aerugo-script",
  "aerugo-sim",
  "aerugo-vfs",
  "aerugo-video",
@@ -106,6 +107,12 @@ dependencies = [
 [[package]]
 name = "aerugo-sim"
 version = "0.1.0"
+dependencies = [
+ "aerugo-formats",
+ "aerugo-script",
+ "aerugo-vfs",
+ "log",
+]
 
 [[package]]
 name = "aerugo-vfs"

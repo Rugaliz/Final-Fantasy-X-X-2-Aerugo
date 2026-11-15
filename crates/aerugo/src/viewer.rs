@@ -1,5 +1,6 @@
 //! Asset viewer: browses the game data. Tabs are added as readers arrive.
 
+mod field;
 mod filelist;
 mod maps;
 mod models;
@@ -15,6 +16,7 @@ use aerugo_debug_ui::egui;
 use aerugo_gfx::Renderer;
 use aerugo_vfs::{Install, Language, Vfs};
 
+use field::FieldView;
 use maps::MapBrowser;
 use models::ModelBrowser;
 #[cfg(test)]
@@ -34,11 +36,20 @@ enum Tab {
     Sounds,
     Movies,
     Scripts,
+    Field,
 }
 
 impl Tab {
-    const ALL: [Tab; 7] =
-        [Tab::Tables, Tab::Textures, Tab::Models, Tab::Maps, Tab::Sounds, Tab::Movies, Tab::Scripts];
+    const ALL: [Tab; 8] = [
+        Tab::Tables,
+        Tab::Textures,
+        Tab::Models,
+        Tab::Maps,
+        Tab::Sounds,
+        Tab::Movies,
+        Tab::Scripts,
+        Tab::Field,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -49,6 +60,7 @@ impl Tab {
             Tab::Sounds => "sounds",
             Tab::Movies => "movies",
             Tab::Scripts => "scripts",
+            Tab::Field => "field",
         }
     }
 
@@ -61,6 +73,7 @@ impl Tab {
             Tab::Sounds => "Sounds",
             Tab::Movies => "Movies",
             Tab::Scripts => "Scripts",
+            Tab::Field => "Field",
         }
     }
 }
@@ -77,6 +90,7 @@ pub struct Viewer {
     sounds: SoundBrowser,
     movies: MoviePlayer,
     scripts: ScriptBrowser,
+    field: FieldView,
     audio: Option<aerugo_audio::AudioOutput>,
 }
 
@@ -128,6 +142,7 @@ impl Viewer {
             sounds: SoundBrowser::with_languages(japanese_voices, original_music),
             movies: MoviePlayer::new(),
             scripts: ScriptBrowser::new(),
+            field: FieldView::new(text_language),
             audio,
         }
     }
@@ -144,6 +159,7 @@ impl Viewer {
         self.maps.close(renderer);
         self.sounds.close(self.audio.as_ref());
         self.movies.close(renderer, self.audio.as_ref());
+        self.field.close(renderer);
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
@@ -167,6 +183,7 @@ impl Viewer {
                     egui::Key::Num5,
                     egui::Key::Num6,
                     egui::Key::Num7,
+                    egui::Key::Num8,
                 ];
                 for (tab, key) in Tab::ALL.into_iter().zip(keys) {
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
@@ -190,6 +207,7 @@ impl Viewer {
                 Tab::Sounds => self.sounds.ui(ui, vfs, self.audio.as_ref()),
                 Tab::Movies => self.movies.ui(ui, vfs, renderer, self.audio.as_ref()),
                 Tab::Scripts => self.scripts.ui(ui, vfs),
+                Tab::Field => self.field.ui(ui, vfs, renderer),
             },
             (None, error) => {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
