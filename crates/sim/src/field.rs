@@ -249,6 +249,9 @@ pub struct Window {
     pub style: Option<u8>,
 }
 
+/// Characters further apart than this vertically do not touch (cdsp0100: one falling past another 16 apart).
+const BUMP_HEIGHT: f32 = 10.0;
+
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
 const OPEN_TICKS: u8 = 2;
 
@@ -610,8 +613,8 @@ impl FieldState {
                 let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
                 let d = (dx * dx + dz * dz).sqrt();
                 // A character pushed back out stands at the contact distance, give or take rounding: that still
-                // counts as touching.
-                if d > r + CONTACT_SLACK {
+                // counts as touching. Characters well above or below each other do not touch.
+                if d > r + CONTACT_SLACK || (a.pos[1] - b.pos[1]).abs() > BUMP_HEIGHT {
                     continue;
                 }
                 // Only the player walking into a character bumps it.
@@ -650,8 +653,10 @@ impl FieldState {
     /// Start a talk when a talk button is pressed while the player has control and no message window is open.
     fn begin_talk(&mut self) {
         let pressed = self.input.confirm || self.input.alt;
-        self.talk = (pressed && self.user_control && !self.windows.iter().any(|w| w.open))
-            .then(|| Talk::new(if self.input.confirm { trigger::TALK } else { trigger::TALK_ALT }));
+        // Windows flagged 0x2000 (labels left on screen) do not hold talking up.
+        self.talk =
+            (pressed && self.user_control && !self.windows.iter().any(|w| w.open && w.flags & 0x2000 == 0))
+                .then(|| Talk::new(if self.input.confirm { trigger::TALK } else { trigger::TALK_ALT }));
     }
 
     fn actor(&mut self, w: usize) -> &mut Actor {
@@ -1385,7 +1390,7 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
     }
     zero!(
         0x500B, 0x500E, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x4013, 0x400A,
-        0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x6032, 0x5001, 0x5010
+        0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
     );
     // Body hit off (1) or on (0): characters without it neither block nor bump.
     n.register(
@@ -1458,7 +1463,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     }
     fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x00E3, 0x0119, 0x0004);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
-    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D, 0x6011, 0x00A3);
+    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D, 0x00A3);
     fixed!(1; 0x801D, 0x801E, 0x801F);
     fixed!(1; 0x8010, 0x8030);
     // A message variable (window, slot, kind, value) for the window's text; returns the window.

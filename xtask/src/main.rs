@@ -1127,6 +1127,12 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             {
                 let a = &ev.state.actors[w];
                 eprintln!(
+                    "f{f} control {} talk reach {} windows open {}",
+                    ev.state.user_control,
+                    ev.state.talk_reach,
+                    ev.state.windows.iter().filter(|w| w.open || w.closing > 0).count()
+                );
+                eprintln!(
                     "f{f} player {:?} prev {:?} pos {:?}; w{w} pos {:?} yaw {} flags {:#x} {:?}",
                     ev.state.player,
                     ev.state.player_prev,
