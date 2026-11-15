@@ -103,6 +103,15 @@ enum Command {
         #[arg(long, default_value_t = 4.0)]
         stop: f32,
     },
+    /// Run every FFX field event in the field engine for a while (confirming now and then) and print which
+    /// natives the scripts call and which Aerugo lacks, by call count.
+    FieldCoverage {
+        #[arg(long, default_value_t = 300)]
+        frames: u32,
+    },
+    /// List the motions scripts play with a frame range (native 0x501A) and how many ticks the next motion
+    /// wait polls as not done.
+    OracleMotions { dir: PathBuf },
     /// Print the start of an archive file as hex.
     Hexdump {
         path: String,
@@ -186,6 +195,8 @@ fn main() -> Result<()> {
             };
             field_run(&install, &event, &run)
         }
+        Command::FieldCoverage { frames } => field_coverage(&install, frames),
+        Command::OracleMotions { dir } => oracle_motions(&dir),
         Command::Hexdump { path, len } => {
             let mut vfs = aerugo_vfs::Vfs::new();
             vfs.mount_install(&install)?;
@@ -527,6 +538,7 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
                 input.confirm = t % 30 == 0;
             }
         }
+        ev.load_motion_frames(&vfs);
         ev.step(input);
         if t % 100 == 0 || ev.state.jump.is_some() {
             let p = ev.state.player.and_then(|p| ev.state.actors.get(p)).map(|a| a.pos);
@@ -977,6 +989,7 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 alt: pressed & 0x80 != 0,
                 ..Input::default()
             };
+            ev.load_motion_frames(&vfs);
             ev.step(input);
             // PLAYER_DIR: the stick, the player's recorded step and the camera, per frame (for fitting the
             // player controller).
@@ -1221,6 +1234,105 @@ fn oracle_arity(dir: &std::path::Path) -> Result<()> {
         }
     }
     println!("{} natives measured: {agree} agree with the table, {differ} differ", measured.len());
+    Ok(())
+}
+
+fn oracle_motions(dir: &std::path::Path) -> Result<()> {
+    use aerugo_formats::script::op_info;
+    use aerugo_script::recording::{Record, parse};
+    use std::collections::HashMap;
+    #[derive(Default)]
+    struct W {
+        pushes: Vec<i64>,
+        // (frame, motion, start, end, not-done polls)
+        pending: Option<(u32, i64, i64, i64, u32)>,
+    }
+    let records = parse(&std::fs::read(dir.join("trace.bin"))?)?;
+    let (mut frame, mut name) = (0u32, String::new());
+    let mut ws: HashMap<u16, W> = HashMap::new();
+    for r in &records {
+        match r {
+            Record::Event { path, .. } => {
+                ws.clear();
+                frame = 0;
+                name = path.clone();
+            }
+            Record::Frame(_) => frame += 1,
+            Record::Instruction { worker, op, operand, .. } => {
+                let w = ws.entry(*worker).or_default();
+                let m = op_info(*op).mnemonic;
+                if m == "push.imm" {
+                    w.pushes.push(i64::from(operand.unwrap_or(0) as i16));
+                } else if m == "push.int" {
+                    w.pushes.push(-1_000_000 - i64::from(operand.unwrap_or(0)));
+                } else if m.starts_with("call") && operand == &Some(0x501A) {
+                    let p = &w.pushes;
+                    if p.len() >= 5 {
+                        let n = p.len();
+                        w.pending = Some((frame, p[n - 5], p[n - 2], p[n - 1], 0));
+                    }
+                    w.pushes.clear();
+                } else {
+                    w.pushes.clear();
+                }
+            }
+            Record::NativePoll { worker, native: 0x501E | 0x5003, flags } => {
+                let w = ws.entry(*worker).or_default();
+                if let Some(p) = &mut w.pending {
+                    if *flags == 0 {
+                        p.4 += 1;
+                    } else {
+                        println!(
+                            "{name} w{worker} f{}: motion {:#x} frames {}..{} waited {}",
+                            p.0, p.1, p.2, p.3, p.4
+                        );
+                        w.pending = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn field_coverage(install: &Install, frames: u32) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_sim::field::{Event, Input};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let paths: Vec<String> = vfs
+        .archives()
+        .filter(|(id, _)| *id == Some(ArchiveId::Ffx))
+        .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
+        .filter(|p| p.ends_with(".ebp") && p.contains("/jppc/event/obj/"))
+        .collect();
+    let mut total = aerugo_script::natives::Coverage::default();
+    for path in &paths {
+        let Ok(mut ev) = Event::load(&vfs, Game::Ffx, path, aerugo_vfs::Language::English) else { continue };
+        for t in 0..frames {
+            if ev.state.player.is_none() && ev.initialized() {
+                ev.state.player = ev.state.actors.iter().position(|a| a.model.is_some_and(|m| m >> 12 == 0));
+            }
+            ev.load_motion_frames(&vfs);
+            ev.step(Input { confirm: t % 30 == 29, ..Input::default() });
+        }
+        for (id, n) in &ev.natives.coverage.calls {
+            *total.calls.entry(*id).or_default() += n;
+        }
+        total.missing.extend(ev.natives.coverage.missing.iter().copied());
+    }
+    println!("FFX field: {} events\n{}", paths.len(), total.report(Game::Ffx));
+    // Every missing native, most called first.
+    let mut missing: Vec<(u16, u64)> =
+        total.missing.iter().map(|id| (*id, total.calls.get(id).copied().unwrap_or(0))).collect();
+    missing.sort_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
+    for (id, n) in missing {
+        println!(
+            "all-missing {id:04x} {:<36} {n}",
+            aerugo_formats::script::native(Game::Ffx, id).display(id)
+        );
+    }
     Ok(())
 }
 

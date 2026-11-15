@@ -217,7 +217,7 @@ impl FieldView {
         self.pending_open = Some(event);
     }
 
-    fn tick(&mut self, input: Input) {
+    fn tick(&mut self, input: Input, vfs: &Vfs) {
         let Some(s) = &mut self.session else { return };
         // The player is the first party member with a body, until the scripts say otherwise.
         if s.event.state.player.is_none() && s.event.initialized() {
@@ -227,6 +227,7 @@ impl FieldView {
                 s.event.state.actors[p].pos = pos;
             }
         }
+        s.event.load_motion_frames(vfs);
         s.event.step(input);
     }
 
@@ -280,7 +281,7 @@ impl FieldView {
                 walk,
                 camera_heading: self.camera_heading,
             };
-            self.tick(input);
+            self.tick(input, vfs);
         }
         self.handle_jump(vfs);
         egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {

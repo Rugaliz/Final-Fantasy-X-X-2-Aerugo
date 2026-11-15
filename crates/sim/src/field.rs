@@ -41,6 +41,8 @@ pub struct Actor {
     pub radius: Option<f32>,
     /// Another character walked into this one last tick.
     bumped: bool,
+    /// A motion played over a frame range: motion id, first frame, last frame (−1: its end), ticks played.
+    pub motion_play: Option<(i32, i32, i32, u32)>,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
     /// Move state per script level: a level's move waits while a higher level runs.
@@ -66,6 +68,7 @@ impl Default for Actor {
             trigger: Trigger::default(),
             radius: None,
             bumped: false,
+            motion_play: None,
             level: 0,
             moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
@@ -434,6 +437,8 @@ pub struct FieldState {
     /// The talk started this tick, while workers offer themselves.
     pub talk: Option<Talk>,
     pub control: PlayerControl,
+    /// Frame counts of each model's motions (in motion-group order), as the host loads them.
+    pub motion_frames: std::collections::HashMap<u16, Vec<u32>>,
     /// Each worker's three data areas in the script (for natives that take tables there).
     pub data_areas: Vec<[u32; 3]>,
     /// The event's entrance records (the save image says which one the party arrived by).
@@ -574,8 +579,31 @@ impl FieldState {
         &mut self.actors[w]
     }
 
+    /// Ticks still to play of an actor's ranged motion (0 when none or unknown).
+    #[allow(dead_code)]
+    fn motion_left(&self, a: &Actor) -> u32 {
+        let Some((motion, start, end, done)) = a.motion_play else { return 0 };
+        let total = if end >= 0 {
+            (end - start).max(0) as u32
+        } else {
+            let len = a
+                .model
+                .and_then(|m| self.motion_frames.get(&m))
+                .and_then(|f| f.get((motion & 0xFFF) as usize))
+                .copied()
+                .unwrap_or(0);
+            len.saturating_sub(start.max(0) as u32)
+        };
+        total.saturating_sub(done)
+    }
+
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
+        for a in &mut self.actors {
+            if let Some(p) = &mut a.motion_play {
+                p.3 += 1;
+            }
+        }
         self.camera.update();
         let actors = &self.actors;
         if let Some((focus, eye)) = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos)) {
@@ -723,6 +751,31 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
         .collect()
 }
 
+/// Frame counts of a model's motions, in the order of its motion groups (by file name) and their entries.
+pub fn motion_frames(vfs: &Vfs, model_path: &str) -> Vec<u32> {
+    use aerugo_formats::motion::{MotionGroup, motion_dir};
+    let Some(dir) = motion_dir(model_path) else { return Vec::new() };
+    let mut paths: Vec<String> = vfs
+        .archives()
+        .flat_map(|(_, a)| {
+            a.entries()
+                .iter()
+                .filter(|e| e.path.starts_with(&dir) && e.path.ends_with(".mgrp") && e.size > 16)
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut out = Vec::new();
+    for path in paths {
+        let Ok(bytes) = vfs.read(&path) else { continue };
+        let Ok(group) = MotionGroup::parse(&bytes) else { continue };
+        out.extend(group.motions.iter().map(|m| u32::from(m.frames)));
+    }
+    out
+}
+
 /// The PS2 map package holding the walk mesh for a drawn map (`…/map/<area>/<map>/…`).
 pub fn walk_mesh_path(map_model: &str) -> Option<String> {
     let rest = map_model.split("/map/").nth(1)?;
@@ -845,6 +898,19 @@ impl Event {
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
         self.tick += 1;
+    }
+
+    /// Load the frame counts of the motions of models that appeared since the last call (hosts call it before each
+    /// tick).
+    pub fn load_motion_frames(&mut self, vfs: &Vfs) {
+        let models: Vec<u16> = self.state.actors.iter().filter_map(|a| a.model).collect();
+        for m in models {
+            if self.state.motion_frames.contains_key(&m) {
+                continue;
+            }
+            let frames = model_path(self.game, m).map(|p| motion_frames(vfs, &p)).unwrap_or_default();
+            self.state.motion_frames.insert(m, frames);
+        }
     }
 
     /// Capture a save: the save image (global block 0), this event and the player's position.
@@ -1272,6 +1338,25 @@ fn register(n: &mut Natives<FieldState>) {
             }),
         );
     }
+    // A motion over a frame range (motion, two values not used here, first frame, last frame or −1), and the
+    // waits for it.
+    n.register(
+        0x501A,
+        Native::result(|g, c| {
+            let end = c.stack.pop_int();
+            let start = c.stack.pop_int();
+            let _b = c.stack.pop_int();
+            let _a = c.stack.pop_int();
+            let motion = c.stack.pop_int();
+            let a = g.actor(c.worker);
+            a.motion = Some(motion);
+            a.motion_play = Some((motion, start, end, 0));
+            Value::Int(0)
+        }),
+    );
+    // The motion waits (0x5003, 0x501E) stay unported until every way of starting a motion keeps its timing
+    // (0x5022 and others start motions too; a wait after them lasts the motion's length): `motion_left` is
+    // what they will return.
     n.register(
         0x5000,
         Native::result(|g, c| {
