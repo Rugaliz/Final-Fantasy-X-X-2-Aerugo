@@ -359,6 +359,16 @@ impl CameraState {
         self.moving.is_some() || self.timers.iter().chain(&self.path_timers).any(|&t| t > 0)
     }
 
+    /// Whether one part's moves are under way: 0 the eye (part bits 0–2, the eye path, a destination move),
+    /// 1 the focus (bits 3–5, the focus path).
+    pub fn part_moving(&self, part: usize) -> bool {
+        if part == 0 {
+            self.moving.is_some() || self.timers[0..3].iter().any(|&t| t > 0) || self.path_timers[0] > 0
+        } else {
+            self.timers[3..6].iter().any(|&t| t > 0) || self.path_timers[1] > 0
+        }
+    }
+
     fn update(&mut self) {
         if std::mem::take(&mut self.pending) && self.destination.is_some() {
             self.start_move();
@@ -2686,6 +2696,15 @@ pub fn register(n: &mut Natives<FieldState>) {
             g.camera.parts = Some(c.stack.pop_int() as u8);
             Value::Int(0)
         }),
+    );
+    // Wait for the eye's (6062) or the focus's (6063) moves.
+    n.register(
+        0x6062,
+        Native { init: None, wait: Some(|g, _| if g.camera.part_moving(0) { 0 } else { 5 }), result: None },
+    );
+    n.register(
+        0x6063,
+        Native { init: None, wait: Some(|g, _| if g.camera.part_moving(1) { 0 } else { 5 }), result: None },
     );
     n.register(
         0x601A,
