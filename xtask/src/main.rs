@@ -992,8 +992,15 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 ours.push(Vec::new());
                 continue;
             }
-            if ev.state.battle.is_some() && run.battles.iter().any(|b| b.1 && (b.0 as usize) < f) {
-                ev.finish_battle();
+            if ev.state.battle.is_some() {
+                if run.battles.iter().any(|b| b.1 && (b.0 as usize) < f) {
+                    ev.finish_battle();
+                } else {
+                    // Aerugo holds from the request; the original's battle flag goes up a few frames later
+                    // (one field worker runs meanwhile): skip those frames too.
+                    ours.push(Vec::new());
+                    continue;
+                }
             }
             if std::env::var("PLAYER_SIM").is_ok()
                 && let Some(p) = ev.state.player
