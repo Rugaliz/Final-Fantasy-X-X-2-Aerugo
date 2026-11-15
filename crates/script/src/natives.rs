@@ -237,6 +237,8 @@ fn register_common<G>(n: &mut Natives<G>) {
             },
         ),
     );
+    // The calling worker's kind.
+    n.register(0x0076, Native::result(|_, c| Value::Int(i32::from(c.kind))));
     // Halt: never finishes.
     n.register(0x005F, Native { init: None, wait: Some(|_, _| 0), result: None });
 

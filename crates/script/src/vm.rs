@@ -10,6 +10,8 @@ use crate::memory::{Memory, encode_address};
 /// Most instructions one worker may run in one frame before it is stopped as stuck.
 const RUN_LIMIT: u32 = 0x1_0000;
 const STACK_SLOTS: usize = 19;
+/// Level the setup entry runs at.
+const INIT_LEVEL: u8 = 7;
 const CALL_DEPTH: usize = 3;
 /// Native wait result bits.
 pub const WAIT_DONE: u32 = 1;
@@ -218,6 +220,8 @@ pub struct TraceEvent {
 /// What a native call can see and change.
 pub struct NativeCall<'a> {
     pub worker: usize,
+    /// The calling worker's kind.
+    pub kind: u8,
     pub level: u8,
     pub scratch: &'a mut [i32; 4],
     pub stack: &'a mut Stack,
@@ -278,7 +282,9 @@ impl Vm {
             .enumerate()
             .map(|(i, w)| {
                 let mut contexts = vec![Context::default(); 9];
-                contexts[0].pc = w.entries.first().copied().unwrap_or(0);
+                // Entry 0 (setup) runs at level 7 (the highest a two-level worker has is 1).
+                let start = if matches!(w.kind, 5 | 6) { 1 } else { INIT_LEVEL };
+                contexts[usize::from(start)].pc = w.entries.first().copied().unwrap_or(0);
                 // Kind 0 workers hold subroutines other workers call into; they never run on their own.
                 let runs = w.kind != 0;
                 Worker {
@@ -288,7 +294,7 @@ impl Vm {
                     accepts: runs,
                     ended_entry: !runs,
                     entry: 0,
-                    level: 0,
+                    level: start,
                     contexts,
                     stack: Stack::default(),
                     queue: Vec::new(),
@@ -757,8 +763,10 @@ impl Vm {
                 let ctx = &mut worker.contexts[li];
                 let first = !ctx.calling;
                 ctx.calling = true;
+                let kind = worker.kind;
                 let mut call = NativeCall {
                     worker: w,
+                    kind,
                     level,
                     scratch: &mut ctx.scratch,
                     stack: &mut worker.stack,

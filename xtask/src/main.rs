@@ -363,9 +363,13 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
 /// The archive path of an event as the original names it (`host0:/ffx/master/jppc/event/...`).
 fn archive_event_path(recorded: &str) -> Option<String> {
     let p = recorded.replace('\\', "/").to_ascii_lowercase();
-    let (_, rest) = p.split_once("/master/")?;
-    let game = if p.contains("/ffx2/") { "ffx2" } else { "ffx" };
-    Some(format!("ffx_ps2/{game}/master/{rest}"))
+    if let Some((_, rest)) = p.split_once("/master/") {
+        let game = if p.contains("/ffx2/") { "ffx2" } else { "ffx" };
+        return Some(format!("ffx_ps2/{game}/master/{rest}"));
+    }
+    // The short form the original keeps: `<aa>/<name>`.
+    let (dir, name) = p.split_once('/')?;
+    Some(format!("ffx_ps2/ffx/master/jppc/event/obj/{dir}/{name}/{name}.ebp"))
 }
 
 fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>) -> Result<()> {
@@ -395,8 +399,11 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             }
         };
         // Start from the save image the original had and hand out its random numbers.
-        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
-        let image = dir.join("saves").join(format!("{:08}-{name}", run.start_frame));
+        let name = path.rsplit('/').next().unwrap_or(&path).trim_end_matches(".ebp").to_owned();
+        let image = dir.join("saves").join(format!("{:08}-{name}.img", run.start_frame));
+        if !image.exists() {
+            println!("run {i}: no save image {}", image.display());
+        }
         if let Ok(img) = std::fs::read(&image) {
             let n = img.len().min(ev.vm.memory.global[0].len());
             ev.vm.memory.global[0][..n].copy_from_slice(&img[..n]);
@@ -424,6 +431,10 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     None => "(nothing)".into(),
                 };
                 let matched: usize = run.frames[..d.frame].iter().map(Vec::len).sum::<usize>() + d.index;
+                let before = &run.frames[d.frame][d.index.saturating_sub(8)..d.index];
+                for t in before {
+                    println!("    {}", show(Some(*t)));
+                }
                 println!(
                     "run {i}: {name}: {} frames, {total} instructions; first difference at frame {} \
                      instruction {} ({matched} matched)\n  original: {}\n  aerugo:   {}",
