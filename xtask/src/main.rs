@@ -1163,6 +1163,24 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 }
             }
             ours.push(std::mem::take(ev.vm.trace.as_mut().expect("tracing")));
+            // COMPARE_SHOW=f: both traces of frame f, side by side.
+            if std::env::var("COMPARE_SHOW").ok().and_then(|v| v.parse::<usize>().ok()) == Some(f) {
+                let fmt = |t: Option<&aerugo_script::TraceEvent>| {
+                    t.map_or(String::new(), |t| {
+                        format!(
+                            "w{} l{} {:05x} {} {}",
+                            t.worker,
+                            t.level,
+                            t.pc,
+                            aerugo_formats::script::op_info(t.op).mnemonic,
+                            t.operand.map(|v| format!("{v:#x}")).unwrap_or_default()
+                        )
+                    })
+                };
+                for k in 0..run.frames[f].len().max(ours[f].len()) {
+                    eprintln!("{k:>4} {:<40} {}", fmt(run.frames[f].get(k)), fmt(ours[f].get(k)));
+                }
+            }
             if let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {
                 found = Some(aerugo_script::recording::Divergence { frame: f, ..d });
                 break;

@@ -245,6 +245,8 @@ pub struct Window {
     pub cancel_choice: u8,
     /// Ticks the taken choice stays readable after a choice window starts closing.
     pub choice_live: u8,
+    /// The style a script set (0066); 0 is the system window (slower to close).
+    pub style: Option<u8>,
 }
 
 /// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
@@ -252,6 +254,10 @@ const OPEN_TICKS: u8 = 2;
 
 /// Ticks a window takes to close (a wait on it polls as not done on the frame it closes and the next).
 const CLOSE_TICKS: u8 = 2;
+
+/// Extra ticks a style-0 (system) window takes to close: 013b choices and 015b pickups end 9 ticks after the
+/// press, style-1 dialogue windows 4.
+const SYSTEM_CLOSE_EXTRA: u8 = 5;
 
 /// Characters revealed per tick.
 const TEXT_SPEED: usize = 2;
@@ -310,7 +316,7 @@ impl Window {
     pub fn close(&mut self) {
         if self.open {
             self.open = false;
-            self.closing = CLOSE_TICKS;
+            self.closing = CLOSE_TICKS + if self.style == Some(0) { SYSTEM_CLOSE_EXTRA } else { 0 };
         }
     }
 
@@ -490,6 +496,8 @@ pub struct FieldState {
     pub settings: std::collections::HashMap<(u16, usize), Vec<Value>>,
     /// The shop price rate in percent, when scripts changed it from 100.
     pub shop_rate: Option<i32>,
+    /// A script warped the player this tick (cleared at the start of each tick).
+    pub player_placed: bool,
     /// A switch scripts turn off around menus they open (0241).
     pub menu_switch_off: bool,
     /// Each worker's three data areas in the script (for natives that take tables there).
@@ -512,7 +520,10 @@ impl World for FieldState {
         // The level the worker's turn ended on is the one whose move advances this tick.
         self.actor(w).level = level;
         let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
-        let step = PlayerStep { prev: self.player_prev, cur: self.actors[p].pos };
+        // A player warped this tick did not walk: nothing is crossed.
+        let cur = self.actors[p].pos;
+        let prev = if self.player_placed { cur } else { self.player_prev };
+        let step = PlayerStep { prev, cur };
         let Some(a) = self.actors.get_mut(w).filter(|a| a.trigger.active) else { return Vec::new() };
         let mut out = Vec::new();
         match kind {
@@ -603,8 +614,12 @@ impl FieldState {
                 if d > r + CONTACT_SLACK {
                     continue;
                 }
-                bumped[j] |= walking[i];
-                bumped[i] |= walking[j];
+                // Only the player walking into a character bumps it.
+                if Some(i) == self.player {
+                    bumped[j] |= walking[i];
+                } else if Some(j) == self.player {
+                    bumped[i] |= walking[j];
+                }
                 // The player does not walk through others.
                 let push = if Some(i) == self.player {
                     Some((i, 1.0))
@@ -1074,6 +1089,7 @@ impl Event {
             }
             return;
         }
+        self.state.player_placed = false;
         self.state.begin_talk();
         let before = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.vm.frame(&mut self.natives.host(&mut self.state));
@@ -1341,7 +1357,7 @@ fn register_settings(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let style = c.stack.pop_int();
             let w = window(c);
-            keep(g, 0x0066, w, vec![Value::Int(style)]);
+            g.windows[w].style = Some(style as u8);
             Value::Int(w as i32)
         }),
     );
@@ -1634,32 +1650,36 @@ fn register_menus(n: &mut Natives<FieldState>) {
     n.register(0x4005, Native::result(|g, c| fade(g, c, 1.0)));
     // A choice window in one call (window, message, ?, ?, x, y, alignment): placed, opened, and waited on; the
     // result is the choice.
-    n.register(
-        0x013B,
-        Native {
-            init: Some(|g, c| {
-                let _align = c.stack.pop_int();
-                let y = c.stack.pop_int();
-                let x = c.stack.pop_int();
-                let cancel = c.stack.pop_int();
-                let first = c.stack.pop_int();
-                let msg = c.stack.pop_int();
-                let w = window(c);
-                g.windows[w].first_choice = first as u8;
-                g.windows[w].cancel_choice = cancel as u8;
-                g.windows[w].message = usize::try_from(msg).ok();
-                g.windows[w].x = x;
-                g.windows[w].y = y;
-                g.windows[w].flags = 0;
-                open_window(g, &c.memory.global[0], w, true);
-                c.scratch[0] = w as i32;
-                c.scratch[1] = 0;
-                c.scratch[2] = 0;
-            }),
-            wait: Some(choice_wait),
-            ..message_wait()
-        },
-    );
+    for id in [0x013B, 0x0267] {
+        n.register(
+            id,
+            Native {
+                init: Some(|g, c| {
+                    let _align = c.stack.pop_int();
+                    let y = c.stack.pop_int();
+                    let x = c.stack.pop_int();
+                    let cancel = c.stack.pop_int();
+                    let first = c.stack.pop_int();
+                    let msg = c.stack.pop_int();
+                    let w = window(c);
+                    g.windows[w].first_choice = first as u8;
+                    g.windows[w].cancel_choice = cancel as u8;
+                    g.windows[w].style = Some(0);
+                    g.windows[w].message = usize::try_from(msg).ok();
+                    g.windows[w].x = x;
+                    g.windows[w].y = y;
+                    g.windows[w].flags = 0;
+                    open_window(g, &c.memory.global[0], w, true);
+                    c.scratch[0] = w as i32;
+                    c.scratch[1] = 0;
+                    c.scratch[2] = 0;
+                    c.scratch[3] = 1;
+                }),
+                wait: Some(choice_wait),
+                ..message_wait()
+            },
+        );
+    }
     n.register(
         0x007D,
         Native {
@@ -1667,6 +1687,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
                 c.scratch[0] = window(c) as i32;
                 c.scratch[1] = 0;
                 c.scratch[2] = 0;
+                c.scratch[3] = 0;
             }),
             wait: Some(choice_wait),
             ..message_wait()
@@ -1748,6 +1769,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
                 g.windows[w].message = Some(g.messages.len() - 1);
                 g.windows[w].x = 0x100;
                 g.windows[w].y = 0xD0;
+                g.windows[w].style = Some(0);
                 open_window(g, image, w, false);
                 c.scratch[0] = w as i32;
                 c.scratch[1] = 0;
@@ -1836,7 +1858,7 @@ fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
         c.scratch[1] = 2;
         g.windows[w].close();
         // Scripts still read the choice until the wait ends.
-        g.windows[w].choice_live = CLOSE_TICKS + 2;
+        g.windows[w].choice_live = g.windows[w].closing + 2;
         return 0;
     }
     // Cursor moves take effect on the tick after the press.
@@ -2175,19 +2197,20 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(old)
         }),
     );
-    // Place the worker (0x126 is a variant with a flag the engine passes on).
-    for id in [0x0013u16, 0x0126] {
-        n.register(
-            id,
-            Native::result(|g, c| {
-                let p = pop3(c);
-                let a = g.actor(c.worker);
-                a.pos = p;
-                a.move_at(c.level).active = None;
-                Value::Int(0)
-            }),
-        );
+    // Place the worker. 0x126 is a warp: the player placed with it did not walk, so triggers see no movement
+    // that tick; a 0x13 placement counts as a move.
+    fn place(g: &mut FieldState, c: &mut NativeCall<'_>, warp: bool) -> Value {
+        let p = pop3(c);
+        if warp && g.player == Some(c.worker) {
+            g.player_placed = true;
+        }
+        let a = g.actor(c.worker);
+        a.pos = p;
+        a.move_at(c.level).active = None;
+        Value::Int(0)
     }
+    n.register(0x0013, Native::result(|g, c| place(g, c, false)));
+    n.register(0x0126, Native::result(|g, c| place(g, c, true)));
     n.register(
         0x0095,
         Native::result(|g, c| {
@@ -2668,6 +2691,8 @@ pub fn register(n: &mut Natives<FieldState>) {
     register_triggers(n);
     register_control(n);
     register_workers(n);
+    // Halt: the worker stops here for good (until a request takes it elsewhere).
+    n.register(0x005F, Native { init: None, wait: Some(|_, _| 0), result: None });
     // Have a worker run again at the end of this frame (its new requests start then); returns the worker.
     n.register(
         0x0116,
@@ -2697,15 +2722,8 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Wait for the eye's (6062) or the focus's (6063) moves.
-    n.register(
-        0x6062,
-        Native { init: None, wait: Some(|g, _| if g.camera.part_moving(0) { 0 } else { 5 }), result: None },
-    );
-    n.register(
-        0x6063,
-        Native { init: None, wait: Some(|g, _| if g.camera.part_moving(1) { 0 } else { 5 }), result: None },
-    );
+    // (6062/6063 wait on the eye's / focus's move channels; which Aerugo timers they map to is not settled:
+    // replayed for now.)
     n.register(
         0x601A,
         Native { init: None, wait: Some(|g, _| if g.camera.is_moving() { 0 } else { 5 }), result: None },
