@@ -364,6 +364,15 @@ impl Script {
         self.code as u32
     }
 
+    /// The map number the script names in its header (event scripts), if any.
+    pub fn map_number(&self) -> Option<i16> {
+        let table = u32_at(&self.data, 4).ok()? as usize;
+        if table == 0 {
+            return None;
+        }
+        u16_at(&self.data, table).ok().map(|v| v as i16)
+    }
+
     /// Offset of the data shared by all workers.
     pub fn shared_data(&self) -> u32 {
         self.shared_data

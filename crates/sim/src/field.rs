@@ -227,8 +227,8 @@ pub struct FieldState {
     /// Worker the player controls.
     pub player: Option<usize>,
     pub ground: Option<Ground>,
-    /// A map change the scripts asked for (event jump), for the session to carry out.
-    pub jump: Option<i32>,
+    /// A map change the scripts asked for: target and entrance, for the session to carry out.
+    pub jump: Option<(i32, i32)>,
     pub rng: Rng,
 }
 
@@ -407,6 +407,11 @@ impl Event {
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.update();
         self.tick += 1;
+    }
+
+    /// The map number in the script's header.
+    pub fn map_number(&self) -> Option<i16> {
+        self.vm.script.map_number()
     }
 
     pub fn initialized(&self) -> bool {
@@ -688,6 +693,16 @@ fn register(n: &mut Natives<FieldState>) {
         0x001B,
         Native { init: None, wait: Some(|g, c| if g.actor(c.worker).turning { 0 } else { 5 }), result: None },
     );
+    // Map change: target and entrance; the session carries it out between ticks.
+    n.register(
+        0x0011,
+        Native::result(|g, c| {
+            let entrance = c.stack.pop_int();
+            let target = c.stack.pop_int();
+            g.jump = Some((target, entrance));
+            Value::Int(0)
+        }),
+    );
     // Messages: text, position, open, wait for the player, close.
     n.register(
         0x0064,
@@ -875,6 +890,50 @@ mod tests {
         assert!(!state.windows[0].open);
         tick(&mut vm, &mut state, false);
         assert!(done(&vm));
+    }
+
+    #[test]
+    fn map_change_is_recorded() {
+        use aerugo_script::asm::{Op, WorkerSrc, assemble};
+        let w = WorkerSrc {
+            kind: 1,
+            entries: vec![vec![
+                Op(0x2E, Some(165)),
+                Op(0x2E, Some(2)),
+                Op(0x58, Some(0x0011)),
+                Op(0x3C, None),
+            ]],
+            ..Default::default()
+        };
+        let mut vm = Vm::new(Arc::new(Script::parse(&assemble(&[w])).unwrap()));
+        let mut natives = Natives::new(Game::Ffx);
+        register(&mut natives);
+        let mut state = FieldState::default();
+        vm.frame(&mut natives.host(&mut state));
+        assert_eq!(state.jump, Some((165, 2)));
+    }
+
+    #[test]
+    fn player_walks_on_ground() {
+        let mut state = FieldState {
+            actors: vec![Actor::default()],
+            player: Some(0),
+            ground: Some(Ground::new(vec![
+                [[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0], [100.0, 0.0, 100.0]],
+                [[-100.0, 0.0, -100.0], [100.0, 0.0, 100.0], [-100.0, 0.0, 100.0]],
+            ])),
+            ..FieldState::default()
+        };
+        state.input.stick = [0.0, 1.0];
+        for _ in 0..10 {
+            state.update();
+        }
+        assert!(state.actors[0].pos[2] > 20.0, "{:?}", state.actors[0].pos);
+        // The edge of the ground stops the player.
+        for _ in 0..200 {
+            state.update();
+        }
+        assert!(state.actors[0].pos[2] <= 100.0);
     }
 
     #[test]

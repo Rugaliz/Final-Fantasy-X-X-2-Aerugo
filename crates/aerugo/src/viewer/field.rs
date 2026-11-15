@@ -37,6 +37,8 @@ struct Session {
     event: Event,
     map: Option<GpuModel>,
     layers: Option<GpuModel>,
+    /// Events a map change could lead to (when more than one).
+    jump_choices: Vec<String>,
     /// Stored cameras of the map's 2D layers.
     map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
     /// Character models by model id (None when missing).
@@ -65,6 +67,10 @@ pub struct FieldView {
     aspect: AspectMode,
     show_layers: bool,
     request: (usize, u16, u8),
+    /// Event scripts by the map number in their header, per game (built when first needed).
+    map_index: HashMap<Game, HashMap<i16, Vec<String>>>,
+    follow_jumps: bool,
+    pending_open: Option<String>,
 }
 
 impl std::fmt::Debug for FieldView {
@@ -96,6 +102,9 @@ impl FieldView {
             aspect: AspectMode::Crop,
             show_layers: false,
             request: (0, 2, 3),
+            map_index: HashMap::new(),
+            follow_jumps: true,
+            pending_open: None,
         }
     }
 
@@ -158,6 +167,7 @@ impl FieldView {
             .map(|c| aerugo_formats::camera::read_cameras(&c))
             .filter(|c| !c.is_empty());
         self.session = Some(Session {
+            jump_choices: Vec::new(),
             map_cameras,
             event,
             map,
@@ -187,7 +197,7 @@ impl FieldView {
         egui::Panel::left("field-files").resizable(true).default_size(260.0).show(ui, |ui| {
             picked = files.ui(ui);
         });
-        if let Some(p) = picked {
+        if let Some(p) = picked.or_else(|| self.pending_open.take()) {
             self.open(vfs, renderer, &p);
         }
         // Input and timing.
@@ -216,6 +226,7 @@ impl FieldView {
                 Input { stick, confirm: std::mem::take(&mut self.confirm), cancel: false, stick_pressed };
             self.tick(input);
         }
+        self.handle_jump(vfs);
         egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.info_ui(ui));
         });
@@ -230,6 +241,59 @@ impl FieldView {
             self.viewport(ui, vfs, renderer);
         });
         ui.ctx().request_repaint();
+    }
+
+    /// Events whose header names map `n` (variants for other platforms and test events left out).
+    fn jump_candidates(&mut self, vfs: &Vfs, game: Game, n: i16) -> Vec<String> {
+        let index = self.map_index.entry(game).or_insert_with(|| {
+            let mut index: HashMap<i16, Vec<String>> = HashMap::new();
+            let root = if game == Game::Ffx { "ffx_ps2/ffx/" } else { "ffx_ps2/ffx2/" };
+            let paths: Vec<String> = vfs
+                .archives()
+                .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
+                .filter(|p| p.starts_with(root) && p.ends_with(".ebp"))
+                .collect();
+            for p in paths {
+                let Ok(d) = vfs.read(&p) else { continue };
+                if let Some(m) = aerugo_formats::script::Script::parse(&d).ok().and_then(|s| s.map_number()) {
+                    index.entry(m).or_default().push(p);
+                }
+            }
+            index
+        });
+        let name = |p: &String| p.rsplit('/').next().unwrap_or(p).to_owned();
+        let mut v: Vec<String> = index
+            .get(&n)
+            .into_iter()
+            .flatten()
+            .filter(|p| {
+                let n = name(p);
+                !n.starts_with("psv") && !n.starts_with("cn_") && !n.starts_with("test")
+            })
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Carry out a map change the scripts asked for when it leads to one event.
+    fn handle_jump(&mut self, vfs: &Vfs) {
+        let Some(s) = &self.session else { return };
+        let Some((target, entrance)) = s.event.state.jump else { return };
+        let game = s.event.game;
+        let candidates = self.jump_candidates(vfs, game, target as i16);
+        let Some(s) = &mut self.session else { return };
+        if self.follow_jumps && candidates.len() == 1 {
+            s.notes.push(format!("jump to map {target} entrance {entrance}: {}", candidates[0]));
+            self.pending_open = Some(candidates[0].clone());
+        } else {
+            s.notes.push(format!(
+                "jump to map {target} entrance {entrance}: {} candidate events",
+                candidates.len()
+            ));
+            s.jump_choices = candidates;
+        }
+        s.event.state.jump = None;
     }
 
     fn info_ui(&mut self, ui: &mut egui::Ui) {
@@ -263,8 +327,17 @@ impl FieldView {
             ev.vm.workers.len(),
             ev.state.player
         ));
-        for n in &s.notes {
+        for n in s.notes.iter().rev().take(6) {
             ui.weak(n);
+        }
+        ui.checkbox(&mut self.follow_jumps, "Follow map changes");
+        if !s.jump_choices.is_empty() {
+            ui.label("Map change to one of:");
+            for p in &s.jump_choices {
+                if ui.button(p.rsplit('/').next().unwrap_or(p)).clicked() {
+                    self.pending_open = Some(p.clone());
+                }
+            }
         }
         ui.separator();
         ui.horizontal(|ui| {
