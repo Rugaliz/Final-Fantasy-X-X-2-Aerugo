@@ -41,6 +41,8 @@ pub struct Actor {
     pub radius: Option<f32>,
     /// The model's own collision radius (from its PS2 character data, once loaded).
     pub model_radius: Option<f32>,
+    /// The heading a move goes along (scripts set and read it).
+    pub move_heading: f32,
     /// The worker's first pass of this tick is over (its moves and turns have had their update).
     first_pass_done: bool,
     /// A move or turn started after that: it first advances next tick.
@@ -79,6 +81,7 @@ impl Default for Actor {
             trigger: Trigger::default(),
             radius: None,
             model_radius: None,
+            move_heading: 0.0,
             first_pass_done: false,
             started_late: false,
             bumped: false,
@@ -433,6 +436,11 @@ pub struct Input {
     pub alt: bool,
     /// The stick moved from rest this tick (for menus and choices).
     pub stick_pressed: bool,
+    /// The pad word the scripts read (pressed this tick: 0x20 confirm, 0x40 cancel, 0x80 the second talk button,
+    /// 0x1000 up, 0x4000 down, ...). Zero lets the fields above stand for it.
+    pub pad: u32,
+    /// The pad word of buttons held (the scripts' other word). Zero lets `pad` stand for it.
+    pub held: u32,
     /// Cancel held: the player walks instead of running.
     pub walk: bool,
     /// Heading of the camera the player sees (towards where it looks on the ground plane, as `atan2(dz, dx)`);
@@ -688,7 +696,6 @@ impl FieldState {
     }
 
     /// Whether an actor's motion still plays (a looping one always does; one with an unknown length does not).
-    #[allow(dead_code)]
     fn motion_playing(&self, a: &Actor) -> bool {
         let Some((motion, start, end, done, loops)) = a.motion_play else { return false };
         if loops != 0 {
@@ -1347,7 +1354,7 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    float_back!(0x002D, 0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x00E4);
+    float_back!(0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x00E4);
     // One int, returned (0074 worker setting, 00bb/00bc/00f3 field settings, 0116 actor flag).
     macro_rules! int_back {
         ($($id:expr),*) => {$(
@@ -1545,6 +1552,29 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
     fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     fixed!(1; 0x801D, 0x801E, 0x801F);
+    // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
+    // show these constants).
+    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x0197, 0x5087, 0x5016, 0x504E);
+    fixed!(1; 0x0196, 0x0198, 0x01C9);
+    // Results that echo an argument: 00cb its value, 00e7 its second as a byte.
+    n.register(0x00CB, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00CB), 0))));
+    n.register(0x00E7, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00E7), 1) & 0xFF)));
+    // Character switches that return the value they replace (1 at first): 5009 the push weight (float), 502a,
+    // 5029.
+    macro_rules! swap {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let old = g.settings.get(&($id, c.worker)).and_then(|v| v.first().copied());
+                take(g, c, $id);
+                match old {
+                    Some(v) => v,
+                    None if $id == 0x5009 => Value::Float(1.0),
+                    None => Value::Int(1),
+                }
+            }));
+        )*};
+    }
+    swap!(0x5009, 0x502A, 0x5029);
     fixed!(1; 0x8010, 0x8030);
     // A message variable (window, slot, kind, value) for the window's text; returns the window.
     n.register(0x009E, Native::result(|g, c| Value::Int(int(&take(g, c, 0x009E), 0))));
@@ -1881,6 +1911,251 @@ fn register_menus(n: &mut Natives<FieldState>) {
             let rate = c.stack.pop_int();
             g.shop_rate = Some(rate);
             Value::Int(rate)
+        }),
+    );
+}
+
+/// The pad word the scripts read this tick.
+fn pad_word(g: &FieldState) -> u32 {
+    if g.input.pad != 0 {
+        return g.input.pad;
+    }
+    let i = &g.input;
+    let mut w = 0;
+    w |= if i.confirm { 0x20 } else { 0 };
+    w |= if i.cancel { 0x40 } else { 0 };
+    w |= if i.alt { 0x80 } else { 0 };
+    if i.stick_pressed {
+        w |= if i.stick[1] > 0.0 {
+            0x1000
+        } else if i.stick[1] < 0.0 {
+            0x4000
+        } else {
+            0
+        };
+    }
+    w
+}
+
+/// The held-buttons word the scripts read this tick.
+fn held_word(g: &FieldState) -> u32 {
+    if g.input.held != 0 || g.input.pad != 0 { g.input.held } else { pad_word(g) }
+}
+
+/// Queries and settings about a worker's move, angles and the pad.
+fn register_queries(n: &mut Natives<FieldState>) {
+    // Close a window; with the flag, wait until it has closed. The result is 1.
+    n.register(
+        0x01E9,
+        Native {
+            init: Some(|g, c| {
+                c.scratch[1] = c.stack.pop_int();
+                let w = c.stack.pop_int().clamp(0, 7);
+                c.scratch[0] = w;
+                g.windows[w as usize].close();
+            }),
+            wait: Some(|g, c| {
+                let w = &g.windows[c.scratch[0] as usize];
+                if c.scratch[1] == 0 || (!w.open && w.closing == 0) { WAIT_DONE } else { 0 }
+            }),
+            result: Some(|_, _| Value::Int(1)),
+        },
+    );
+    use aerugo_script::natives::heading;
+    // Heading from the worker to its move target / to a point (x, y, z), on the ground plane.
+    n.register(
+        0x001F,
+        Native::result(|g, c| {
+            let level = c.level;
+            let a = g.actor(c.worker);
+            let t = a.move_at(level).target;
+            Value::Float(heading(a.pos[0], a.pos[2], t[0], t[2]))
+        }),
+    );
+    n.register(
+        0x00F4,
+        Native::result(|g, c| {
+            let [x, _, z] = pop3(c);
+            let a = g.actor(c.worker);
+            Value::Float(heading(a.pos[0], a.pos[2], x, z))
+        }),
+    );
+    // Pitch towards the move target: the heading of (ground distance, height) from (0, own height).
+    n.register(
+        0x0020,
+        Native::result(|g, c| {
+            let level = c.level;
+            let a = g.actor(c.worker);
+            let t = a.move_at(level).target;
+            let d = ((t[0] - a.pos[0]).powi(2) + (t[2] - a.pos[2]).powi(2)).sqrt();
+            Value::Float(heading(0.0, a.pos[1], d, t[1]))
+        }),
+    );
+    // The heading moves go along: set, read.
+    n.register(
+        0x0023,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            g.actor(c.worker).move_heading = v;
+            Value::Float(v)
+        }),
+    );
+    n.register(0x0090, Native::result(|g, c| Value::Float(g.actor(c.worker).move_heading)));
+    // Target pitch of a turn (wrapped; turns in pitch are not modelled).
+    n.register(0x0029, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
+    // Whether the current level's move is under way.
+    n.register(
+        0x00C4,
+        Native::result(|g, c| {
+            let level = c.level;
+            Value::Int(i32::from(g.actor(c.worker).move_at(level).active.is_some()))
+        }),
+    );
+    // Whether worker w is within r of this one (in space).
+    n.register(
+        0x0128,
+        Native::result(|g, c| {
+            let r = c.stack.pop_float();
+            let w = c.stack.pop_int().max(0) as usize;
+            let b = g.actor(w).pos;
+            let a = g.actor(c.worker).pos;
+            let d2 = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+            Value::Int(i32::from(d2 <= r * r))
+        }),
+    );
+    // Facing test: whether (x1, z1) lies within `half` of `yaw` seen from (x0, z0).
+    n.register(
+        0x1015,
+        Native::result(|_, c| {
+            let z1 = c.stack.pop_float();
+            let x1 = c.stack.pop_float();
+            let z0 = c.stack.pop_float();
+            let x0 = c.stack.pop_float();
+            let half = c.stack.pop_float();
+            let yaw = c.stack.pop_float();
+            Value::Int(i32::from(wrap_angle(heading(x0, z0, x1, z1) - yaw).abs() < half))
+        }),
+    );
+    // Stop worker w's turn where it is.
+    n.register(
+        0x0078,
+        Native::result(|g, c| {
+            let w = c.stack.pop_int().max(0) as usize;
+            let a = g.actor(w);
+            a.turning = false;
+            a.turn_steps = None;
+            Value::Int(0)
+        }),
+    );
+    // The pad: the word, one bit of it, and a wait until the given bits are let go.
+    n.register(0x0046, Native::result(|g, _| Value::Int((pad_word(g) & 0xFFFF) as i32)));
+    n.register(
+        0x004D,
+        Native::result(|g, c| {
+            let bit = c.stack.pop_int() as u32 & 31;
+            Value::Int(i32::from(pad_word(g) & 0xFFFF & (1 << bit) != 0))
+        }),
+    );
+    n.register(
+        0x022D,
+        Native {
+            init: Some(|_, c| c.scratch[0] = c.stack.pop_int()),
+            wait: Some(|g, c| if pad_word(g) & (c.scratch[0] as u32) & 0xFFFF == 0 { WAIT_DONE } else { 0 }),
+            result: None,
+        },
+    );
+    // Buttons held: the word and one bit of it; one bit of the pressed word as the pad gives it.
+    n.register(0x0044, Native::result(|g, _| Value::Int((held_word(g) & 0xFFFF) as i32)));
+    n.register(
+        0x004C,
+        Native::result(|g, c| {
+            let bit = c.stack.pop_int() as u32 & 31;
+            Value::Int(i32::from(held_word(g) & 0xFFFF & (1 << bit) != 0))
+        }),
+    );
+    n.register(
+        0x0051,
+        Native::result(|g, c| {
+            let bit = c.stack.pop_int() as u32 & 31;
+            Value::Int(i32::from(pad_word(g) & 0xFFFF & (1 << bit) != 0))
+        }),
+    );
+    // The stick's angle from its two bytes (centre 0x80), 0 inside the dead zone (and 1e-6 for an angle of 0).
+    n.register(
+        0x014E,
+        Native::result(|_, c| {
+            let y = c.stack.pop_int() - 0x80;
+            let x = c.stack.pop_int() - 0x80;
+            let dead = c.stack.pop_int();
+            if x * x + y * y < dead * dead {
+                return Value::Float(0.0);
+            }
+            let a = (y as f32).atan2(x as f32);
+            Value::Float(if a == 0.0 { 1e-6 } else { a })
+        }),
+    );
+    // Whether the player has control (or the scripts steer another worker).
+    n.register(
+        0x019F,
+        Native::result(|g, c| {
+            c.stack.pop_int();
+            Value::Int(i32::from(g.user_control))
+        }),
+    );
+    // Distance in space between two workers; a worker's facing.
+    n.register(
+        0x00A4,
+        Native::result(|g, c| {
+            let b = c.stack.pop_int().max(0) as usize;
+            let a = c.stack.pop_int().max(0) as usize;
+            let (p, q) = (g.actor(a).pos, g.actor(b).pos);
+            Value::Float(((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt())
+        }),
+    );
+    n.register(
+        0x0093,
+        Native::result(|g, c| {
+            let w = c.stack.pop_int().max(0) as usize;
+            Value::Float(g.actor(w).yaw)
+        }),
+    );
+    // End every level's move of worker w.
+    n.register(
+        0x0036,
+        Native::result(|g, c| {
+            let w = c.stack.pop_int().max(0) as usize;
+            for m in &mut g.actor(w).moves {
+                m.active = None;
+            }
+            Value::Int(0)
+        }),
+    );
+    // Target roll of a turn (wrapped; not modelled).
+    n.register(0x002A, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
+    // A map part's animation set back (returns 1).
+    n.register(
+        0x8003,
+        Native::result(|_, c| {
+            c.stack.pop_int();
+            Value::Int(1)
+        }),
+    );
+    // Sound effects (not played yet): the result is the sound.
+    for id in [0x00DFu16, 0x00E0] {
+        n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
+    }
+    // Switches whose result is whether they were turned on.
+    for id in [0x00E9u16, 0x0177] {
+        n.register(id, Native::result(|_, c| Value::Int(i32::from(c.stack.pop_int() != 0))));
+    }
+    // Map change with a fade (as 0x0011).
+    n.register(
+        0x010B,
+        Native::result(|g, c| {
+            let entrance = c.stack.pop_int();
+            let target = c.stack.pop_int();
+            g.jump = Some((target, entrance));
+            Value::Int(0)
         }),
     );
 }
@@ -2277,6 +2552,7 @@ fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
 /// Register every field native Aerugo implements.
 pub fn register(n: &mut Natives<FieldState>) {
     register_treasure(n);
+    register_queries(n);
     register_menus(n);
     register_settings(n);
     register_engine_settings(n);
@@ -2472,9 +2748,24 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The waits for a motion (0x5003, 0x501E) stay with the recordings: after 0x5022(0) the original waits out
-    // the rest of the motion the character engine was already playing (walk, idle), so they need the engine's
-    // own motion state. `motion_playing` is what they will use.
+    // The waits for a motion (0x5003, 0x501E): until a motion played once has run its frames (a looping one, or
+    // one of unknown length, does not hold the script up). The original also waits out the rest of a motion the
+    // character engine was already playing (after 0x5022(0)), which needs the engine's own motion state: the
+    // comparisons keep these waits with the recordings.
+    for id in [0x5003u16, 0x501E] {
+        n.register(
+            id,
+            Native {
+                init: None,
+                wait: Some(|g, c| {
+                    let a = g.actor(c.worker).clone();
+                    let once = a.motion_play.is_some_and(|p| p.4 == 0);
+                    if once && g.motion_playing(&a) { 0 } else { WAIT_DONE }
+                }),
+                result: None,
+            },
+        );
+    }
     n.register(
         0x5000,
         Native::result(|g, c| {
@@ -2601,6 +2892,17 @@ pub fn register(n: &mut Natives<FieldState>) {
             let v = c.stack.pop_float();
             for m in &mut g.actor(c.worker).moves {
                 m.speed = v;
+            }
+            Value::Float(v)
+        }),
+    );
+    // Arrival radius of every level's move (0x0017: the current level's).
+    n.register(
+        0x002D,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            for m in &mut g.actor(c.worker).moves {
+                m.radius = v;
             }
             Value::Float(v)
         }),

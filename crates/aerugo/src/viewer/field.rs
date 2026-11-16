@@ -411,6 +411,8 @@ impl FieldView {
                 stick_pressed,
                 walk,
                 camera_heading: self.camera_heading,
+                pad: 0,
+                held: 0,
             };
             self.tick(input, vfs);
         }

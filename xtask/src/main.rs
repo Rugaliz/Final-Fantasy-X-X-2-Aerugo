@@ -999,6 +999,9 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         ev.natives.replay = Some(run.replay.clone());
         // Menus last as long as the player keeps them open: replay them.
         ev.natives.remove(0x401D);
+        // Motion waits follow the character engine's own motion state, which Aerugo does not model yet.
+        ev.natives.remove(0x5003);
+        ev.natives.remove(0x501E);
         ev.vm.trace = Some(Vec::new());
         // Compare as we go and stop at the first difference: a run that has gone astray can loop at the run
         // limit every frame, and its trace would not fit in memory.
@@ -1097,7 +1100,14 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             } else {
                 0.0
             };
+            let held = run
+                .inputs
+                .get(f)
+                .and_then(|d| d.get(0..4))
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four bytes")));
             let input = Input {
+                pad: pressed,
+                held,
                 confirm: pressed & 0x20 != 0,
                 cancel: pressed & 0x40 != 0,
                 alt: pressed & 0x80 != 0,
