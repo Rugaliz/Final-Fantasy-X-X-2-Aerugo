@@ -51,6 +51,9 @@ pub struct Actor {
     bumped: bool,
     /// Body hit turned off (500f): neither blocks nor bumps.
     pub no_body_hit: bool,
+    /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
+    /// height difference unless both test it.
+    pub height_test: bool,
     /// The motion playing: motion id, first frame, last frame (−1: its end), ticks played, loops left (0xFF:
     /// for ever).
     pub motion_play: Option<(i32, i32, i32, u32, u8)>,
@@ -96,6 +99,7 @@ impl Default for Actor {
             started_late: false,
             bumped: false,
             no_body_hit: false,
+            height_test: true,
             motion_play: None,
             motion_speed: 0x100,
             level: 0,
@@ -808,7 +812,7 @@ impl FieldState {
             let r = a.collision_radius() + b.collision_radius();
             let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
             let d = (dx * dx + dz * dz).sqrt();
-            let level = (a.pos[1] - b.pos[1]).abs() <= BUMP_HEIGHT;
+            let level = !(a.height_test && b.height_test) || (a.pos[1] - b.pos[1]).abs() <= BUMP_HEIGHT;
             // Pushed back out, the player stands at the contact distance give or take rounding: walking on into
             // the other still touches it.
             let touching = level && d <= r + CONTACT_SLACK;
@@ -1814,6 +1818,15 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
                 store_float_var(c, areas, desc, v);
             }
+            Value::Int(0)
+        }),
+    );
+    // Height test of the calling worker's body in collisions on or off.
+    n.register(
+        0x5073,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            g.actor(c.worker).height_test = v != 0;
             Value::Int(0)
         }),
     );
