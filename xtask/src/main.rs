@@ -1072,6 +1072,21 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 a.pos = rec.pos;
                 a.yaw = rec.yaw;
             }
+            // Bodies walking go where the original's went: the character engine moves them by the real frame
+            // time, which the recordings do not carry (walks after a map load run long, and a stopping body
+            // slides on). Their recorded positions are the input here, as the player's are.
+            if let Some(ps) = run.positions.get(f + 1) {
+                for q in ps {
+                    let w = usize::from(q.worker);
+                    if Some(w) != ev.state.player
+                        && let Some(a) = ev.state.actors.get_mut(w)
+                        && a.model.is_some()
+                        && a.is_walking()
+                    {
+                        a.pos = q.pos;
+                    }
+                }
+            }
             // Buttons the scripts saw pressed this frame (the original's pressed word).
             let pressed = run
                 .inputs
@@ -1185,11 +1200,12 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     ev.vm.workers[w].queue.iter().map(|r| (r.level, r.entry, r.running)).collect::<Vec<_>>()
                 );
                 eprintln!(
-                    "f{f} player {:?} prev {:?} pos {:?}; w{w} model {:?} radius {} pos {:?} yaw {} flags {:#x} {:?}",
+                    "f{f} player {:?} prev {:?} pos {:?}; w{w} model {:?} character {:?} radius {} pos {:?} yaw {} flags {:#x} {:?}",
                     ev.state.player,
                     ev.state.player_prev,
                     ev.state.player.map(|p| ev.state.actors[p].pos),
                     a.model,
+                    a.character,
                     a.collision_radius(),
                     a.pos,
                     a.yaw,

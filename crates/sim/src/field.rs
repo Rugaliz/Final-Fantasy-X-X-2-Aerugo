@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aerugo_formats::Game;
 use aerugo_formats::script::Script;
 use aerugo_formats::text::{self, Charset};
-use aerugo_script::natives::{Native, World, wrap_angle};
+use aerugo_script::natives::{Native, World, heading, wrap_angle};
 
 use crate::control::PlayerControl;
 use crate::trigger::{self, PlayerStep, Talk, Talker, Trigger};
@@ -65,6 +65,16 @@ pub struct Actor {
     turning: bool,
     /// A turn over a set number of frames: the step per frame and the frames left.
     turn_steps: Option<(f32, u32)>,
+    /// The level that started the turn: it advances only while that level runs, and only that level's
+    /// set_rotation ends it (turns are per level in the original).
+    turn_level: u8,
+    /// The running turn's mode word (rotate.start), its eased progress and the progress per tick.
+    turn_mode: u32,
+    turn_t: f32,
+    turn_inc: f32,
+    /// Facing pitch, and the pitch moves in space go along.
+    pub pitch: f32,
+    pub move_pitch: f32,
 }
 
 impl Default for Actor {
@@ -94,6 +104,12 @@ impl Default for Actor {
             turn_speed: [0.0; 2],
             turning: false,
             turn_steps: None,
+            turn_level: 0,
+            turn_mode: 0,
+            turn_t: 0.0,
+            turn_inc: 0.0,
+            pitch: 0.0,
+            move_pitch: 0.0,
         }
     }
 }
@@ -124,6 +140,9 @@ struct MoveState {
     /// Walking speed (a walk covers speed / 20 per tick) and arrival radius (0: none).
     speed: f32,
     radius: f32,
+    /// The heading and pitch the next move starts along (0021, 0022).
+    start_heading: Option<f32>,
+    start_pitch: Option<f32>,
     active: Option<ActorMove>,
 }
 
@@ -132,8 +151,9 @@ struct MoveState {
 enum ActorMove {
     /// From `from` to `to` over `frames` ticks; `count` ticks done.
     Timed { from: [f32; 3], to: [f32; 3], count: f32, frames: f32 },
-    /// Towards `to` at a speed, on the ground plane only or in space.
-    Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32 },
+    /// Towards `to` at a speed, on the ground plane only or in space; `mode` is move.start's mode word (0x8000:
+    /// steered, the heading turning toward the target at a limited rate; 0x4000: the turn ends with it).
+    Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32, mode: u32 },
 }
 
 /// One tick of a walk from `pos` to `to`: steps of speed / 20, ending (true) once within speed / 10 with a last
@@ -149,10 +169,136 @@ fn walk_step(pos: [f32; 3], to: [f32; 3], speed: f32, ground_only: bool, radius:
     }
     (std::array::from_fn(|k| pos[k] + d[k] / len * step), done)
 }
+/// The settings key of a per-level value of a worker.
+fn level_key(worker: usize, level: u8) -> usize {
+    worker | (usize::from(level) + 1) << 16
+}
+
+/// A turn block's rate before a script sets one (π/10 a tick).
+const DEFAULT_TURN_RATE: f32 = std::f32::consts::PI / 10.0;
+
+/// Turn `cur` toward `target` by at most `max` (exactly onto it when closer).
+fn turn_toward(cur: f32, target: f32, max: f32) -> f32 {
+    let d = wrap_angle(target - cur);
+    if d.abs() < max { target } else { wrap_angle(cur + max.copysign(d)) }
+}
+
+/// The share of an eased turn's rate at progress `t`: 0.4 at the ends, 1 halfway.
+fn turn_ease(t: f32) -> f32 {
+    ((1.0 - (t - 0.5) * 4.0 * (t - 0.5)) * 0.6 + 0.4).clamp(0.0, 1.0)
+}
+
+/// What a steered walk does this tick, once its heading is known: the step length, whether the move ends, and
+/// whether it keeps to the ground.
+#[derive(Debug, Clone, Copy)]
+struct SteerStep {
+    len: f32,
+    done: bool,
+    ground_only: bool,
+    mode: u32,
+}
+
 impl Actor {
+    /// A steered walk (move mode 0x8000), first half of the tick: the arrival tests on the position before the
+    /// step, then the heading (and pitch, in space) turned toward the target by at most the steering rates.
+    fn steer_walk_begin(&mut self, yaw_rate: f32, pitch_rate: f32) -> Option<SteerStep> {
+        let pos = self.pos;
+        let level = self.level;
+        let Some(ActorMove::Walk { to, speed, ground_only, radius, mode }) = self.move_at(level).active
+        else {
+            return None;
+        };
+        if mode & 0x8000 == 0 {
+            return None;
+        }
+        let arrived = (to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2) < radius * radius;
+        let aim = if ground_only { [to[0], pos[1], to[2]] } else { to };
+        let d = ((aim[0] - pos[0]).powi(2) + (aim[1] - pos[1]).powi(2) + (aim[2] - pos[2]).powi(2)).sqrt();
+        let near = d <= speed / 10.0;
+        if pos[0] != to[0] || pos[2] != to[2] {
+            self.move_heading =
+                turn_toward(self.move_heading, heading(pos[0], pos[2], to[0], to[2]), yaw_rate);
+            if !ground_only {
+                let ground = ((to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2)).sqrt();
+                self.move_pitch =
+                    turn_toward(self.move_pitch, heading(0.0, pos[1], ground, to[1]), pitch_rate);
+            }
+        }
+        Some(SteerStep {
+            len: if near { d / 2.0 } else { speed / 20.0 },
+            done: near || arrived,
+            ground_only,
+            mode,
+        })
+    }
+
+    /// Second half: the step along the heading (after the turn, which a linked turn sets it from).
+    fn steer_walk_end(&mut self, st: SteerStep, ground: Option<&Ground>) {
+        let (h, p) = (self.move_heading, if st.ground_only { 0.0 } else { self.move_pitch });
+        let mut next = [
+            self.pos[0] + st.len * p.cos() * h.cos(),
+            self.pos[1] + st.len * p.sin(),
+            self.pos[2] + st.len * p.cos() * h.sin(),
+        ];
+        if st.ground_only
+            && let Some(y) = ground.and_then(|g| g.floor(next))
+        {
+            next[1] = y;
+        }
+        // A hidden body walks in the character engine only (see advance_move).
+        if self.visible || self.model.is_none() {
+            self.pos = next;
+        }
+        if st.done {
+            let level = self.level;
+            self.move_at(level).active = None;
+            // A move linked to the turn (0x4000) ends it too.
+            if st.mode & 0x4000 != 0 {
+                self.turning = false;
+                self.turn_steps = None;
+            }
+        }
+    }
+
+    /// One tick of a steered turn (kinds 1 and 2 with mode 0x8000): the facing turns toward the current level's
+    /// move target, an eased turn (kind 2) at the rate times `turn_ease` of its progress. With 0x1000 the walk
+    /// goes along the facing.
+    fn steer_turn(&mut self, rate: f32) {
+        let kind = self.turn_mode & 0x1F;
+        let mut share = 1.0;
+        if kind == 2 {
+            self.turn_t = (self.turn_t + self.turn_inc).clamp(0.0, 1.0);
+            share = turn_ease(self.turn_t);
+        }
+        let level = self.level;
+        let to = self.move_at(level).target;
+        let pos = self.pos;
+        let want = heading(pos[0], pos[2], to[0], to[2]);
+        let ground = ((to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2)).sqrt();
+        self.yaw = turn_toward(self.yaw, want, rate * share);
+        self.pitch = turn_toward(self.pitch, heading(0.0, pos[1], ground, to[1]), rate * share);
+        if kind == 2 && self.turn_t >= 1.0 && self.yaw == want {
+            self.turn_mode = self.turn_mode & !0x1F | 1;
+        }
+        if self.turn_mode & 0x1000 != 0 {
+            self.move_heading = self.yaw;
+            self.move_pitch = self.pitch;
+        }
+    }
+
+    /// Whether the current level runs a steered walk.
+    fn steered_walk(&self) -> bool {
+        matches!(self.move_state().active, Some(ActorMove::Walk { mode, .. }) if mode & 0x8000 != 0)
+    }
+
     /// Radius for collisions between characters.
     pub fn collision_radius(&self) -> f32 {
         self.radius.or(self.model_radius).unwrap_or(DEFAULT_RADIUS)
+    }
+
+    /// Whether the running level's move is a walk under way.
+    pub fn is_walking(&self) -> bool {
+        matches!(self.move_state().active, Some(ActorMove::Walk { .. }))
     }
 
     /// Whether the running level's move is under way.
@@ -171,12 +317,18 @@ impl Actor {
     /// One tick of the running level's move.
     fn advance_move(&mut self, ground: Option<&Ground>) {
         let pos = self.pos;
+        let body_hidden = !self.visible && self.model.is_some();
         let level = self.level;
         let m = self.move_at(level);
         let Some(mv) = &mut m.active else { return };
         let (next, done) = match mv {
-            ActorMove::Walk { to, speed, ground_only, radius } => {
+            ActorMove::Walk { to, speed, ground_only, radius, .. } => {
                 let (mut next, done) = walk_step(pos, *to, *speed, *ground_only, *radius);
+                // A hidden body walks in the character engine only: the worker's position stays, so the walk
+                // never arrives (znkd1400 w6).
+                if body_hidden {
+                    next = pos;
+                }
                 if *ground_only && let Some(y) = ground.and_then(|g| g.floor(next)) {
                     next[1] = y;
                 }
@@ -781,8 +933,34 @@ impl FieldState {
             if std::mem::take(&mut a.started_late) {
                 continue;
             }
-            a.advance_move(self.ground.as_ref());
-            if a.turning
+            let setting_at = |id: u16, key: usize| {
+                self.settings.get(&(id, key)).and_then(|v| v.first()).map(|v| match v {
+                    Value::Float(f) => *f,
+                    Value::Int(x) => *x as f32,
+                })
+            };
+            let setting = |id: u16| setting_at(id, i);
+            let lvl = a.level;
+            let level_setting = |id: u16| setting_at(id, level_key(i, lvl));
+            let turn_runs = a.turn_level == a.level;
+            let steering_turn = a.turning
+                && turn_runs
+                && a.turn_steps.is_none()
+                && matches!(a.turn_mode & 0x1F, 1 | 2)
+                && a.turn_mode & 0x8000 != 0
+                && a.steered_walk();
+            let steer = a.steer_walk_begin(
+                level_setting(0x002B).or(setting(0x006D)).unwrap_or(0.0),
+                setting(0x002C).or(setting(0x006E)).unwrap_or(0.0),
+            );
+            if steer.is_none() {
+                a.advance_move(self.ground.as_ref());
+            }
+            if steering_turn {
+                let rate = level_setting(if a.turn_mode & 0x200 != 0 { 0x00E3 } else { 0x002E });
+                a.steer_turn(rate.unwrap_or(DEFAULT_TURN_RATE));
+            } else if a.turning
+                && turn_runs
                 && let Some((step, left)) = &mut a.turn_steps
             {
                 a.yaw = wrap_angle(a.yaw + *step);
@@ -792,7 +970,7 @@ impl FieldState {
                     a.turning = false;
                     a.turn_steps = None;
                 }
-            } else if a.turning {
+            } else if a.turning && turn_runs {
                 let step = if a.turn_speed[0] > 0.0 { a.turn_speed[0] } else { 0.2 };
                 let d = wrap_angle(a.turn_target - a.yaw);
                 if d.abs() <= step {
@@ -801,6 +979,9 @@ impl FieldState {
                 } else {
                     a.yaw = wrap_angle(a.yaw + step.copysign(d));
                 }
+            }
+            if let Some(st) = steer {
+                a.steer_walk_end(st, self.ground.as_ref());
             }
         }
         // The player covers last tick's push, then this tick's input makes the next one (only while the
@@ -1376,7 +1557,19 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    float_set!(0x002E, 0x002F, 0x0030);
+    float_set!(0x002F, 0x0030, 0x002C);
+    // Per-level turn and steering rates (002e the turn rate, 00e3 the other one, 002b the steering rate): kept
+    // by worker and level.
+    macro_rules! level_float_set {
+        ($($id:expr),*) => {$(
+            n.register($id, Native::result(|g, c| {
+                let v = c.stack.pop_float();
+                keep(g, $id, level_key(c.worker, c.level), vec![Value::Float(v)]);
+                Value::Int(0)
+            }));
+        )*};
+    }
+    level_float_set!(0x002E, 0x00E3, 0x002B);
     // The calling worker's facing (wrapped).
     n.register(
         0x0025,
@@ -1548,7 +1741,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x00E3, 0x0119, 0x0004);
+    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x0119, 0x0004);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
     fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     fixed!(1; 0x801D, 0x801E, 0x801F);
@@ -1620,6 +1813,23 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
             for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
                 store_float_var(c, areas, desc, v);
+            }
+            Value::Int(0)
+        }),
+    );
+    // A body's position (worker, then three variable descriptors for x, y, z); nothing for a worker with none.
+    n.register(
+        0x5037,
+        Native::result(|g, c| {
+            let z = c.stack.pop_int();
+            let y = c.stack.pop_int();
+            let x = c.stack.pop_int();
+            let w = c.stack.pop_int().max(0) as usize;
+            if let Some(a) = g.actors.get(w).filter(|a| a.model.is_some()).cloned() {
+                let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+                for (desc, v) in [(x, a.pos[0]), (y, a.pos[1]), (z, a.pos[2])] {
+                    store_float_var(c, areas, desc, v);
+                }
             }
             Value::Int(0)
         }),
@@ -2645,8 +2855,10 @@ pub fn register(n: &mut Natives<FieldState>) {
             let yaw = wrap_angle(c.stack.pop_float());
             let a = g.actor(c.worker);
             a.yaw = yaw;
-            a.turning = false;
-            a.turn_steps = None;
+            if a.turn_level == c.level {
+                a.turning = false;
+                a.turn_steps = None;
+            }
             Value::Float(yaw)
         }),
     );
@@ -2896,6 +3108,23 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(v)
         }),
     );
+    // The heading and pitch the current level's next move starts along (wrapped).
+    n.register(
+        0x0021,
+        Native::result(|g, c| {
+            let v = wrap_angle(c.stack.pop_float());
+            g.actor(c.worker).move_at(c.level).start_heading = Some(v);
+            Value::Float(v)
+        }),
+    );
+    n.register(
+        0x0022,
+        Native::result(|g, c| {
+            let v = wrap_angle(c.stack.pop_float());
+            g.actor(c.worker).move_at(c.level).start_pitch = Some(v);
+            Value::Float(v)
+        }),
+    );
     // Arrival radius of every level's move (0x0017: the current level's).
     n.register(
         0x002D,
@@ -2934,6 +3163,13 @@ pub fn register(n: &mut Natives<FieldState>) {
             let a = g.actor(c.worker);
             let from = a.pos;
             a.started_late |= a.first_pass_done;
+            let (h, p) = (a.move_at(c.level).start_heading, a.move_at(c.level).start_pitch);
+            if let Some(h) = h {
+                a.move_heading = h;
+            }
+            if let Some(p) = p {
+                a.move_pitch = p;
+            }
             let m = a.move_at(c.level);
             // Modes 1 and 2 walk at the set speed (1 on the ground plane, 2 in space); the others run over the
             // frame count.
@@ -2943,6 +3179,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                     speed: m.speed,
                     ground_only: mode & 0x7F == 1,
                     radius: m.radius,
+                    mode: mode as u32,
                 },
                 _ => ActorMove::Timed { from, to: m.target, count: 0.0, frames: m.frames },
             });
@@ -2993,9 +3230,26 @@ pub fn register(n: &mut Natives<FieldState>) {
             c.stack.pop_int();
             let mode = c.stack.pop_int() as u32;
             c.stack.pop_int();
+            let rate = g
+                .settings
+                .get(&(0x002E, level_key(c.worker, c.level)))
+                .and_then(|v| v.first())
+                .map_or(DEFAULT_TURN_RATE, |v| match v {
+                    Value::Float(f) => *f,
+                    Value::Int(x) => *x as f32,
+                });
             let a = g.actor(c.worker);
             a.turning = true;
             a.started_late |= a.first_pass_done;
+            a.turn_mode = mode;
+            a.turn_level = c.level;
+            // An eased turn (kind 2) goes through its progress in steps of 5/6 of the rate over the whole turns
+            // of the angle left (truncated; none: it stays at the start).
+            if mode & 0x1F == 2 {
+                let n = wrap_angle(a.yaw - a.turn_target) as i32;
+                a.turn_t = 0.0;
+                a.turn_inc = if n == 0 { 0.0 } else { (rate * 0.833_333_3 / n as f32).abs() };
+            }
             // Modes 3 and 4 without a speed turn at an even rate over the set number of frames, the short way.
             a.turn_steps = (matches!(mode & 0xffff_001f, 3 | 4) && a.turn_speed[0] == 0.0).then(|| {
                 let frames = a.turn_speed[1].max(1.0) as u32;
@@ -3617,6 +3871,38 @@ mod tests {
             chr_path(Game::Ffx, 0x2051).as_deref(),
             Some("ffx_ps2/ffx/master/jppc/chr/npc/n081/mdl/n081.chr")
         );
+    }
+
+    #[test]
+    fn eased_turns_and_turning_toward() {
+        // 0.4 of the rate at the ends of an eased turn, all of it halfway.
+        assert!((turn_ease(0.0) - 0.4).abs() < 1e-6);
+        assert!((turn_ease(0.5) - 1.0).abs() < 1e-6);
+        assert!((turn_ease(1.0) - 0.4).abs() < 1e-6);
+        // At most the step, exactly onto the target when closer, the short way round.
+        assert_eq!(turn_toward(0.0, 1.0, 0.25), 0.25);
+        assert_eq!(turn_toward(0.0, 0.1, 0.25), 0.1);
+        assert!((turn_toward(3.0, -3.0, 0.1) - 3.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_steered_turn_leads_the_walk() {
+        // cdsp0700 w2: facing 0, target at heading 2.4857; the turn's rate 0.1745 eased, its progress 0.1309 a
+        // tick: the first step is 0.1175, and the walk (0x1000) goes along the facing.
+        let mut a = Actor { model: Some(1), ..Actor::default() };
+        let to = [2.4857f32.cos() * 100.0, 0.0, 2.4857f32.sin() * 100.0];
+        a.move_at(0).target = to;
+        a.move_at(0).active =
+            Some(ActorMove::Walk { to, speed: 20.0, ground_only: true, radius: 0.0, mode: 0xC001 });
+        a.turning = true;
+        a.turn_mode = 0xD202;
+        a.turn_inc = 0.1309;
+        a.steer_turn(0.17453294);
+        assert!((a.yaw - 0.1175).abs() < 1e-3, "{}", a.yaw);
+        assert_eq!(a.move_heading, a.yaw);
+        let st = a.steer_walk_begin(0.0, 0.0).expect("a steered walk");
+        a.steer_walk_end(st, None);
+        assert!((a.pos[0] - a.yaw.cos()).abs() < 1e-4 && (a.pos[2] - a.yaw.sin()).abs() < 1e-4);
     }
 
     #[test]
