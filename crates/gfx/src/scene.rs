@@ -954,6 +954,8 @@ impl SceneState {
                     device.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertices.buffer], &[0]);
                     device.cmd_bind_index_buffer(cmd, mesh.indices.buffer, 0, vk::IndexType::UINT32);
                     let m = d.model;
+                    // A mirrored model matrix (some maps are exported that way) turns its triangles round too.
+                    let flip = flip != (det3(&m) < 0.0);
                     for (pi, (part, set)) in mesh.parts.iter().enumerate() {
                         if d.part.is_some_and(|p| p != pi)
                             || part.index_count == 0

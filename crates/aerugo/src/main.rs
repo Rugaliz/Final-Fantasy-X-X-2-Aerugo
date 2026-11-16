@@ -6,6 +6,8 @@ mod cli;
 #[cfg(test)]
 mod golden;
 mod launcher;
+#[cfg(test)]
+mod mapshot;
 mod scene;
 mod settings;
 mod viewer;
@@ -88,9 +90,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         install,
         notice,
         test_scene: cli.test_scene,
-        viewer: cli.viewer || cli.field.is_some(),
+        viewer: cli.viewer || (cli.field.is_some() && !cli.new_game),
         field: cli.field,
         new_game: cli.new_game,
+        load_steam: cli.load_steam,
     };
     let mut app = app::App::new(opts)?;
     app.run()?;

@@ -526,12 +526,6 @@ pub struct CameraState {
 }
 
 impl CameraState {
-    /// Vertical field of view from the screen distance (the frame is 448 high).
-    pub fn fov_y(&self) -> f32 {
-        let d = if self.screen_distance > 1.0 { self.screen_distance } else { 400.0 };
-        2.0 * (224.0 / d).atan()
-    }
-
     /// The eye's channels or its path move (what a camera wait waits for) are under way.
     pub fn is_moving(&self) -> bool {
         self.timers[0..5].iter().any(|&t| t > 0) || self.path_timers[0] > 0
@@ -903,6 +897,8 @@ impl FieldState {
             if eye.is_some() {
                 self.camera.position = eye;
             }
+        } else if let Some(eye) = self.camera.focus.and_then(|f| self.camera.follow.polar_eye(f)) {
+            self.camera.position = Some(eye);
         }
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
@@ -1749,7 +1745,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     }
     fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x0119, 0x0004);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
-    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
+    fixed!(0; 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     fixed!(1; 0x801D, 0x801E, 0x801F);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
@@ -3398,11 +3394,31 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Destination, then a move time in frames starts the move; wait until it arrives; stop.
+    // The eye at a heading and pitch (degrees) and a distance from the focus, kept there as the focus moves
+    // (moving there over the frames a move time sets); 0x6005 adds to the heading, pitch and distance it has (an
+    // eye placed otherwise is first measured that way).
     n.register(
         0x6004,
         Native::result(|g, c| {
-            g.camera.destination = Some(pop3(c));
+            let [yaw, pitch, dist] = pop3(c);
+            g.camera.follow.clear_eye();
+            g.camera.follow.polar = Some([yaw.to_radians(), pitch.to_radians(), dist]);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6005,
+        Native::result(|g, c| {
+            let [yaw, pitch, dist] = pop3(c);
+            let cam = &mut g.camera;
+            let now = cam.follow.polar.or_else(|| {
+                let (eye, focus) = (cam.position?, cam.focus?);
+                Some(crate::follow_camera::to_polar(focus, eye))
+            });
+            if let Some([y, p, d]) = now {
+                cam.follow.clear_eye();
+                cam.follow.polar = Some([y + yaw.to_radians(), p + pitch.to_radians(), d + dist]);
+            }
             Value::Int(0)
         }),
     );

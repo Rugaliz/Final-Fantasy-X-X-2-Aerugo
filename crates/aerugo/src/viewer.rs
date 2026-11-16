@@ -1,6 +1,6 @@
 //! Asset viewer: browses the game data. Tabs are added as readers arrive.
 
-mod field;
+pub(crate) mod field;
 mod filelist;
 mod maps;
 mod models;
@@ -163,6 +163,12 @@ impl Viewer {
         v.field = FieldView::game(text_language);
         v.game = true;
         v
+    }
+
+    /// On the game screen, continue from a save file of the original release instead of the title.
+    pub fn continue_from_steam(&mut self, data: &[u8]) -> Result<(), String> {
+        self.field = FieldView::game_from_steam(self.field.language(), data)?;
+        Ok(())
     }
 
     /// Show the field runner on an event.

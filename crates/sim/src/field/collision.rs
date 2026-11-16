@@ -64,11 +64,12 @@ impl Ground {
         let mut tris = Vec::new();
         for m in &model.meshes {
             let w = &m.world;
+            // Map models are a tenth of game scale, turned half round Z (x and y negated) against game space.
             let place = |p: [f32; 3]| {
                 [
-                    w[0] * p[0] + w[4] * p[1] + w[8] * p[2] + w[12],
-                    -(w[1] * p[0] + w[5] * p[1] + w[9] * p[2] + w[13]),
-                    -(w[2] * p[0] + w[6] * p[1] + w[10] * p[2] + w[14]),
+                    -10.0 * (w[0] * p[0] + w[4] * p[1] + w[8] * p[2] + w[12]),
+                    -10.0 * (w[1] * p[0] + w[5] * p[1] + w[9] * p[2] + w[13]),
+                    10.0 * (w[2] * p[0] + w[6] * p[1] + w[10] * p[2] + w[14]),
                 ]
             };
             for seg in &m.segments {
@@ -139,6 +140,11 @@ impl Ground {
         }
         // Every triangle of a walk mesh is walkable (only its open edges are walls), steep slopes too.
         (!tris.is_empty()).then(|| Ground { step: WALK_MESH_STEP, ..Ground::new(tris) })
+    }
+
+    /// The triangles (map space).
+    pub fn triangles(&self) -> &[[[f32; 3]; 3]] {
+        &self.tris
     }
 
     pub fn is_empty(&self) -> bool {

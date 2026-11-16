@@ -36,6 +36,8 @@ pub struct StartOptions {
     pub field: Option<String>,
     /// Start a new game of FFX on the game screen.
     pub new_game: bool,
+    /// A save file of the original release to continue from on the game screen.
+    pub load_steam: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,7 @@ impl App {
     pub fn new(opts: StartOptions) -> Result<Self> {
         let start_in_viewer = opts.viewer;
         let new_game = opts.new_game;
+        let load_steam = opts.load_steam.clone();
         let start_field = opts.field.clone();
         let settings = opts.settings;
         let platform = Platform::new(&WindowConfig {
@@ -162,8 +165,21 @@ impl App {
             cjk_fonts: false,
             renderer,
         };
-        if new_game && entry_status(app.ui.launcher.current(), GameId::Ffx) == EntryStatus::Ready {
+        let ffx_ready = entry_status(app.ui.launcher.current(), GameId::Ffx) == EntryStatus::Ready;
+        if let Some(path) = load_steam.filter(|_| ffx_ready) {
             app.open_game();
+            let started = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|d| app.ui.viewer.as_mut().map_or(Ok(()), |v| v.continue_from_steam(&d)));
+            if let Err(e) = started {
+                log::warn!("{}: {e}", path.display());
+            }
+        } else if new_game && ffx_ready {
+            app.open_game();
+            // With an event named too, the game screen starts there instead of the title (for testing).
+            if let (Some(v), Some(event)) = (app.ui.viewer.as_mut(), start_field.clone()) {
+                v.open_field(event);
+            }
         } else if start_in_viewer {
             app.open_viewer();
             if let (Some(v), Some(event)) = (app.ui.viewer.as_mut(), start_field) {

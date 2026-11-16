@@ -209,6 +209,39 @@ impl Path {
     }
 }
 
+/// The point at a heading, pitch and distance (radians, radians, units) from `from`.
+pub fn polar_point(from: [f32; 3], [yaw, pitch, dist]: [f32; 3]) -> [f32; 3] {
+    [
+        from[0] + dist * pitch.cos() * yaw.cos(),
+        from[1] + dist * pitch.sin(),
+        from[2] + dist * pitch.cos() * yaw.sin(),
+    ]
+}
+
+/// The heading, pitch and distance of `to` from `from` (the inverse of [`polar_point`]).
+pub fn to_polar(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let pitch = if dist > 0.0 { (d[1] / dist).clamp(-1.0, 1.0).asin() } else { 0.0 };
+    [d[2].atan2(d[0]), pitch, dist]
+}
+
+/// A move in progress blends from its start to the new place, a share of count / frames a tick.
+fn blend(m: &mut Option<([f32; 3], u32, u32)>, to: [f32; 3]) -> [f32; 3] {
+    match m {
+        Some((from, frames, done)) => {
+            let t = *done as f32 / (*frames).max(1) as f32;
+            *done += 1;
+            let out = std::array::from_fn(|k| from[k] + (to[k] - from[k]) * t);
+            if *done > *frames {
+                *m = None;
+            }
+            out
+        }
+        None => to,
+    }
+}
+
 /// Most limits a camera part keeps.
 const MAX_LIMITS: usize = 5;
 
@@ -227,6 +260,8 @@ pub struct FollowCamera {
     rail_t: f32,
     /// The eye on a path at the focus's place along its rail.
     pub eye_rail: Option<Path>,
+    /// The eye at a heading, pitch and distance from the focus (radians, radians, units).
+    pub polar: Option<[f32; 3]>,
     /// The focus as eased so far.
     focus: Option<[f32; 3]>,
     /// Moves from where the focus and the eye were to their new places: start, frame count, frames done.
@@ -290,22 +325,16 @@ impl FollowCamera {
                 ]
             })
         });
-        // A move in progress blends from its start to the new place, a share of count / frames a tick.
-        let blend = |m: &mut Option<([f32; 3], u32, u32)>, to: [f32; 3]| match m {
-            Some((from, frames, done)) => {
-                let t = *done as f32 / (*frames).max(1) as f32;
-                *done += 1;
-                let out = std::array::from_fn(|k| from[k] + (to[k] - from[k]) * t);
-                if *done > *frames {
-                    *m = None;
-                }
-                out
-            }
-            None => to,
-        };
+        let eye = eye.or_else(|| self.polar.map(|p| polar_point(focus, p)));
         let focus = blend(&mut self.focus_move, focus);
         let eye = eye.map(|e| blend(&mut self.eye_move, e));
         Some((focus, eye))
+    }
+
+    /// The polar eye around a focus the scripts placed (while not following), moving there when a move is timed.
+    pub fn polar_eye(&mut self, focus: [f32; 3]) -> Option<[f32; 3]> {
+        let to = polar_point(focus, self.polar?);
+        Some(blend(&mut self.eye_move, to))
     }
 
     /// Drop every way the eye was placed (before a script sets a new one).
@@ -313,6 +342,7 @@ impl FollowCamera {
         self.orbit = None;
         self.path = None;
         self.eye_rail = None;
+        self.polar = None;
     }
 
     /// Stop following (the scripts take the camera back).

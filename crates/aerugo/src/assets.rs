@@ -188,6 +188,16 @@ pub fn load_effect(vfs: &Vfs, game: Game, id: &str) -> Option<Effect> {
 
 /// Load a model cluster and everything it references.
 pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
+    load(vfs, renderer, path, false)
+}
+
+/// A field map model. Map models face the other way from character models (they are turned into game space,
+/// where characters are mirrored into it), so their triangles' front side is the other winding.
+pub fn load_map_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
+    load(vfs, renderer, path, true)
+}
+
+fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<GpuModel, String> {
     let cluster = Cluster::parse(vfs.read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
@@ -265,12 +275,16 @@ pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuM
                 }
                 state
             });
+            let mut material = state.unwrap_or_default();
+            if map {
+                material.front_ccw = !material.front_ccw;
+            }
             parts.push(MeshPart {
                 first_index: first,
                 index_count: idx.len() as u32,
                 texture,
                 alpha_cutoff: 0.3,
-                material: state.unwrap_or_default(),
+                material,
             });
             part_segments.push(si);
             part_effects.push(effect_id);

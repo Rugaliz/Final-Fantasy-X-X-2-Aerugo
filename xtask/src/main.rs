@@ -143,10 +143,18 @@ enum Command {
     /// Print a movie's length and its first video frame times (number from the video list, or a path).
     MovieInfo { movie: String },
     /// Print the start of an archive file as hex.
+    /// Print each material's effect and its parameter buffer (the tweakable parameters' names, then the buffer as
+    /// floats).
+    MaterialParams { path: String },
+    /// Copy a file out of the game's archives (for local inspection; never commit what it writes).
+    Extract { path: String, out: PathBuf },
     Hexdump {
         path: String,
         #[arg(long, default_value_t = 256)]
         len: usize,
+        /// Start here (hex with 0x, or decimal).
+        #[arg(long, default_value = "0", value_parser = parse_offset)]
+        offset: usize,
     },
     /// Disassemble one worker of an event script (event as the recordings name it, e.g. `zn/znkd0900`).
     ScriptDump { event: String, worker: usize },
@@ -258,15 +266,44 @@ fn main() -> Result<()> {
         Command::OracleRandom { dir } => oracle_random(&dir),
         Command::OracleFrames { dir, run, from, to } => oracle_frames(&dir, run, from, to),
         Command::OracleNatives { dir, natives } => oracle_natives(&dir, &natives),
-        Command::Hexdump { path, len } => {
+        Command::MaterialParams { path } => {
+            use aerugo_formats::phyre::Cluster;
+            let mut vfs = aerugo_vfs::Vfs::new();
+            vfs.mount_install(&install)?;
+            let c = Cluster::parse(vfs.read(&path)?)?;
+            for (i, m) in c.objects("PMaterial").into_iter().enumerate() {
+                let fx = c.pointer(m, "m_effectVariant").map(|p| format!("{p:?}")).unwrap_or_default();
+                let Some(pb) = c.target(m, "m_parameterBuffer") else { continue };
+                let names: Vec<String> = c
+                    .array_targets(pb, "m_tweakableShaderParameterDefinitions")
+                    .into_iter()
+                    .filter_map(|d| c.string(d, "m_name"))
+                    .collect();
+                let bytes = c.object_bytes(pb);
+                let floats: Vec<String> = bytes[12..]
+                    .chunks_exact(4)
+                    .map(|b| format!("{:.4}", f32::from_le_bytes(b.try_into().unwrap())))
+                    .collect();
+                println!("material {i} fx {fx}\n  names {names:?}\n  data {}", floats.join(" "));
+            }
+            Ok(())
+        }
+        Command::Extract { path, out } => {
+            let mut vfs = aerugo_vfs::Vfs::new();
+            vfs.mount_install(&install)?;
+            std::fs::write(&out, vfs.read(&path)?)?;
+            Ok(())
+        }
+        Command::Hexdump { path, len, offset } => {
             let mut vfs = aerugo_vfs::Vfs::new();
             vfs.mount_install(&install)?;
             let data = vfs.read(&path)?;
+            let data = data.get(offset..).unwrap_or(&[]);
             for (i, row) in data[..len.min(data.len())].chunks(16).enumerate() {
                 let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
                 let text: String =
                     row.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
-                println!("{:06x}  {:<48} {text}", i * 16, hex.join(" "));
+                println!("{:06x}  {:<48} {text}", offset + i * 16, hex.join(" "));
             }
             Ok(())
         }
@@ -523,8 +560,13 @@ fn model_parts(install: &Install, path: &str) -> Result<()> {
                 .and_then(|cl| effect::read_effect(&cl));
             let blend =
                 fx.as_ref().map(|f| if f.is_transparent() { "blend" } else { "opaque" }).unwrap_or("?");
+            let raster = fx
+                .as_ref()
+                .and_then(|f| f.main_state())
+                .map(|p| format!("{:?}{}", p.cull, if p.front_ccw { " ccw" } else { " cw" }))
+                .unwrap_or_default();
             println!(
-                "mesh {mi} {:<24} seg {si}: {tris:>6} tris  y {ylo:>9.1}..{yhi:>9.1}  alpha {:?}  {blend:<6} fx {fx_id}  tex {}",
+                "mesh {mi} {:<24} seg {si}: {tris:>6} tris  y {ylo:>9.1}..{yhi:>9.1}  alpha {:?}  {blend:<6} {raster} fx {fx_id}  tex {}",
                 m.name,
                 alpha.map(|(a, b)| format!("{a:.2}..{b:.2}")),
                 mat.and_then(|m| m.base_texture()).unwrap_or("-"),
@@ -583,6 +625,13 @@ struct FieldRunPlan {
     stop: f32,
 }
 
+fn parse_offset(s: &str) -> Result<usize, String> {
+    match s.strip_prefix("0x") {
+        Some(h) => usize::from_str_radix(h, 16).map_err(|e| e.to_string()),
+        None => s.parse().map_err(|e: std::num::ParseIntError| e.to_string()),
+    }
+}
+
 fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> {
     let FieldRunPlan { ticks, ref image, confirm_every, walk_from, stick, ref goto, stop } = *plan;
     let mut leg = 0usize;
@@ -594,7 +643,7 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
     let game = if path.contains("/ffx2/") { Game::Ffx2 } else { Game::Ffx };
     let mut ev = Event::load(&vfs, game, &path, aerugo_vfs::Language::English).map_err(anyhow::Error::msg)?;
     // Event::load reads the walk mesh; without one, the drawn map's triangles.
-    if ev.state.ground.is_some() {
+    if ev.state.ground.is_some() && std::env::var("FIELD_PROBE_MAP").is_err() {
         println!("ground from the walk mesh");
     } else if let Some(p) = &ev.map_model
         && let Ok(d) = vfs.read(p)
@@ -603,6 +652,82 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
     {
         ev.state.ground = Some(aerugo_sim::field::collision::Ground::from_model(&c, &model));
         println!("ground from {p}");
+    }
+    // FIELD_ALIGN: how many walk-mesh triangle centres have a floor of the drawn map at their height, with the map
+    // turned half round X (as drawn) or mirrored in Y only.
+    if std::env::var("FIELD_ALIGN").is_ok()
+        && let Some(walk) = ev.state.ground.as_ref()
+        && let Some(p) = &ev.map_model
+        && let Ok(d) = vfs.read(p)
+        && let Ok(c) = aerugo_formats::phyre::Cluster::parse(d)
+        && let Ok(model) = aerugo_formats::mesh::read_model(&c)
+    {
+        let map = aerugo_sim::field::collision::Ground::from_model(&c, &model);
+        let (mut n, mut turned, mut mirrored) = (0, 0, 0);
+        for t in walk.triangles().iter().step_by(3) {
+            let m: [f32; 3] = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
+            n += 1;
+            if map.heights(m[0], m[2]).any(|h| (h - m[1]).abs() < 1.0) {
+                turned += 1;
+            }
+            if map.heights(m[0], -m[2]).any(|h| (h - m[1]).abs() < 1.0) {
+                mirrored += 1;
+            }
+        }
+        println!("align: {n} walk triangles, floor matches turned {turned}, mirrored {mirrored}");
+        // Scales: map = game / s (with z kept or mirrored); a match is a map floor within 0.2 map units.
+        let mut best: Vec<(usize, f32, i32, i32)> = Vec::new();
+        for i in 0..400 {
+            let sc = (0.2f32.ln() + (20f32.ln() - 0.2f32.ln()) * i as f32 / 399.0).exp();
+            for (mz, mx) in [(1, 1), (-1, 1), (1, -1), (-1, -1)] {
+                let hits = walk
+                    .triangles()
+                    .iter()
+                    .filter(|t| {
+                        let m: [f32; 3] = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0 / sc);
+                        map.heights(m[0] * mx as f32, m[2] * mz as f32).any(|h| (h - m[1]).abs() < 0.2)
+                    })
+                    .count();
+                best.push((hits, sc, mx, mz));
+            }
+        }
+        best.sort_by_key(|b| std::cmp::Reverse(b.0));
+        println!("best scales (hits, s, mirror x, mirror z): {:?}", &best[..6]);
+        if let Ok(out) = std::env::var("FIELD_ALIGN_DUMP") {
+            let flat = |tris: &[[[f32; 3]; 3]]| -> Vec<u8> {
+                tris.iter().flatten().flatten().flat_map(|v| v.to_le_bytes()).collect()
+            };
+            std::fs::write(format!("{out}.walk"), flat(walk.triangles()))?;
+            std::fs::write(format!("{out}.map"), flat(map.triangles()))?;
+        }
+        let bounds = |tris: &[[[f32; 3]; 3]]| {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in tris.iter().flatten() {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+            }
+            (lo, hi)
+        };
+        println!("walk bounds {:?}", bounds(walk.triangles()));
+        // Map triangles that are near level (floors), outside the sky.
+        let floors: Vec<[[f32; 3]; 3]> = map
+            .triangles()
+            .iter()
+            .filter(|t| t.iter().all(|v| v[0].abs() < 250.0 && v[2].abs() < 250.0))
+            .filter(|t| {
+                let (a, b) = (
+                    [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]],
+                    [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]],
+                );
+                let nrm = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+                len > 0.0 && nrm[1].abs() / len > 0.9
+            })
+            .copied()
+            .collect();
+        println!("map floor bounds {:?} ({} tris)", bounds(&floors), floors.len());
     }
     // FIELD_PROBE="x z;x z": floor heights there.
     if let (Ok(probe), Some(g)) = (std::env::var("FIELD_PROBE"), ev.state.ground.as_ref()) {
@@ -679,6 +804,11 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
             println!(
                 "t{t} player {:?} {p:?} control {} windows {windows:?} level7 {talking:?} map {:?}",
                 ev.state.player, ev.state.user_control, ev.state.jump
+            );
+            let cam = &ev.state.camera;
+            println!(
+                "   camera eye {:?} focus {:?} screen {} follow {:?}",
+                cam.position, cam.focus, cam.screen_distance, cam.follow
             );
             if ev.state.jump.is_some() {
                 break;
@@ -1024,6 +1154,15 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
         if only.is_some_and(|o| o != i) {
             continue;
         }
+        // CAMERA_DUMP: the original's camera points per frame (focus, eye), without comparing.
+        if std::env::var("CAMERA_DUMP").is_ok() {
+            for (f, c) in run.cameras.iter().enumerate() {
+                if let Some((a, b)) = c {
+                    println!("cam {} f{f} focus {:?} eye {:?}", run.path, &a[..3], &b[..3]);
+                }
+            }
+            continue;
+        }
         let Some(path) = archive_event_path(&run.path) else {
             println!("run {i}: event {} {:?}: path not understood", run.index, run.path);
             continue;
@@ -1224,7 +1363,8 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             {
                 let cam = &ev.state.camera;
                 eprintln!(
-                    "cam f{f} orig {:?} {:?} aerugo {:?} {:?}",
+                    "cam {} f{f} orig {:?} {:?} aerugo {:?} {:?}",
+                    run.path.rsplit('/').next().unwrap_or(&run.path),
                     &a[..3],
                     &b[..3],
                     cam.position,

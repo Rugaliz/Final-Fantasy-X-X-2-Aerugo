@@ -54,6 +54,7 @@ cargo run --release -- --list-games        # print what was detected and exit
 cargo run --release -- --portable          # keep settings next to the executable
 cargo run --release -- --test-scene        # timing test scene (30 Hz simulation at display rate)
 cargo run --release -- --new-game          # start a new game of FFX right away
+cargo run --release -- --load-steam FILE   # continue from a save of the original release (only read)
 cargo run --release -- --viewer            # asset viewer: tables, textures, models, maps, sounds, movies, scripts
 cargo run --release -- --fps-limit 240 --present-mode mailbox
 cargo run --release -- --help              # all options

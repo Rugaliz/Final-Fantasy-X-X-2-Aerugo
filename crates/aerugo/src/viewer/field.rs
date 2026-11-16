@@ -26,7 +26,7 @@ use super::filelist::FileList;
 use super::maps::{best_camera, camera_view_proj, fit_layers};
 use super::models::{OrbitCamera, game_to_view, load_motions};
 use super::movies::{MoviePlayer, movie_ticks};
-use crate::assets::{GpuModel, load_model};
+use crate::assets::{GpuModel, load_map_model, load_model};
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +131,63 @@ const FFX_EVENTS: &[(i32, &str)] = &[
     (389, "zn/znkd0801"),
 ];
 
+/// The frame the remaster draws the field in (16:9; wider windows get bars or crop around it).
+pub const FIELD_FRAME: f32 = 16.0 / 9.0;
+
+/// The vertical field of view for a script's screen distance as the remaster draws it: half the frame height is
+/// 240 at that distance (fitted to captures of the original on three maps), and the distance is 1024 until a
+/// script sets one.
+pub fn field_fov_y(screen_distance: f32) -> f32 {
+    let d = if screen_distance > 1.0 { screen_distance } else { 1024.0 };
+    2.0 * (240.0 / d).atan()
+}
+
+/// Where a map model goes in game space: map models are a tenth of game scale and turned half round the Z axis
+/// (x and y negated) against it (fitted to the walk meshes of eight maps, and to captures of the original).
+pub fn map_place() -> Mat4 {
+    Mat4::from_scale(Vec3::new(-10.0, -10.0, 10.0))
+}
+
+/// The scene camera's view and projection in the field frame (before the aspect policy): eye and focus in game
+/// space, the vertical field of view, the roll, and the map's extent in game units (which keeps the whole map
+/// inside the far plane however close the focus is).
+pub fn script_camera(eye: [f32; 3], focus: [f32; 3], fov_y: f32, roll: f32, extent: f32) -> Mat4 {
+    let r = game_to_view();
+    let (eye, focus) = (r.transform_point3(Vec3::from(eye)), r.transform_point3(Vec3::from(focus)));
+    let d = (focus - eye).length().max(1.0);
+    let far = (d * 200.0).max(extent * 2.0 + (eye - focus).length());
+    let near = (d * 0.01).clamp(0.05, 1.0);
+    Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+        * Mat4::perspective_rh(fov_y, FIELD_FRAME, near, far)
+        * Mat4::from_rotation_z(roll)
+        * Mat4::look_at_rh(eye, focus, Vec3::Y)
+        * r
+}
+
+/// A map model's bounds in view space (for framing the orbit camera on it).
+fn map_view_bounds(m: &GpuModel) -> (Vec3, Vec3) {
+    let t = game_to_view() * map_place();
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for i in 0..8 {
+        let c = Vec3::new(
+            if i & 1 == 0 { m.min.x } else { m.max.x },
+            if i & 2 == 0 { m.min.y } else { m.max.y },
+            if i & 4 == 0 { m.min.z } else { m.max.z },
+        );
+        let p = t.transform_point3(c);
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    (lo, hi)
+}
+
+/// The event file of an FFX event number, when the table has it.
+fn ffx_event_path(n: i32) -> Option<String> {
+    let (_, e) = FFX_EVENTS.iter().find(|(k, _)| *k == n)?;
+    let name = e.rsplit('/').next().unwrap_or(e);
+    Some(format!("ffx_ps2/ffx/master/jppc/event/obj/{e}/{name}.ebp"))
+}
+
 /// The title's two choices (pictures in the original).
 const TITLE_CHOICES: [&str; 2] = ["New Game", "Load Game"];
 
@@ -199,6 +256,23 @@ impl FieldView {
         v
     }
 
+    /// The game screen continuing from a save file of the original release (read, never written): the event
+    /// its save image names (word 0), with the image in place.
+    pub fn game_from_steam(lang: Language, data: &[u8]) -> Result<FieldView, String> {
+        let save = SaveGame::import_steam(Game::Ffx, data).map_err(|e| e.to_string())?;
+        let n = i32::from(u16::from_le_bytes([save.image[0], save.image[1]]));
+        let path = ffx_event_path(n).ok_or_else(|| format!("event {n} is not in the event table yet"))?;
+        let mut v = FieldView::game(lang);
+        v.open_later(path);
+        v.pending_restore = Some(save);
+        Ok(v)
+    }
+
+    /// The language of the game text.
+    pub fn language(&self) -> Language {
+        self.lang
+    }
+
     /// Whether the player chose to leave the game (cleared by asking).
     pub fn take_quit(&mut self) -> bool {
         std::mem::take(&mut self.quit)
@@ -230,7 +304,7 @@ impl FieldView {
         let mut notes = Vec::new();
         let mut load = |p: &Option<String>| -> Option<GpuModel> {
             let p = p.as_ref()?;
-            match load_model(vfs, renderer, p) {
+            match load_map_model(vfs, renderer, p) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     notes.push(format!("{p}: {e}"));
@@ -255,7 +329,8 @@ impl FieldView {
             event.state.ground = Some(Ground::from_model(&c, &model));
         }
         if let Some(m) = &map {
-            self.orbit = OrbitCamera::framing(m.min, m.max);
+            let (lo, hi) = map_view_bounds(m);
+            self.orbit = OrbitCamera::framing(lo, hi);
         }
         let mut restore_position = None;
         if let Some(save) = self.pending_restore.take() {
@@ -654,10 +729,9 @@ impl FieldView {
     /// Events whose header names map `n` (variants for other platforms and test events left out).
     fn jump_candidates(&mut self, vfs: &Vfs, game: Game, n: i16) -> Vec<String> {
         if game == Game::Ffx
-            && let Some((_, e)) = FFX_EVENTS.iter().find(|(k, _)| *k == i32::from(n))
+            && let Some(path) = ffx_event_path(i32::from(n))
         {
-            let name = e.rsplit('/').next().unwrap_or(e);
-            return vec![format!("ffx_ps2/ffx/master/jppc/event/obj/{e}/{name}.ebp")];
+            return vec![path];
         }
         let index = self.map_index.entry(game).or_insert_with(|| {
             let mut index: HashMap<i16, Vec<String>> = HashMap::new();
@@ -936,8 +1010,8 @@ impl FieldView {
             self.orbit.target = game_to_view().transform_point3(Vec3::from(p.pos));
         }
         let aspect = size.x / size.y.max(1.0);
-        // The original frame is 512 × 448; the script and map cameras follow the aspect policy around it.
-        let design = 512.0 / 448.0;
+        // The scene camera draws a 16:9 frame (the remaster's), the PS2 map cameras their layers' frame; both
+        // follow the aspect policy around it.
         let mode = self.aspect;
         let policy = |base: Mat4, design: f32| {
             Mat4::from_cols_array(&clip_transform(design, aspect, mode, [0.0, 0.0]).matrix()) * base
@@ -981,20 +1055,9 @@ impl FieldView {
         let map_camera = map_camera.map(|(vp, _)| vp);
         let view_proj = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {
-                let r = game_to_view();
-                let (eye, focus) =
-                    (r.transform_point3(Vec3::from(eye)), r.transform_point3(Vec3::from(focus)));
-                // Near and far planes: the map's whole extent stays in view however close the focus is.
-                let d = (focus - eye).length().max(1.0);
-                let extent = s.map.as_ref().map_or(0.0, |m| (m.max - m.min).length());
-                let far = (d * 200.0).max(extent * 2.0 + (eye - focus).length());
-                let near = (d * 0.01).clamp(0.05, 1.0);
-                let base = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                    * Mat4::perspective_rh(st.camera.fov_y(), design, near, far)
-                    * Mat4::from_rotation_z(st.camera.roll)
-                    * Mat4::look_at_rh(eye, focus, Vec3::Y)
-                    * r;
-                policy(base, design)
+                let extent = s.map.as_ref().map_or(0.0, |m| (m.max - m.min).length() * 10.0);
+                let fov = field_fov_y(st.camera.screen_distance);
+                policy(script_camera(eye, focus, fov, st.camera.roll, extent), FIELD_FRAME)
             }
             (CameraMode::Map, _, _, Some(vp)) => vp,
             _ => self.orbit.view_proj(aspect),
@@ -1040,7 +1103,7 @@ impl FieldView {
             };
         // The map model is in view space (game space turned half a turn about X); everything is drawn through the
         // game-to-view turn, so the map takes the inverse first (the turn is its own inverse).
-        let map_place = game_to_view();
+        let map_place = map_place();
         if let Some(m) = &s.map {
             add(m, map_place, None, &mut joints);
         }

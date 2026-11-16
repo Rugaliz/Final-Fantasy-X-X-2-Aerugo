@@ -35,9 +35,13 @@ pub struct Cli {
     #[arg(long, value_name = "EVENT")]
     pub field: Option<String>,
 
-    /// Start a new game of FFX right away (the game screen, from the title).
+    /// Start a new game of FFX right away (the game screen, from the title; with `--field`, from that event).
     #[arg(long)]
     pub new_game: bool,
+
+    /// Continue FFX on the game screen from a save file of the original release (only read).
+    #[arg(long, value_name = "FILE")]
+    pub load_steam: Option<PathBuf>,
 
     /// Open the timing test scene.
     #[arg(long)]
