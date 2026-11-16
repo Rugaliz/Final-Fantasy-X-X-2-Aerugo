@@ -44,7 +44,8 @@ pub enum VarType {
 }
 
 impl VarType {
-    fn from_nibble(n: u8) -> VarType {
+    /// The type a variable descriptor names in its top four bits.
+    pub fn from_nibble(n: u8) -> VarType {
         match n {
             0 => VarType::U8,
             1 => VarType::I8,

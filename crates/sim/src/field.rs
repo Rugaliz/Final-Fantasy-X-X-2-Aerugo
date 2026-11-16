@@ -37,9 +37,15 @@ pub struct Actor {
     /// bit n is set.
     pub flags: u32,
     pub trigger: Trigger,
-    /// Collision radius set by a script (else the default).
+    /// Collision radius set by a script (else the model's).
     pub radius: Option<f32>,
-    /// Another character walked into this one last tick.
+    /// The model's own collision radius (from its PS2 character data, once loaded).
+    pub model_radius: Option<f32>,
+    /// The worker's first pass of this tick is over (its moves and turns have had their update).
+    first_pass_done: bool,
+    /// A move or turn started after that: it first advances next tick.
+    started_late: bool,
+    /// The player touched this one walking (cleared once they are apart): a bump is this going on.
     bumped: bool,
     /// Body hit turned off (500f): neither blocks nor bumps.
     pub no_body_hit: bool,
@@ -72,6 +78,9 @@ impl Default for Actor {
             flags: 0,
             trigger: Trigger::default(),
             radius: None,
+            model_radius: None,
+            first_pass_done: false,
+            started_late: false,
             bumped: false,
             no_body_hit: false,
             motion_play: None,
@@ -94,8 +103,7 @@ struct Movement {
     done: u32,
 }
 
-/// Collision radius of a character without a script-set one. The engine takes a per-model size times the model's
-/// scale; 4 is what the recordings show for the party leader (the only one measured so far).
+/// Collision radius of a character whose model size is not known (the party leader's: 4).
 const DEFAULT_RADIUS: f32 = 4.0;
 
 /// How far past the sum of the radii two characters still touch.
@@ -138,11 +146,10 @@ fn walk_step(pos: [f32; 3], to: [f32; 3], speed: f32, ground_only: bool, radius:
     }
     (std::array::from_fn(|k| pos[k] + d[k] / len * step), done)
 }
-
 impl Actor {
     /// Radius for collisions between characters.
     pub fn collision_radius(&self) -> f32 {
-        self.radius.unwrap_or(DEFAULT_RADIUS)
+        self.radius.or(self.model_radius).unwrap_or(DEFAULT_RADIUS)
     }
 
     /// Whether the running level's move is under way.
@@ -343,10 +350,11 @@ pub struct CameraState {
     destination: Option<[f32; 3]>,
     move_frames: u32,
     moving: Option<Movement>,
-    /// Ticks left of the timed moves of the camera's parts (bits of a part mask); a camera wait lasts until
-    /// all have run out.
+    /// Ticks left of the move channels: 0–2 the eye's three values, 3 and 4 the roll and the screen distance, 5–7 the
+    /// focus's three values. A move of n frames keeps its channels busy for n + 1 polls from the tick it is set.
     timers: [u32; 8],
-    /// Parts the next move time applies to (all three of the usual ones until a script picks).
+    /// Eye channels (bits 0–4) the next eye move time applies to; all until a script picks, and only for one
+    /// move.
     parts: Option<u8>,
     /// Ticks left of the moves of the eye and the focus along a path.
     path_timers: [u32; 2],
@@ -363,18 +371,29 @@ impl CameraState {
         2.0 * (224.0 / d).atan()
     }
 
+    /// The eye's channels or its path move (what a camera wait waits for) are under way.
     pub fn is_moving(&self) -> bool {
-        self.moving.is_some() || self.timers.iter().chain(&self.path_timers).any(|&t| t > 0)
+        self.timers[0..5].iter().any(|&t| t > 0) || self.path_timers[0] > 0
     }
 
-    /// Whether one part's moves are under way: 0 the eye (part bits 0–2, the eye path, a destination move),
-    /// 1 the focus (bits 3–5, the focus path).
-    pub fn part_moving(&self, part: usize) -> bool {
-        if part == 0 {
-            self.moving.is_some() || self.timers[0..3].iter().any(|&t| t > 0) || self.path_timers[0] > 0
-        } else {
-            self.timers[3..6].iter().any(|&t| t > 0) || self.path_timers[1] > 0
+    /// The focus's channels or its path move are under way.
+    pub fn focus_moving(&self) -> bool {
+        self.timers[5..8].iter().any(|&t| t > 0) || self.path_timers[1] > 0
+    }
+
+    /// Time the eye's channels (those the part mask leaves, all by default) over `frames` (0: stops them).
+    pub fn time_eye(&mut self, frames: u32) {
+        let parts = self.parts.take().unwrap_or(0x1F);
+        for (bit, t) in self.timers[0..5].iter_mut().enumerate() {
+            if parts & (1 << bit) != 0 {
+                *t = if frames == 0 { 0 } else { frames + 1 };
+            }
         }
+    }
+
+    /// Time the focus's channels over `frames`.
+    pub fn time_focus(&mut self, frames: u32) {
+        self.timers[5..8].fill(if frames == 0 { 0 } else { frames + 1 });
     }
 
     fn update(&mut self) {
@@ -460,12 +479,16 @@ pub struct FieldState {
     pub party: [u8; 3],
     /// Random values to hand out instead of the generator's (replaying a recording of the original).
     pub rng_replay: std::collections::VecDeque<u32>,
-    /// Where the player stood at the start of the last tick and of this one (what triggers test the step
-    /// between).
+    /// Where the player stood when the scripts of the last tick were done (before its own walk), and the
+    /// step from there to where it stands is what triggers test. A script placing it late in a tick (in a later
+    /// pass) is then not seen as a step the tick after (bjyt0400 f1435), as in the original, which takes the
+    /// step from the player's own update.
     pub player_prev: [f32; 3],
     player_start: Option<[f32; 3]>,
     /// The player has control (scripts turn it on and off); talking needs it.
     pub user_control: bool,
+    /// The player was walking on the last tick it had control.
+    player_was_walking: bool,
     /// Added to every talk radius (a script sets it; 0 by default).
     pub talk_reach: f32,
     /// The talk started this tick, while workers offer themselves.
@@ -473,6 +496,8 @@ pub struct FieldState {
     pub control: PlayerControl,
     /// Frame counts of each model's motions by motion number, as the host loads them.
     pub motion_frames: std::collections::HashMap<u16, std::collections::HashMap<u16, u32>>,
+    /// Collision radii of models by id (None: no character data).
+    pub model_radii: std::collections::HashMap<u16, Option<f32>>,
     /// Movie files by number (the game's video list).
     pub videos: std::collections::HashMap<u32, String>,
     /// The movie playing, if any.
@@ -504,6 +529,8 @@ pub struct FieldState {
     pub menu_switch_off: bool,
     /// Each worker's three data areas in the script (for natives that take tables there).
     pub data_areas: Vec<[u32; 3]>,
+    /// Each worker's kind.
+    pub kinds: Vec<u8>,
     /// The event's entrance records (the save image says which one the party arrived by).
     pub entrances: Vec<aerugo_formats::script::Entrance>,
     /// The player's step for next tick (from this tick's push), on the ground plane.
@@ -519,8 +546,12 @@ impl FieldState {
 
 impl World for FieldState {
     fn worker_ran(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
-        // The level the worker's turn ended on is the one whose move advances this tick.
-        self.actor(w).level = level;
+        // The level the worker's turn ended on is the one whose move advances this tick. (The original advances
+        // moves and turns here, at the end of the worker's first pass: one started in a later pass of the same
+        // tick waits for the next.)
+        let a = self.actor(w);
+        a.level = level;
+        a.first_pass_done = true;
         let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
         // A player warped this tick did not walk: nothing is crossed.
         let cur = self.actors[p].pos;
@@ -583,68 +614,59 @@ impl World for FieldState {
 }
 
 impl FieldState {
-    /// Characters collide on the ground plane within the sum of their radii: the player is pushed back out, and
-    /// one walking into another bumps it. Returns the workers bumped this tick that were not bumped the tick before.
+    /// The player pushes others back out (it does not walk through them), and walking into one bumps it: the
+    /// one touched gets a flag, and a bump is the flag going on. The flag goes off only once the two are apart
+    /// (further than the sum of their radii) while the player is not walking into it. Returns the workers bumped
+    /// this tick.
+    ///
+    /// The player's walking is the original controller's speed, which stays as it was while control is off: a
+    /// player that walked up to something and stood there a hair apart (pushed out, rounding to just past the
+    /// contact distance) bumps it again once control comes back (cdsp0000 f2719, bjyt0400 f1509); one left just
+    /// within it does not (bjyt0200 f113, bjyt0400 f252). Characters well above or below each other do not
+    /// touch. Only the player bumps (pairs of others, and others walking into the player, do not).
     fn bumps(&mut self) -> Vec<usize> {
-        let walking: Vec<bool> = self
-            .actors
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                if Some(i) == self.player {
-                    // Walking under the player's control (a script placing the player is not a walk).
-                    self.user_control && (a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2])
-                } else {
-                    matches!(a.move_state().active, Some(ActorMove::Walk { speed, .. }) if speed != 0.0)
-                }
-            })
-            .collect();
-        let bodies: Vec<usize> = (0..self.actors.len())
-            .filter(|&i| {
-                self.actors[i].model.is_some() && self.actors[i].visible && !self.actors[i].no_body_hit
-            })
-            .collect();
-        let mut bumped = vec![false; self.actors.len()];
-        for (k, &i) in bodies.iter().enumerate() {
-            for &j in &bodies[k + 1..] {
-                let (a, b) = (&self.actors[i], &self.actors[j]);
-                let r = a.collision_radius() + b.collision_radius();
-                let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
-                let d = (dx * dx + dz * dz).sqrt();
-                // A character pushed back out stands at the contact distance, give or take rounding: that still
-                // counts as touching. Characters well above or below each other do not touch.
-                if d > r + CONTACT_SLACK || (a.pos[1] - b.pos[1]).abs() > BUMP_HEIGHT {
-                    continue;
-                }
-                // Only the player walking into a character bumps it.
-                if Some(i) == self.player {
-                    bumped[j] |= walking[i];
-                } else if Some(j) == self.player {
-                    bumped[i] |= walking[j];
-                }
-                // The player does not walk through others.
-                let push = if Some(i) == self.player {
-                    Some((i, 1.0))
-                } else if Some(j) == self.player {
-                    Some((j, -1.0))
-                } else {
-                    None
-                };
-                if let Some((p, sign)) = push
-                    && d > 0.0
-                {
-                    let out = (r - d) / d * sign;
-                    self.actors[p].pos[0] += dx * out;
-                    self.actors[p].pos[2] += dz * out;
-                }
-            }
+        let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
+        let player_moved = {
+            let a = &self.actors[p];
+            a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2]
+        };
+        let walking = self.user_control && (player_moved || self.player_was_walking);
+        if self.user_control {
+            self.player_was_walking = player_moved;
         }
+        let body = |a: &Actor| a.model.is_some() && a.visible && !a.no_body_hit;
         let mut out = Vec::new();
-        for (i, (a, now)) in self.actors.iter_mut().zip(bumped).enumerate() {
-            if now && !a.bumped {
-                out.push(i);
+        for o in 0..self.actors.len() {
+            if o == p {
+                continue;
             }
-            a.bumped = now;
+            let (a, b) = (&self.actors[p], &self.actors[o]);
+            if !body(a) || !body(b) {
+                self.actors[o].bumped = false;
+                continue;
+            }
+            let r = a.collision_radius() + b.collision_radius();
+            let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
+            let d = (dx * dx + dz * dz).sqrt();
+            let level = (a.pos[1] - b.pos[1]).abs() <= BUMP_HEIGHT;
+            // Pushed back out, the player stands at the contact distance give or take rounding: walking on into
+            // the other still touches it.
+            let touching = level && d <= r + CONTACT_SLACK;
+            let apart = !level || d > r;
+            let was = self.actors[o].bumped;
+            if walking && touching {
+                if !was {
+                    out.push(o);
+                }
+                self.actors[o].bumped = true;
+            } else if apart || walking {
+                self.actors[o].bumped = false;
+            }
+            if touching && d > 0.0 {
+                let push = (r - d) / d;
+                self.actors[p].pos[0] += dx * push;
+                self.actors[p].pos[2] += dz * push;
+            }
         }
         out
     }
@@ -736,7 +758,22 @@ impl FieldState {
             }
             w.shown = if w.instant { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
-        for a in &mut self.actors {
+        for (i, a) in self.actors.iter_mut().enumerate() {
+            // Bodies not moving settle onto the nearest floor (cdsp0100: one placed under the floor comes up).
+            if Some(i) != self.player
+                && a.model.is_some()
+                && a.move_state().active.is_none()
+                && let Some(g) = self.ground.as_ref()
+                && let Some(h) = g
+                    .heights(a.pos[0], a.pos[2])
+                    .min_by(|x, y| (x - a.pos[1]).abs().total_cmp(&(y - a.pos[1]).abs()))
+            {
+                a.pos[1] = h;
+            }
+            a.first_pass_done = false;
+            if std::mem::take(&mut a.started_late) {
+                continue;
+            }
             a.advance_move(self.ground.as_ref());
             if a.turning
                 && let Some((step, left)) = &mut a.turn_steps
@@ -862,6 +899,30 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
             }
         })
         .collect()
+}
+
+/// The PS2 character data of a model id (`.chr`: its header carries the collision radius among other sizes).
+pub fn chr_path(game: Game, id: u16) -> Option<String> {
+    let p = model_path(game, id)?;
+    let (_, rest) = p.split_once("/chr/")?;
+    let (dir, _) = rest.split_once("/mdl/")?;
+    let name = dir.rsplit('/').next()?;
+    let root = match game {
+        Game::Ffx => "ffx_ps2/ffx/master/jppc",
+        Game::Ffx2 => "ffx_ps2/ffx2/master/jppc",
+    };
+    Some(format!("{root}/chr/{dir}/mdl/{name}.chr"))
+}
+
+/// A character's collision radius from its `.chr` data: header version (u32 at 4) 10 or later has an info block
+/// (offset at 0x58) whose second float is the radius; older data takes 1.
+pub fn chr_radius(d: &[u8]) -> Option<f32> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if u32_at(4)? < 10 {
+        return Some(1.0);
+    }
+    let info = u32_at(0x58)? as usize;
+    u32_at(info + 4).map(f32::from_bits).filter(|r| r.is_finite() && *r > 0.0)
 }
 
 /// Frame counts of a model's motions by motion number (each group entry's first motion record).
@@ -1025,6 +1086,7 @@ impl Event {
             actors,
             entrances: script.entrances(),
             data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
+            kinds: script.workers.iter().map(|w| w.kind).collect(),
             ..FieldState::default()
         };
         if let Some(tp) = event_text_path(game, path, lang)
@@ -1089,7 +1151,7 @@ impl Event {
             self.state.party = [p[0], p[1], p[2]];
         }
         if let Some(pos) = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos) {
-            self.state.player_prev = self.state.player_start.replace(pos).unwrap_or(pos);
+            self.state.player_prev = self.state.player_start.unwrap_or(pos);
         }
         // A battle starts at the start of the next frame and holds the field's scripts until the host ends it
         // (the original runs the battle's own script meanwhile; one field worker keeps going for the first four
@@ -1110,6 +1172,7 @@ impl Event {
         self.state.begin_talk();
         let before = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.vm.frame(&mut self.natives.host(&mut self.state));
+        self.state.player_start = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.state.update();
         self.walk_encounters(before);
         self.tick += 1;
@@ -1204,6 +1267,11 @@ impl Event {
             }
             let frames = model_path(self.game, m).map(|p| motion_frames(vfs, &p)).unwrap_or_default();
             self.state.motion_frames.insert(m, frames);
+            let radius = chr_path(self.game, m).and_then(|p| vfs.read(&p).ok()).and_then(|d| chr_radius(&d));
+            self.state.model_radii.insert(m, radius);
+        }
+        for a in &mut self.state.actors {
+            a.model_radius = a.model.and_then(|m| self.state.model_radii.get(&m).copied().flatten());
         }
     }
 
@@ -1475,7 +1543,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     }
     fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x00E3, 0x0119, 0x0004);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
-    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D, 0x00A3);
+    fixed!(0; 0x6005, 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     fixed!(1; 0x801D, 0x801E, 0x801F);
     fixed!(1; 0x8010, 0x8030);
     // A message variable (window, slot, kind, value) for the window's text; returns the window.
@@ -1501,6 +1569,29 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             let choices = win.message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.choices);
             let ready = (win.open && win.opening == 0 && win.shown >= win.reveal) || win.choice_live > 0;
             Value::Int(if ready && choices > 0 { win.choice as i32 } else { -1 })
+        }),
+    );
+    // A worker's position into three float variables (worker, x, y, z descriptors); a line's midpoint for
+    // line workers (kinds 2 and 5).
+    n.register(
+        0x00A3,
+        Native::result(|g, c| {
+            let z = c.stack.pop_int();
+            let y = c.stack.pop_int();
+            let x = c.stack.pop_int();
+            let w = target(c);
+            let kind = g.kinds.get(w).copied().unwrap_or(0);
+            let a = g.actors.get(w).cloned().unwrap_or_default();
+            let p = if matches!(kind, 2 | 5) {
+                std::array::from_fn(|k| (a.pos[k] + a.trigger.b[k]) * 0.5)
+            } else {
+                a.pos
+            };
+            let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+            for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
+                store_float_var(c, areas, desc, v);
+            }
+            Value::Int(0)
         }),
     );
     // The ground distance (x, z) between two workers.
@@ -1566,6 +1657,24 @@ fn register_worker_switches(n: &mut Natives<FieldState>) {
             Value::Int(c.worker as i32)
         }),
     );
+}
+
+/// Store a float into the variable a descriptor names (type bits 28–31, area 25–27, offset 0–23), as the calling
+/// worker sees it (the shared area is not reachable from here and is left alone).
+fn store_float_var(c: &mut NativeCall<'_>, areas: [u32; 3], desc: i32, v: f32) {
+    use aerugo_formats::script::{Var, VarType};
+    let d = desc as u32;
+    let var = Var {
+        ty: VarType::from_nibble((d >> 28) as u8),
+        area: ((d >> 25) & 7) as u8,
+        offset: d & 0xFF_FFFF,
+        count: 1,
+    };
+    if var.area == 6 {
+        return;
+    }
+    let place = c.memory.place(&var, 0, c.worker, areas, 0);
+    c.memory.store_float(place, var.ty, v, false);
 }
 
 /// Open a window on its message: the text reveal starts over.
@@ -1855,8 +1964,11 @@ fn message_wait() -> Native<FieldState> {
             }
             if msg.choices > 0 && g.input.stick[1] != 0.0 && g.input.stick_pressed {
                 let n = usize::from(msg.choices);
-                win.choice =
-                    if g.input.stick[1] > 0.0 { (win.choice + n - 1) % n } else { (win.choice + 1) % n };
+                win.choice = if g.input.stick[1] > 0.0 {
+                    win.choice.saturating_sub(1)
+                } else {
+                    (win.choice + 1).min(n - 1)
+                };
             }
             if g.input.confirm {
                 if win.shown < win.reveal {
@@ -1889,7 +2001,9 @@ fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
     let n = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| usize::from(m.choices));
     let win = &mut g.windows[w];
     if c.scratch[2] != 0 && n > 0 {
-        win.choice = if c.scratch[2] > 0 { (win.choice + n - 1) % n } else { (win.choice + 1) % n };
+        // The cursor stops at the first and the last choice (cdsp0000: up on the first stays there).
+        win.choice =
+            if c.scratch[2] > 0 { win.choice.saturating_sub(1) } else { (win.choice + 1).min(n - 1) };
     }
     c.scratch[2] = 0;
     if c.scratch[1] == 0 && win.open && win.shown >= win.reveal {
@@ -2110,22 +2224,36 @@ fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
     Value::Int(1)
 }
 
-fn camera_move_time(g: &mut FieldState, c: &mut NativeCall) -> Value {
+/// A move time with speeding up, steady and slowing down frame counts (then a fourth value): the channels
+/// run for the three together. `eye`: the eye's channels (else the focus's).
+fn camera_move_time(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> Value {
     let _d = c.stack.pop_int();
-    let frames: i32 = (0..3).map(|_| c.stack.pop_int().max(0)).sum();
+    let frames = (0..3).map(|_| c.stack.pop_int() as i16).fold(0i16, |a, b| a.wrapping_add(b));
+    let frames = frames.max(0) as u32;
     let cam = &mut g.camera;
-    let parts = cam.parts.unwrap_or(7);
-    for (bit, t) in cam.timers.iter_mut().enumerate() {
-        if parts & (1 << bit) != 0 {
-            *t = frames as u32 + 1;
+    if eye {
+        let parts = cam.parts.unwrap_or(0x1F);
+        cam.time_eye(frames);
+        if parts & 7 != 0 {
+            cam.move_frames = frames.max(1);
+            cam.moving = None;
+            cam.pending = true;
         }
-    }
-    if parts & 7 != 0 {
-        cam.move_frames = frames.max(1) as u32;
-        cam.moving = None;
-        cam.pending = true;
+    } else {
+        cam.time_focus(frames);
     }
     Value::Int(0)
+}
+
+/// A linear move time in frames for the eye or the focus (the same channels as above).
+fn camera_move_frames(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> u32 {
+    let frames = (c.stack.pop_int() as i16).max(0) as u32;
+    if eye {
+        g.camera.time_eye(frames)
+    } else {
+        g.camera.time_focus(frames)
+    }
+    frames
 }
 
 fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
@@ -2503,6 +2631,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let _a = c.stack.pop_int();
             let a = g.actor(c.worker);
             let from = a.pos;
+            a.started_late |= a.first_pass_done;
             let m = a.move_at(c.level);
             // Modes 1 and 2 walk at the set speed (1 on the ground plane, 2 in space); the others run over the
             // frame count.
@@ -2564,6 +2693,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             c.stack.pop_int();
             let a = g.actor(c.worker);
             a.turning = true;
+            a.started_late |= a.first_pass_done;
             // Modes 3 and 4 without a speed turn at an even rate over the set number of frames, the short way.
             a.turn_steps = (matches!(mode & 0xffff_001f, 3 | 4) && a.turn_speed[0] == 0.0).then(|| {
                 let frames = a.turn_speed[1].max(1.0) as u32;
@@ -2665,9 +2795,17 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6002,
         Native::result(|g, c| {
-            g.camera.position = Some(pop3(c));
-            g.camera.follow.clear_eye();
-            g.camera.moving = None;
+            let to = pop3(c);
+            let cam = &mut g.camera;
+            cam.follow.clear_eye();
+            // While the eye's channels are timed, it travels there over the frames left; else it is placed.
+            cam.moving = match (cam.position, cam.timers[0]) {
+                (Some(from), left) if left > 1 => Some(Movement { from, to, frames: left - 1, done: 0 }),
+                _ => {
+                    cam.position = Some(to);
+                    None
+                }
+            };
             Value::Int(0)
         }),
     );
@@ -2682,7 +2820,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6010,
         Native::result(|g, c| {
-            let frames = c.stack.pop_int().max(1) as u32;
+            let frames = camera_move_frames(g, c, true).max(1);
             g.camera.move_frames = frames;
             g.camera.start_move();
             // The following camera's eye moves there from where it is over the frames.
@@ -2695,19 +2833,36 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x602E,
         Native::result(|g, c| {
-            let frames = c.stack.pop_int().max(1) as u32;
+            let frames = camera_move_frames(g, c, false).max(1);
             if let Some(from) = g.camera.focus {
                 g.camera.follow.focus_move = Some((from, frames, 0));
             }
             Value::Int(0)
         }),
     );
-    // Speeding up, steady and slowing down frame counts, then a fourth value; the move takes the first three
-    // together, and a camera wait polls as not done for one tick more. 0x6015 sets another mode with the same
-    // timing.
+    // Speeding up, steady and slowing down frame counts, then a fourth value: 0x6014 the eye, 0x6032 the focus;
+    // 0x6015 / 0x6033 the same moving by angles and distance around the other.
     for id in [0x6014u16, 0x6015] {
-        n.register(id, Native::result(camera_move_time));
+        n.register(id, Native::result(|g, c| camera_move_time(g, c, true)));
     }
+    for id in [0x6032u16, 0x6033] {
+        n.register(id, Native::result(|g, c| camera_move_time(g, c, false)));
+    }
+    // Linear move times: 0x6011 the eye around the focus, 0x602F the focus around the eye.
+    n.register(
+        0x6011,
+        Native::result(|g, c| {
+            camera_move_frames(g, c, true);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x602F,
+        Native::result(|g, c| {
+            camera_move_frames(g, c, false);
+            Value::Int(0)
+        }),
+    );
     // Eye and focus along a path: (path, start, step per tick, mode); the position on the path goes from the
     // start to 1 by the step each tick.
     n.register(0x6046, Native::result(|g, c| path_move(g, c, 0)));
@@ -2752,12 +2907,25 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x601A,
         Native { init: None, wait: Some(|g, _| if g.camera.is_moving() { 0 } else { 5 }), result: None },
     );
+    // Stop the eye's / the focus's moves where they are; wait for the focus's.
     n.register(
         0x6016,
         Native::result(|g, _| {
             g.camera.moving = None;
+            g.camera.timers[0..5].fill(0);
             Value::Int(0)
         }),
+    );
+    n.register(
+        0x6034,
+        Native::result(|g, _| {
+            g.camera.timers[5..8].fill(0);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6038,
+        Native { init: None, wait: Some(|g, _| if g.camera.focus_moving() { 0 } else { 5 }), result: None },
     );
     n.register(
         0x603B,
@@ -3143,5 +3311,20 @@ mod tests {
             Some("ffx_data/gamedata/ps3data/chr/npc/n035/mdl/d3d11/n035.dae.phyre")
         );
         assert_eq!(model_path(Game::Ffx, 0x9000), None);
+        assert_eq!(
+            chr_path(Game::Ffx, 0x2051).as_deref(),
+            Some("ffx_ps2/ffx/master/jppc/chr/npc/n081/mdl/n081.chr")
+        );
+    }
+
+    #[test]
+    fn chr_radius_from_the_info_block() {
+        let mut d = vec![0u8; 0x100];
+        d[4] = 11;
+        d[0x58] = 0x80;
+        d[0x84..0x88].copy_from_slice(&3.5f32.to_le_bytes());
+        assert_eq!(chr_radius(&d), Some(3.5));
+        d[4] = 9;
+        assert_eq!(chr_radius(&d), Some(1.0));
     }
 }

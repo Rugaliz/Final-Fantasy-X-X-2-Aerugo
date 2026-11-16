@@ -955,6 +955,9 @@ fn archive_event_path(recorded: &str) -> Option<String> {
     Some(format!("ffx_ps2/ffx/master/jppc/event/obj/{dir}/{name}/{name}.ebp"))
 }
 
+/// A recorded step of the player longer than this (on the ground plane) is a placement, not a walk.
+const PLACEMENT_JUMP: f32 = 6.0;
+
 fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>) -> Result<()> {
     use aerugo_formats::Game;
     use aerugo_script::recording::{event_runs, first_divergence, parse};
@@ -1054,10 +1057,14 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             // The player goes where the original's went (the stick is not replayed). The original moves
             // the player in its own turn, before other workers' triggers test it: by the position recorded at the
             // start of the next frame.
+            // Not a jump without control: that is a script placing the player, which it does itself (a placement
+            // late in the tick must not be seen early by the triggers: bjyt0400 f1435).
             if let Some(p) = ev.state.player
                 && let Some(rec) =
                     run.positions.get(f + 1).and_then(|ps| ps.iter().find(|q| usize::from(q.worker) == p))
                 && let Some(a) = ev.state.actors.get_mut(p)
+                && (ev.state.user_control
+                    || (rec.pos[0] - a.pos[0]).hypot(rec.pos[2] - a.pos[2]) <= PLACEMENT_JUMP)
             {
                 a.pos = rec.pos;
                 a.yaw = rec.yaw;
@@ -1075,6 +1082,14 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 .and_then(|d| d.get(0x10..0x14))
                 .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four bytes")));
             let fresh = pressed & !pressed_before;
+            // COMPARE_INPUT=from,to: the pressed words of those frames.
+            if let Ok(spec) = std::env::var("COMPARE_INPUT")
+                && let Some((a, b)) = spec.split_once(',')
+                && (a.parse().unwrap_or(0)..=b.parse().unwrap_or(0)).contains(&f)
+                && pressed != 0
+            {
+                eprintln!("f{f} pressed {pressed:#06x} fresh {fresh:#06x}");
+            }
             let dpad = if fresh & 0x1000 != 0 {
                 1.0
             } else if fresh & 0x4000 != 0 {
@@ -1088,6 +1103,7 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                 alt: pressed & 0x80 != 0,
                 stick: [0.0, dpad],
                 stick_pressed: dpad != 0.0,
+
                 ..Input::default()
             };
             ev.load_motion_frames(&vfs);
@@ -1159,15 +1175,20 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     ev.vm.workers[w].queue.iter().map(|r| (r.level, r.entry, r.running)).collect::<Vec<_>>()
                 );
                 eprintln!(
-                    "f{f} player {:?} prev {:?} pos {:?}; w{w} pos {:?} yaw {} flags {:#x} {:?}",
+                    "f{f} player {:?} prev {:?} pos {:?}; w{w} model {:?} radius {} pos {:?} yaw {} flags {:#x} {:?}",
                     ev.state.player,
                     ev.state.player_prev,
                     ev.state.player.map(|p| ev.state.actors[p].pos),
+                    a.model,
+                    a.collision_radius(),
                     a.pos,
                     a.yaw,
                     a.flags,
                     a.trigger
                 );
+                if let Some(g) = ev.state.ground.as_ref() {
+                    eprintln!("  floors under w{w}: {:?}", g.heights(a.pos[0], a.pos[2]).collect::<Vec<_>>());
+                }
                 if let Some(ps) = run.positions.get(f)
                     && let Some(me) = ps.iter().find(|q| usize::from(q.worker) == w)
                 {
@@ -1220,7 +1241,10 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
                     eprintln!("{k:>4} {:<40} {}", fmt(run.frames[f].get(k)), fmt(ours[f].get(k)));
                 }
             }
-            if let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {
+            // The recording's last frame may be cut short (the session ended mid-frame): nothing recorded there
+            // is no difference.
+            let cut = f + 1 == run.frames.len() && run.frames[f].is_empty();
+            if !cut && let Some(d) = first_divergence(&run.frames[f..=f], &ours[f..=f]) {
                 found = Some(aerugo_script::recording::Divergence { frame: f, ..d });
                 break;
             }
