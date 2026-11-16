@@ -9,10 +9,10 @@ use aerugo_gfx::{ContextOptions, EguiFrame, FrameInput, PresentMode, Quad, Rende
 use aerugo_platform::sdl3::event::{Event, WindowEvent};
 use aerugo_platform::sdl3::keyboard::{Keycode, Mod};
 use aerugo_platform::{FrameLimiter, Platform, WindowConfig};
-use aerugo_vfs::{Install, Language};
+use aerugo_vfs::{GameId, Install, Language};
 use anyhow::Result;
 
-use crate::launcher::{InstallSource, Launcher, LauncherAction, entry_status};
+use crate::launcher::{EntryStatus, InstallSource, Launcher, LauncherAction, entry_status};
 use crate::scene::SceneState;
 use crate::settings::{MusicSet, Settings, VoiceLanguage};
 use crate::viewer::{Viewer, ViewerAction};
@@ -34,6 +34,8 @@ pub struct StartOptions {
     pub viewer: bool,
     /// Open the viewer's field runner on this event.
     pub field: Option<String>,
+    /// Start a new game of FFX on the game screen.
+    pub new_game: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +108,7 @@ impl std::fmt::Debug for App {
 impl App {
     pub fn new(opts: StartOptions) -> Result<Self> {
         let start_in_viewer = opts.viewer;
+        let new_game = opts.new_game;
         let start_field = opts.field.clone();
         let settings = opts.settings;
         let platform = Platform::new(&WindowConfig {
@@ -159,7 +162,9 @@ impl App {
             cjk_fonts: false,
             renderer,
         };
-        if start_in_viewer {
+        if new_game && entry_status(app.ui.launcher.current(), GameId::Ffx) == EntryStatus::Ready {
+            app.open_game();
+        } else if start_in_viewer {
             app.open_viewer();
             if let (Some(v), Some(event)) = (app.ui.viewer.as_mut(), start_field) {
                 v.open_field(event);
@@ -289,7 +294,11 @@ impl App {
             Action::Launcher(a) => match a {
                 LauncherAction::StartGame(game) => {
                     let status = entry_status(self.ui.launcher.current(), game);
-                    self.ui.launcher.notice = Some(format!("{}: {}", game.title(), status.describe()));
+                    if status == EntryStatus::Ready && game == GameId::Ffx {
+                        self.open_game();
+                    } else {
+                        self.ui.launcher.notice = Some(format!("{}: {}", game.title(), status.describe()));
+                    }
                 }
                 LauncherAction::OpenTestScene => {
                     self.ui.scene = SceneState::new();
@@ -328,6 +337,20 @@ impl App {
                 LauncherAction::Quit => self.quit = true,
             },
         }
+    }
+
+    /// Start a new game of FFX on the game screen.
+    fn open_game(&mut self) {
+        if !self.cjk_fonts {
+            aerugo_debug_ui::fonts::add_cjk_fallbacks(&self.egui.ctx);
+            self.cjk_fonts = true;
+        }
+        let lang = Language::from_code(&self.ui.settings.game.text_language).unwrap_or(Language::English);
+        let japanese = self.ui.settings.game.voice == VoiceLanguage::Japanese;
+        let original = self.ui.settings.game.music == MusicSet::Original;
+        self.ui.viewer =
+            Some(Viewer::open_game(self.ui.launcher.current(), lang, &self.platform.sdl, japanese, original));
+        self.ui.screen = Screen::Viewer;
     }
 
     fn open_viewer(&mut self) {

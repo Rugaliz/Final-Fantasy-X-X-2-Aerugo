@@ -177,6 +177,12 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         top: usize,
     },
+    /// List a model's mesh parts: triangles, material, effect (and whether it blends), base texture, vertex alpha
+    /// range and height range (for finding parts a renderer draws wrong).
+    ModelParts {
+        /// Archive path of the model cluster.
+        path: String,
+    },
     /// Print a Phyre cluster: header, instance lists and every object's fields.
     DumpPhyre {
         /// Archive path (as printed by `list`).
@@ -272,6 +278,7 @@ fn main() -> Result<()> {
         }
         Command::FsbExport { bank, index, out } => fsb_export(&install, &bank, index, &out),
         Command::DumpPhyre { path, class } => dump_phyre(&install, &path, class.as_deref()),
+        Command::ModelParts { path } => model_parts(&install, &path),
     }
 }
 
@@ -478,6 +485,51 @@ fn check_phyre(install: &Install, every: usize, verbose: bool, threads: Option<u
     }
     if !failures.is_empty() {
         bail!("{} clusters failed", failures.len());
+    }
+    Ok(())
+}
+
+fn model_parts(install: &Install, path: &str) -> Result<()> {
+    use aerugo_formats::{effect, mesh, phyre::Cluster};
+    let mut vfs = aerugo_vfs::Vfs::new();
+    vfs.mount_install(install)?;
+    let c = Cluster::parse(vfs.read(path)?)?;
+    let model = mesh::read_model(&c)?;
+    let game = if path.starts_with("ffx-2") { aerugo_formats::Game::Ffx2 } else { aerugo_formats::Game::Ffx };
+    for (mi, m) in model.meshes.iter().enumerate() {
+        for (si, seg) in m.segments.iter().enumerate() {
+            let Some(pos) = seg.positions() else { continue };
+            let p = mesh::stream_floats(&c, pos);
+            // Heights in the model's space (its world transform applied).
+            let w = glam::Mat4::from_cols_array(&m.world);
+            let ys: Vec<f32> = p
+                .chunks(3)
+                .filter(|v| v.len() == 3)
+                .map(|v| w.transform_point3(glam::Vec3::new(v[0], v[1], v[2])).y)
+                .collect();
+            let (ylo, yhi) = ys.iter().fold((f32::MAX, f32::MIN), |(a, b), &y| (a.min(y), b.max(y)));
+            let alpha = seg.stream("Color").map(|s| {
+                let f = mesh::stream_floats(&c, s);
+                f.chunks(4)
+                    .filter_map(|v| v.get(3).copied())
+                    .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)))
+            });
+            let tris = mesh::segment_indices(&c, seg).len() / 3;
+            let mat = m.materials.get(seg.material as usize);
+            let fx_id = mat.map(|m| m.effect.clone()).unwrap_or_default();
+            let fx = effect::effect_cluster_path(game, &fx_id)
+                .and_then(|p| vfs.read(&p).ok())
+                .and_then(|d| Cluster::parse(d).ok())
+                .and_then(|cl| effect::read_effect(&cl));
+            let blend =
+                fx.as_ref().map(|f| if f.is_transparent() { "blend" } else { "opaque" }).unwrap_or("?");
+            println!(
+                "mesh {mi} {:<24} seg {si}: {tris:>6} tris  y {ylo:>9.1}..{yhi:>9.1}  alpha {:?}  {blend:<6} fx {fx_id}  tex {}",
+                m.name,
+                alpha.map(|(a, b)| format!("{a:.2}..{b:.2}")),
+                mat.and_then(|m| m.base_texture()).unwrap_or("-"),
+            );
+        }
     }
     Ok(())
 }

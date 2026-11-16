@@ -38,6 +38,14 @@ Requirements:
 cargo run --release
 ```
 
+In the launcher, **Final Fantasy X** starts a new game from the title screen (or start straight there with
+`cargo run --release -- --new-game`). What works so far is the field: the title, the story scripts, walking,
+talking, treasure, shops, save spheres, movies and map changes through the first chapter (Zanarkand, Baaj
+Temple, the Al Bhed ship). Battles are a placeholder that ends as won, and many maps still draw incompletely.
+
+Keys on the game screen: **arrows / WASD** move, **Enter / Space** confirm and talk, **Backspace** cancel,
+**Q** the second talk button, **Escape** skips a movie or opens the pause menu (resume or quit to the launcher).
+
 Useful options:
 
 ```sh
@@ -45,6 +53,7 @@ cargo run --release -- --game-dir "/path/to/FINAL FANTASY FFX&FFX-2 HD Remaster"
 cargo run --release -- --list-games        # print what was detected and exit
 cargo run --release -- --portable          # keep settings next to the executable
 cargo run --release -- --test-scene        # timing test scene (30 Hz simulation at display rate)
+cargo run --release -- --new-game          # start a new game of FFX right away
 cargo run --release -- --viewer            # asset viewer: tables, textures, models, maps, sounds, movies, scripts
 cargo run --release -- --fps-limit 240 --present-mode mailbox
 cargo run --release -- --help              # all options

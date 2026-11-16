@@ -90,6 +90,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         test_scene: cli.test_scene,
         viewer: cli.viewer || cli.field.is_some(),
         field: cli.field,
+        new_game: cli.new_game,
     };
     let mut app = app::App::new(opts)?;
     app.run()?;

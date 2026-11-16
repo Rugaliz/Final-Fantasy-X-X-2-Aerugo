@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long, value_name = "EVENT")]
     pub field: Option<String>,
 
+    /// Start a new game of FFX right away (the game screen, from the title).
+    #[arg(long)]
+    pub new_game: bool,
+
     /// Open the timing test scene.
     #[arg(long)]
     pub test_scene: bool,

@@ -1,5 +1,8 @@
 //! Field runner: an event's script running at 30 Hz on its map, with actors, message windows, the script camera,
 //! player control (WASD, Enter to confirm), a worker inspector and native coverage.
+//!
+//! The same runner is the game screen ([`FieldView::game`]): the field fills the window through the scene's own
+//! camera, with game message boxes and a pause menu, and no developer panels.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,6 +69,7 @@ pub struct FieldView {
     step_once: bool,
     confirm: bool,
     alt: bool,
+    cancel: bool,
     last_stick: [f32; 2],
     /// Heading of the camera drawn last (the stick is relative to it).
     camera_heading: Option<f32>,
@@ -90,7 +94,52 @@ pub struct FieldView {
     import_path: String,
     /// The movie the scripts play, drawn over the field.
     movie: MoviePlayer,
+    /// The game screen: no developer panels, the scene camera, game message boxes, a pause menu.
+    game: bool,
+    /// The pause menu is open (game screen).
+    pause_menu: bool,
+    /// The player asked to leave the game (game screen).
+    quit: bool,
 }
+
+/// FFX event numbers (what map changes name) and their events, as recordings of the original showed them. The
+/// original reads its table of event files at run time; until that table is read here, these cover the first
+/// chapter, and other targets fall back to the map number in the script headers.
+const FFX_EVENTS: &[(i32, &str)] = &[
+    (23, "te/test20"),
+    (48, "bj/bjyt0000"),
+    (49, "bj/bjyt0200"),
+    (50, "bj/bjyt0300"),
+    (52, "bj/bjyt0600"),
+    (63, "bj/bjyt0400"),
+    (64, "cd/cdsp0700"),
+    (71, "cd/cdsp0000"),
+    (74, "bj/bjyt0700"),
+    (132, "zn/znkd0600"),
+    (165, "zn/znkd0500"),
+    (288, "cd/cdsp0100"),
+    (348, "me/memochek"),
+    (349, "lo/loopdemo"),
+    (366, "zn/znkd0800"),
+    (367, "zn/znkd0900"),
+    (368, "zn/znkd1000"),
+    (370, "zn/znkd1200"),
+    (371, "zn/znkd1300"),
+    (376, "zn/znkd1400"),
+    (384, "op/open0100"),
+    (385, "op/open0200"),
+    (389, "zn/znkd0801"),
+];
+
+/// The title's two choices (pictures in the original).
+const TITLE_CHOICES: [&str; 2] = ["New Game", "Load Game"];
+
+/// The menu the title asks for to load a game.
+const LOAD_GAME_MENU: u32 = 0x4010_0000;
+
+/// The first event of a new game: the title script (it checks the memory card, shows the title menu and starts
+/// the opening).
+const FFX_TITLE_EVENT: &str = "ffx_ps2/ffx/master/jppc/event/obj/te/test20/test20.ebp";
 
 impl std::fmt::Debug for FieldView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,6 +164,7 @@ impl FieldView {
             step_once: false,
             confirm: false,
             alt: false,
+            cancel: false,
             last_stick: [0.0, 0.0],
             camera_heading: None,
             interpolate: true,
@@ -133,7 +183,25 @@ impl FieldView {
             slot: 1,
             import_path: String::new(),
             movie: MoviePlayer::new(),
+            game: false,
+            pause_menu: false,
+            quit: false,
         }
+    }
+
+    /// The game screen, starting a new game of FFX at its title script.
+    pub fn game(lang: Language) -> FieldView {
+        let mut v = FieldView::new(lang);
+        v.game = true;
+        v.camera_mode = CameraMode::Script;
+        v.follow_player = true;
+        v.open_later(FFX_TITLE_EVENT.to_owned());
+        v
+    }
+
+    /// Whether the player chose to leave the game (cleared by asking).
+    pub fn take_quit(&mut self) -> bool {
+        std::mem::take(&mut self.quit)
     }
 
     pub fn close(&mut self, renderer: &mut Renderer, audio: Option<&AudioOutput>) {
@@ -202,6 +270,7 @@ impl FieldView {
             .and_then(|d| Cluster::parse(d).ok())
             .map(|c| aerugo_formats::camera::read_cameras(&c))
             .filter(|c| !c.is_empty());
+        log::info!("field: {path} (map {})", event.map_model.as_deref().unwrap_or("none"));
         self.session = Some(Session {
             restore_position,
             jump_choices: Vec::new(),
@@ -241,8 +310,70 @@ impl FieldView {
         s.event.step(input);
     }
 
+    /// The title's Load Game screen (game screen): the saved games; loading one goes on from where it was saved,
+    /// Back returns to the title.
+    fn load_menu(&mut self, ui: &mut egui::Ui) {
+        let dir = aerugo_platform::user_dir(false).join("saves");
+        let slots: Vec<(u32, SaveGame)> = (1..=9)
+            .filter_map(|n| {
+                let b = std::fs::read(dir.join(format!("slot{n}.aesv"))).ok()?;
+                Some((n, SaveGame::from_bytes(&b).ok()?))
+            })
+            .collect();
+        let mut chosen = None;
+        let mut back = false;
+        egui::Area::new(egui::Id::new("game-load"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                game_frame().show(ui, |ui| {
+                    ui.set_min_width(420.0);
+                    ui.label(egui::RichText::new("Load Game").size(26.0).color(egui::Color32::WHITE));
+                    ui.add_space(8.0);
+                    if slots.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No saved games yet.")
+                                .size(18.0)
+                                .color(egui::Color32::from_gray(210)),
+                        );
+                    }
+                    for (n, save) in &slots {
+                        let place = save.event.as_deref().and_then(|e| e.rsplit('/').nth(1)).unwrap_or("?");
+                        let time = save.ticks / 30;
+                        let label = format!(
+                            "Slot {n} · {place} · {}:{:02}:{:02}",
+                            time / 3600,
+                            time / 60 % 60,
+                            time % 60
+                        );
+                        if ui.button(egui::RichText::new(label).size(18.0)).clicked() {
+                            chosen = Some(save.clone());
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(egui::RichText::new("Back").size(18.0)).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Backspace))
+                    {
+                        back = true;
+                    }
+                });
+            });
+        if let Some(save) = chosen {
+            if let Some(ev) = save.event.clone() {
+                self.pending_open = Some(ev);
+            }
+            self.pending_restore = Some(save);
+        } else if back && let Some(s) = &mut self.session {
+            s.event.close_menu();
+        }
+    }
+
     /// The menu the scripts asked for: saving (save spheres), shops; others just close.
     fn menu_window(&mut self, ui: &mut egui::Ui, mode: u32) {
+        if self.game && mode == LOAD_GAME_MENU {
+            self.load_menu(ui);
+            return;
+        }
         use aerugo_sim::field::menu_mode;
         use aerugo_sim::items;
         let slot = &mut self.slot;
@@ -362,34 +493,77 @@ impl FieldView {
         renderer: &mut Renderer,
         audio: Option<&AudioOutput>,
     ) {
-        let files = self.files.get_or_insert_with(|| FileList::new(vfs, |p| p.ends_with(".ebp")));
         let mut picked = None;
-        egui::Panel::left("field-files").resizable(true).default_size(260.0).show(ui, |ui| {
-            picked = files.ui(ui);
-        });
+        if !self.game {
+            let files = self.files.get_or_insert_with(|| FileList::new(vfs, |p| p.ends_with(".ebp")));
+            egui::Panel::left("field-files").resizable(true).default_size(260.0).show(ui, |ui| {
+                picked = files.ui(ui);
+            });
+        }
         if let Some(p) = picked.or_else(|| self.pending_open.take()) {
             self.open(vfs, renderer, audio, &p);
         }
         // Input and timing.
-        // WASD walks (Shift held: slower), Enter / Space confirms and talks, Q talks with the second button,
-        // Escape skips a movie.
-        let (stick, confirm_now, alt_now, walk) = ui.input(|i| {
-            let k = |a: egui::Key, b: egui::Key| {
-                f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
-            };
+        // WASD or the arrow keys walk (Shift held: slower), Enter / Space confirms and talks, Backspace cancels, Q
+        // talks with the second button, Escape skips a movie (on the game screen, otherwise pauses).
+        let (stick, confirm_now, alt_now, cancel_now, walk) = ui.input(|i| {
+            let down = |a: egui::Key, b: egui::Key| i.key_down(a) || i.key_down(b);
+            let k = |pos: bool, neg: bool| f32::from(u8::from(pos)) - f32::from(u8::from(neg));
             (
-                [k(egui::Key::D, egui::Key::A), k(egui::Key::W, egui::Key::S)],
+                [
+                    k(down(egui::Key::D, egui::Key::ArrowRight), down(egui::Key::A, egui::Key::ArrowLeft)),
+                    k(down(egui::Key::W, egui::Key::ArrowUp), down(egui::Key::S, egui::Key::ArrowDown)),
+                ],
                 i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Q),
+                i.key_pressed(egui::Key::Backspace),
                 i.modifiers.shift,
             )
         });
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        // The buttons held, as the scripts' word has them: confirm 0x20 (with Start 0x800 on the game screen, so
+        // Enter also skips the logos to the title), cancel 0x40, the second talk button 0x80, the d-pad.
+        let game = self.game;
+        let held = ui.input(|i| {
+            let mut w = 0u32;
+            if i.key_down(egui::Key::Enter) || i.key_down(egui::Key::Space) {
+                w |= 0x20 | if game { 0x800 } else { 0 };
+            }
+            if i.key_down(egui::Key::Backspace) {
+                w |= 0x40;
+            }
+            if i.key_down(egui::Key::Q) {
+                w |= 0x80;
+            }
+            for (keys, bit) in [
+                ([egui::Key::W, egui::Key::ArrowUp], 0x1000),
+                ([egui::Key::D, egui::Key::ArrowRight], 0x2000),
+                ([egui::Key::S, egui::Key::ArrowDown], 0x4000),
+                ([egui::Key::A, egui::Key::ArrowLeft], 0x8000),
+            ] {
+                if keys.iter().any(|&k| i.key_down(k)) {
+                    w |= bit;
+                }
+            }
+            w
+        });
+        let movie_playing =
+            self.session.as_ref().is_some_and(|s| s.event.state.movie.as_ref().is_some_and(|m| m.playing));
+        if self.game && escape && !movie_playing {
+            self.pause_menu = !self.pause_menu;
+        }
+        let (stick, confirm_now, alt_now, cancel_now) = if self.pause_menu {
+            ([0.0, 0.0], false, false, false)
+        } else {
+            (stick, confirm_now, alt_now, cancel_now)
+        };
         self.confirm |= confirm_now;
         self.alt |= alt_now;
+        self.cancel |= cancel_now;
         let now = Instant::now();
         let elapsed = self.last.map_or(std::time::Duration::ZERO, |t| now - t);
         self.last = Some(now);
-        let steps = if self.paused {
+        let steps = if self.paused || self.pause_menu {
             self.alpha = 1.0;
             u32::from(std::mem::take(&mut self.step_once))
         } else {
@@ -406,17 +580,18 @@ impl FieldView {
             let input = Input {
                 stick,
                 confirm: std::mem::take(&mut self.confirm),
-                cancel: false,
+                cancel: std::mem::take(&mut self.cancel),
                 alt: std::mem::take(&mut self.alt),
                 stick_pressed,
                 walk,
                 camera_heading: self.camera_heading,
                 pad: 0,
-                held: 0,
+                held: if self.pause_menu { 0 } else { held },
             };
             self.tick(input, vfs);
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape))
+        if escape
+            && movie_playing
             && let Some(s) = &mut self.session
         {
             s.event.skip_movie();
@@ -445,15 +620,24 @@ impl FieldView {
             }
         }
         self.handle_jump(vfs);
-        egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.info_ui(ui));
-        });
-        egui::CentralPanel::default_margins().show(ui, |ui| {
+        if !self.game {
+            egui::Panel::right("field-info").resizable(true).default_size(360.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.info_ui(ui));
+            });
+        }
+        let panel = if self.game {
+            egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+        } else {
+            egui::CentralPanel::default_margins()
+        };
+        panel.show(ui, |ui| {
             if let Some(e) = &self.error {
                 ui.colored_label(ui.visuals().warn_fg_color, e);
             }
             if self.session.is_none() {
-                ui.label("Pick an event on the left. WASD walks the player, Enter confirms messages.");
+                if !self.game {
+                    ui.label("Pick an event on the left. WASD walks the player, Enter confirms messages.");
+                }
                 return;
             }
             let rect = ui.available_rect_before_wrap();
@@ -461,11 +645,20 @@ impl FieldView {
                 self.viewport(ui, vfs, renderer);
             }
         });
+        if self.pause_menu {
+            self.pause_ui(ui);
+        }
         ui.ctx().request_repaint();
     }
 
     /// Events whose header names map `n` (variants for other platforms and test events left out).
     fn jump_candidates(&mut self, vfs: &Vfs, game: Game, n: i16) -> Vec<String> {
+        if game == Game::Ffx
+            && let Some((_, e)) = FFX_EVENTS.iter().find(|(k, _)| *k == i32::from(n))
+        {
+            let name = e.rsplit('/').next().unwrap_or(e);
+            return vec![format!("ffx_ps2/ffx/master/jppc/event/obj/{e}/{name}.ebp")];
+        }
         let index = self.map_index.entry(game).or_insert_with(|| {
             let mut index: HashMap<i16, Vec<String>> = HashMap::new();
             let root = if game == Game::Ffx { "ffx_ps2/ffx/" } else { "ffx_ps2/ffx2/" };
@@ -504,9 +697,16 @@ impl FieldView {
         let game = s.event.game;
         let candidates = self.jump_candidates(vfs, game, target as i16);
         let Some(s) = &mut self.session else { return };
-        if self.follow_jumps && candidates.len() == 1 {
+        log::info!("field: map change to {target} entrance {entrance}: {candidates:?}");
+        if (self.follow_jumps && candidates.len() == 1) || (self.game && !candidates.is_empty()) {
             s.notes.push(format!("jump to map {target} entrance {entrance}: {}", candidates[0]));
             self.pending_open = Some(candidates[0].clone());
+            // The game goes on in the next event: the save image carries over, with the event and entrance
+            // moved to the previous ones and the new ones in their place (as the original's map change does).
+            let mut save = s.event.save();
+            carry_over(&mut save.image, target, entrance);
+            save.position = None;
+            self.pending_restore = Some(save);
         } else {
             s.notes.push(format!(
                 "jump to map {target} entrance {entrance}: {} candidate events",
@@ -760,6 +960,14 @@ impl FieldView {
         let alpha = if self.interpolate { self.alpha } else { 1.0 };
         let view = View::of(st).blended_from(self.prev_view.as_ref(), alpha);
         let (cam_eye, cam_focus) = (view.eye, view.focus);
+        // The game screen shows the scene's camera; the orbit camera only stands in until a script sets one.
+        if self.game {
+            self.camera_mode = if cam_eye.is_some() && cam_focus.is_some() {
+                CameraMode::Script
+            } else {
+                CameraMode::Follow
+            };
+        }
         self.camera_heading = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {
                 Some((focus[2] - eye[2]).atan2(focus[0] - eye[0]))
@@ -776,9 +984,13 @@ impl FieldView {
                 let r = game_to_view();
                 let (eye, focus) =
                     (r.transform_point3(Vec3::from(eye)), r.transform_point3(Vec3::from(focus)));
+                // Near and far planes: the map's whole extent stays in view however close the focus is.
                 let d = (focus - eye).length().max(1.0);
+                let extent = s.map.as_ref().map_or(0.0, |m| (m.max - m.min).length());
+                let far = (d * 200.0).max(extent * 2.0 + (eye - focus).length());
+                let near = (d * 0.01).clamp(0.05, 1.0);
                 let base = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                    * Mat4::perspective_rh(st.camera.fov_y(), design, d * 0.01, d * 200.0)
+                    * Mat4::perspective_rh(st.camera.fov_y(), design, near, far)
                     * Mat4::from_rotation_z(st.camera.roll)
                     * Mat4::look_at_rh(eye, focus, Vec3::Y)
                     * r;
@@ -852,7 +1064,7 @@ impl FieldView {
         }
         renderer.submit_scene(SceneView {
             view_proj: view_proj.to_cols_array(),
-            clear: [0.05, 0.05, 0.08, 1.0],
+            clear: if self.game { [0.0, 0.0, 0.0, 1.0] } else { [0.05, 0.05, 0.08, 1.0] },
             draws,
             joints,
             culling: true,
@@ -867,12 +1079,26 @@ impl FieldView {
             let lines: Vec<&str> = shown.lines().collect();
             let total = msg.text.lines().count();
             let first_choice = total.saturating_sub(usize::from(msg.choices));
+            // The title's choices are pictures in the original; the window only holds blank slots for them.
+            let title = self.game && msg.choices > 0 && msg.text.lines().all(|l| l.trim().is_empty());
             let text = lines
                 .iter()
                 .enumerate()
                 .map(|(k, l)| {
                     if msg.choices > 0 && k >= first_choice {
-                        format!("{} {l}", if k - first_choice == w.choice { "▸" } else { "  " })
+                        let label = if title {
+                            TITLE_CHOICES.get(k - first_choice).copied().unwrap_or("")
+                        } else {
+                            l.trim_end()
+                        };
+                        let cursor = if !self.game {
+                            "▸"
+                        } else if k - first_choice == w.choice {
+                            ">"
+                        } else {
+                            "  "
+                        };
+                        format!("{cursor} {label}")
                     } else {
                         (*l).to_owned()
                     }
@@ -881,15 +1107,109 @@ impl FieldView {
                 .join("\n");
             let pos =
                 rect.min + egui::vec2(w.x as f32 / 512.0 * rect.width(), w.y as f32 / 448.0 * rect.height());
-            egui::Area::new(egui::Id::new(("field-window", i))).fixed_pos(pos).show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(rect.width() * 0.6);
-                    ui.label(text);
-                    ui.weak("Enter ▸");
-                });
-            });
+            let game = self.game;
+            let pivot = match w.align {
+                4 => egui::Align2::CENTER_CENTER,
+                2 => egui::Align2::RIGHT_CENTER,
+                _ => egui::Align2::LEFT_TOP,
+            };
+            egui::Area::new(egui::Id::new(("field-window", i))).fixed_pos(pos).pivot(pivot).show(
+                ui.ctx(),
+                |ui| {
+                    if game {
+                        message_box(ui, &text, rect.width(), w.shown >= w.reveal);
+                    } else {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_max_width(rect.width() * 0.6);
+                            ui.label(text);
+                            ui.weak("Enter ▸");
+                        });
+                    }
+                },
+            );
         }
     }
+}
+
+impl FieldView {
+    /// The game screen's pause menu: resume or leave to the launcher.
+    fn pause_ui(&mut self, ui: &mut egui::Ui) {
+        let screen = ui.ctx().content_rect();
+        egui::Area::new(egui::Id::new("game-pause-dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+            });
+        egui::Area::new(egui::Id::new("game-pause"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                game_frame().show(ui, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Paused").size(28.0).color(egui::Color32::WHITE));
+                        ui.add_space(12.0);
+                        if ui.button(egui::RichText::new("Resume").size(20.0)).clicked() {
+                            self.pause_menu = false;
+                        }
+                        ui.add_space(6.0);
+                        if ui.button(egui::RichText::new("Quit to launcher").size(20.0)).clicked() {
+                            self.pause_menu = false;
+                            self.quit = true;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Arrows / WASD move · Enter talk, confirm · Backspace cancel",
+                            )
+                            .size(14.0)
+                            .color(egui::Color32::from_gray(200)),
+                        );
+                    });
+                });
+            });
+    }
+}
+
+/// A map change in the save image: word 0 is the event, word 2 the one before; byte 0xC the entrance, 0xD the one
+/// before.
+fn carry_over(image: &mut [u8], target: i32, entrance: i32) {
+    if image.len() < 0xE {
+        return;
+    }
+    image.copy_within(0..2, 2);
+    image[0..2].copy_from_slice(&(target as u16).to_le_bytes());
+    image[0xD] = image[0xC];
+    image[0xC] = entrance as u8;
+}
+
+/// The frame of a game box: deep blue, half see-through, with a light edge (the look of FFX's windows).
+fn game_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(18, 32, 92, 215))
+        .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(196, 204, 230)))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(18, 12))
+}
+
+/// A message window on the game screen: the text so far (sized to it), and a marker once it is all shown.
+fn message_box(ui: &mut egui::Ui, text: &str, view_width: f32, complete: bool) {
+    let size = (view_width / 48.0).clamp(16.0, 30.0);
+    game_frame().show(ui, |ui| {
+        ui.set_max_width(view_width * 0.7);
+        let mut job = egui::text::LayoutJob::default();
+        let body = egui::TextFormat::simple(egui::FontId::proportional(size), egui::Color32::WHITE);
+        job.append(text, 0.0, body);
+        if complete {
+            let mark = egui::TextFormat::simple(
+                egui::FontId::proportional(size * 0.6),
+                egui::Color32::from_rgb(230, 220, 160),
+            );
+            job.append("  ▼", 0.0, mark);
+        }
+        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
+    });
 }
 
 /// What the field shows at one tick: each actor's position and heading, and the camera.
@@ -937,6 +1257,17 @@ impl View {
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    #[test]
+    fn map_changes_carry_the_save_image() {
+        let mut img = vec![0u8; 16];
+        img[0..2].copy_from_slice(&348u16.to_le_bytes());
+        img[0xC] = 2;
+        carry_over(&mut img, 23, 1);
+        assert_eq!(u16::from_le_bytes([img[0], img[1]]), 23);
+        assert_eq!(u16::from_le_bytes([img[2], img[3]]), 348);
+        assert_eq!((img[0xC], img[0xD]), (1, 2));
+    }
 
     #[test]
     fn views_blend_but_not_across_jumps() {

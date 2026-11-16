@@ -92,6 +92,8 @@ pub struct Viewer {
     scripts: ScriptBrowser,
     field: FieldView,
     audio: Option<aerugo_audio::AudioOutput>,
+    /// The game screen: only the field, without the viewer's tabs.
+    game: bool,
 }
 
 /// What the viewer asks the app to do.
@@ -144,7 +146,23 @@ impl Viewer {
             scripts: ScriptBrowser::new(),
             field: FieldView::new(text_language),
             audio,
+            game: false,
         }
+    }
+
+    /// The game screen: a new game of FFX from its title script, the field filling the window.
+    pub fn open_game(
+        install: Option<&Install>,
+        text_language: Language,
+        sdl: &aerugo_platform::sdl3::Sdl,
+        japanese_voices: bool,
+        original_music: bool,
+    ) -> Viewer {
+        let mut v = Viewer::open(install, text_language, sdl, japanese_voices, original_music, "field");
+        v.tab = Tab::Field;
+        v.field = FieldView::game(text_language);
+        v.game = true;
+        v
     }
 
     /// Show the field runner on an event.
@@ -169,6 +187,17 @@ impl Viewer {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) -> Option<ViewerAction> {
+        if self.game {
+            match &self.vfs {
+                Some(vfs) => self.field.ui(ui, vfs, renderer, self.audio.as_ref()),
+                None => {
+                    egui::CentralPanel::default_margins().show(ui, |ui| {
+                        ui.label(self.error.as_deref().unwrap_or("No data."));
+                    });
+                }
+            }
+            return self.field.take_quit().then_some(ViewerAction::Back);
+        }
         let mut action = None;
         egui::Panel::top("viewer-bar").show(ui, |ui| {
             ui.horizontal(|ui| {

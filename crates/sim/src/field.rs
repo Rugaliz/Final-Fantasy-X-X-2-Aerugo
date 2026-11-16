@@ -386,9 +386,11 @@ pub fn model_path(game: Game, id: u16) -> Option<String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Window {
     pub message: Option<usize>,
-    /// Screen position in the original's 512 × 448 frame.
+    /// Screen position in the original's 512 × 448 frame, and how the window sits on it (4: centred there, 2: its
+    /// right edge there; otherwise its top left corner).
     pub x: i32,
     pub y: i32,
+    pub align: i32,
     pub open: bool,
     /// Characters revealed so far (text appears over a few ticks).
     pub shown: usize,
@@ -1753,6 +1755,23 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     // show these constants).
     fixed!(0; 0x0002, 0x0005, 0x00D1, 0x0197, 0x5087, 0x5016, 0x504E);
     fixed!(1; 0x0196, 0x0198, 0x01C9);
+    // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
+    // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
+    fixed!(1; 0x01C6, 0x0253);
+    fixed!(3; 0x0243);
+    fixed!(0; 0x400E);
+    // Reading the save dictionary (01c5): done at once but the worker's turn ends there; nothing to report (0).
+    n.register(
+        0x01C5,
+        Native {
+            init: Some(|_, c| {
+                c.stack.pop_int();
+                c.stack.pop_int();
+            }),
+            wait: Some(|_, _| WAIT_DONE),
+            result: Some(|_, _| Value::Int(0)),
+        },
+    );
     // Results that echo an argument: 00cb its value, 00e7 its second as a byte.
     n.register(0x00CB, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00CB), 0))));
     n.register(0x00E7, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00E7), 1) & 0xFF)));
@@ -3298,12 +3317,13 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x0065,
         Native::result(|g, c| {
-            let _align = c.stack.pop_int();
+            let align = c.stack.pop_int();
             let y = c.stack.pop_int();
             let x = c.stack.pop_int();
             let w = window(c);
             g.windows[w].x = x;
             g.windows[w].y = y;
+            g.windows[w].align = align;
             Value::Int(0)
         }),
     );

@@ -55,9 +55,9 @@ fn archive_file_name(id: ArchiveId) -> &'static str {
     p.rsplit('/').next().unwrap_or(p)
 }
 
-/// Entries whose game module exists. None yet: modules arrive with later milestones.
-fn implemented(_game: GameId) -> bool {
-    false
+/// Entries whose game module exists: FFX (its field; battles are a placeholder).
+fn implemented(game: GameId) -> bool {
+    game == GameId::Ffx
 }
 
 pub fn entry_status(install: Option<&Install>, game: GameId) -> EntryStatus {
@@ -275,7 +275,8 @@ mod tests {
     #[test]
     fn entry_status_reports_missing_archives() {
         let install = fake_install(&[ArchiveId::Ffx, ArchiveId::MetaMenu]);
-        assert_eq!(entry_status(Some(&install), GameId::Ffx), EntryStatus::NotImplemented);
+        assert_eq!(entry_status(Some(&install), GameId::Ffx), EntryStatus::Ready);
+        assert_eq!(entry_status(Some(&install), GameId::FfxEternalCalm), EntryStatus::NotImplemented);
         assert_eq!(
             entry_status(Some(&install), GameId::Ffx2),
             EntryStatus::MissingData(vec![ArchiveId::Ffx2])
