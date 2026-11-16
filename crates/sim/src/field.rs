@@ -236,7 +236,7 @@ pub struct Window {
     pub reveal: usize,
     /// Where the reveal stops until confirm is pressed, in the same count.
     pub stops: Vec<usize>,
-    /// Flags a script set for the window; 0x1000 shows the text at once.
+    /// Flags a script set for the window (0x2000: a label left on screen).
     pub flags: u16,
     /// Opened to show its text at once (choice windows).
     pub instant: bool,
@@ -265,9 +265,6 @@ const SYSTEM_CLOSE_EXTRA: u8 = 5;
 /// Characters revealed per tick.
 const TEXT_SPEED: usize = 2;
 
-/// Window flag: the text appears at once instead of a few characters per tick.
-const WINDOW_INSTANT: u16 = 0x1000;
-
 /// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
 const NAMES: usize = 0x634C;
 const NAME_SLOT: usize = 0x14;
@@ -292,6 +289,8 @@ pub struct Message {
     /// What the text reveal goes through: everything but line breaks, after a first line that is only control
     /// codes (the speaker's name, shown at once).
     pub reveal: Vec<RevealPart>,
+    /// The text starts with {09:30}: it shows at once.
+    pub instant: bool,
 }
 
 /// A piece of a message's text reveal.
@@ -735,11 +734,7 @@ impl FieldState {
                 }
                 continue;
             }
-            w.shown = if w.instant || w.flags & WINDOW_INSTANT != 0 {
-                stop
-            } else {
-                (w.shown + TEXT_SPEED).min(stop)
-            };
+            w.shown = if w.instant { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
         for a in &mut self.actors {
             a.advance_move(self.ground.as_ref());
@@ -857,7 +852,14 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
                 })
                 .collect();
             let reveal = reveal_parts(&tokens);
-            Message { text, raw: text::to_display(&tokens), choices: (word(i * 8 + 2) >> 8) as u8, reveal }
+            let instant = starts_instant(&tokens);
+            Message {
+                text,
+                raw: text::to_display(&tokens),
+                choices: (word(i * 8 + 2) >> 8) as u8,
+                reveal,
+                instant,
+            }
         })
         .collect()
 }
@@ -960,6 +962,11 @@ const NAME_CODE: u8 = 0x13;
 const PAUSE_CODE: u8 = 0x01;
 
 /// What the text reveal goes through in a message: characters, names spelled out, and pauses.
+/// Whether a text opens with the {09:30} code, which shows it at once.
+fn starts_instant(tokens: &[text::Token]) -> bool {
+    matches!(tokens.first(), Some(text::Token::Control { code: 0x09, arg: Some(0x30) }))
+}
+
 fn reveal_parts(tokens: &[text::Token]) -> Vec<RevealPart> {
     let first_break = tokens.iter().position(|t| matches!(t, text::Token::LineBreak));
     let speaker_line =
@@ -1045,7 +1052,12 @@ impl Event {
                 .collect();
         }
         // The walk mesh from the PS2 map package next to the drawn map.
-        if let Some(vpa) = map_model.as_deref().and_then(walk_mesh_path) {
+        // (Maps drawn as pre-rendered backgrounds have no 3D model but still have a walk mesh.)
+        let vpa = map_model.as_deref().and_then(walk_mesh_path).or_else(|| {
+            (game == Game::Ffx && name.len() >= 6 && name.is_ascii())
+                .then(|| format!("ffx_ps2/ffx/master/jppc/map/{}/{}/bin/mapout.vpa", &name[..4], &name[..6]))
+        });
+        if let Some(vpa) = vpa {
             state.ground = vfs.read(&vpa).ok().and_then(|d| Ground::from_walk_mesh(&d));
         }
         let mut natives = Natives::new(game);
@@ -1558,6 +1570,7 @@ fn register_worker_switches(n: &mut Natives<FieldState>) {
 
 /// Open a window on its message: the text reveal starts over.
 fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
+    let text_instant = g.windows[w].message.and_then(|m| g.messages.get(m)).is_some_and(|m| m.instant);
     let (mut reveal, mut stops) = (0, Vec::new());
     for part in g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(&[][..], |m| &m.reveal) {
         match *part {
@@ -1574,14 +1587,20 @@ fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
     win.choice = usize::from(win.first_choice);
     win.opening = OPEN_TICKS;
     win.closing = 0;
-    win.instant = instant;
+    win.instant = instant || text_instant;
 }
 
 /// A message made at run time (not from the event's text).
 fn runtime_message(text: &str) -> Message {
     let tokens: Vec<text::Token> =
         text.chars().map(|c| if c == '\n' { text::Token::LineBreak } else { text::Token::Char(c) }).collect();
-    Message { text: text.to_owned(), raw: text.to_owned(), choices: 0, reveal: reveal_parts(&tokens) }
+    Message {
+        text: text.to_owned(),
+        raw: text.to_owned(),
+        choices: 0,
+        reveal: reveal_parts(&tokens),
+        instant: true,
+    }
 }
 
 /// Treasure: give treasure `index` (the item, key item, equipment or gil) into the save image. Returns whether
@@ -2994,6 +3013,7 @@ mod tests {
                 raw: String::new(),
                 choices: 0,
                 reveal: vec![RevealPart::Chars(11)],
+                instant: false,
             }],
             ..FieldState::default()
         };

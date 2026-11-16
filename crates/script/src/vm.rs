@@ -190,6 +190,8 @@ pub struct Worker {
     /// Extra-pass marks: a two-bit count of extra passes this frame (bits 7–8), marks that become a count at
     /// the end of the pass (bits 9–10), and "requests from this worker mark their target" (bit 12).
     pub pass_marks: u16,
+    /// The entries engine signals run, when a script changed them (0x79): one per signal type.
+    pub signal_entries: Option<[i16; 8]>,
 }
 
 impl Worker {
@@ -359,6 +361,7 @@ impl Vm {
                     rate: 1.0,
                     rate_acc: 0.0,
                     pass_marks: 0,
+                    signal_entries: None,
                 }
             })
             .collect();
@@ -500,7 +503,11 @@ impl Vm {
             _ => return false,
         };
         let t = usize::from(signal & 7);
-        let (level, entry) = (SIGNAL_LEVELS[levels][t], SIGNAL_ENTRIES[entries][t]);
+        let entry = match self.workers[w].signal_entries {
+            Some(table) => table[t],
+            None => SIGNAL_ENTRIES[entries][t],
+        };
+        let level = SIGNAL_LEVELS[levels][t];
         if level == 255 || entry < 0 {
             return false;
         }
@@ -1125,10 +1132,20 @@ impl Vm {
                     }
                 }
             }
+            // The entry a signal type runs (entry, type, and the variable the table lives in).
             0x79 => {
+                let entry = s.pop_int() as i16;
+                let t = s.pop_int().clamp(0, 7) as usize;
                 s.pop();
-                s.pop();
-                s.pop();
+                let kind = worker.kind;
+                let row = match kind {
+                    1 => 0,
+                    2 | 3 => 1,
+                    5 => 2,
+                    _ => 3,
+                };
+                let table = worker.signal_entries.get_or_insert(SIGNAL_ENTRIES[row]);
+                table[t] = entry;
             }
             0x7A => {
                 s.pop();

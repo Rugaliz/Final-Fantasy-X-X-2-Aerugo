@@ -138,6 +138,8 @@ enum Command {
     OracleFrames { dir: PathBuf, run: usize, from: u32, to: u32 },
     /// Count random numbers per event and stream in a recording (first values shown).
     OracleRandom { dir: PathBuf },
+    /// Print an event's messages (raw, with control codes): `event-text bj/bjyt0000 5 16`.
+    EventText { event: String, messages: Vec<usize> },
     /// Print a movie's length and its first video frame times (number from the video list, or a path).
     MovieInfo { movie: String },
     /// Print the start of an archive file as hex.
@@ -226,6 +228,24 @@ fn main() -> Result<()> {
         Command::FieldCoverage { frames } => field_coverage(&install, frames),
         Command::OracleMotions { dir } => oracle_motions(&dir),
         Command::MovieInfo { movie } => movie_info(&install, &movie),
+        Command::EventText { event, messages } => {
+            let mut vfs = aerugo_vfs::Vfs::new();
+            vfs.mount_install(&install)?;
+            let path = archive_event_path(&event).context("event path not understood")?;
+            let ev = aerugo_sim::field::Event::load(
+                &vfs,
+                aerugo_formats::Game::Ffx,
+                &path,
+                aerugo_vfs::Language::English,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            for i in messages {
+                if let Some(m) = ev.state.messages.get(i) {
+                    println!("{i}: {:?}\n   reveal {:?}", m.raw, m.reveal);
+                }
+            }
+            Ok(())
+        }
         Command::NativeArgs { native } => native_args(&install, native),
         Command::KernelText { table, first, last } => kernel_text(&install, &table, first, last),
         Command::OracleMissing { dir } => oracle_missing(&dir),
@@ -1127,10 +1147,16 @@ fn oracle_compare(install: &Install, dir: &std::path::Path, only: Option<usize>)
             {
                 let a = &ev.state.actors[w];
                 eprintln!(
-                    "f{f} control {} talk reach {} windows open {}",
+                    "f{f} control {} talk reach {} windows open {} ground {:?}",
                     ev.state.user_control,
                     ev.state.talk_reach,
-                    ev.state.windows.iter().filter(|w| w.open || w.closing > 0).count()
+                    ev.state.windows.iter().filter(|w| w.open || w.closing > 0).count(),
+                    ev.state.ground.as_ref().map(|g| (g.is_empty(), g.standing(ev.state.actors[w].pos)))
+                );
+                eprintln!(
+                    "f{f} w{w} level {} queue {:?}",
+                    ev.vm.workers[w].level,
+                    ev.vm.workers[w].queue.iter().map(|r| (r.level, r.entry, r.running)).collect::<Vec<_>>()
                 );
                 eprintln!(
                     "f{f} player {:?} prev {:?} pos {:?}; w{w} pos {:?} yaw {} flags {:#x} {:?}",
