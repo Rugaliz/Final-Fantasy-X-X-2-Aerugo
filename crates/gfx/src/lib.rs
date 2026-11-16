@@ -17,7 +17,7 @@ pub use quad::{Quad, QuadPipeline};
 pub use renderer::{EguiFrame, FrameInput, Renderer, TextureHandle};
 pub use scene::{
     BlendFactor, BlendOp, BlendState, CompareOp, CullMode, Draw, MaterialState, MeshDesc, MeshHandle,
-    MeshPart, SceneVertex, SceneView,
+    MeshPart, SceneVertex, SceneView, ToneCurve,
 };
 pub use swapchain::PresentMode;
 pub use texture::{TexFormat, Texture, TextureDesc};

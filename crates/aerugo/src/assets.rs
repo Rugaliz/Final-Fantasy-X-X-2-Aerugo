@@ -39,7 +39,7 @@ use aerugo_formats::phyre::Cluster;
 use aerugo_formats::{Game, effect::PassState};
 use aerugo_gfx::{
     BlendFactor, BlendOp, BlendState, CompareOp, CullMode, MaterialState, MeshDesc, MeshHandle, MeshPart,
-    Renderer, SceneVertex, TextureHandle,
+    Renderer, SceneVertex, TextureHandle, ToneCurve,
 };
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
@@ -186,6 +186,16 @@ pub fn load_effect(vfs: &Vfs, game: Game, id: &str) -> Option<Effect> {
     effect::read_effect(&cluster)
 }
 
+/// Whether an effect's compiled shaders contain an alpha test (a DXBC `discard` instruction token, either
+/// condition), which the remaster uses only in some variants.
+fn effect_discards(vfs: &Vfs, game: Game, id: &str) -> bool {
+    let Some(data) = effect::effect_cluster_path(game, id).and_then(|p| vfs.read(&p).ok()) else {
+        return false;
+    };
+    data.chunks_exact(4)
+        .any(|w| matches!(u32::from_le_bytes([w[0], w[1], w[2], w[3]]), 0x0300_000D | 0x0304_000D))
+}
+
 /// Load a model cluster and everything it references.
 pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
     load(vfs, renderer, path, false)
@@ -202,7 +212,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
     let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
     let mut texture_cache: HashMap<String, Option<TextureHandle>> = HashMap::new();
-    let mut effect_cache: HashMap<String, Option<MaterialState>> = HashMap::new();
+    let mut effect_cache: HashMap<String, (Option<MaterialState>, bool)> = HashMap::new();
     let game = game_of_path(path);
     for (source, m) in model.meshes.iter().enumerate() {
         let world = Mat4::from_cols_array(&m.world);
@@ -266,25 +276,39 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 material.and_then(|mat| mat.base_texture()).map(|t| format!(", {t}")).unwrap_or_default()
             ));
             let effect_id = material.map(|m| m.effect.clone()).unwrap_or_default();
-            let state = *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
+            let (state, alpha_test) = *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
                 let state = load_effect(vfs, game, &effect_id)
                     .and_then(|fx| fx.main_state())
                     .map(|p| material_state(&p));
                 if state.is_none() && !effect_id.is_empty() {
                     out.warnings.push(format!("effect {effect_id} not found; drawing with default state"));
                 }
-                state
+                (state, effect_discards(vfs, game, &effect_id))
             });
             let mut material = state.unwrap_or_default();
             if map {
                 material.front_ccw = !material.front_ccw;
             }
+            // The remaster's sky shader never alpha-tests (a fading sky keeps its pixels); the map variants that
+            // alpha-test discard under the material's threshold (0.5 stands in until the material's own value is
+            // read). Other map parts and characters keep 0.3 until their blending and thresholds are read.
+            let family = aerugo_formats::effect::effect_family(&effect_id).to_ascii_lowercase();
+            let curve = match family.as_str() {
+                _ if !map => ToneCurve::None,
+                "phyreuvanimationshader" => ToneCurve::Sky,
+                _ => ToneCurve::Field,
+            };
             parts.push(MeshPart {
                 first_index: first,
                 index_count: idx.len() as u32,
                 texture,
-                alpha_cutoff: 0.3,
+                alpha_cutoff: match (curve, alpha_test) {
+                    (ToneCurve::Sky, _) => 0.0,
+                    (ToneCurve::Field, true) => 0.5,
+                    _ => 0.3,
+                },
                 material,
+                curve,
             });
             part_segments.push(si);
             part_effects.push(effect_id);

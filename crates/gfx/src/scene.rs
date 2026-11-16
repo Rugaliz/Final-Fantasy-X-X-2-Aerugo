@@ -620,6 +620,31 @@ pub struct MeshPart {
     /// Fragments with lower alpha are discarded.
     pub alpha_cutoff: f32,
     pub material: MaterialState,
+    /// The remaster's colour curve after texture × vertex colour (its field shaders brighten the PS2 colours).
+    pub curve: ToneCurve,
+}
+
+/// The colour curves of the remaster's field shaders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToneCurve {
+    /// Colours as they are.
+    #[default]
+    None,
+    /// Lit map and water shaders: per channel 2.1·min(c, 0.4) + 1.08·clamp(c, 0.4, 0.58) − 0.47 (about twice
+    /// as bright up to 0.4, then a shoulder to 1).
+    Field,
+    /// The UV-animated sky: c' = min(0.3·c + c^(1/1.7), 1), then 0.5 − 0.5·cos(π·c').
+    Sky,
+}
+
+impl ToneCurve {
+    fn code(self) -> f32 {
+        match self {
+            ToneCurve::None => 0.0,
+            ToneCurve::Field => 2.0,
+            ToneCurve::Sky => 3.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -999,7 +1024,7 @@ impl SceneState {
                                 d.joint_base.unwrap_or(0) as f32,
                                 if d.joint_base.is_some() { 1.0 } else { 0.0 },
                                 part.alpha_cutoff,
-                                if d.lit { 1.0 } else { 0.0 },
+                                if d.lit { 1.0 } else { part.curve.code() },
                             ],
                         };
                         let bytes = std::slice::from_raw_parts(
