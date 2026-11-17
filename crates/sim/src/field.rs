@@ -632,6 +632,8 @@ pub struct FieldState {
     /// Worker the player controls.
     pub player: Option<usize>,
     pub ground: Option<Ground>,
+    /// The map's fog from its PS2 map package (the scripts may change it).
+    pub map_fog: Option<MapFog>,
     /// A map change the scripts asked for: target and entrance, for the session to carry out.
     pub jump: Option<(i32, i32)>,
     pub rng: Rng,
@@ -1144,6 +1146,52 @@ pub fn motion_frames(vfs: &Vfs, model_path: &str) -> std::collections::HashMap<u
     out
 }
 
+/// A map's fog as its PS2 map package states it (the scene chunk of the map object data): colour, the limit
+/// (0–255) and the near and far distances.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapFog {
+    pub color: [u8; 3],
+    pub limit: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl MapFog {
+    /// From a `mapout.vpa` package: the section the `MAP1` header names at +0x14 is the map object data (a
+    /// 0x40-byte header, then chunks of a 0x40-byte header — type, size — and their data); chunk 4 holds the
+    /// scene values, with the fog colour bytes at +0xC and the limit, near and far as floats from +0x10.
+    pub fn from_map_package(vpa: &[u8]) -> Option<MapFog> {
+        let u32_at = |at: usize| vpa.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let f32_at = |at: usize| u32_at(at).map(f32::from_bits);
+        if !vpa.starts_with(b"MAP1") {
+            return None;
+        }
+        let section = u32_at(0x14)? as usize;
+        if u32_at(section)? != 0x0021_4365 {
+            return None;
+        }
+        let mut at = section + 0x40;
+        for _ in 0..4096 {
+            let (kind, size) = (u32_at(at)?, u32_at(at + 4)? as usize);
+            if kind == 4 {
+                let d = at + 0x40;
+                let c = vpa.get(d + 0xC..d + 0xF)?;
+                return Some(MapFog {
+                    color: [c[0], c[1], c[2]],
+                    limit: f32_at(d + 0x10)?,
+                    near: f32_at(d + 0x14)?,
+                    far: f32_at(d + 0x18)?,
+                });
+            }
+            if size == 0 {
+                return None;
+            }
+            at += 0x40 + size;
+        }
+        None
+    }
+}
+
 /// The PS2 map package holding the walk mesh for a drawn map (`…/map/<area>/<map>/…`).
 pub fn walk_mesh_path(map_model: &str) -> Option<String> {
     let rest = map_model.split("/map/").nth(1)?;
@@ -1309,8 +1357,9 @@ impl Event {
             (game == Game::Ffx && name.len() >= 6 && name.is_ascii())
                 .then(|| format!("ffx_ps2/ffx/master/jppc/map/{}/{}/bin/mapout.vpa", &name[..4], &name[..6]))
         });
-        if let Some(vpa) = vpa {
-            state.ground = vfs.read(&vpa).ok().and_then(|d| Ground::from_walk_mesh(&d));
+        if let Some(d) = vpa.and_then(|p| vfs.read(&p).ok()) {
+            state.ground = Ground::from_walk_mesh(&d);
+            state.map_fog = MapFog::from_map_package(&d);
         }
         let mut natives = Natives::new(game);
         register(&mut natives);

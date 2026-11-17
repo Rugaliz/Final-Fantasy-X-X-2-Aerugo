@@ -1132,6 +1132,11 @@ impl FieldView {
             joints,
             culling: true,
             mirrored: false,
+            // The remaster starts every map measured so far with its fog limit at 0 (no fog, whatever the PS2
+            // package states); only scripts raise it (0x803c), which is not ported yet.
+            fog: None,
+            // Scene time: the event's ticks at 30 a second, plus the share of the next.
+            time: (s.event.tick as f32 + alpha) / 30.0,
         });
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;

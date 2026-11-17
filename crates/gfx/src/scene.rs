@@ -450,7 +450,7 @@ impl ScenePipeline {
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
         // SAFETY: valid device and create infos.
         let material_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -622,6 +622,8 @@ pub struct MeshPart {
     pub material: MaterialState,
     /// The remaster's colour curve after texture × vertex colour (its field shaders brighten the PS2 colours).
     pub curve: ToneCurve,
+    /// Texture coordinates move by this much per second of [`SceneView::time`] (UV-animated field parts).
+    pub uv_scroll: [f32; 2],
 }
 
 /// The colour curves of the remaster's field shaders.
@@ -681,6 +683,38 @@ pub struct SceneView {
     /// Reverse the triangle winding the view matrix implies (front faces follow the handedness of
     /// `view_proj` on their own; this is for tests and special views).
     pub mirrored: bool,
+    /// Distance fog for parts drawn with a field curve (the remaster's map shaders).
+    pub fog: Option<Fog>,
+    /// Scene time in seconds (moves UV-animated parts).
+    pub time: f32,
+}
+
+/// The remaster's field fog: the share of fog colour at view depth `d` is
+/// `min(saturate((d − near) / (far − near + 0.01))^curve, limit)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fog {
+    pub color: [f32; 3],
+    /// View depths (the units of `view_proj`'s space).
+    pub near: f32,
+    pub far: f32,
+    pub curve: f32,
+    pub limit: f32,
+}
+
+impl Fog {
+    /// The scene constants the shaders read from the first slot of the joint buffer.
+    fn constants(fog: Option<Fog>) -> [f32; 16] {
+        let mut c = [0.0; 16];
+        if let Some(f) = fog {
+            c[..3].copy_from_slice(&f.color);
+            c[3] = 1.0;
+            c[4] = f.near;
+            c[5] = f.far;
+            c[6] = f.curve;
+            c[7] = f.limit;
+        }
+        c
+    }
 }
 
 #[derive(Debug)]
@@ -872,9 +906,11 @@ impl SceneState {
         }
         let device = &ctx.device;
         // Joint matrices for this frame slot (its previous submission has finished).
-        if view.joints.len() * 64 > self.joints[frame].buffer.size as usize {
+        // The joint buffer starts with the scene constants (fog); joint matrices follow.
+        let slots = view.joints.len() + 1;
+        if slots * 64 > self.joints[frame].buffer.size as usize {
             let fresh = SceneStateRef { pipeline: &self.pipeline, pool: self.pool }
-                .joint_slot(ctx, view.joints.len().next_power_of_two())?;
+                .joint_slot(ctx, slots.next_power_of_two())?;
             let mut old = std::mem::replace(&mut self.joints[frame], fresh);
             // SAFETY: this slot's last use has completed (its fence was waited before recording).
             unsafe {
@@ -883,7 +919,8 @@ impl SceneState {
             }
         }
         if let Some(m) = self.joints[frame].buffer.mapped() {
-            for (i, j) in view.joints.iter().enumerate() {
+            let scene = Fog::constants(view.fog);
+            for (i, j) in std::iter::once(&scene).chain(view.joints.iter()).enumerate() {
                 for (k, f) in j.iter().enumerate() {
                     m[i * 64 + k * 4..i * 64 + k * 4 + 4].copy_from_slice(&f.to_le_bytes());
                 }
@@ -1020,12 +1057,22 @@ impl SceneState {
                                 [m[1], m[5], m[9], m[13]],
                                 [m[2], m[6], m[10], m[14]],
                             ],
-                            params: [
-                                d.joint_base.unwrap_or(0) as f32,
-                                if d.joint_base.is_some() { 1.0 } else { 0.0 },
-                                part.alpha_cutoff,
-                                if d.lit { 1.0 } else { part.curve.code() },
-                            ],
+                            // Field parts (never skinned) take their texture scroll in the joint slots.
+                            params: if part.curve != ToneCurve::None && !d.lit {
+                                [
+                                    (part.uv_scroll[0] * view.time).fract(),
+                                    (part.uv_scroll[1] * view.time).fract(),
+                                    part.alpha_cutoff,
+                                    part.curve.code(),
+                                ]
+                            } else {
+                                [
+                                    d.joint_base.unwrap_or(0) as f32,
+                                    if d.joint_base.is_some() { 1.0 } else { 0.0 },
+                                    part.alpha_cutoff,
+                                    if d.lit { 1.0 } else { part.curve.code() },
+                                ]
+                            },
                         };
                         let bytes = std::slice::from_raw_parts(
                             (&push as *const ScenePush).cast::<u8>(),

@@ -388,6 +388,8 @@ impl MapBrowser {
             joints: Vec::new(),
             culling: self.culling,
             mirrored: false,
+            fog: None,
+            time: 0.0,
         });
     }
 
@@ -625,6 +627,8 @@ mod tests {
                         joints: Vec::new(),
                         culling: true,
                         mirrored: false,
+                        fog: None,
+                        time: 0.0,
                     };
                     let px = renderer.render_offscreen(view, (w, h)).unwrap();
                     let share = edge_clear_share(&px, w, h);

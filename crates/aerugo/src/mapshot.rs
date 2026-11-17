@@ -44,10 +44,16 @@ fn map_shot() {
     let mut vfs = Vfs::new();
     vfs.mount_install(&inst).unwrap();
     let model = assets::load_map_model(&vfs, &mut renderer, map).unwrap();
+    // AERUGO_SHOT_SKIP = mesh indices to leave out (for telling layers apart).
+    let skip: Vec<usize> = std::env::var("AERUGO_SHOT_SKIP")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
     let mut draws: Vec<Draw> = model
         .meshes
         .iter()
-        .map(|m| Draw {
+        .enumerate()
+        .filter(|(i, _)| !skip.contains(i))
+        .map(|(_, m)| Draw {
             mesh: m.mesh,
             model: (map_place() * m.world).to_cols_array(),
             joint_base: None,
@@ -92,6 +98,29 @@ fn map_shot() {
         }
     }
     let extent = (model.max - model.min).length() * 10.0;
+    // AERUGO_SHOT_FOG = `distance scale,limit mode (a: l/255, b: (1 − l/255)·0.4, c: 1 − l/255),curve`: the map
+    // package's fog converted that way (for fitting the conversion to captures); unset draws no fog.
+    let fog = std::env::var("AERUGO_SHOT_FOG").ok().and_then(|spec| {
+        let mf = aerugo_sim::field::walk_mesh_path(map)
+            .and_then(|p| vfs.read(&p).ok())
+            .and_then(|d| aerugo_sim::field::MapFog::from_map_package(&d))?;
+        let f: Vec<&str> = spec.split(',').collect();
+        let k: f32 = f[0].parse().unwrap();
+        let l = mf.limit / 255.0;
+        let limit = match f[1] {
+            "a" => l,
+            "b" => (1.0 - l) * 0.4,
+            _ => 1.0 - l,
+        };
+        eprintln!("fog {mf:?} -> limit {limit}");
+        Some(aerugo_gfx::Fog {
+            color: mf.color.map(|c| f32::from(c) / 255.0),
+            near: mf.near * k,
+            far: mf.far * k,
+            curve: f[2].parse().unwrap(),
+            limit,
+        })
+    });
     let aspect = SIZE.0 as f32 / SIZE.1 as f32;
     let sweep = std::env::var("AERUGO_SHOT_SWEEP").ok();
     // AERUGO_SHOT_CAMS = a file of `name;eye;focus;d` lines: one picture per camera (out-<name>.png).
@@ -130,6 +159,8 @@ fn map_shot() {
                     joints: joints.clone(),
                     culling: true,
                     mirrored: false,
+                    fog,
+                    time: std::env::var("AERUGO_SHOT_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0),
                 },
                 SIZE,
             )

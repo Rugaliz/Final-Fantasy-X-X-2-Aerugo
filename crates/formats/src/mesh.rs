@@ -87,14 +87,22 @@ pub struct TextureBinding {
     pub asset: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Material {
     /// Effect asset id (`PS3Data/Shaders/<name>.fx#<variant>`).
     pub effect: String,
     pub textures: Vec<TextureBinding>,
+    /// The material's numeric shader parameters by name (`MaterialColour`, `AlphaThreshold`, ...), as many floats
+    /// as each takes.
+    pub values: Vec<(String, Vec<f32>)>,
 }
 
 impl Material {
+    /// A numeric shader parameter.
+    pub fn value(&self, name: &str) -> Option<&[f32]> {
+        self.values.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
+    }
+
     /// The base colour texture, if the material has one.
     pub fn base_texture(&self) -> Option<&str> {
         let pick = |p: &str| self.textures.iter().find(|t| t.parameter == p).map(|t| t.asset.as_str());
@@ -202,9 +210,26 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
         _ => String::new(),
     };
     let mut textures = Vec::new();
+    let mut values = Vec::new();
     if let Some(buffer) = cluster.target(mat, "m_parameterBuffer") {
+        let bytes = cluster.object_bytes(buffer);
         for def in cluster.array_targets(buffer, "m_tweakableShaderParameterDefinitions") {
             if cluster.u32(def, "m_parameterType") != Some(TEXTURE_PARAMETER) {
+                // Numbers sit in the buffer object at their buffer offset (the object's header fills offsets no
+                // parameter uses); values past the object's end were left out of the file.
+                let u16_at = |f: &[u8]| u16::from_le_bytes([f[0], f[1]]) as usize;
+                let (Some(name), Some(off), Some(size)) = (
+                    cluster.string(def, "m_name"),
+                    cluster.field(def, "m_bufferLoc.m_offset").filter(|f| f.len() >= 2).map(u16_at),
+                    cluster.field(def, "m_bufferLoc.m_size").filter(|f| f.len() >= 2).map(u16_at),
+                ) else {
+                    continue;
+                };
+                if let Some(raw) = bytes.get(off..off + size).filter(|_| size > 0 && size <= 64) {
+                    let floats =
+                        raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                    values.push((name, floats));
+                }
                 continue;
             }
             let Some(loc) = cluster.u32(def, "m_bufferLoc") else { continue };
@@ -230,7 +255,7 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
             }
         }
     }
-    Material { effect, textures }
+    Material { effect, textures, values }
 }
 
 fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, MeshError> {

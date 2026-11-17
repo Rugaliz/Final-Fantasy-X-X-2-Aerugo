@@ -16,7 +16,7 @@ pub use context::{Context, ContextOptions, validation_error_count};
 pub use quad::{Quad, QuadPipeline};
 pub use renderer::{EguiFrame, FrameInput, Renderer, TextureHandle};
 pub use scene::{
-    BlendFactor, BlendOp, BlendState, CompareOp, CullMode, Draw, MaterialState, MeshDesc, MeshHandle,
+    BlendFactor, BlendOp, BlendState, CompareOp, CullMode, Draw, Fog, MaterialState, MeshDesc, MeshHandle,
     MeshPart, SceneVertex, SceneView, ToneCurve,
 };
 pub use swapchain::PresentMode;

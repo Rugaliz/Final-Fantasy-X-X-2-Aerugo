@@ -235,6 +235,8 @@ impl ModelBrowser {
                 joints,
                 culling: self.culling,
                 mirrored: false,
+                fog: None,
+                time: 0.0,
             });
             if self.show_bones {
                 self.draw_bones(ui, &response, view_proj, &overlay);

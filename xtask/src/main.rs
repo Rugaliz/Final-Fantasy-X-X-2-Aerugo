@@ -146,6 +146,13 @@ enum Command {
     /// Print each material's effect and its parameter buffer (the tweakable parameters' names, then the buffer as
     /// floats).
     MaterialParams { path: String },
+    /// List archive files (under a path prefix, below a size) containing all of the given little-endian f32 values.
+    FindFloats {
+        prefix: String,
+        #[arg(long, default_value_t = 4_000_000)]
+        max_size: u64,
+        values: Vec<f32>,
+    },
     /// Copy a file out of the game's archives (for local inspection; never commit what it writes).
     Extract { path: String, out: PathBuf },
     Hexdump {
@@ -277,7 +284,12 @@ fn main() -> Result<()> {
                 let names: Vec<String> = c
                     .array_targets(pb, "m_tweakableShaderParameterDefinitions")
                     .into_iter()
-                    .filter_map(|d| c.string(d, "m_name"))
+                    .filter_map(|d| {
+                        let off =
+                            c.field(d, "m_bufferLoc.m_offset").map(|b| u16::from_le_bytes([b[0], b[1]]));
+                        let size = c.field(d, "m_bufferLoc.m_size").map(|b| u16::from_le_bytes([b[0], b[1]]));
+                        Some(format!("{}@{:?}+{:?}", c.string(d, "m_name")?, off, size))
+                    })
                     .collect();
                 let bytes = c.object_bytes(pb);
                 let floats: Vec<String> = bytes[12..]
@@ -285,6 +297,23 @@ fn main() -> Result<()> {
                     .map(|b| format!("{:.4}", f32::from_le_bytes(b.try_into().unwrap())))
                     .collect();
                 println!("material {i} fx {fx}\n  names {names:?}\n  data {}", floats.join(" "));
+            }
+            Ok(())
+        }
+        Command::FindFloats { prefix, max_size, values } => {
+            let mut vfs = aerugo_vfs::Vfs::new();
+            vfs.mount_install(&install)?;
+            let entries: Vec<(String, u64)> = vfs
+                .archives()
+                .flat_map(|(_, a)| a.entries().iter().map(|e| (e.path.clone(), e.size)))
+                .filter(|(p, size)| p.starts_with(&prefix) && *size <= max_size)
+                .collect();
+            let pats: Vec<[u8; 4]> = values.iter().map(|v| v.to_le_bytes()).collect();
+            for (p, _) in entries {
+                let Ok(d) = vfs.read(&p) else { continue };
+                if pats.iter().all(|pat| d.windows(4).any(|w| w == pat)) {
+                    println!("{p}");
+                }
             }
             Ok(())
         }
@@ -563,8 +592,35 @@ fn model_parts(install: &Install, path: &str) -> Result<()> {
             let raster = fx
                 .as_ref()
                 .and_then(|f| f.main_state())
-                .map(|p| format!("{:?}{}", p.cull, if p.front_ccw { " ccw" } else { " cw" }))
+                .map(|p| {
+                    format!(
+                        "{:?}{}{}",
+                        p.cull,
+                        if p.front_ccw { " ccw" } else { " cw" },
+                        p.blend
+                            .map(|b| format!(
+                                " {:?}/{:?}/{:?} a {:?}/{:?}",
+                                b.src, b.dst, b.op, b.src_alpha, b.dst_alpha
+                            ))
+                            .unwrap_or_default()
+                    )
+                })
                 .unwrap_or_default();
+            if std::env::var("PARTS_VALUES").is_ok()
+                && let Some(mat) = mat
+            {
+                let v = |n: &str| mat.value(n).map(|v| format!("{v:?}")).unwrap_or_else(|| "-".into());
+                println!(
+                    "    colour {} scale {} emissive {} fgEff {} alpha {} scroll {} {}",
+                    v("MaterialColour"),
+                    v("clrScaleFactor"),
+                    v("MaterialEmissiveness"),
+                    v("fgEff"),
+                    v("AlphaThreshold"),
+                    v("ScrollSpeed_X"),
+                    v("ScrollSpeed_Y")
+                );
+            }
             println!(
                 "mesh {mi} {:<24} seg {si}: {tris:>6} tris  y {ylo:>9.1}..{yhi:>9.1}  alpha {:?}  {blend:<6} {raster} fx {fx_id}  tex {}",
                 m.name,

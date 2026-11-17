@@ -233,6 +233,20 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
             let w = read_vec(&cluster, seg.stream("SkinWeights"), count, [0.0; 4]);
             let j = read_vec(&cluster, seg.stream("SkinIndices"), count, [0.0; 4]);
             skinned |= seg.stream("SkinIndices").is_some();
+            // Map shaders multiply the texture by the material's colour and colour scale as well as the vertex
+            // colour; each segment has its own vertices, so the two fold into the vertex colours here.
+            let tint: [f32; 4] = match m.materials.get(seg.material as usize).filter(|_| map) {
+                Some(mat) => {
+                    let get = |name: &str| {
+                        mat.value(name)
+                            .filter(|v| v.len() == 4)
+                            .map_or([1.0; 4], |v| [v[0], v[1], v[2], v[3]])
+                    };
+                    let (a, b) = (get("MaterialColour"), get("clrScaleFactor"));
+                    std::array::from_fn(|k| a[k] * b[k])
+                }
+                None => [1.0; 4],
+            };
             let base = vertices.len() as u32;
             for v in 0..count {
                 let wp = world.transform_point3(Vec3::from(p[v]));
@@ -242,7 +256,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     position: p[v],
                     normal: n[v],
                     uv: uv[v],
-                    color: col[v],
+                    color: std::array::from_fn(|k| col[v][k] * tint[k]),
                     weights: w[v],
                     joints: j[v].map(|x| x as u8),
                 });
@@ -298,10 +312,19 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 "phyreuvanimationshader" => ToneCurve::Sky,
                 _ => ToneCurve::Field,
             };
+            let scalar = |name: &str| {
+                m.materials
+                    .get(seg.material as usize)
+                    .and_then(|mat| mat.value(name))
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(0.0)
+            };
+            let uv_scroll = [scalar("ScrollSpeed_X"), scalar("ScrollSpeed_Y")];
             parts.push(MeshPart {
                 first_index: first,
                 index_count: idx.len() as u32,
                 texture,
+                uv_scroll,
                 alpha_cutoff: match (curve, alpha_test) {
                     (ToneCurve::Sky, _) => 0.0,
                     (ToneCurve::Field, true) => 0.5,
