@@ -47,6 +47,22 @@ pub struct VertexStream {
     pub count: u32,
     /// Byte range in [`Cluster::vertex_buffer`].
     pub data: Range<usize>,
+    /// Which set of its semantic the stream belongs to (texture coordinate set 0, 1, … with its tangents).
+    pub set: u8,
+}
+
+/// A shader input fed from a stream set other than the default, as a mesh instance binds it (the remaster's
+/// map shaders name their inputs `Uv`, `Uv1`, `Uv_nmlmap1`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInput {
+    /// Semantic of the stream (`ST`).
+    pub semantic: String,
+    /// Shader input name.
+    pub name: String,
+    /// Semantic index of the shader input (`TEXCOORD<index>`).
+    pub index: u8,
+    /// Stream set that feeds it.
+    pub set: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +77,33 @@ pub struct Segment {
     pub max_index: u32,
     /// For skinned segments: skin index → (hierarchy matrix, skeleton matrix).
     pub skin_bones: Vec<(u16, u16)>,
+    /// The instance's input bindings for this segment (inputs not listed read set 0).
+    pub inputs: Vec<StreamInput>,
 }
 
 impl Segment {
     pub fn stream(&self, semantic: &str) -> Option<&VertexStream> {
         self.streams.iter().find(|s| s.semantic == semantic)
+    }
+
+    /// The `n`-th stream of a semantic (a second UV set, its tangents).
+    pub fn stream_nth(&self, semantic: &str, n: usize) -> Option<&VertexStream> {
+        self.streams.iter().filter(|s| s.semantic == semantic).nth(n)
+    }
+
+    /// The stream set a shader input (semantic and index, e.g. `ST` 4 for `TEXCOORD4`) reads.
+    pub fn input_set(&self, semantic: &str, index: u8) -> u8 {
+        self.inputs.iter().find(|i| i.semantic == semantic && i.index == index).map_or(0, |i| i.set)
+    }
+
+    /// The stream of a semantic in a set; a segment with a single stream of that semantic feeds every set
+    /// from it.
+    pub fn stream_in_set(&self, semantic: &str, set: u8) -> Option<&VertexStream> {
+        self.streams.iter().find(|s| s.semantic == semantic && s.set == set).or_else(|| {
+            let mut all = self.streams.iter().filter(|s| s.semantic == semantic);
+            let first = all.next();
+            if all.next().is_none() { first } else { None }
+        })
     }
 
     /// Position stream (`Vertex` or `SkinnableVertex`).
@@ -145,7 +183,8 @@ pub const IDENTITY: [f32; 16] =
     [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 const TRIANGLE_LIST: u32 = 2;
 const INDEX_U32: u32 = 8;
-const TEXTURE_PARAMETER: u32 = 66;
+/// Parameter types of texture samplers: 2D, and cube maps.
+const TEXTURE_PARAMETERS: [u32; 2] = [66, 68];
 
 /// Archive path of the texture cluster for a texture asset id (`PS3Data/chr/x/tex/a.dds` →
 /// `<game>_data/gamedata/ps3data/chr/x/tex/d3d11/a.dds.phyre`). `model_path` is the model's archive path, used
@@ -214,7 +253,7 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
     if let Some(buffer) = cluster.target(mat, "m_parameterBuffer") {
         let bytes = cluster.object_bytes(buffer);
         for def in cluster.array_targets(buffer, "m_tweakableShaderParameterDefinitions") {
-            if cluster.u32(def, "m_parameterType") != Some(TEXTURE_PARAMETER) {
+            if !cluster.u32(def, "m_parameterType").is_some_and(|t| TEXTURE_PARAMETERS.contains(&t)) {
                 // Numbers sit in the buffer object at their buffer offset (the object's header fills offsets no
                 // parameter uses); values past the object's end were left out of the file.
                 let u16_at = |f: &[u8]| u16::from_le_bytes([f[0], f[1]]) as usize;
@@ -292,6 +331,7 @@ fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, Me
                 stride,
                 count,
                 data: offset + within..offset + size,
+                set: cluster.u32(s, "m_streamSet").unwrap_or(0) as u8,
             });
         }
     }
@@ -320,7 +360,25 @@ fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, Me
         indices: start..start + len,
         max_index: cluster.u32(seg, "m_indexData.m_maximumIndex").unwrap_or(0),
         skin_bones,
+        inputs: Vec::new(),
     })
+}
+
+/// The stream bindings of one segment context of a mesh instance.
+fn stream_inputs(cluster: &Cluster, context: ObjectId) -> Vec<StreamInput> {
+    cluster
+        .array_targets(context, "m_streamBindings")
+        .into_iter()
+        .map(|b| StreamInput {
+            semantic: match cluster.pointer(b, "m_renderDataType") {
+                Some(Pointer::User(u)) => cluster.user_string(u),
+                _ => String::new(),
+            },
+            name: cluster.string(b, "m_name").unwrap_or_default(),
+            index: cluster.u32(b, "m_index").unwrap_or(0) as u8,
+            set: cluster.u32(b, "m_inputSet").unwrap_or(0) as u8,
+        })
+        .collect()
 }
 
 /// Read every mesh instance of a model cluster.
@@ -330,8 +388,13 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
         let Some(mesh) = cluster.target(inst, "m_mesh") else { continue };
         let world = instance_world(cluster, inst);
         let mut segments = Vec::new();
+        let contexts = cluster.array_targets(inst, "m_segmentContext");
         for (i, seg) in cluster.array_targets(mesh, "m_meshSegments").into_iter().enumerate() {
-            segments.push(segment(cluster, i, seg)?);
+            let mut s = segment(cluster, i, seg)?;
+            if let Some(&c) = contexts.get(i) {
+                s.inputs = stream_inputs(cluster, c);
+            }
+            segments.push(s);
         }
         // The instance's material set, else the mesh's defaults.
         let mut mats: Vec<ObjectId> = cluster.array_targets(mesh, "m_defaultMaterials");

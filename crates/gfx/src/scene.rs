@@ -24,6 +24,10 @@ pub struct SceneVertex {
     pub color: [f32; 4],
     pub weights: [f32; 4],
     pub joints: [u8; 4],
+    /// Second texture coordinate set (water: second base texture and second normal map).
+    pub uv2: [f32; 2],
+    /// Tangent of the first texture coordinate set (water normal mapping).
+    pub tangent: [f32; 3],
 }
 
 #[repr(C)]
@@ -32,7 +36,7 @@ pub(crate) struct ScenePush {
     pub view_proj: [f32; 16],
     /// Model matrix rows 0–2 (affine).
     pub model: [[f32; 4]; 3],
-    /// x: first joint, y: skinned, z: alpha cutoff, w: lit.
+    /// x: first joint (water: first constant slot), y: skinned, z: alpha cutoff, w: shading mode.
     pub params: [f32; 4],
 }
 
@@ -441,6 +445,8 @@ impl From<&MaterialState> for PipelineKey {
 pub(crate) struct ScenePipeline {
     pub material_layout: vk::DescriptorSetLayout,
     pub joints_layout: vk::DescriptorSetLayout,
+    /// Set 2: the water shader's second texture, two normal maps and cube map.
+    pub extra_layout: vk::DescriptorSetLayout,
     pub layout: vk::PipelineLayout,
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
@@ -480,7 +486,23 @@ impl ScenePipeline {
                 None,
             )
         }?;
-        let set_layouts = [material_layout, joints_layout];
+        let extra_bindings: Vec<_> = (0..WATER_TEXTURES as u32)
+            .map(|b| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            })
+            .collect();
+        // SAFETY: as above.
+        let extra_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&extra_bindings),
+                None,
+            )
+        }?;
+        let set_layouts = [material_layout, joints_layout, extra_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(size_of::<ScenePush>() as u32)];
@@ -498,6 +520,7 @@ impl ScenePipeline {
         let mut p = ScenePipeline {
             material_layout,
             joints_layout,
+            extra_layout,
             layout,
             vert,
             frag,
@@ -542,6 +565,8 @@ impl ScenePipeline {
             attr(3, vk::Format::R32G32B32A32_SFLOAT, std::mem::offset_of!(SceneVertex, color)),
             attr(4, vk::Format::R32G32B32A32_SFLOAT, std::mem::offset_of!(SceneVertex, weights)),
             attr(5, vk::Format::R8G8B8A8_UINT, std::mem::offset_of!(SceneVertex, joints)),
+            attr(6, vk::Format::R32G32_SFLOAT, std::mem::offset_of!(SceneVertex, uv2)),
+            attr(7, vk::Format::R32G32B32_SFLOAT, std::mem::offset_of!(SceneVertex, tangent)),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&binding)
@@ -617,6 +642,7 @@ impl ScenePipeline {
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_set_layout(self.material_layout, None);
             device.destroy_descriptor_set_layout(self.joints_layout, None);
+            device.destroy_descriptor_set_layout(self.extra_layout, None);
         }
     }
 }
@@ -639,6 +665,49 @@ pub struct MeshPart {
     pub curve: ToneCurve,
     /// Texture coordinates move by this much per second of [`SceneView::time`] (UV-animated field parts).
     pub uv_scroll: [f32; 2],
+    /// Drawn with the remaster's water shader.
+    pub water: Option<Water>,
+}
+
+/// Textures a water part samples besides its base texture.
+pub const WATER_TEXTURES: usize = 4;
+
+/// What the remaster's water shader adds to a part: c = (base + (0,0,0,1) + second texture) × colour × cube(n) +
+/// cube(reflect(view, n)) × specular, with n from two scrolling normal maps; then × vertex colour, fog, colour
+/// scale and the field curve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Water {
+    /// Second base texture, first and second normal map, cube map (`None` uses neutral defaults).
+    pub textures: [Option<crate::renderer::TextureHandle>; WATER_TEXTURES],
+    /// Texture scroll per second: base, second base, normal map 1, normal map 2 (u, v each).
+    pub scroll: [[f32; 2]; 4],
+    /// Whether each normal map reads the second coordinate set ([`SceneVertex::uv2`]) rather than the first.
+    pub normal_uv2: [bool; 2],
+    /// Specular colour and shininess.
+    pub specular: [f32; 4],
+    /// MaterialColour × MultiTexBlendFactor.
+    pub color: [f32; 4],
+    /// clrScaleFactor.
+    pub scale: [f32; 4],
+    /// fgEff (per-channel share of the fog).
+    pub fog: [f32; 3],
+}
+
+impl Water {
+    /// The two constant slots the shaders read (see `mesh.frag`).
+    fn constants(&self) -> [[f32; 16]; 2] {
+        let s = &self.scroll;
+        let mut a = [0.0; 16];
+        a[..8].copy_from_slice(&[s[0][0], s[0][1], s[1][0], s[1][1], s[2][0], s[2][1], s[3][0], s[3][1]]);
+        a[8..12].copy_from_slice(&self.specular);
+        a[12..].copy_from_slice(&self.color);
+        let mut b = [0.0; 16];
+        b[..4].copy_from_slice(&self.scale);
+        b[4..7].copy_from_slice(&self.fog);
+        b[8] = f32::from(u8::from(self.normal_uv2[0]));
+        b[9] = f32::from(u8::from(self.normal_uv2[1]));
+        [a, b]
+    }
 }
 
 /// The colour curves of the remaster's field shaders.
@@ -717,9 +786,12 @@ pub struct Fog {
 }
 
 impl Fog {
-    /// The scene constants the shaders read from the first slot of the joint buffer.
-    fn constants(fog: Option<Fog>) -> [f32; 16] {
+    /// The scene constants the shaders read from the first slot of the joint buffer: fog, then the eye
+    /// position and scene time.
+    fn constants(fog: Option<Fog>, eye: [f32; 3], time: f32) -> [f32; 16] {
         let mut c = [0.0; 16];
+        c[8..11].copy_from_slice(&eye);
+        c[11] = time;
         if let Some(f) = fog {
             c[..3].copy_from_slice(&f.color);
             c[3] = 1.0;
@@ -736,7 +808,8 @@ impl Fog {
 pub(crate) struct GpuMesh {
     pub vertices: Buffer,
     pub indices: Buffer,
-    pub parts: Vec<(MeshPart, vk::DescriptorSet)>,
+    /// Each part with its base texture set (set 0) and extra texture set (set 2).
+    pub parts: Vec<(MeshPart, vk::DescriptorSet, vk::DescriptorSet)>,
 }
 
 #[derive(Debug)]
@@ -762,6 +835,10 @@ pub(crate) struct SceneState {
     pub pool: vk::DescriptorPool,
     pub sampler: vk::Sampler,
     pub material_sets: std::collections::HashMap<vk::ImageView, vk::DescriptorSet>,
+    /// Water texture sets by their views (set 2).
+    pub extra_sets: std::collections::HashMap<[vk::ImageView; WATER_TEXTURES], vk::DescriptorSet>,
+    /// Views bound in set 2 for parts without water (neutral textures; set by the renderer at start-up).
+    pub default_extra: [vk::ImageView; WATER_TEXTURES],
     pub meshes: std::collections::HashMap<u64, GpuMesh>,
     pub next_mesh: u64,
     pub joints: Vec<JointSlot>,
@@ -770,13 +847,18 @@ pub(crate) struct SceneState {
 }
 
 const SCENE_SETS: u32 = 8192;
+/// Water texture sets (one per distinct combination of textures).
+const EXTRA_SETS: u32 = 256;
 
 impl SceneState {
     pub fn new(ctx: &Context, frames: usize) -> Result<SceneState> {
         let device = &ctx.device;
         let pipeline = ScenePipeline::new(device)?;
         let sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE, descriptor_count: SCENE_SETS },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32,
+            },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER, descriptor_count: SCENE_SETS },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -788,7 +870,7 @@ impl SceneState {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                    .max_sets(SCENE_SETS + frames as u32)
+                    .max_sets(SCENE_SETS + EXTRA_SETS + frames as u32)
                     .pool_sizes(&sizes),
                 None,
             )
@@ -808,6 +890,8 @@ impl SceneState {
             pool,
             sampler,
             material_sets: Default::default(),
+            extra_sets: Default::default(),
+            default_extra: [vk::ImageView::null(); WATER_TEXTURES],
             meshes: Default::default(),
             next_mesh: 1,
             joints: Vec::new(),
@@ -860,11 +944,61 @@ impl SceneState {
         Ok(set)
     }
 
-    /// Forget the set of a view that is being destroyed (the device must be idle).
+    /// Descriptor set with the water textures `views` (created once per combination).
+    pub fn extra_set(
+        &mut self,
+        ctx: &Context,
+        views: [vk::ImageView; WATER_TEXTURES],
+    ) -> Result<vk::DescriptorSet> {
+        if let Some(&s) = self.extra_sets.get(&views) {
+            return Ok(s);
+        }
+        let layouts = [self.pipeline.extra_layout];
+        // SAFETY: valid pool and layout.
+        let set = unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.pool).set_layouts(&layouts),
+            )
+        }
+        .context("too many water materials")?[0];
+        let images: Vec<[vk::DescriptorImageInfo; 1]> = views
+            .iter()
+            .map(|&v| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(v)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            })
+            .collect();
+        let writes: Vec<_> = images
+            .iter()
+            .enumerate()
+            .map(|(b, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(b as u32)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(info)
+            })
+            .collect();
+        // SAFETY: the set is new.
+        unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        self.extra_sets.insert(views, set);
+        Ok(set)
+    }
+
+    /// Forget the sets of a view that is being destroyed (the device must be idle).
     pub fn forget_view(&mut self, ctx: &Context, view: vk::ImageView) {
-        if let Some(set) = self.material_sets.remove(&view) {
-            // SAFETY: the device is idle (caller), so the set is unused.
-            unsafe { ctx.device.free_descriptor_sets(self.pool, &[set]).ok() };
+        let mut sets: Vec<vk::DescriptorSet> = self.material_sets.remove(&view).into_iter().collect();
+        self.extra_sets.retain(|k, s| {
+            let keep = !k.contains(&view);
+            if !keep {
+                sets.push(*s);
+            }
+            keep
+        });
+        if !sets.is_empty() {
+            // SAFETY: the device is idle (caller), so the sets are unused.
+            unsafe { ctx.device.free_descriptor_sets(self.pool, &sets).ok() };
         }
     }
 
@@ -872,7 +1006,7 @@ impl SceneState {
         &mut self,
         ctx: &Context,
         desc: &MeshDesc<'_>,
-        sets: Vec<vk::DescriptorSet>,
+        sets: Vec<(vk::DescriptorSet, vk::DescriptorSet)>,
     ) -> Result<MeshHandle> {
         // SAFETY: SceneVertex is plain old data (repr(C), no padding-sensitive invariants).
         let vbytes = unsafe {
@@ -897,7 +1031,7 @@ impl SceneState {
         }
         let id = self.next_mesh;
         self.next_mesh += 1;
-        let parts = desc.parts.iter().copied().zip(sets).collect();
+        let parts = desc.parts.iter().copied().zip(sets).map(|(p, (s, e))| (p, s, e)).collect();
         self.meshes.insert(id, GpuMesh { vertices, indices, parts });
         Ok(MeshHandle(id))
     }
@@ -921,8 +1055,22 @@ impl SceneState {
         }
         let device = &ctx.device;
         // Joint matrices for this frame slot (its previous submission has finished).
-        // The joint buffer starts with the scene constants (fog); joint matrices follow.
-        let slots = view.joints.len() + 1;
+        // The joint buffer starts with the scene constants (fog, eye, time); joint matrices follow, then two
+        // constant slots per drawn water part.
+        let mut water: Vec<[[f32; 16]; 2]> = Vec::new();
+        let mut water_slot = std::collections::HashMap::new();
+        for (di, d) in view.draws.iter().enumerate() {
+            let Some(mesh) = self.meshes.get(&d.mesh.0) else { continue };
+            for (pi, (part, _, _)) in mesh.parts.iter().enumerate() {
+                if let Some(w) = &part.water
+                    && d.part.is_none_or(|p| p == pi)
+                {
+                    water_slot.insert((di, pi), (1 + view.joints.len() + 2 * water.len()) as f32);
+                    water.push(w.constants());
+                }
+            }
+        }
+        let slots = view.joints.len() + 1 + 2 * water.len();
         if slots * 64 > self.joints[frame].buffer.size as usize {
             let fresh = SceneStateRef { pipeline: &self.pipeline, pool: self.pool }
                 .joint_slot(ctx, slots.next_power_of_two())?;
@@ -934,8 +1082,10 @@ impl SceneState {
             }
         }
         if let Some(m) = self.joints[frame].buffer.mapped() {
-            let scene = Fog::constants(view.fog);
-            for (i, j) in std::iter::once(&scene).chain(view.joints.iter()).enumerate() {
+            let scene = Fog::constants(view.fog, eye_of(&view.view_proj), view.time);
+            for (i, j) in
+                std::iter::once(&scene).chain(view.joints.iter()).chain(water.iter().flatten()).enumerate()
+            {
                 for (k, f) in j.iter().enumerate() {
                     m[i * 64 + k * 4..i * 64 + k * 4 + 4].copy_from_slice(&f.to_le_bytes());
                 }
@@ -1020,20 +1170,23 @@ impl SceneState {
                 &[self.joints[frame].set],
                 &[],
             );
+            // Parts without water bind the neutral extra set once.
+            let default_extra = self.extra_sets.get(&self.default_extra).copied();
+            let mut bound_extra = vk::DescriptorSet::null();
             // Opaque parts first, then blended parts in submission order.
             let mut bound = vk::Pipeline::null();
             // Materials state winding as the original renderer sees it; a view whose linear part has a positive
             // determinant (in Vulkan clip space) shows it the other way round.
             let flip = (det3(&view.view_proj) > 0.0) != view.mirrored;
             for blended in [false, true] {
-                for d in &view.draws {
+                for (di, d) in view.draws.iter().enumerate() {
                     let Some(mesh) = self.meshes.get(&d.mesh.0) else { continue };
                     device.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertices.buffer], &[0]);
                     device.cmd_bind_index_buffer(cmd, mesh.indices.buffer, 0, vk::IndexType::UINT32);
                     let m = d.model;
                     // A mirrored model matrix (some maps are exported that way) turns its triangles round too.
                     let flip = flip != (det3(&m) < 0.0);
-                    for (pi, (part, set)) in mesh.parts.iter().enumerate() {
+                    for (pi, (part, set, extra)) in mesh.parts.iter().enumerate() {
                         if d.part.is_some_and(|p| p != pi)
                             || part.index_count == 0
                             || part.material.blend.is_some() != blended
@@ -1072,8 +1225,11 @@ impl SceneState {
                                 [m[1], m[5], m[9], m[13]],
                                 [m[2], m[6], m[10], m[14]],
                             ],
-                            // Field parts (never skinned) take their texture scroll in the joint slots.
-                            params: if part.curve != ToneCurve::None && !d.lit {
+                            // Field parts (never skinned) take their texture scroll in the joint slots; water
+                            // parts their constant slot.
+                            params: if let Some(&slot) = water_slot.get(&(di, pi)) {
+                                [slot, 0.0, part.alpha_cutoff, 4.0]
+                            } else if part.curve != ToneCurve::None && !d.lit {
                                 [
                                     (part.uv_scroll[0] * view.time).fract(),
                                     (part.uv_scroll[1] * view.time).fract(),
@@ -1108,6 +1264,20 @@ impl SceneState {
                             &[*set],
                             &[],
                         );
+                        let extra = if part.water.is_some() { Some(*extra) } else { default_extra };
+                        if let Some(e) = extra
+                            && e != bound_extra
+                        {
+                            device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                self.pipeline.layout,
+                                2,
+                                &[e],
+                                &[],
+                            );
+                            bound_extra = e;
+                        }
                         device.cmd_draw_indexed(cmd, part.index_count, 1, part.first_index, 0, 0);
                     }
                 }
@@ -1194,6 +1364,32 @@ impl SceneStateRef<'_> {
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
         Ok(JointSlot { buffer, set })
     }
+}
+
+/// The eye of a perspective view-projection (column-major): the point where clip x, y and w are all zero.
+/// Zero when the matrix has none (an orthographic projection).
+fn eye_of(m: &[f32; 16]) -> [f32; 3] {
+    let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
+    let (a, b, c) = (row(0), row(1), row(3));
+    // Solve [a; b; c]·e = −[a.w; b.w; c.w] by Cramer's rule.
+    let det = |x: [f32; 3], y: [f32; 3], z: [f32; 3]| {
+        x[0] * (y[1] * z[2] - y[2] * z[1]) - x[1] * (y[0] * z[2] - y[2] * z[0])
+            + x[2] * (y[0] * z[1] - y[1] * z[0])
+    };
+    let (r0, r1, r2) = ([a[0], a[1], a[2]], [b[0], b[1], b[2]], [c[0], c[1], c[2]]);
+    let d = det(r0, r1, r2);
+    if d.abs() < 1e-12 {
+        return [0.0; 3];
+    }
+    let rhs = [-a[3], -b[3], -c[3]];
+    let col = |i: usize| {
+        let mut m = [r0, r1, r2];
+        for (k, row) in m.iter_mut().enumerate() {
+            row[i] = rhs[k];
+        }
+        det(m[0], m[1], m[2]) / d
+    };
+    [col(0), col(1), col(2)]
 }
 
 /// Determinant of the upper-left 3×3 of a column-major 4×4 matrix.

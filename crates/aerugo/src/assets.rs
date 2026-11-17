@@ -39,7 +39,7 @@ use aerugo_formats::phyre::Cluster;
 use aerugo_formats::{Game, effect::PassState};
 use aerugo_gfx::{
     BlendFactor, BlendOp, BlendState, CompareOp, CullMode, MaterialState, MeshDesc, MeshHandle, MeshPart,
-    Renderer, SceneVertex, TextureHandle, ToneCurve,
+    Renderer, SceneVertex, TextureHandle, ToneCurve, Water,
 };
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
@@ -228,7 +228,17 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
             let count = pos.count as usize;
             let p = read_vec(&cluster, Some(pos), count, [0.0; 3]);
             let n = read_vec(&cluster, seg.normals(), count, [0.0, 1.0, 0.0]);
-            let uv = read_vec(&cluster, seg.stream("ST"), count, [0.0; 2]);
+            // Texture coordinates as the instance binds them: the base texture's `Uv` (TEXCOORD0) and the
+            // water shader's `Uv1` (TEXCOORD4) can each read either stream set.
+            let uv_set = seg.input_set("ST", 0);
+            let uv2_set = if seg.inputs.iter().any(|i| i.semantic == "ST" && i.index == 4) {
+                seg.input_set("ST", 4)
+            } else {
+                1
+            };
+            let uv = read_vec(&cluster, seg.stream_in_set("ST", uv_set), count, [0.0; 2]);
+            let uv2 = read_vec(&cluster, seg.stream_in_set("ST", uv2_set), count, [0.0; 2]);
+            let tangent = read_vec(&cluster, seg.stream_in_set("Tangent", 0), count, [1.0, 0.0, 0.0]);
             let col = read_vec(&cluster, seg.stream("Color"), count, [1.0; 4]);
             let w = read_vec(&cluster, seg.stream("SkinWeights"), count, [0.0; 4]);
             let j = read_vec(&cluster, seg.stream("SkinIndices"), count, [0.0; 4]);
@@ -250,7 +260,15 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     aerugo_formats::effect::effect_family(&mat.effect)
                         .eq_ignore_ascii_case("phyrechrlitshader")
                 });
-            let tint: [f32; 4] = if map {
+            // The water shader applies its colours itself (after the cube map lookups).
+            let water = map
+                && seg_material.is_some_and(|mat| {
+                    aerugo_formats::effect::effect_family(&mat.effect)
+                        .eq_ignore_ascii_case("phyrewatershader")
+                });
+            let tint: [f32; 4] = if water {
+                [1.0; 4]
+            } else if map {
                 let (a, b) = (get4("MaterialColour"), get4("clrScaleFactor"));
                 std::array::from_fn(|k| a[k] * b[k])
             } else if character {
@@ -271,30 +289,37 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     color: if character { tint } else { std::array::from_fn(|k| col[v][k] * tint[k]) },
                     weights: w[v],
                     joints: j[v].map(|x| x as u8),
+                    uv2: uv2[v],
+                    tangent: tangent[v],
                 });
             }
             let first = indices.len() as u32;
             let idx = mesh::segment_indices(&cluster, seg);
             indices.extend(idx.iter().map(|&i| base + i.min(count.saturating_sub(1) as u32)));
             let material = m.materials.get(seg.material as usize);
-            let texture = match material.and_then(|mat| mat.base_texture()) {
-                Some(asset) => {
-                    let tex_path = mesh::texture_cluster_path(path, asset);
-                    *texture_cache.entry(tex_path.clone()).or_insert_with(|| {
-                        match load_texture(vfs, renderer, &tex_path) {
-                            Ok(h) => {
-                                out.textures.push(h);
-                                Some(h)
-                            }
-                            Err(e) => {
-                                out.warnings.push(format!("{tex_path}: {e}"));
-                                None
-                            }
+            let mut texture_of = |asset: &str| {
+                let tex_path = mesh::texture_cluster_path(path, asset);
+                *texture_cache.entry(tex_path.clone()).or_insert_with(|| {
+                    match load_texture(vfs, renderer, &tex_path) {
+                        Ok(h) => {
+                            out.textures.push(h);
+                            Some(h)
                         }
-                    })
-                }
-                None => None,
+                        Err(e) => {
+                            out.warnings.push(format!("{tex_path}: {e}"));
+                            None
+                        }
+                    }
+                })
             };
+            let texture = material.and_then(|mat| mat.base_texture()).and_then(&mut texture_of);
+            let water_textures = water.then(|| {
+                ["TextureSampler1", "NormalMapSampler", "NormalMap2Sampler", "CubeMapSampler"].map(|p| {
+                    material
+                        .and_then(|mat| mat.textures.iter().find(|t| t.parameter == p))
+                        .and_then(|t| texture_of(&t.asset))
+                })
+            });
             names.push(format!(
                 "segment {si}: {} triangles, material {}{}",
                 idx.len() / 3,
@@ -332,6 +357,29 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     .unwrap_or(0.0)
             };
             let uv_scroll = [scalar("ScrollSpeed_X"), scalar("ScrollSpeed_Y")];
+            let water = water_textures.map(|textures| {
+                let get3 = |name: &str| {
+                    seg_material
+                        .and_then(|mat| mat.value(name))
+                        .filter(|v| v.len() >= 3)
+                        .map_or([1.0; 3], |v| [v[0], v[1], v[2]])
+                };
+                let (spec, colour, blend) =
+                    (get3("SpecularColor"), get4("MaterialColour"), scalar("MultiTexBlendFactor"));
+                let scroll =
+                    |t: &str| [scalar(&format!("ScrollSpeed_{t}_X")), scalar(&format!("ScrollSpeed_{t}_Y"))];
+                // Each normal map reads the base or the second coordinates, whichever set it is bound to.
+                let normal_uv2 = [6, 7].map(|i| seg.input_set("ST", i) == uv2_set && uv2_set != uv_set);
+                Water {
+                    textures,
+                    normal_uv2,
+                    scroll: [scroll("tex0"), scroll("tex1"), scroll("nml1"), scroll("nml2")],
+                    specular: [spec[0], spec[1], spec[2], scalar("SpecularShininess")],
+                    color: colour.map(|c| c * blend),
+                    scale: get4("clrScaleFactor"),
+                    fog: get3("fgEff"),
+                }
+            });
             parts.push(MeshPart {
                 first_index: first,
                 index_count: idx.len() as u32,
@@ -345,6 +393,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 },
                 material,
                 curve,
+                water,
             });
             part_segments.push(si);
             part_effects.push(effect_id);

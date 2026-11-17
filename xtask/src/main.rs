@@ -610,9 +610,37 @@ fn model_parts(install: &Install, path: &str) -> Result<()> {
                 && let Some(col) = seg.stream("Color")
             {
                 let f = mesh::stream_floats(&c, col);
+                println!(
+                    "    colour stream {:?} {} values, {} positions",
+                    col.format,
+                    f.len() / 4,
+                    seg.positions().map_or(0, |p| p.count)
+                );
+                let mut bins = [(0usize, 0f32); 5];
+                for v in f.chunks(4) {
+                    let b = ((v[3].clamp(0.0, 0.999)) * 5.0) as usize;
+                    bins[b].0 += 1;
+                    bins[b].1 += (v[0] + v[1] + v[2]) / 3.0;
+                }
+                let stats: Vec<String> = bins
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, s))| format!("a{}: {n} mean {:.2}", i, s / (*n).max(1) as f32))
+                    .collect();
+                println!("    by alpha {stats:?}");
                 for v in f.chunks(4).step_by((f.len() / 4 / 12).max(1)).take(12) {
                     println!("    colour {v:?}");
                 }
+            }
+            if std::env::var("PARTS_TEXTURES").is_ok()
+                && let Some(mat) = mat
+            {
+                for t in &mat.textures {
+                    println!("    texture {} = {}", t.parameter, t.asset);
+                }
+                let names: Vec<String> =
+                    seg.streams.iter().map(|s| format!("{}{:?}", s.semantic, s.format)).collect();
+                println!("    streams {names:?}");
             }
             if std::env::var("PARTS_VALUES").is_ok()
                 && let Some(mat) = mat
@@ -628,6 +656,24 @@ fn model_parts(install: &Install, path: &str) -> Result<()> {
                     v("ScrollSpeed_X"),
                     v("ScrollSpeed_Y")
                 );
+                if mat.value("SpecularColor").is_some() {
+                    let scroll: Vec<String> = ["tex0", "tex1", "nml1", "nml2"]
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{} {}",
+                                v(&format!("ScrollSpeed_{t}_X")),
+                                v(&format!("ScrollSpeed_{t}_Y"))
+                            )
+                        })
+                        .collect();
+                    println!(
+                        "    water specular {} shininess {} blend {} scroll {scroll:?}",
+                        v("SpecularColor"),
+                        v("SpecularShininess"),
+                        v("MultiTexBlendFactor")
+                    );
+                }
             }
             println!(
                 "mesh {mi} {:<24} seg {si}: {tris:>6} tris  y {ylo:>9.1}..{yhi:>9.1}  alpha {:?}  {blend:<6} {raster} fx {fx_id}  tex {}",

@@ -131,6 +131,9 @@ pub struct Renderer {
     ui_textures: UiTextures,
     scene: SceneState,
     white: Option<TextureHandle>,
+    /// What water parts sample where a texture is missing (black, flat normal, flat normal, white cube); parts
+    /// without water bind these too.
+    water_defaults: Option<[TextureHandle; crate::scene::WATER_TEXTURES]>,
     textures: HashMap<u64, TextureEntry>,
     next_texture: u64,
     wanted_size: (u32, u32),
@@ -235,6 +238,7 @@ impl Renderer {
             ui_textures,
             scene,
             white: None,
+            water_defaults: None,
             textures: HashMap::new(),
             next_texture: 1,
             wanted_size: size,
@@ -253,6 +257,27 @@ impl Renderer {
             data: vec![&white],
             name: "white",
         })?);
+        let pixel = |r: &mut Self, rgba: &[u8; 4], cube: bool, name: &str| {
+            let layers = if cube { 6 } else { 1 };
+            r.create_texture(&TextureDesc {
+                format: TexFormat::Rgba8,
+                width: 1,
+                height: 1,
+                levels: 1,
+                layers,
+                cube,
+                data: vec![rgba.as_slice(); layers as usize],
+                name,
+            })
+        };
+        let black = pixel(&mut renderer, &[0, 0, 0, 0], false, "black")?;
+        let flat = pixel(&mut renderer, &[128, 128, 255, 255], false, "flat normal")?;
+        let cube = pixel(&mut renderer, &[255; 4], true, "white cube")?;
+        let defaults = [black, flat, flat, cube];
+        let views = defaults.map(|h| renderer.textures[&h.0].texture.view);
+        renderer.scene.default_extra = views;
+        renderer.scene.extra_set(&renderer.ctx, views)?;
+        renderer.water_defaults = Some(defaults);
         Ok(renderer)
     }
 
@@ -343,10 +368,20 @@ impl Renderer {
     /// Upload a mesh. Parts without a texture sample white.
     pub fn create_mesh(&mut self, desc: &MeshDesc<'_>) -> Result<MeshHandle> {
         let mut sets = Vec::with_capacity(desc.parts.len());
+        let defaults = self.water_defaults.context("no default textures")?;
         for part in &desc.parts {
-            let handle = part.texture.or(self.white).context("no white texture")?;
-            let view = self.textures.get(&handle.0).context("unknown texture")?.texture.view;
-            sets.push(self.scene.material_set(&self.ctx, view)?);
+            let view_of = |h: TextureHandle| -> Result<vk::ImageView> {
+                Ok(self.textures.get(&h.0).context("unknown texture")?.texture.view)
+            };
+            let view = view_of(part.texture.or(self.white).context("no white texture")?)?;
+            let set = self.scene.material_set(&self.ctx, view)?;
+            let mut views = self.scene.default_extra;
+            if let Some(w) = &part.water {
+                for (i, t) in w.textures.iter().enumerate() {
+                    views[i] = view_of(t.unwrap_or(defaults[i]))?;
+                }
+            }
+            sets.push((set, self.scene.extra_set(&self.ctx, views)?));
         }
         self.scene.create_mesh(&self.ctx, desc, sets)
     }

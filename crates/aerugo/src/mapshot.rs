@@ -6,7 +6,8 @@
 //! `AERUGO_SHOT_CHR` = `model path;x,y,z;yaw` adds a character in its default pose; `AERUGO_SHOT_SWEEP` =
 //! `d,d,…;ty,ty,…` renders one picture per screen distance and vertical clip offset (out-<d>-<ty>.png), for
 //! fitting the projection to a capture; `AERUGO_SHOT_CAMS` = a file of `name;eye;focus;d` lines renders one
-//! picture per camera (out-<name>.png).
+//! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
+//! draws both sides of everything.
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -16,7 +17,15 @@ use glam::{Mat4, Vec3};
 use crate::assets;
 use crate::viewer::field::{FIELD_FRAME, field_fov_y, map_place, script_camera};
 
-const SIZE: (u32, u32) = (1280, 720);
+/// Picture size; `AERUGO_SHOT_SIZE` = `w,h` overrides it (captures of the original are 2560×1440).
+fn size() -> (u32, u32) {
+    std::env::var("AERUGO_SHOT_SIZE")
+        .ok()
+        .and_then(|s| {
+            s.split_once(',').and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+        })
+        .unwrap_or((1280, 720))
+}
 
 /// One picture to render: name tag, eye, focus, screen distance, vertical clip offset.
 type Variant = (String, [f32; 3], [f32; 3], f32, f32);
@@ -121,7 +130,8 @@ fn map_shot() {
             limit,
         })
     });
-    let aspect = SIZE.0 as f32 / SIZE.1 as f32;
+    let size = size();
+    let aspect = size.0 as f32 / size.1 as f32;
     let sweep = std::env::var("AERUGO_SHOT_SWEEP").ok();
     // AERUGO_SHOT_CAMS = a file of `name;eye;focus;d` lines: one picture per camera (out-<name>.png).
     let cams = std::env::var("AERUGO_SHOT_CAMS").ok().map(|f| std::fs::read_to_string(f).unwrap());
@@ -157,12 +167,12 @@ fn map_shot() {
                     clear: [0.0, 0.0, 0.0, 1.0],
                     draws: draws.clone(),
                     joints: joints.clone(),
-                    culling: true,
+                    culling: std::env::var("AERUGO_SHOT_NOCULL").is_err(),
                     mirrored: false,
                     fog,
                     time: std::env::var("AERUGO_SHOT_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0),
                 },
-                SIZE,
+                size,
             )
             .unwrap();
         let name = if tag.is_empty() {
@@ -171,7 +181,7 @@ fn map_shot() {
             format!("{}-{tag}.png", out.trim_end_matches(".png"))
         };
         let file = std::fs::File::create(name).unwrap();
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), SIZE.0, SIZE.1);
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), size.0, size.1);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).unwrap();
