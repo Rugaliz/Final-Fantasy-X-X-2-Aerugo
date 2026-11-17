@@ -136,6 +136,7 @@ impl App {
             Ok(n) => log::info!("3D view multisampling: {n}×"),
             Err(e) => log::warn!("multisampling: {e:#}"),
         }
+        renderer.set_sharpen(settings.graphics.sharpen);
 
         let mut egui = EguiSdl::new();
         egui.ui_scale = settings.ui.scale;
@@ -414,6 +415,9 @@ impl App {
         {
             log::warn!("multisampling: {e:#}");
         }
+        if new.graphics.sharpen != old.graphics.sharpen {
+            self.renderer.set_sharpen(new.graphics.sharpen);
+        }
         if new.ui.scale != old.ui.scale {
             self.egui.ui_scale = new.ui.scale;
         }
@@ -470,6 +474,7 @@ fn without_untouched_overrides(current: &Settings, launch: &Settings, file: &Set
             &file.graphics.validation,
         ),
         msaa: keep(&current.graphics.msaa, &launch.graphics.msaa, &file.graphics.msaa),
+        sharpen: keep(&current.graphics.sharpen, &launch.graphics.sharpen, &file.graphics.sharpen),
     };
     out.game.dir = keep(&current.game.dir, &launch.game.dir, &file.game.dir);
     out
@@ -598,6 +603,7 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, info: &RenderInfo) {
             }
         },
     );
+    ui.checkbox(&mut settings.graphics.sharpen, "Sharpen (the remaster's unsharp mask)");
     ui.add(egui::Slider::new(&mut settings.ui.scale, 0.5..=3.0).text("Interface scale"));
 
     ui.separator();

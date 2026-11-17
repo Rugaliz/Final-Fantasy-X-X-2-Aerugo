@@ -136,6 +136,8 @@ pub struct Renderer {
     water_defaults: Option<[TextureHandle; crate::scene::WATER_TEXTURES]>,
     /// Samples per pixel of the 3D viewport (1 = no multisampling).
     samples: vk::SampleCountFlags,
+    /// Sharpen the 3D viewport with the remaster's unsharp mask.
+    sharpen: bool,
     textures: HashMap<u64, TextureEntry>,
     next_texture: u64,
     wanted_size: (u32, u32),
@@ -242,6 +244,7 @@ impl Renderer {
             white: None,
             water_defaults: None,
             samples: vk::SampleCountFlags::TYPE_1,
+            sharpen: false,
             textures: HashMap::new(),
             next_texture: 1,
             wanted_size: size,
@@ -414,6 +417,16 @@ impl Renderer {
         Ok(count)
     }
 
+    /// Sharpen the 3D view with the remaster's unsharp mask (its "UnSharpMask" setting); ignored where the
+    /// device cannot run the compute passes.
+    pub fn set_sharpen(&mut self, on: bool) {
+        if on != self.sharpen {
+            self.ctx.wait_idle();
+            self.drop_viewport();
+            self.sharpen = on;
+        }
+    }
+
     /// The UI texture showing the 3D viewport, (re)created at `size` pixels.
     pub fn viewport_texture(&mut self, size: (u32, u32)) -> Result<egui::TextureId> {
         let extent = vk::Extent2D { width: size.0.clamp(1, 16384), height: size.1.clamp(1, 16384) };
@@ -522,11 +535,55 @@ impl Renderer {
             .image_info(&info)];
         // SAFETY: the set is new.
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
+        // The unsharp mask's blur images (failures leave the view unsharpened).
+        let unsharp = match (&self.scene.unsharp, self.sharpen) {
+            (Some(u), true) => {
+                let blur = || {
+                    Target::new(
+                        ctx,
+                        VIEWPORT_FORMAT,
+                        extent,
+                        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                        vk::ImageAspectFlags::COLOR,
+                        None,
+                        vk::SampleCountFlags::TYPE_1,
+                    )
+                };
+                match (blur(), blur()) {
+                    (Ok(mut a), Ok(mut b)) => {
+                        match u.sets(ctx, self.scene.pool, color.view, a.view, b.view) {
+                            Ok(sets) => Some(crate::scene::UnsharpTargets { a, b, sets }),
+                            Err(e) => {
+                                log::warn!("unsharp mask: {e:#}");
+                                // SAFETY: never used.
+                                unsafe {
+                                    a.destroy(ctx);
+                                    b.destroy(ctx);
+                                }
+                                None
+                            }
+                        }
+                    }
+                    (a, b) => {
+                        for t in [a, b] {
+                            match t {
+                                // SAFETY: never used.
+                                Ok(mut t) => unsafe { t.destroy(ctx) },
+                                Err(e) => log::warn!("unsharp mask: {e:#}"),
+                            }
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
         self.scene.viewport = Some(Viewport {
             color,
             msaa_color,
             depth,
+            unsharp,
             extent,
             ui_set: set,
             ui_id,
@@ -557,6 +614,11 @@ impl Renderer {
                     m.destroy(&self.ctx);
                 }
                 vp.depth.destroy(&self.ctx);
+                if let Some(mut u) = vp.unsharp.take() {
+                    self.ctx.device.free_descriptor_sets(self.scene.pool, &u.sets).ok();
+                    u.a.destroy(&self.ctx);
+                    u.b.destroy(&self.ctx);
+                }
             }
         }
     }

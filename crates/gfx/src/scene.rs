@@ -11,6 +11,7 @@ use crate::context::Context;
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
 static CC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/colorcorrect.comp.spv"));
+static USM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unsharp.comp.spv"));
 
 pub const VIEWPORT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -864,6 +865,8 @@ pub(crate) struct Viewport {
     pub msaa_color: Option<Target>,
     /// Depth, with as many samples as the colour target drawn into.
     pub depth: Target,
+    /// Images and sets of the unsharp mask (with sharpening on).
+    pub unsharp: Option<UnsharpTargets>,
     pub extent: vk::Extent2D,
     pub ui_set: vk::DescriptorSet,
     pub ui_id: egui::TextureId,
@@ -890,6 +893,156 @@ pub(crate) struct SceneState {
     pub pending_table: Option<vk::ImageView>,
     /// The colour-correction pass (`None` where the device cannot write RGBA8 images from compute shaders).
     pub color_correction: Option<ColorCorrection>,
+    /// The unsharp-mask passes (as above).
+    pub unsharp: Option<Unsharp>,
+}
+/// The remaster's unsharp mask at its default settings (blur distance 1.2 pixels, intensity 0.45, threshold 0.04).
+const USM_DISTANCE: f32 = 1.2;
+const USM_INTENSITY: f32 = 0.45;
+const USM_THRESHOLD: f32 = 0.04;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct UnsharpPush {
+    step: [f32; 2],
+    intensity: f32,
+    threshold: f32,
+    sharpen: f32,
+}
+
+/// Compute passes sharpening the viewport like the remaster's unsharp mask: blur vertically into one image,
+/// horizontally into another, then sharpen the viewport in place.
+#[derive(Debug)]
+pub(crate) struct Unsharp {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    sampler: vk::Sampler,
+}
+
+/// The two blur images of a viewport and the sets of the three passes.
+#[derive(Debug)]
+pub(crate) struct UnsharpTargets {
+    pub a: Target,
+    pub b: Target,
+    pub sets: [vk::DescriptorSet; 3],
+}
+
+impl Unsharp {
+    fn new(device: &ash::Device) -> Result<Unsharp> {
+        let bindings = [
+            (0, vk::DescriptorType::SAMPLED_IMAGE),
+            (1, vk::DescriptorType::SAMPLER),
+            (2, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+        .map(|(b, t)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(t)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(size_of::<UnsharpPush>() as u32)];
+        // SAFETY: valid device and create infos; objects made before a failure are left to the device's
+        // destruction (start-up only).
+        unsafe {
+            let set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+            let layouts = [set_layout];
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&push),
+                None,
+            )?;
+            let module = crate::quad::shader_module(device, USM_SPV)?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0];
+            let sampler = device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?;
+            Ok(Unsharp { set_layout, layout, module, pipeline, sampler })
+        }
+    }
+
+    /// Sets for the passes over `color` with blur images `a` and `b`: color → a, a → b, b sharpens color.
+    pub(crate) fn sets(
+        &self,
+        ctx: &Context,
+        pool: vk::DescriptorPool,
+        color: vk::ImageView,
+        a: vk::ImageView,
+        b: vk::ImageView,
+    ) -> Result<[vk::DescriptorSet; 3]> {
+        let layouts = [self.set_layout; 3];
+        // SAFETY: valid pool and layout.
+        let sets = unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
+            )
+        }
+        .context("no room for the unsharp-mask sets")?;
+        for (set, (source, target)) in sets.iter().zip([(color, a), (a, b), (b, color)]) {
+            let sampled = [vk::DescriptorImageInfo::default()
+                .image_view(source)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let sampler = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+            let storage = [vk::DescriptorImageInfo::default()
+                .image_view(target)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&sampled),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&storage),
+            ];
+            // SAFETY: the sets are new.
+            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        }
+        Ok([sets[0], sets[1], sets[2]])
+    }
+
+    /// # Safety
+    /// The passes must not be in use; their sets are freed with the pool or by the viewport.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_shader_module(self.module, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+        }
+    }
 }
 
 /// Compute pass applying a colour-correction table to the viewport in place.
@@ -1038,6 +1191,8 @@ const MAX_ANISOTROPY: f32 = 16.0;
 const EXTRA_SETS: u32 = 256;
 /// Colour-correction sets (one per viewport size and table in use).
 const CC_SETS: u32 = 64;
+/// Unsharp-mask sets (three per viewport).
+const USM_SETS: u32 = 6;
 
 impl SceneState {
     pub fn new(ctx: &Context, frames: usize) -> Result<SceneState> {
@@ -1046,13 +1201,16 @@ impl SceneState {
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32 + CC_SETS,
+                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32 + CC_SETS + USM_SETS,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: SCENE_SETS + CC_SETS,
+                descriptor_count: SCENE_SETS + CC_SETS + USM_SETS,
             },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: CC_SETS },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: CC_SETS + USM_SETS,
+            },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: frames as u32,
@@ -1063,7 +1221,7 @@ impl SceneState {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                    .max_sets(SCENE_SETS + EXTRA_SETS + CC_SETS + frames as u32)
+                    .max_sets(SCENE_SETS + EXTRA_SETS + CC_SETS + USM_SETS + frames as u32)
                     .pool_sizes(&sizes),
                 None,
             )
@@ -1094,6 +1252,7 @@ impl SceneState {
             pending: None,
             pending_table: None,
             color_correction: if ctx.storage_rgba8 { Some(ColorCorrection::new(device)?) } else { None },
+            unsharp: if ctx.storage_rgba8 { Some(Unsharp::new(device)?) } else { None },
         };
         for _ in 0..frames {
             let slot = state.joint_slot(ctx, 256)?;
@@ -1515,13 +1674,21 @@ impl SceneState {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
-            if let Some((pipeline, layout, set)) = correct {
+            // Post-processing in place on the viewport image (GENERAL layout): colour correction, then the
+            // unsharp mask.
+            let usm = match (&vp.unsharp, &self.unsharp) {
+                (Some(t), Some(u)) => Some((t, u)),
+                _ => None,
+            };
+            if correct.is_some() || usm.is_some() {
                 let to_general = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(last.0)
                     .src_access_mask(last.1)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(
-                        vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                            | vk::AccessFlags2::SHADER_SAMPLED_READ,
                     )
                     .old_layout(last.2)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -1531,14 +1698,82 @@ impl SceneState {
                     cmd,
                     &vk::DependencyInfo::default().image_memory_barriers(&to_general),
                 );
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-                device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
                 last = (
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_STORAGE_WRITE,
                     vk::ImageLayout::GENERAL,
                 );
+            }
+            let groups = (extent.width.div_ceil(8), extent.height.div_ceil(8));
+            if let Some((pipeline, layout, set)) = correct {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+            }
+            if let Some((t, u)) = usm {
+                // Each pass reads what the one before wrote.
+                let compute_to_compute = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_SAMPLED_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )];
+                let blur_images: Vec<_> = [t.a.image, t.b.image]
+                    .into_iter()
+                    .map(|image| {
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::NONE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_WRITE
+                                    | vk::AccessFlags2::SHADER_SAMPLED_READ,
+                            )
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .image(image)
+                            .subresource_range(color_range)
+                    })
+                    .collect();
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(&compute_to_compute)
+                        .image_memory_barriers(&blur_images),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, u.pipeline);
+                let passes = [
+                    ([0.0, USM_DISTANCE / extent.height as f32], 0.0),
+                    ([USM_DISTANCE / extent.width as f32, 0.0], 0.0),
+                    ([0.0, 0.0], 1.0),
+                ];
+                for (i, (&set, (step, sharpen))) in t.sets.iter().zip(passes).enumerate() {
+                    if i > 0 {
+                        device.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                        );
+                    }
+                    let push =
+                        UnsharpPush { step, intensity: USM_INTENSITY, threshold: USM_THRESHOLD, sharpen };
+                    let bytes = std::slice::from_raw_parts(
+                        (&push as *const UnsharpPush).cast::<u8>(),
+                        size_of::<UnsharpPush>(),
+                    );
+                    device.cmd_push_constants(cmd, u.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        u.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+                }
             }
             let to_read = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(last.0)
@@ -1574,6 +1809,10 @@ impl SceneState {
                     m.destroy(ctx);
                 }
                 vp.depth.destroy(ctx);
+                if let Some(mut u) = vp.unsharp.take() {
+                    u.a.destroy(ctx);
+                    u.b.destroy(ctx);
+                }
             }
         }
         // SAFETY: the device is idle; sets are freed with the pool.
@@ -1583,6 +1822,9 @@ impl SceneState {
             self.pipeline.destroy(&ctx.device);
             if let Some(cc) = &self.color_correction {
                 cc.destroy(&ctx.device);
+            }
+            if let Some(u) = &self.unsharp {
+                u.destroy(&ctx.device);
             }
         }
     }

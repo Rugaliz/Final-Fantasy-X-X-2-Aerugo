@@ -36,6 +36,8 @@ pub struct GraphicsSettings {
     pub validation: bool,
     /// Multisample anti-aliasing of the 3D view, in samples per pixel (1 = off; the remaster's high setting is 8).
     pub msaa: u32,
+    /// Sharpen the 3D view with the remaster's unsharp mask.
+    pub sharpen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,7 +104,14 @@ impl Default for WindowSettings {
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        Self { present_mode: "fifo".into(), frame_limit: 0, gpu: String::new(), validation: false, msaa: 8 }
+        Self {
+            present_mode: "fifo".into(),
+            frame_limit: 0,
+            gpu: String::new(),
+            validation: false,
+            msaa: 8,
+            sharpen: true,
+        }
     }
 }
 

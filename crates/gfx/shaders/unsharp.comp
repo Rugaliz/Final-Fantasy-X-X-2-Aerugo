@@ -1,0 +1,43 @@
+#version 450
+// The remaster's unsharp mask (after colour correction): a 7-tap blur run vertically then horizontally
+// (weights 0.4, 0.15, 0.1, 0.05 at 1.2-pixel steps), then c + intensity · sign(d) · max(|d| − threshold, 0) /
+// (1 − threshold), d = c − blur.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D source;
+layout(set = 0, binding = 1) uniform sampler linearClamp;
+layout(set = 0, binding = 2, rgba8) uniform image2D target;
+
+layout(push_constant) uniform Push {
+    // Blur step in texture coordinates (one direction at a time).
+    vec2 step;
+    float intensity;
+    float threshold;
+    // > 0.5: sharpen `target` in place with the blurred `source`; else blur `source` into `target`.
+    float sharpen;
+} pc;
+
+vec4 at(vec2 uv) {
+    return textureLod(sampler2D(source, linearClamp), uv, 0.0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    if (pc.sharpen > 0.5) {
+        vec4 c = imageLoad(target, p);
+        vec4 d = c - at(uv);
+        vec4 s = sign(d) * max(abs(d) - pc.threshold, 0.0) / (1.0 - pc.threshold);
+        imageStore(target, p, c + s * pc.intensity);
+    } else {
+        vec2 s = pc.step;
+        vec4 c = at(uv) * 0.4 + (at(uv + s) + at(uv - s)) * 0.15 + (at(uv + 2.0 * s) + at(uv - 2.0 * s)) * 0.1
+               + (at(uv + 3.0 * s) + at(uv - 3.0 * s)) * 0.05;
+        imageStore(target, p, c);
+    }
+}

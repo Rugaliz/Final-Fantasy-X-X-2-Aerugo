@@ -8,7 +8,8 @@
 //! fitting the projection to a capture; `AERUGO_SHOT_CAMS` = a file of `name;eye;focus;d` lines renders one
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
 //! draws both sides of everything; `AERUGO_SHOT_NOCC` leaves out the map's colour correction;
-//! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer; `AERUGO_SHOT_MSAA` sets the samples per pixel.
+//! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer; `AERUGO_SHOT_MSAA` sets the samples per pixel;
+//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask.
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -56,6 +57,8 @@ fn map_shot() {
     // AERUGO_SHOT_MSAA = samples per pixel (default 8, the remaster's high setting).
     let msaa = std::env::var("AERUGO_SHOT_MSAA").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     renderer.set_msaa(msaa).unwrap();
+    // The unsharp mask is on as in the captures; AERUGO_SHOT_NOSHARPEN turns it off.
+    renderer.set_sharpen(std::env::var("AERUGO_SHOT_NOSHARPEN").is_err());
     let mut vfs = Vfs::new();
     vfs.mount_install(&inst).unwrap();
     let model = assets::load_map_model(&vfs, &mut renderer, map).unwrap();
