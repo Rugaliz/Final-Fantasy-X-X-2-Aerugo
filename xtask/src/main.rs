@@ -606,6 +606,14 @@ fn model_parts(install: &Install, path: &str) -> Result<()> {
                     )
                 })
                 .unwrap_or_default();
+            if std::env::var("PARTS_COLOURS").is_ok_and(|v| v.parse() == Ok(mi))
+                && let Some(col) = seg.stream("Color")
+            {
+                let f = mesh::stream_floats(&c, col);
+                for v in f.chunks(4).step_by((f.len() / 4 / 12).max(1)).take(12) {
+                    println!("    colour {v:?}");
+                }
+            }
             if std::env::var("PARTS_VALUES").is_ok()
                 && let Some(mat) = mat
             {

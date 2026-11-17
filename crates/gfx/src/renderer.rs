@@ -368,6 +368,9 @@ impl Renderer {
         self.ctx.wait_idle();
         self.drop_viewport();
         let ctx = &self.ctx;
+        // The scene writes display-ready values; the UI renderer takes texture samples as linear and encodes
+        // its output for a non-sRGB swapchain, so it samples the viewport through an sRGB view (which decodes
+        // them) to show the scene unchanged.
         let mut color = Target::new(
             ctx,
             VIEWPORT_FORMAT,
@@ -376,6 +379,7 @@ impl Renderer {
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
+            Some(vk::Format::R8G8B8A8_SRGB),
         )?;
         let depth = match Target::new(
             ctx,
@@ -383,6 +387,7 @@ impl Renderer {
             extent,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::ImageAspectFlags::DEPTH,
+            None,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -419,7 +424,7 @@ impl Renderer {
         }?[0];
         let info = [vk::DescriptorImageInfo::default()
             .sampler(self.ui_textures.linear)
-            .image_view(color.view)
+            .image_view(color.alt_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let write = [vk::WriteDescriptorSet::default()
             .dst_set(set)

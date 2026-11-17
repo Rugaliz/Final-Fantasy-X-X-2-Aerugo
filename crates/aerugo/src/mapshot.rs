@@ -82,7 +82,7 @@ fn map_shot() {
                             mesh: mesh.mesh,
                             model: (place * mesh.world).to_cols_array(),
                             joint_base: Some(base),
-                            lit: true,
+                            lit: false,
                             part: Some(pi),
                         });
                     }

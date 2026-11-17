@@ -235,17 +235,29 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
             skinned |= seg.stream("SkinIndices").is_some();
             // Map shaders multiply the texture by the material's colour and colour scale as well as the vertex
             // colour; each segment has its own vertices, so the two fold into the vertex colours here.
-            let tint: [f32; 4] = match m.materials.get(seg.material as usize).filter(|_| map) {
-                Some(mat) => {
-                    let get = |name: &str| {
-                        mat.value(name)
-                            .filter(|v| v.len() == 4)
-                            .map_or([1.0; 4], |v| [v[0], v[1], v[2], v[3]])
-                    };
-                    let (a, b) = (get("MaterialColour"), get("clrScaleFactor"));
-                    std::array::from_fn(|k| a[k] * b[k])
-                }
-                None => [1.0; 4],
+            let seg_material = m.materials.get(seg.material as usize);
+            let get4 = |name: &str| {
+                seg_material
+                    .and_then(|mat| mat.value(name))
+                    .filter(|v| v.len() == 4)
+                    .map_or([1.0; 4], |v| [v[0], v[1], v[2], v[3]])
+            };
+            // The remaster's character shader never reads the "Color" stream (its data is not a colour): its
+            // vertex colour is a height gradient between two material colours (both white by default), and
+            // its light comes from run-time constants (left at a neutral 1 until they are read).
+            let character = !map
+                && seg_material.is_some_and(|mat| {
+                    aerugo_formats::effect::effect_family(&mat.effect)
+                        .eq_ignore_ascii_case("phyrechrlitshader")
+                });
+            let tint: [f32; 4] = if map {
+                let (a, b) = (get4("MaterialColour"), get4("clrScaleFactor"));
+                std::array::from_fn(|k| a[k] * b[k])
+            } else if character {
+                let (a, b) = (get4("MaterialColour"), get4("VertexColorOrigin"));
+                std::array::from_fn(|k| a[k] * b[k])
+            } else {
+                [1.0; 4]
             };
             let base = vertices.len() as u32;
             for v in 0..count {
@@ -256,7 +268,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     position: p[v],
                     normal: n[v],
                     uv: uv[v],
-                    color: std::array::from_fn(|k| col[v][k] * tint[k]),
+                    color: if character { tint } else { std::array::from_fn(|k| col[v][k] * tint[k]) },
                     weights: w[v],
                     joints: j[v].map(|x| x as u8),
                 });
@@ -328,6 +340,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 alpha_cutoff: match (curve, alpha_test) {
                     (ToneCurve::Sky, _) => 0.0,
                     (ToneCurve::Field, true) => 0.5,
+                    _ if character => scalar("AlphaThreshold"),
                     _ => 0.3,
                 },
                 material,

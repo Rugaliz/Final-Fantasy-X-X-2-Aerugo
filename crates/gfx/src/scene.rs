@@ -189,6 +189,8 @@ pub(crate) fn one_time_submit(ctx: &Context, f: impl FnOnce(vk::CommandBuffer)) 
 pub(crate) struct Target {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// A second view of the image in another format (null when not asked for).
+    pub alt_view: vk::ImageView,
     allocation: Option<Allocation>,
 }
 
@@ -199,8 +201,15 @@ impl Target {
         extent: vk::Extent2D,
         usage: vk::ImageUsageFlags,
         aspect: vk::ImageAspectFlags,
+        alt_format: Option<vk::Format>,
     ) -> Result<Target> {
+        let flags = if alt_format.is_some() {
+            vk::ImageCreateFlags::MUTABLE_FORMAT
+        } else {
+            vk::ImageCreateFlags::empty()
+        };
         let info = vk::ImageCreateInfo::default()
+            .flags(flags)
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
@@ -212,7 +221,8 @@ impl Target {
             .initial_layout(vk::ImageLayout::UNDEFINED);
         // SAFETY: valid device and create info.
         let image = unsafe { ctx.device.create_image(&info, None) }?;
-        let mut t = Target { image, view: vk::ImageView::null(), allocation: None };
+        let mut t =
+            Target { image, view: vk::ImageView::null(), alt_view: vk::ImageView::null(), allocation: None };
         let r = (|| -> Result<()> {
             // SAFETY: image was just created.
             let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
@@ -239,6 +249,10 @@ impl Target {
                 });
             // SAFETY: the image is bound.
             t.view = unsafe { ctx.device.create_image_view(&view_info, None) }?;
+            if let Some(alt) = alt_format {
+                // SAFETY: the image is bound and was created mutable-format.
+                t.alt_view = unsafe { ctx.device.create_image_view(&view_info.format(alt), None) }?;
+            }
             Ok(())
         })();
         if let Err(e) = r {
@@ -254,6 +268,7 @@ impl Target {
     pub unsafe fn destroy(&mut self, ctx: &Context) {
         // SAFETY: guaranteed by the caller; null handles are ignored.
         unsafe {
+            ctx.device.destroy_image_view(self.alt_view, None);
             ctx.device.destroy_image_view(self.view, None);
             ctx.device.destroy_image(self.image, None);
         }
