@@ -390,6 +390,64 @@ fn stream_inputs(cluster: &Cluster, context: ObjectId) -> Vec<StreamInput> {
         .collect()
 }
 
+/// A map's scene settings: the remaster keeps them on the map cluster's camera named `GlobalCamera` (fog, the
+/// background colour, glow, depth of field and the character light all come from here).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SceneSettings {
+    pub near: f32,
+    pub far: f32,
+    pub ambient: [f32; 3],
+    pub background: [f32; 3],
+    pub fog_color: [f32; 3],
+    pub fog_near: f32,
+    pub fog_far: f32,
+    pub fog_curve: f32,
+    /// Fog limit as stored (0–255 scale).
+    pub fog_limit: f32,
+    /// Glow upper and lower threshold, gain, spread.
+    pub glow: [f32; 4],
+    /// Depth of field: focus plane distance, focus range, blur range.
+    pub dof: [f32; 3],
+    pub character_light_intensity: [f32; 4],
+    pub character_light_pitch: [f32; 4],
+    pub character_light_yaw: [f32; 4],
+    /// Vertical field of view (radians).
+    pub fov: f32,
+}
+
+/// The scene settings of a map cluster (its `GlobalCamera`), if it has them.
+pub fn scene_settings(cluster: &Cluster) -> Option<SceneSettings> {
+    let cam = cluster
+        .objects("PCameraPerspective")
+        .into_iter()
+        .find(|&c| cluster.string(c, "m_name").as_deref() == Some("GlobalCamera"))?;
+    let f = |name: &str| cluster.floats(cam, name, 1).and_then(|v| v.first().copied()).unwrap_or(0.0);
+    let v4 = |name: &str| {
+        cluster.floats(cam, &format!("{name}.m_elements"), 4).map_or([0.0; 4], |v| [v[0], v[1], v[2], v[3]])
+    };
+    let v3 = |name: &str| {
+        let v = v4(name);
+        [v[0], v[1], v[2]]
+    };
+    Some(SceneSettings {
+        near: f("m_nearPlane"),
+        far: f("m_farPlane"),
+        ambient: v3("m_ambientColor"),
+        background: v3("m_bgColor"),
+        fog_color: v3("m_fogColor"),
+        fog_near: f("m_fogNear"),
+        fog_far: f("m_fogFar"),
+        fog_curve: f("m_fogCurve"),
+        fog_limit: f("m_fogLimit"),
+        glow: [f("m_glowUpperThreshold"), f("m_glowLowerThreshold"), f("m_glowGain"), f("m_glowSpread")],
+        dof: [f("m_dofFocusPlaneDistance"), f("m_dofFocusRange"), f("m_dofFocusBlurRange")],
+        character_light_intensity: v4("m_charcterLightIntensity"),
+        character_light_pitch: v4("m_charcterLightPitch"),
+        character_light_yaw: v4("m_characterLightYaw"),
+        fov: f("m_FOV"),
+    })
+}
+
 /// Read every mesh instance of a model cluster.
 pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
     let mut meshes = Vec::new();

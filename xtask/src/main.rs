@@ -715,7 +715,14 @@ fn dump_phyre(install: &Install, path: &str, class: Option<&str>) -> Result<()> 
             let id = aerugo_formats::ObjectId { list: i as u32, index };
             println!("\n{}[{index}]", c.namespace.classes[l.class].name);
             for f in c.describe(id) {
-                println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, f.value);
+                // Vectors and matrices: every element, not just the first.
+                let value = match f.name.ends_with(".m_elements") && f.type_name == "float" {
+                    true => c
+                        .floats(id, &f.name, if f.name.contains("Matrix") { 16 } else { 4 })
+                        .map_or(f.value.clone(), |v| format!("{v:?}")),
+                    false => f.value.clone(),
+                };
+                println!("  {:#06x} {:<36} {:<28} {}", f.offset, f.name, f.type_name, value);
             }
         }
     }

@@ -1125,16 +1125,21 @@ impl FieldView {
                 add(m, place, pose, &mut joints);
             }
         }
+        // The map's scene settings: its fog, and its background colour behind everything.
+        let settings = s.map.as_ref().and_then(|m| m.scene);
+        let clear = match (settings, self.game) {
+            (Some(st), true) => [st.background[0], st.background[1], st.background[2], 1.0],
+            (None, true) => [0.0, 0.0, 0.0, 1.0],
+            (_, false) => [0.05, 0.05, 0.08, 1.0],
+        };
         renderer.submit_scene(SceneView {
             view_proj: view_proj.to_cols_array(),
-            clear: if self.game { [0.0, 0.0, 0.0, 1.0] } else { [0.05, 0.05, 0.08, 1.0] },
+            clear,
             draws,
             joints,
             culling: true,
             mirrored: false,
-            // The remaster starts every map measured so far with its fog limit at 0 (no fog, whatever the PS2
-            // package states); only scripts raise it (0x803c), which is not ported yet.
-            fog: None,
+            fog: settings.as_ref().map(crate::assets::scene_fog),
             // Scene time: the event's ticks at 30 a second, plus the share of the next.
             time: (s.event.tick as f32 + alpha) / 30.0,
             color_correction: s.map.as_ref().and_then(|m| m.color_correction),

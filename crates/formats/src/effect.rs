@@ -162,6 +162,8 @@ pub struct Effect {
     pub scene_passes: Vec<ScenePass>,
     /// Names of the material parameters the variant takes.
     pub parameters: Vec<String>,
+    /// The variant's material switches (`IGNORE_FOG`, `TEXTURE_ENABLED`, …) with their values.
+    pub switches: Vec<(String, String)>,
 }
 
 impl Effect {
@@ -179,6 +181,11 @@ impl Effect {
     /// State of the first shader pass of [`Effect::main_pass`].
     pub fn main_state(&self) -> Option<PassState> {
         self.main_pass().and_then(|p| p.passes.first().copied())
+    }
+
+    /// Whether a material switch is set to "1".
+    pub fn switch(&self, name: &str) -> bool {
+        self.switches.iter().any(|(n, v)| n == name && v == "1")
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -244,7 +251,12 @@ pub fn read_effect(c: &Cluster) -> Option<Effect> {
         .into_iter()
         .filter_map(|d| c.string(d, "m_name"))
         .collect();
-    Some(Effect { scene_passes, parameters })
+    let switches = c
+        .objects("PMaterialSwitch")
+        .into_iter()
+        .filter_map(|s| Some((c.string(s, "m_name")?, c.string(s, "m_value").unwrap_or_default())))
+        .collect();
+    Some(Effect { scene_passes, parameters, switches })
 }
 
 /// Archive path of the cluster for an effect asset id (`PS3Data/Shaders/<name>.fx#<variant>`).
@@ -285,10 +297,10 @@ mod tests {
         let shadow = ScenePass { kind: "Shadow".into(), passes: vec![PassState::default()] };
         let blended = PassState { blend: Some(Blend::ALPHA), ..PassState::default() };
         let transparent = ScenePass { kind: "Transparent".into(), passes: vec![blended] };
-        let e = Effect { scene_passes: vec![shadow.clone(), opaque], parameters: vec![] };
+        let e = Effect { scene_passes: vec![shadow.clone(), opaque], parameters: vec![], switches: vec![] };
         assert_eq!(e.main_pass().unwrap().kind, "Opaque");
         assert!(!e.is_transparent());
-        let e = Effect { scene_passes: vec![shadow, transparent], parameters: vec![] };
+        let e = Effect { scene_passes: vec![shadow, transparent], parameters: vec![], switches: vec![] };
         assert!(e.is_transparent());
         assert_eq!(e.main_state().unwrap().blend, Some(Blend::ALPHA));
     }

@@ -58,6 +58,8 @@ pub struct GpuModel {
     pub model: Model,
     /// A map's colour-correction table (see [`aerugo_gfx::SceneView::color_correction`]).
     pub color_correction: Option<TextureHandle>,
+    /// A map's scene settings (fog, background, glow, character light).
+    pub scene: Option<mesh::SceneSettings>,
 }
 
 #[derive(Debug)]
@@ -198,6 +200,18 @@ fn effect_discards(vfs: &Vfs, game: Game, id: &str) -> bool {
         .any(|w| matches!(u32::from_le_bytes([w[0], w[1], w[2], w[3]]), 0x0300_000D | 0x0304_000D))
 }
 
+/// The fog of a map's scene settings: its colour, distances (game units) and curve, with the 0–255 limit as a
+/// share of fog colour. Event scripts can change it in the original (natives 0x8037–0x8041, not ported yet).
+pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
+    aerugo_gfx::Fog {
+        color: s.fog_color,
+        near: s.fog_near,
+        far: s.fog_far,
+        curve: s.fog_curve,
+        limit: (s.fog_limit / 255.0).clamp(0.0, 1.0),
+    }
+}
+
 /// Load a model cluster and everything it references.
 pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
     load(vfs, renderer, path, false)
@@ -214,7 +228,8 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
     let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
     let mut texture_cache: HashMap<String, Option<TextureHandle>> = HashMap::new();
-    let mut effect_cache: HashMap<String, (Option<MaterialState>, bool)> = HashMap::new();
+    // Per effect: pass state, whether it alpha-tests, whether it ignores fog.
+    let mut effect_cache: HashMap<String, (Option<MaterialState>, bool, bool)> = HashMap::new();
     let game = game_of_path(path);
     for (source, m) in model.meshes.iter().enumerate() {
         let world = Mat4::from_cols_array(&m.world);
@@ -329,15 +344,17 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 material.and_then(|mat| mat.base_texture()).map(|t| format!(", {t}")).unwrap_or_default()
             ));
             let effect_id = material.map(|m| m.effect.clone()).unwrap_or_default();
-            let (state, alpha_test) = *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
-                let state = load_effect(vfs, game, &effect_id)
-                    .and_then(|fx| fx.main_state())
-                    .map(|p| material_state(&p));
-                if state.is_none() && !effect_id.is_empty() {
-                    out.warnings.push(format!("effect {effect_id} not found; drawing with default state"));
-                }
-                (state, effect_discards(vfs, game, &effect_id))
-            });
+            let (state, alpha_test, ignore_fog) =
+                *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
+                    let fx = load_effect(vfs, game, &effect_id);
+                    let ignore_fog = fx.as_ref().is_some_and(|fx| fx.switch("IGNORE_FOG"));
+                    let state = fx.and_then(|fx| fx.main_state()).map(|p| material_state(&p));
+                    if state.is_none() && !effect_id.is_empty() {
+                        out.warnings
+                            .push(format!("effect {effect_id} not found; drawing with default state"));
+                    }
+                    (state, effect_discards(vfs, game, &effect_id), ignore_fog)
+                });
             let mut material = state.unwrap_or_default();
             if map {
                 material.front_ccw = !material.front_ccw;
@@ -396,6 +413,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 material,
                 curve,
                 water,
+                fog: !ignore_fog,
             });
             part_segments.push(si);
             part_effects.push(effect_id);
@@ -426,6 +444,9 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
         out.max = Vec3::splat(1.0);
     }
     out.model = model;
+    if map {
+        out.scene = mesh::scene_settings(&cluster);
+    }
     if map
         && let Some(p) = mesh::color_correction_path(path)
         && vfs.exists(&p)

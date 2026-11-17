@@ -36,11 +36,11 @@ layout(push_constant) uniform Push {
 
 layout(location = 0) out vec4 outColor;
 
-// The fog share at this fragment's view depth (0 when the scene has no fog).
+// The fog share at this fragment's view depth (0 when the scene has no fog or the part ignores it).
 float fogShare() {
     vec4 fogColor = joints[0][0];
     vec4 fog = joints[0][1];
-    if (fogColor.w < 0.5) {
+    if (fogColor.w < 0.5 || pc.params.w > 7.5) {
         return 0.0;
     }
     float f = clamp((abs(vDepth) - fog.x) / (fog.y - fog.x + 0.01), 0.0, 1.0);
@@ -78,8 +78,9 @@ vec4 water() {
 
 // params.w: 0 colours as they are, 1 simple lighting (viewer), 2 the remaster's field curve, 3 its sky curve,
 // 4 its water shader (then the field curve).
+// Codes over 7.5 are the same shading without fog.
 void main() {
-    float mode = pc.params.w;
+    float mode = pc.params.w > 7.5 ? pc.params.w - 8.0 : pc.params.w;
     vec4 c;
     if (mode > 3.5) {
         c = water();

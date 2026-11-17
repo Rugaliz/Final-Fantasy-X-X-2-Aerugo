@@ -43,8 +43,10 @@ void main() {
     vec3 n = inNormal;
     // params.w >= 1.5: a field part; params.xy is then its texture scroll instead of joints. 4: water, with
     // params.x its first constant slot.
-    bool field = pc.params.w > 1.5;
-    bool water = pc.params.w > 3.5;
+    // Codes over 7.5 are the same shading without fog.
+    float mode = pc.params.w > 7.5 ? pc.params.w - 8.0 : pc.params.w;
+    bool field = mode > 1.5;
+    bool water = mode > 3.5;
     if (!field && pc.params.y > 0.5) {
         uint base = uint(pc.params.x) + 1u;
         mat4 skin = inWeights.x * joints[base + inJoints.x]

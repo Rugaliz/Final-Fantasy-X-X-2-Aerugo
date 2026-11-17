@@ -116,28 +116,22 @@ fn map_shot() {
         }
     }
     let extent = (model.max - model.min).length() * 10.0;
-    // AERUGO_SHOT_FOG = `distance scale,limit mode (a: l/255, b: (1 − l/255)·0.4, c: 1 − l/255),curve`: the map
-    // package's fog converted that way (for fitting the conversion to captures); unset draws no fog.
-    let fog = std::env::var("AERUGO_SHOT_FOG").ok().and_then(|spec| {
-        let mf = aerugo_sim::field::walk_mesh_path(map)
-            .and_then(|p| vfs.read(&p).ok())
-            .and_then(|d| aerugo_sim::field::MapFog::from_map_package(&d))?;
-        let f: Vec<&str> = spec.split(',').collect();
-        let k: f32 = f[0].parse().unwrap();
-        let l = mf.limit / 255.0;
-        let limit = match f[1] {
-            "a" => l,
-            "b" => (1.0 - l) * 0.4,
-            _ => 1.0 - l,
-        };
-        eprintln!("fog {mf:?} -> limit {limit}");
-        Some(aerugo_gfx::Fog {
-            color: mf.color.map(|c| f32::from(c) / 255.0),
-            near: mf.near * k,
-            far: mf.far * k,
-            curve: f[2].parse().unwrap(),
-            limit,
-        })
+    // The map's fog as the game screen draws it; AERUGO_SHOT_FOG = `none`, or a fixed limit (a number), with an
+    // optional `,k` scaling the fog distances, for fitting to captures.
+    let fog = model.scene.and_then(|s| {
+        let spec = std::env::var("AERUGO_SHOT_FOG").unwrap_or_default();
+        if spec == "none" {
+            return None;
+        }
+        let mut f = assets::scene_fog(&s);
+        let (limit, k) = spec.split_once(',').map_or((spec.as_str(), 1.0), |(l, k)| (l, k.parse().unwrap()));
+        if let Ok(l) = limit.parse() {
+            f.limit = l;
+        }
+        f.near *= k;
+        f.far *= k;
+        eprintln!("fog {f:?}");
+        Some(f)
     });
     let size = size();
     let aspect = size.0 as f32 / size.1 as f32;
@@ -173,7 +167,9 @@ fn map_shot() {
             .render_offscreen(
                 SceneView {
                     view_proj: view_proj.to_cols_array(),
-                    clear: [0.0, 0.0, 0.0, 1.0],
+                    clear: model.scene.map_or([0.0, 0.0, 0.0, 1.0], |s| {
+                        [s.background[0], s.background[1], s.background[2], 1.0]
+                    }),
                     draws: draws.clone(),
                     joints: joints.clone(),
                     culling: std::env::var("AERUGO_SHOT_NOCULL").is_err(),

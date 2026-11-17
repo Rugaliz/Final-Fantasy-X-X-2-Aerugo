@@ -704,6 +704,8 @@ pub struct MeshPart {
     pub uv_scroll: [f32; 2],
     /// Drawn with the remaster's water shader.
     pub water: Option<Water>,
+    /// Takes the scene's fog (field curves only; the remaster's sky variants ignore it).
+    pub fog: bool,
 }
 
 /// Textures a water part samples besides its base texture.
@@ -1613,14 +1615,15 @@ impl SceneState {
                             ],
                             // Field parts (never skinned) take their texture scroll in the joint slots; water
                             // parts their constant slot.
+                            // Shading codes over 7.5 leave out the fog (8 + the code).
                             params: if let Some(&slot) = water_slot.get(&(di, pi)) {
-                                [slot, 0.0, part.alpha_cutoff, 4.0]
+                                [slot, 0.0, part.alpha_cutoff, if part.fog { 4.0 } else { 12.0 }]
                             } else if part.curve != ToneCurve::None && !d.lit {
                                 [
                                     (part.uv_scroll[0] * view.time).fract(),
                                     (part.uv_scroll[1] * view.time).fract(),
                                     part.alpha_cutoff,
-                                    part.curve.code(),
+                                    part.curve.code() + if part.fog { 0.0 } else { 8.0 },
                                 ]
                             } else {
                                 [
