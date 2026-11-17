@@ -390,6 +390,7 @@ impl MapBrowser {
             mirrored: false,
             fog: None,
             time: 0.0,
+            color_correction: l.model.as_ref().and_then(|m| m.color_correction),
         });
     }
 
@@ -629,6 +630,7 @@ mod tests {
                         mirrored: false,
                         fog: None,
                         time: 0.0,
+                        color_correction: None,
                     };
                     let px = renderer.render_offscreen(view, (w, h)).unwrap();
                     let share = edge_clear_share(&px, w, h);

@@ -412,7 +412,12 @@ impl Renderer {
             extent,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::TRANSFER_SRC,
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | if self.ctx.storage_rgba8 {
+                    vk::ImageUsageFlags::STORAGE
+                } else {
+                    vk::ImageUsageFlags::empty()
+                },
             vk::ImageAspectFlags::COLOR,
             Some(vk::Format::R8G8B8A8_SRGB),
         )?;
@@ -493,6 +498,7 @@ impl Renderer {
             if let Some(egui) = self.egui.as_mut() {
                 egui.remove_user_texture(vp.ui_id);
             }
+            self.scene.forget_view(&self.ctx, vp.color.view);
             // SAFETY: callers waited for the device.
             unsafe {
                 self.ctx.device.free_descriptor_sets(self.ui_textures.pool, &[vp.ui_set]).ok();
@@ -515,6 +521,7 @@ impl Renderer {
             vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::GpuToCpu,
         )?;
+        self.scene.pending_table = self.table_view(&view);
         self.scene.pending = Some(view);
         let (ctx, scene) = (&self.ctx, &mut self.scene);
         let mut recorded = Ok(());
@@ -582,7 +589,13 @@ impl Renderer {
 
     /// Draw `view` into the viewport this frame.
     pub fn submit_scene(&mut self, view: SceneView) {
+        self.scene.pending_table = self.table_view(&view);
         self.scene.pending = Some(view);
+    }
+
+    /// The view of a scene's colour-correction table.
+    fn table_view(&self, view: &SceneView) -> Option<vk::ImageView> {
+        view.color_correction.and_then(|h| self.textures.get(&h.0)).map(|e| e.texture.view)
     }
 
     pub fn context(&self) -> &Context {

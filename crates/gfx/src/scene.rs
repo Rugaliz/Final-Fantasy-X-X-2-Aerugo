@@ -10,6 +10,7 @@ use crate::context::Context;
 
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+static CC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/colorcorrect.comp.spv"));
 
 pub const VIEWPORT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -207,8 +208,10 @@ impl Target {
         aspect: vk::ImageAspectFlags,
         alt_format: Option<vk::Format>,
     ) -> Result<Target> {
+        // The alternative view may not support every usage of the image (an sRGB view cannot be a storage
+        // image), so the image allows views with fewer usages.
         let flags = if alt_format.is_some() {
-            vk::ImageCreateFlags::MUTABLE_FORMAT
+            vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE
         } else {
             vk::ImageCreateFlags::empty()
         };
@@ -254,8 +257,12 @@ impl Target {
             // SAFETY: the image is bound.
             t.view = unsafe { ctx.device.create_image_view(&view_info, None) }?;
             if let Some(alt) = alt_format {
-                // SAFETY: the image is bound and was created mutable-format.
-                t.alt_view = unsafe { ctx.device.create_image_view(&view_info.format(alt), None) }?;
+                let mut alt_usage =
+                    vk::ImageViewUsageCreateInfo::default().usage(usage & !vk::ImageUsageFlags::STORAGE);
+                // SAFETY: the image is bound and was created mutable-format with extended usage.
+                t.alt_view = unsafe {
+                    ctx.device.create_image_view(&view_info.format(alt).push_next(&mut alt_usage), None)
+                }?;
             }
             Ok(())
         })();
@@ -771,6 +778,9 @@ pub struct SceneView {
     pub fog: Option<Fog>,
     /// Scene time in seconds (moves UV-animated parts).
     pub time: f32,
+    /// The map's colour-correction table (256×1; each channel of the finished picture is looked up in that
+    /// channel), as the remaster applies it with its colour correction setting on.
+    pub color_correction: Option<crate::renderer::TextureHandle>,
 }
 
 /// The remaster's field fog: the share of fog colour at view depth `d` is
@@ -844,11 +854,158 @@ pub(crate) struct SceneState {
     pub joints: Vec<JointSlot>,
     pub viewport: Option<Viewport>,
     pub pending: Option<SceneView>,
+    /// View of the pending scene's colour-correction table (resolved by the renderer).
+    pub pending_table: Option<vk::ImageView>,
+    /// The colour-correction pass (`None` where the device cannot write RGBA8 images from compute shaders).
+    pub color_correction: Option<ColorCorrection>,
+}
+
+/// Compute pass applying a colour-correction table to the viewport in place.
+#[derive(Debug)]
+pub(crate) struct ColorCorrection {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    /// Clamped, linear (a table lookup).
+    sampler: vk::Sampler,
+    /// Sets by (viewport view, table view).
+    sets: std::collections::HashMap<(vk::ImageView, vk::ImageView), vk::DescriptorSet>,
+}
+
+impl ColorCorrection {
+    fn new(device: &ash::Device) -> Result<ColorCorrection> {
+        let bindings = [
+            (0, vk::DescriptorType::STORAGE_IMAGE),
+            (1, vk::DescriptorType::SAMPLED_IMAGE),
+            (2, vk::DescriptorType::SAMPLER),
+        ]
+        .map(|(b, t)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(t)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        // SAFETY: valid device and create infos; objects made before a failure are left to the device's
+        // destruction (start-up only).
+        unsafe {
+            let set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+            let layouts = [set_layout];
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                None,
+            )?;
+            let module = crate::quad::shader_module(device, CC_SPV)?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0];
+            let sampler = device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?;
+            Ok(ColorCorrection { set_layout, layout, module, pipeline, sampler, sets: Default::default() })
+        }
+    }
+
+    /// The set writing `target` through `table` (created once per pair).
+    fn set(
+        &mut self,
+        ctx: &Context,
+        pool: vk::DescriptorPool,
+        target: vk::ImageView,
+        table: vk::ImageView,
+    ) -> Result<vk::DescriptorSet> {
+        if let Some(&s) = self.sets.get(&(target, table)) {
+            return Ok(s);
+        }
+        let layouts = [self.set_layout];
+        // SAFETY: valid pool and layout.
+        let set = unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
+            )
+        }
+        .context("too many colour-correction tables")?[0];
+        let storage =
+            [vk::DescriptorImageInfo::default().image_view(target).image_layout(vk::ImageLayout::GENERAL)];
+        let sampled = [vk::DescriptorImageInfo::default()
+            .image_view(table)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let sampler = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&storage),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&sampled),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&sampler),
+        ];
+        // SAFETY: the set is new.
+        unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        self.sets.insert((target, table), set);
+        Ok(set)
+    }
+
+    /// Sets that use `view` (either side), removed from the cache.
+    fn take_sets_of(&mut self, view: vk::ImageView) -> Vec<vk::DescriptorSet> {
+        let mut out = Vec::new();
+        self.sets.retain(|&(a, b), s| {
+            let keep = a != view && b != view;
+            if !keep {
+                out.push(*s);
+            }
+            keep
+        });
+        out
+    }
+
+    /// # Safety
+    /// The pass must not be in use; its sets are freed with the pool.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_shader_module(self.module, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+        }
+    }
 }
 
 const SCENE_SETS: u32 = 8192;
+/// The remaster's anisotropic filtering at its high setting.
+const MAX_ANISOTROPY: f32 = 16.0;
 /// Water texture sets (one per distinct combination of textures).
 const EXTRA_SETS: u32 = 256;
+/// Colour-correction sets (one per viewport size and table in use).
+const CC_SETS: u32 = 64;
 
 impl SceneState {
     pub fn new(ctx: &Context, frames: usize) -> Result<SceneState> {
@@ -857,9 +1014,13 @@ impl SceneState {
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32,
+                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32 + CC_SETS,
             },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER, descriptor_count: SCENE_SETS },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: SCENE_SETS + CC_SETS,
+            },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: CC_SETS },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: frames as u32,
@@ -870,7 +1031,7 @@ impl SceneState {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                    .max_sets(SCENE_SETS + EXTRA_SETS + frames as u32)
+                    .max_sets(SCENE_SETS + EXTRA_SETS + CC_SETS + frames as u32)
                     .pool_sizes(&sizes),
                 None,
             )
@@ -882,6 +1043,8 @@ impl SceneState {
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(ctx.max_anisotropy > 1.0)
+            .max_anisotropy(ctx.max_anisotropy.min(MAX_ANISOTROPY))
             .max_lod(vk::LOD_CLAMP_NONE);
         // SAFETY: valid device.
         let sampler = unsafe { device.create_sampler(&sampler_info, None) }?;
@@ -897,6 +1060,8 @@ impl SceneState {
             joints: Vec::new(),
             viewport: None,
             pending: None,
+            pending_table: None,
+            color_correction: if ctx.storage_rgba8 { Some(ColorCorrection::new(device)?) } else { None },
         };
         for _ in 0..frames {
             let slot = state.joint_slot(ctx, 256)?;
@@ -996,6 +1161,9 @@ impl SceneState {
             }
             keep
         });
+        if let Some(cc) = self.color_correction.as_mut() {
+            sets.extend(cc.take_sets_of(view));
+        }
         if !sets.is_empty() {
             // SAFETY: the device is idle (caller), so the sets are unused.
             unsafe { ctx.device.free_descriptor_sets(self.pool, &sets).ok() };
@@ -1125,6 +1293,12 @@ impl SceneState {
                 .subresource_range(depth_range),
         ];
         let extent = vp.extent;
+        // The colour-correction pass for this scene, if it has a table and the device can run it.
+        let table = self.pending_table.take();
+        let correct = match (table, self.color_correction.as_mut()) {
+            (Some(t), Some(cc)) => Some((cc.pipeline, cc.layout, cc.set(ctx, self.pool, vp.color.view, t)?)),
+            _ => None,
+        };
         // SAFETY: `cmd` is recording outside a render pass; all handles belong to this device.
         unsafe {
             device
@@ -1283,12 +1457,42 @@ impl SceneState {
                 }
             }
             device.cmd_end_rendering(cmd);
+            let mut last = (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+            if let Some((pipeline, layout, set)) = correct {
+                let to_general = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(last.0)
+                    .src_access_mask(last.1)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )
+                    .old_layout(last.2)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(vp.color.image)
+                    .subresource_range(color_range)];
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
+                last = (
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
             let to_read = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .src_stage_mask(last.0)
+                .src_access_mask(last.1)
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .old_layout(last.2)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image(vp.color.image)
                 .subresource_range(color_range)];
@@ -1321,6 +1525,9 @@ impl SceneState {
             ctx.device.destroy_sampler(self.sampler, None);
             ctx.device.destroy_descriptor_pool(self.pool, None);
             self.pipeline.destroy(&ctx.device);
+            if let Some(cc) = &self.color_correction {
+                cc.destroy(&ctx.device);
+            }
         }
     }
 }

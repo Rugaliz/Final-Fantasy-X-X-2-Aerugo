@@ -56,6 +56,8 @@ pub struct GpuModel {
     /// Problems that did not stop loading (missing textures, …).
     pub warnings: Vec<String>,
     pub model: Model,
+    /// A map's colour-correction table (see [`aerugo_gfx::SceneView::color_correction`]).
+    pub color_correction: Option<TextureHandle>,
 }
 
 #[derive(Debug)]
@@ -424,6 +426,18 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
         out.max = Vec3::splat(1.0);
     }
     out.model = model;
+    if map
+        && let Some(p) = mesh::color_correction_path(path)
+        && vfs.exists(&p)
+    {
+        match load_texture(vfs, renderer, &p) {
+            Ok(h) => {
+                out.textures.push(h);
+                out.color_correction = Some(h);
+            }
+            Err(e) => out.warnings.push(format!("{p}: {e}")),
+        }
+    }
     Ok(out)
 }
 

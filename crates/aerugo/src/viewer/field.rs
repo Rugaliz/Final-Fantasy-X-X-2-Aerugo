@@ -1137,6 +1137,7 @@ impl FieldView {
             fog: None,
             // Scene time: the event's ticks at 30 a second, plus the share of the next.
             time: (s.event.tick as f32 + alpha) / 30.0,
+            color_correction: s.map.as_ref().and_then(|m| m.color_correction),
         });
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;

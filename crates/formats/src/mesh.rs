@@ -202,6 +202,15 @@ pub fn texture_cluster_path(model_path: &str, asset: &str) -> String {
     }
 }
 
+/// The colour-correction table of the map a map model belongs to (`…/map/<area>/<map>/mdl/d3d11/<name>.phyre` →
+/// `…/map/<area>/<map>/tex/d3d11/<map>_colorcorrection.dds.phyre`); many maps have none.
+pub fn color_correction_path(model_path: &str) -> Option<String> {
+    let lower = model_path.to_ascii_lowercase();
+    let (dir, _) = lower.split_once("/mdl/")?;
+    let map = dir.rsplit('/').next()?;
+    Some(format!("{dir}/tex/d3d11/{map}_colorcorrection.dds.phyre"))
+}
+
 /// Column-major product a × b.
 pub fn mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut out = [0.0; 16];
@@ -452,6 +461,16 @@ pub fn segment_indices(cluster: &Cluster, s: &Segment) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_correction_paths() {
+        assert_eq!(
+            color_correction_path("ffx_data/gamedata/ps3data/map/cdsp/cdsp07/mdl/d3d11/cdsp07.dae.phyre")
+                .as_deref(),
+            Some("ffx_data/gamedata/ps3data/map/cdsp/cdsp07/tex/d3d11/cdsp07_colorcorrection.dds.phyre")
+        );
+        assert_eq!(color_correction_path("ffx_data/gamedata/ps3data/chr/pc/c000.dae.phyre"), None);
+    }
 
     #[test]
     fn texture_paths() {

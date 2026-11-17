@@ -7,7 +7,8 @@
 //! `d,d,…;ty,ty,…` renders one picture per screen distance and vertical clip offset (out-<d>-<ty>.png), for
 //! fitting the projection to a capture; `AERUGO_SHOT_CAMS` = a file of `name;eye;focus;d` lines renders one
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
-//! draws both sides of everything.
+//! draws both sides of everything; `AERUGO_SHOT_NOCC` leaves out the map's colour correction;
+//! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer.
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -48,8 +49,10 @@ fn map_shot() {
     let parts: Vec<&str> = spec.split(';').collect();
     let (map, eye, focus, out) = (parts[0], point(parts[1]), point(parts[2]), parts[4]);
     let screen: f32 = parts[3].parse().unwrap();
+    // AERUGO_SHOT_VALIDATE runs with the Vulkan validation layer and fails on any error it reports.
+    let validate = std::env::var("AERUGO_SHOT_VALIDATE").is_ok();
     let mut renderer =
-        Renderer::new_headless(&ContextOptions { validation: false, preferred_gpu: None }).unwrap();
+        Renderer::new_headless(&ContextOptions { validation: validate, preferred_gpu: None }).unwrap();
     let mut vfs = Vfs::new();
     vfs.mount_install(&inst).unwrap();
     let model = assets::load_map_model(&vfs, &mut renderer, map).unwrap();
@@ -171,6 +174,10 @@ fn map_shot() {
                     mirrored: false,
                     fog,
                     time: std::env::var("AERUGO_SHOT_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0),
+                    // AERUGO_SHOT_NOCC leaves out the map's colour correction.
+                    color_correction: model
+                        .color_correction
+                        .filter(|_| std::env::var("AERUGO_SHOT_NOCC").is_err()),
                 },
                 size,
             )
@@ -185,5 +192,8 @@ fn map_shot() {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).unwrap();
+    }
+    if validate {
+        assert_eq!(aerugo_gfx::validation_error_count(), 0, "Vulkan validation errors (see stderr)");
     }
 }

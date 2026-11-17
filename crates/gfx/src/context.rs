@@ -32,6 +32,10 @@ pub struct Context {
     pub queue_family: u32,
     pub queue: vk::Queue,
     pub allocator: Option<Arc<Mutex<Allocator>>>,
+    /// Largest sampler anisotropy the device allows (1 without anisotropic filtering).
+    pub max_anisotropy: f32,
+    /// RGBA8 images can be written from compute shaders (post-processing in place).
+    pub storage_rgba8: bool,
 }
 
 impl std::fmt::Debug for Context {
@@ -138,8 +142,21 @@ impl Context {
             if surface_fn.is_some() { vec![ash::khr::swapchain::NAME.as_ptr()] } else { vec![] };
         let mut features13 =
             vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
-        // The games' textures are BC1–BC3; every desktop GPU supports them.
-        let core = vk::PhysicalDeviceFeatures::default().texture_compression_bc(true);
+        // The games' textures are BC1–BC3; every desktop GPU supports them. Anisotropic filtering where available
+        // (the remaster's high setting is 16×).
+        // SAFETY: valid physical device.
+        let supported = unsafe { instance.get_physical_device_features(physical_device) };
+        // SAFETY: as above.
+        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let anisotropy = supported.sampler_anisotropy == vk::TRUE;
+        let max_anisotropy = if anisotropy { limits.max_sampler_anisotropy.max(1.0) } else { 1.0 };
+        // SAFETY: as above.
+        let rgba8 = unsafe {
+            instance.get_physical_device_format_properties(physical_device, vk::Format::R8G8B8A8_UNORM)
+        };
+        let storage_rgba8 = rgba8.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
+        let core =
+            vk::PhysicalDeviceFeatures::default().texture_compression_bc(true).sampler_anisotropy(anisotropy);
         let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -174,6 +191,8 @@ impl Context {
             queue_family,
             queue,
             allocator: Some(Arc::new(Mutex::new(allocator))),
+            max_anisotropy,
+            storage_rgba8,
         })
     }
 
