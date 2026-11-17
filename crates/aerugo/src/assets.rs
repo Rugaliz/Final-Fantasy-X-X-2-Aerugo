@@ -232,7 +232,9 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
     let mut effect_cache: HashMap<String, (Option<MaterialState>, bool, bool)> = HashMap::new();
     let game = game_of_path(path);
     for (source, m) in model.meshes.iter().enumerate() {
-        let world = Mat4::from_cols_array(&m.world);
+        // The remaster draws a map's sky objects (draw object kind 1) without their node's scale and offset:
+        // with them the opening's sky shows its bright cloud band far higher than the captures do.
+        let world = if map && m.kind == 1 { Mat4::IDENTITY } else { Mat4::from_cols_array(&m.world) };
         let mut part_segments = Vec::new();
         let mut part_effects = Vec::new();
         let mut vertices: Vec<SceneVertex> = Vec::new();

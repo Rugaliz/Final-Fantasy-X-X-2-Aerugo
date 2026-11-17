@@ -162,6 +162,8 @@ pub struct Mesh {
     pub materials: Vec<Material>,
     pub bounds_min: [f32; 3],
     pub bounds_size: [f32; 3],
+    /// The PS2 draw object kind (`m_DObjKind`): 1 marks a map's sky objects.
+    pub kind: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -477,6 +479,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             .and_then(|b| Some((cluster.floats(b, "m_min", 3)?, cluster.floats(b, "m_size", 3)?)))
             .map(|(a, b)| ([a[0], a[1], a[2]], [b[0], b[1], b[2]]))
             .unwrap_or(([0.0; 3], [0.0; 3]));
+        let kind = cluster.u32(inst, "m_DObjKind").unwrap_or(0) as i32;
         meshes.push(Mesh {
             name: cluster.string(inst, "m_name").unwrap_or_default(),
             instance: inst,
@@ -486,6 +489,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             materials,
             bounds_min,
             bounds_size,
+            kind,
         });
     }
     Ok(Model { meshes })
