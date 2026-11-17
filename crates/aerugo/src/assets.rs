@@ -407,6 +407,8 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 alpha_cutoff: match (curve, alpha_test) {
                     (ToneCurve::Sky, _) => 0.0,
                     (ToneCurve::Field, true) => 0.5,
+                    // Blended map parts whose shader never discards keep every pixel (faint ones blend in).
+                    (ToneCurve::Field, false) if material.blend.is_some() => 0.0,
                     _ if character => scalar("AlphaThreshold"),
                     _ => 0.3,
                 },
