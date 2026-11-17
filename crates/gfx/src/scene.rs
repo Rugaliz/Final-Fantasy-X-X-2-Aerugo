@@ -207,6 +207,7 @@ impl Target {
         usage: vk::ImageUsageFlags,
         aspect: vk::ImageAspectFlags,
         alt_format: Option<vk::Format>,
+        samples: vk::SampleCountFlags,
     ) -> Result<Target> {
         // The alternative view may not support every usage of the image (an sRGB view cannot be a storage
         // image), so the image allows views with fewer usages.
@@ -222,7 +223,7 @@ impl Target {
             .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
@@ -458,6 +459,8 @@ pub(crate) struct ScenePipeline {
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
     pipelines: std::collections::HashMap<PipelineKey, vk::Pipeline>,
+    /// Samples per pixel of the targets the pipelines draw into.
+    samples: vk::SampleCountFlags,
 }
 
 impl ScenePipeline {
@@ -532,6 +535,7 @@ impl ScenePipeline {
             vert,
             frag,
             pipelines: Default::default(),
+            samples: vk::SampleCountFlags::TYPE_1,
         };
         p.get(device, &MaterialState::default())?;
         Ok(p)
@@ -543,6 +547,32 @@ impl ScenePipeline {
         if let Some(&p) = self.pipelines.get(&key) {
             return Ok(p);
         }
+        let pipeline = self.build(device, key)?;
+        self.pipelines.insert(key, pipeline);
+        Ok(pipeline)
+    }
+
+    /// Rebuild every pipeline for targets with `samples` per pixel.
+    ///
+    /// # Safety
+    /// No pipeline may be in use.
+    pub unsafe fn set_samples(&mut self, device: &ash::Device, samples: vk::SampleCountFlags) -> Result<()> {
+        if samples == self.samples {
+            return Ok(());
+        }
+        self.samples = samples;
+        let keys: Vec<PipelineKey> = self.pipelines.keys().copied().collect();
+        for key in keys {
+            let fresh = self.build(device, key)?;
+            if let Some(old) = self.pipelines.insert(key, fresh) {
+                // SAFETY: guaranteed by the caller.
+                unsafe { device.destroy_pipeline(old, None) };
+            }
+        }
+        Ok(())
+    }
+
+    fn build(&self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
         let (vert, frag, layout) = (self.vert, self.frag, self.layout);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -585,8 +615,8 @@ impl ScenePipeline {
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::NONE)
             .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample =
+            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(self.samples);
         let depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -632,7 +662,6 @@ impl ScenePipeline {
         // SAFETY: all referenced objects are valid for the call.
         let pipeline = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
             .map_err(|(_, e)| e)?[0];
-        self.pipelines.insert(key, pipeline);
         Ok(pipeline)
     }
 
@@ -831,6 +860,9 @@ pub(crate) struct JointSlot {
 #[derive(Debug)]
 pub(crate) struct Viewport {
     pub color: Target,
+    /// The multisampled colour target, resolved into `color` (with MSAA on).
+    pub msaa_color: Option<Target>,
+    /// Depth, with as many samples as the colour target drawn into.
     pub depth: Target,
     pub extent: vk::Extent2D,
     pub ui_set: vk::DescriptorSet,
@@ -1269,7 +1301,7 @@ impl SceneState {
         };
         let depth_range =
             vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::DEPTH, ..color_range };
-        let barriers = [
+        let mut barriers = vec![
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .src_access_mask(vk::AccessFlags2::NONE)
@@ -1292,6 +1324,19 @@ impl SceneState {
                 .image(vp.depth.image)
                 .subresource_range(depth_range),
         ];
+        if let Some(ms) = &vp.msaa_color {
+            barriers.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(ms.image)
+                    .subresource_range(color_range),
+            );
+        }
         let extent = vp.extent;
         // The colour-correction pass for this scene, if it has a table and the device can run it.
         let table = self.pending_table.take();
@@ -1303,12 +1348,20 @@ impl SceneState {
         unsafe {
             device
                 .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&barriers));
-            let color = [vk::RenderingAttachmentInfo::default()
-                .image_view(vp.color.view)
+            let attachment = vk::RenderingAttachmentInfo::default()
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: view.clear } })];
+                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: view.clear } });
+            // With MSAA the samples are averaged into the viewport image at the end of the pass.
+            let color = [match &vp.msaa_color {
+                Some(ms) => attachment
+                    .image_view(ms.view)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(vp.color.view)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                None => attachment.image_view(vp.color.view).store_op(vk::AttachmentStoreOp::STORE),
+            }];
             let depth = vk::RenderingAttachmentInfo::default()
                 .image_view(vp.depth.view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -1517,6 +1570,9 @@ impl SceneState {
             // SAFETY: the device is idle.
             unsafe {
                 vp.color.destroy(ctx);
+                if let Some(mut m) = vp.msaa_color.take() {
+                    m.destroy(ctx);
+                }
                 vp.depth.destroy(ctx);
             }
         }

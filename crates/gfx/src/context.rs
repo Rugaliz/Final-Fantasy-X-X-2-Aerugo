@@ -36,6 +36,8 @@ pub struct Context {
     pub max_anisotropy: f32,
     /// RGBA8 images can be written from compute shaders (post-processing in place).
     pub storage_rgba8: bool,
+    /// Sample counts usable for multisampled colour and depth targets together.
+    pub msaa_counts: vk::SampleCountFlags,
 }
 
 impl std::fmt::Debug for Context {
@@ -155,6 +157,7 @@ impl Context {
             instance.get_physical_device_format_properties(physical_device, vk::Format::R8G8B8A8_UNORM)
         };
         let storage_rgba8 = rgba8.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
+        let msaa_counts = limits.framebuffer_color_sample_counts & limits.framebuffer_depth_sample_counts;
         let core =
             vk::PhysicalDeviceFeatures::default().texture_compression_bc(true).sampler_anisotropy(anisotropy);
         let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core);
@@ -193,6 +196,7 @@ impl Context {
             allocator: Some(Arc::new(Mutex::new(allocator))),
             max_anisotropy,
             storage_rgba8,
+            msaa_counts,
         })
     }
 

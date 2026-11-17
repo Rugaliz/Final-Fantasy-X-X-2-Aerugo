@@ -124,7 +124,7 @@ impl App {
             PresentMode::from_name(&settings.graphics.present_mode).unwrap_or(PresentMode::Fifo);
         let gpu = Some(settings.graphics.gpu.clone()).filter(|g| !g.is_empty());
         let extensions = platform.vulkan_instance_extensions()?;
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             &platform.window,
             &extensions,
             platform.drawable_size(),
@@ -132,6 +132,10 @@ impl App {
             &ContextOptions { validation: settings.graphics.validation, preferred_gpu: gpu },
         )?;
         log::info!("renderer ready on {}", renderer.device_name());
+        match renderer.set_msaa(settings.graphics.msaa) {
+            Ok(n) => log::info!("3D view multisampling: {n}×"),
+            Err(e) => log::warn!("multisampling: {e:#}"),
+        }
 
         let mut egui = EguiSdl::new();
         egui.ui_scale = settings.ui.scale;
@@ -405,6 +409,11 @@ impl App {
         if new.graphics.frame_limit != old.graphics.frame_limit {
             self.limiter.set_limit(Some(new.graphics.frame_limit));
         }
+        if new.graphics.msaa != old.graphics.msaa
+            && let Err(e) = self.renderer.set_msaa(new.graphics.msaa)
+        {
+            log::warn!("multisampling: {e:#}");
+        }
         if new.ui.scale != old.ui.scale {
             self.egui.ui_scale = new.ui.scale;
         }
@@ -460,6 +469,7 @@ fn without_untouched_overrides(current: &Settings, launch: &Settings, file: &Set
             &launch.graphics.validation,
             &file.graphics.validation,
         ),
+        msaa: keep(&current.graphics.msaa, &launch.graphics.msaa, &file.graphics.msaa),
     };
     out.game.dir = keep(&current.game.dir, &launch.game.dir, &file.game.dir);
     out
@@ -579,6 +589,15 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, info: &RenderInfo) {
     ui.checkbox(&mut settings.window.fullscreen, "Fullscreen (F11)");
     present_mode_combo(ui, settings, info);
     frame_limit_combo(ui, settings);
+    let label = |n: u32| if n <= 1 { "Off".to_owned() } else { format!("{n}×") };
+    egui::ComboBox::from_label("Anti-aliasing (MSAA)").selected_text(label(settings.graphics.msaa)).show_ui(
+        ui,
+        |ui| {
+            for n in [1, 2, 4, 8] {
+                ui.selectable_value(&mut settings.graphics.msaa, n, label(n));
+            }
+        },
+    );
     ui.add(egui::Slider::new(&mut settings.ui.scale, 0.5..=3.0).text("Interface scale"));
 
     ui.separator();

@@ -134,6 +134,8 @@ pub struct Renderer {
     /// What water parts sample where a texture is missing (black, flat normal, flat normal, white cube); parts
     /// without water bind these too.
     water_defaults: Option<[TextureHandle; crate::scene::WATER_TEXTURES]>,
+    /// Samples per pixel of the 3D viewport (1 = no multisampling).
+    samples: vk::SampleCountFlags,
     textures: HashMap<u64, TextureEntry>,
     next_texture: u64,
     wanted_size: (u32, u32),
@@ -239,6 +241,7 @@ impl Renderer {
             scene,
             white: None,
             water_defaults: None,
+            samples: vk::SampleCountFlags::TYPE_1,
             textures: HashMap::new(),
             next_texture: 1,
             wanted_size: size,
@@ -392,6 +395,25 @@ impl Renderer {
         self.scene.destroy_mesh(&self.ctx, mesh);
     }
 
+    /// Multisample the 3D viewport with up to `samples` per pixel (1 turns it off; the remaster's high setting is
+    /// 8). Takes the largest count the device supports up to that; returns the count in use.
+    pub fn set_msaa(&mut self, samples: u32) -> Result<u32> {
+        let wanted = samples.clamp(1, 64).next_power_of_two();
+        let count = [64u32, 32, 16, 8, 4, 2]
+            .into_iter()
+            .find(|&n| n <= wanted && self.ctx.msaa_counts.contains(vk::SampleCountFlags::from_raw(n)))
+            .unwrap_or(1);
+        let flags = vk::SampleCountFlags::from_raw(count);
+        if flags != self.samples {
+            self.ctx.wait_idle();
+            self.drop_viewport();
+            // SAFETY: the device is idle, so no pipeline is in use.
+            unsafe { self.scene.pipeline.set_samples(&self.ctx.device, flags) }?;
+            self.samples = flags;
+        }
+        Ok(count)
+    }
+
     /// The UI texture showing the 3D viewport, (re)created at `size` pixels.
     pub fn viewport_texture(&mut self, size: (u32, u32)) -> Result<egui::TextureId> {
         let extent = vk::Extent2D { width: size.0.clamp(1, 16384), height: size.1.clamp(1, 16384) };
@@ -420,7 +442,28 @@ impl Renderer {
                 },
             vk::ImageAspectFlags::COLOR,
             Some(vk::Format::R8G8B8A8_SRGB),
+            vk::SampleCountFlags::TYPE_1,
         )?;
+        let samples = self.samples;
+        let msaa = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            Target::new(
+                ctx,
+                VIEWPORT_FORMAT,
+                extent,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                None,
+                samples,
+            )
+        });
+        let msaa_color = match msaa.transpose() {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: never used.
+                unsafe { color.destroy(ctx) };
+                return Err(e);
+            }
+        };
         let depth = match Target::new(
             ctx,
             DEPTH_FORMAT,
@@ -428,11 +471,17 @@ impl Renderer {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::ImageAspectFlags::DEPTH,
             None,
+            samples,
         ) {
             Ok(d) => d,
             Err(e) => {
                 // SAFETY: never used.
-                unsafe { color.destroy(ctx) };
+                unsafe {
+                    color.destroy(ctx);
+                    if let Some(mut m) = msaa_color {
+                        m.destroy(ctx);
+                    }
+                }
                 return Err(e);
             }
         };
@@ -476,6 +525,7 @@ impl Renderer {
         let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
         self.scene.viewport = Some(Viewport {
             color,
+            msaa_color,
             depth,
             extent,
             ui_set: set,
@@ -503,6 +553,9 @@ impl Renderer {
             unsafe {
                 self.ctx.device.free_descriptor_sets(self.ui_textures.pool, &[vp.ui_set]).ok();
                 vp.color.destroy(&self.ctx);
+                if let Some(mut m) = vp.msaa_color.take() {
+                    m.destroy(&self.ctx);
+                }
                 vp.depth.destroy(&self.ctx);
             }
         }

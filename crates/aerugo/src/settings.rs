@@ -34,6 +34,8 @@ pub struct GraphicsSettings {
     /// Prefer the GPU whose name contains this text; empty = automatic.
     pub gpu: String,
     pub validation: bool,
+    /// Multisample anti-aliasing of the 3D view, in samples per pixel (1 = off; the remaster's high setting is 8).
+    pub msaa: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,7 +102,7 @@ impl Default for WindowSettings {
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        Self { present_mode: "fifo".into(), frame_limit: 0, gpu: String::new(), validation: false }
+        Self { present_mode: "fifo".into(), frame_limit: 0, gpu: String::new(), validation: false, msaa: 8 }
     }
 }
 
