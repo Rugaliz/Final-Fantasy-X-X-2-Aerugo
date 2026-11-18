@@ -78,11 +78,11 @@ pub struct Actor {
     /// Facing pitch, and the pitch moves in space go along.
     pub pitch: f32,
     pub move_pitch: f32,
-    /// How lit the character is (its material colour is × shade × 0.85 + 0.15): 1, or what native 5088 set, or for
-    /// the party the walk mesh's shade where they stand.
+    /// How lit the character is (its material colour is × shade × 0.85 + 0.15): the walk mesh's shade where it
+    /// stands, or what native 5088 set while that is off.
     pub shade: Eased,
-    /// Native 5088 set the shade (the walk mesh no longer does).
-    pub shade_set: bool,
+    /// The shade follows the walk mesh (on for every character; native 5060 switches it).
+    pub shade_from_ground: bool,
     /// The character's colour and alpha (natives 5015 and 5033): its material colour and its shade colour; alpha 0
     /// hides it.
     pub color: [Eased; 4],
@@ -123,7 +123,7 @@ impl Default for Actor {
             pitch: 0.0,
             move_pitch: 0.0,
             shade: Eased::new(1.0),
-            shade_set: false,
+            shade_from_ground: true,
             color: [Eased::new(1.0); 4],
         }
     }
@@ -981,10 +981,9 @@ impl FieldState {
             for c in &mut a.color {
                 c.tick();
             }
-            // The party take their shade from the walk mesh (the original does for characters whose data asks
-            // for it; which do is not read yet).
-            if !a.shade_set
-                && a.model.is_some_and(|m| m >> 12 == 0)
+            // Characters take their shade from the walk mesh where they stand, unless a script switched it off.
+            if a.shade_from_ground
+                && a.model.is_some()
                 && let Some(s) = self.ground.as_ref().and_then(|g| g.shade_at(a.pos))
             {
                 a.shade = Eased::new(s);
@@ -1892,9 +1891,17 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             let frames = c.stack.pop_int();
             let shade = c.stack.pop_float();
             let w = c.worker;
-            let a = g.actor(w);
-            a.shade.set(shade, frames);
-            a.shade_set = true;
+            g.actor(w).shade.set(shade, frames);
+            Value::Int(0)
+        }),
+    );
+    // Whether a character's shade follows the walk mesh.
+    n.register(
+        0x5060,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            let w = c.worker;
+            g.actor(w).shade_from_ground = on;
             Value::Int(0)
         }),
     );

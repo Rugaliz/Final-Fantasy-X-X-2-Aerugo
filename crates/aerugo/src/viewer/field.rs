@@ -1165,9 +1165,8 @@ impl FieldView {
             }),
             // Scene time: the event's ticks at 30 a second, plus the share of the next.
             time: (s.event.tick as f32 + alpha) / 30.0,
-            // A map's colour-correction table is set from event code in the remaster (callers of its setter are
-            // scene code, not map loading); the cdsp07 capture shows the table not applied. Off until those
-            // events are ported.
+            // The remaster loads a map's colour-correction table but switches the pass off at start-up; only its
+            // debug tweak menu turns it on (the cdsp07 capture shows the table not applied).
             color_correction: None,
             glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
             character_light: self.game.then(|| {
