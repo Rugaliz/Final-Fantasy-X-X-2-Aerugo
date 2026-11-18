@@ -1165,7 +1165,17 @@ impl FieldView {
                 // The remaster's run-time material colour: the character's colour × (shade × 0.85 + 0.15); the
                 // colour is also its shade colour.
                 let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
-                let k = a.shade.value * 0.85 + 0.15;
+                // The walk-mesh shade is taken where the character is drawn: for an event motion that is where
+                // its root (joint 1) has carried it, not the actor's own position.
+                let shade = pose
+                    .filter(|_| event_motion && a.shade_from_ground)
+                    .and_then(|(m, t, sc)| {
+                        let root = m.joint_at(1, t).translation;
+                        let at = [pos[0] + root[0] * sc, pos[1] + root[1] * sc, pos[2] + root[2] * sc];
+                        st.ground.as_ref().and_then(|g| g.shade_at(at))
+                    })
+                    .unwrap_or(a.shade.value);
+                let k = shade * 0.85 + 0.15;
                 let tint = self.game.then_some(aerugo_gfx::CharacterTint {
                     material: rgb.map(|c| c * k),
                     shade: rgb,
