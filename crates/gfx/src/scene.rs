@@ -437,6 +437,9 @@ pub struct MaterialState {
     pub depth_compare: CompareOp,
     /// Writes the normal target (opaque map parts and characters, as the remaster's shaders that output one).
     pub normals: bool,
+    /// With multisampling, the fragment's alpha sets its coverage and the alpha test is skipped (the remaster's
+    /// multisampled passes; without multisampling they alpha-test).
+    pub alpha_to_coverage: bool,
 }
 
 impl Default for MaterialState {
@@ -451,6 +454,7 @@ impl Default for MaterialState {
             depth_write: true,
             depth_compare: CompareOp::LessOrEqual,
             normals: false,
+            alpha_to_coverage: false,
         }
     }
 }
@@ -461,11 +465,17 @@ pub(crate) struct PipelineKey {
     blend: Option<BlendState>,
     write_mask: u8,
     normals: bool,
+    alpha_to_coverage: bool,
 }
 
 impl From<&MaterialState> for PipelineKey {
     fn from(m: &MaterialState) -> PipelineKey {
-        PipelineKey { blend: m.blend, write_mask: m.write_mask, normals: m.normals }
+        PipelineKey {
+            blend: m.blend,
+            write_mask: m.write_mask,
+            normals: m.normals,
+            alpha_to_coverage: m.alpha_to_coverage,
+        }
     }
 }
 
@@ -636,8 +646,9 @@ impl ScenePipeline {
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::NONE)
             .line_width(1.0);
-        let multisample =
-            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(self.samples);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(self.samples)
+            .alpha_to_coverage_enable(key.alpha_to_coverage && self.samples != vk::SampleCountFlags::TYPE_1);
         let depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -2002,6 +2013,14 @@ impl SceneState {
                         let fade =
                             MaterialState { blend: Some(BlendState::FAKE_TRANSPARENT), ..part.material };
                         let mat = if faded && part.material.blend.is_none() { &fade } else { &part.material };
+                        // Coverage from alpha replaces the alpha test when multisampling.
+                        let cutoff = if mat.alpha_to_coverage
+                            && self.pipeline.samples != vk::SampleCountFlags::TYPE_1
+                        {
+                            0.0
+                        } else {
+                            part.alpha_cutoff
+                        };
                         let Some(&pipeline) = self.pipeline.pipelines.get(&PipelineKey::from(mat)) else {
                             continue;
                         };
@@ -2038,12 +2057,12 @@ impl SceneState {
                             // Shading codes over 7.5 leave out the fog (8 + the code).
                             params: if let Some(&slot) = water_slot.get(&(di, pi)) {
                                 let code = if part.water.is_some_and(|w| w.ice) { 5.0 } else { 4.0 };
-                                [slot, 0.0, part.alpha_cutoff, code + if part.fog { 0.0 } else { 8.0 }]
+                                [slot, 0.0, cutoff, code + if part.fog { 0.0 } else { 8.0 }]
                             } else if part.curve != ToneCurve::None && !d.lit {
                                 [
                                     (part.uv_scroll[0] * view.time).fract(),
                                     (part.uv_scroll[1] * view.time).fract(),
-                                    part.alpha_cutoff,
+                                    cutoff,
                                     part.curve.code() + if part.fog { 0.0 } else { 8.0 },
                                 ]
                             } else {
@@ -2056,7 +2075,7 @@ impl SceneState {
                                 [
                                     d.joint_base.unwrap_or(0) as f32,
                                     y,
-                                    part.alpha_cutoff,
+                                    cutoff,
                                     if d.lit {
                                         1.0
                                     } else {

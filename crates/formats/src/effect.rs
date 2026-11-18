@@ -132,6 +132,8 @@ pub struct PassState {
     pub blend: Option<Blend>,
     /// RGBA write mask (bit 0 = red).
     pub write_mask: u8,
+    /// Alpha to coverage (the remaster's multisampled passes use it where their no-MSAA twins alpha-test).
+    pub alpha_to_coverage: bool,
 }
 
 impl Default for PassState {
@@ -144,6 +146,7 @@ impl Default for PassState {
             depth_compare: Compare::LessEqual,
             blend: None,
             write_mask: 0xF,
+            alpha_to_coverage: false,
         }
     }
 }
@@ -222,6 +225,7 @@ fn pass_state(c: &Cluster, pass: ObjectId) -> PassState {
             .and_then(|b| b.first().copied())
             .unwrap_or(0xF)
             & 0xF,
+        alpha_to_coverage: u("m_blendDesc.AlphaToCoverageEnable").unwrap_or(0) != 0,
     }
 }
 

@@ -176,6 +176,7 @@ pub fn material_state(p: &PassState) -> MaterialState {
             Compare::Always => CompareOp::Always,
         },
         normals: false,
+        alpha_to_coverage: p.alpha_to_coverage,
     }
 }
 
@@ -546,8 +547,10 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 uv_scroll,
                 // Map shaders that alpha-test discard where the texture's alpha is under the material's threshold
                 // (the additive effects shader tests it × the material colour's alpha); the others keep every
-                // pixel.
+                // pixel. The character shader's opaque pass never alpha-tests; its transparent one tests texture ×
+                // vertex alpha against the threshold.
                 alpha_cutoff: match family.as_str() {
+                    _ if character && material.blend.is_none() => 0.0,
                     _ if character => scalar("AlphaThreshold"),
                     _ if !map => 0.3,
                     _ if !alpha_test => 0.0,
