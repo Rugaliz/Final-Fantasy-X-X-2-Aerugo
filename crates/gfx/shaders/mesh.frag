@@ -1,6 +1,6 @@
 #version 450
 // Base texture × vertex colour, alpha test, simple two-sided lambert lighting (viewer), the remaster's field and
-// sky colour curves and its water shader.
+// sky colour curves and its water and ice shaders.
 
 layout(location = 0) in vec2 vUv;
 layout(location = 1) in vec4 vColor;
@@ -20,7 +20,7 @@ layout(set = 1, binding = 0) readonly buffer Joints {
     mat4 joints[];
 };
 
-// Water: second base texture, two normal maps, cube map.
+// Water: second base texture, two normal maps, cube map. Ice: specular map, (unused), (unused), cube map.
 layout(set = 2, binding = 0) uniform texture2D secondTexture;
 layout(set = 2, binding = 1) uniform texture2D normalMap1;
 layout(set = 2, binding = 2) uniform texture2D normalMap2;
@@ -78,17 +78,40 @@ vec4 water() {
     return clamp(c * w1[0], 0.0, 1.0);
 }
 
+// The remaster's ice shader: texture × colour × cube(n) + cube(reflect(view, n)) × shininess × specular map,
+// then × vertex colour, fog, colour scale (the sky curve follows).
+vec4 ice() {
+    mat4 w0 = joints[uint(pc.params.x)];
+    mat4 w1 = joints[uint(pc.params.x) + 1u];
+    vec3 n = normalize(vNormal);
+    vec3 v = normalize(vWorld - joints[0][2].xyz);
+    vec3 r = v - 2.0 * dot(v, n) * n;
+    vec4 env = texture(samplerCube(cubeMap, baseSampler), mapDir(n));
+    vec4 refl = texture(samplerCube(cubeMap, baseSampler), mapDir(r)) * w0[2].w
+              * texture(sampler2D(secondTexture, baseSampler), vUv);
+    vec4 c = texture(sampler2D(baseTexture, baseSampler), vUv) * w0[3] * env + refl;
+    vec3 toFog = joints[0][0].rgb - c.rgb * vColor.rgb;
+    c *= vColor;
+    c.rgb += w1[1].rgb * toFog * fogShare();
+    return c * w1[0];
+}
+
 // params.w: 0 colours as they are, 1 simple lighting (viewer), 2 the remaster's field curve, 3 its sky curve,
-// 4 its water shader (then the field curve).
+// 4 its water shader (then the field curve), 5 its ice shader (then the sky curve), 6 map shading without a curve
+// (clamped to 1).
 // Codes over 7.5 are the same shading without fog.
 void main() {
     float mode = pc.params.w > 7.5 ? pc.params.w - 8.0 : pc.params.w;
     vec4 c;
-    if (mode > 3.5) {
+    if (mode > 4.5 && mode < 5.5) {
+        c = ice();
+    } else if (mode > 3.5 && mode < 4.5) {
         c = water();
     } else {
-        c = texture(sampler2D(baseTexture, baseSampler), vUv) * vColor;
-        if (c.a < pc.params.z) {
+        vec4 t = texture(sampler2D(baseTexture, baseSampler), vUv);
+        c = t * vColor;
+        // The field shaders test the texture's own alpha; characters and the rest the coloured one.
+        if ((mode > 1.5 ? t.a : c.a) < pc.params.z) {
             discard;
         }
     }
@@ -98,7 +121,7 @@ void main() {
         float d = abs(dot(n, normalize(vec3(0.4, 0.8, 0.45))));
         rgb *= 0.45 + 0.65 * d;
     }
-    if (mode > 1.5 && mode < 3.5) {
+    if ((mode > 1.5 && mode < 3.5) || mode > 5.5) {
         rgb += (joints[0][0].rgb - rgb) * fogShare();
     }
     // Characters (no tone curve of their own) fade toward the fog colour as the field curve shows it.
@@ -107,8 +130,10 @@ void main() {
         vec3 fog = min(f, vec3(0.4)) * 2.1 + clamp(f, vec3(0.4), vec3(0.58)) * 1.08 - 0.47;
         rgb += (fog - rgb) * fogShare();
     }
-    if ((mode > 1.5 && mode < 2.5) || mode > 3.5) {
+    if ((mode > 1.5 && mode < 2.5) || (mode > 3.5 && mode < 4.5)) {
         rgb = min(rgb, vec3(0.4)) * 2.1 + clamp(rgb, vec3(0.4), vec3(0.58)) * 1.08 - 0.47;
+    } else if (mode > 5.5) {
+        rgb = min(rgb, vec3(1.0));
     } else if (mode > 2.5) {
         vec3 s = clamp(rgb, 0.0, 1.0);
         s = min(s * 0.3 + pow(s, vec3(0.588235)), vec3(1.0));

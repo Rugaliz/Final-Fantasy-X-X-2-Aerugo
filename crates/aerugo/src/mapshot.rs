@@ -118,6 +118,8 @@ fn map_shot() {
         }
     }
     let extent = (model.max - model.min).length() * 10.0;
+    let (lo, hi) = (map_place().transform_point3(model.min), map_place().transform_point3(model.max));
+    eprintln!("map bounds (game units) {:?} .. {:?}", lo.min(hi), lo.max(hi));
     // The map's fog as the game screen draws it; AERUGO_SHOT_FOG = `none`, or a fixed limit (a number), with an
     // optional `,k` scaling the fog distances, for fitting to captures.
     let fog = model.scene.and_then(|s| {

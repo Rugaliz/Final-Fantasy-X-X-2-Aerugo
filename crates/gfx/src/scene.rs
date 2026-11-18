@@ -732,8 +732,13 @@ pub const WATER_TEXTURES: usize = 4;
 /// What the remaster's water shader adds to a part: c = (base + (0,0,0,1) + second texture) × colour × cube(n) +
 /// cube(reflect(view, n)) × specular, with n from two scrolling normal maps; then × vertex colour, fog, colour
 /// scale and the field curve.
+///
+/// Its ice shader takes the same constants: c = base × colour × cube(n) + cube(reflect(view, n)) × shininess ×
+/// specular map, with the vertex normal; then × vertex colour, fog, colour scale and the sky curve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Water {
+    /// Drawn with the ice shader (textures: specular map, unused, unused, cube map).
+    pub ice: bool,
     /// Second base texture, first and second normal map, cube map (`None` uses neutral defaults).
     pub textures: [Option<crate::renderer::TextureHandle>; WATER_TEXTURES],
     /// Texture scroll per second: base, second base, normal map 1, normal map 2 (u, v each).
@@ -776,8 +781,10 @@ pub enum ToneCurve {
     /// Lit map and water shaders: per channel 2.1·min(c, 0.4) + 1.08·clamp(c, 0.4, 0.58) − 0.47 (about twice
     /// as bright up to 0.4, then a shoulder to 1).
     Field,
-    /// The UV-animated sky: c' = min(0.3·c + c^(1/1.7), 1), then 0.5 − 0.5·cos(π·c').
+    /// The sky, ice and additive effect shaders: c' = min(0.3·c + c^(1/1.7), 1), then 0.5 − 0.5·cos(π·c').
     Sky,
+    /// Map shaders without a curve: colours clamped to 1 (fog and alpha test as the field curve's).
+    Clamp,
 }
 
 impl ToneCurve {
@@ -786,6 +793,7 @@ impl ToneCurve {
             ToneCurve::None => 0.0,
             ToneCurve::Field => 2.0,
             ToneCurve::Sky => 3.0,
+            ToneCurve::Clamp => 6.0,
         }
     }
 }
@@ -1933,7 +1941,8 @@ impl SceneState {
                             // parts their constant slot.
                             // Shading codes over 7.5 leave out the fog (8 + the code).
                             params: if let Some(&slot) = water_slot.get(&(di, pi)) {
-                                [slot, 0.0, part.alpha_cutoff, if part.fog { 4.0 } else { 12.0 }]
+                                let code = if part.water.is_some_and(|w| w.ice) { 5.0 } else { 4.0 };
+                                [slot, 0.0, part.alpha_cutoff, code + if part.fog { 0.0 } else { 8.0 }]
                             } else if part.curve != ToneCurve::None && !d.lit {
                                 [
                                     (part.uv_scroll[0] * view.time).fract(),

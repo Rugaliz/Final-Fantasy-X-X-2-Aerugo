@@ -191,14 +191,63 @@ pub fn load_effect(vfs: &Vfs, game: Game, id: &str) -> Option<Effect> {
     effect::read_effect(&cluster)
 }
 
-/// Whether an effect's compiled shaders contain an alpha test (a DXBC `discard` instruction token, either
-/// condition), which the remaster uses only in some variants.
-fn effect_discards(vfs: &Vfs, game: Game, id: &str) -> bool {
+/// What an effect's compiled pixel shaders do that the renderer copies (both vary by variant, not by family).
+#[derive(Debug, Clone, Copy, Default)]
+struct EffectCode {
+    /// Some pixel shader alpha-tests (a DXBC `discard` instruction, either condition).
+    discards: bool,
+    /// The colour curve they end with: the sky curve where one has its 1/1.7 power, else the field curve where
+    /// one has its 2.1 and 1.08 slopes, else none (`None` when the effect has no pixel shaders to read).
+    curve: Option<ToneCurve>,
+}
+
+/// The code tokens of every pixel shader in an effect cluster (each DXBC container's SHDR or SHEX chunk).
+fn pixel_shaders(data: &[u8]) -> Vec<Vec<u32>> {
+    let word =
+        |d: &[u8], o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = data.get(at..).and_then(|d| d.windows(4).position(|w| w == b"DXBC")) {
+        let start = at + i;
+        let size = word(data, start + 24).unwrap_or(0).max(4);
+        let blob = &data[start..(start + size).min(data.len())];
+        for c in 0..word(blob, 28).unwrap_or(0) {
+            let Some(o) = word(blob, 32 + 4 * c) else { break };
+            if !matches!(blob.get(o..o + 4), Some(b"SHDR" | b"SHEX")) {
+                continue;
+            }
+            let len = word(blob, o + 4).unwrap_or(0);
+            let code = blob.get(o + 8..o + 8 + len).unwrap_or_default();
+            let tokens: Vec<u32> =
+                code.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+            // The version token's program type is 0 for pixel shaders.
+            if tokens.first().is_some_and(|v| v >> 16 == 0) {
+                out.push(tokens);
+            }
+        }
+        at = start + size;
+    }
+    out
+}
+
+/// Read an effect cluster's pixel shaders for what [`EffectCode`] records.
+fn effect_code(vfs: &Vfs, game: Game, id: &str) -> EffectCode {
     let Some(data) = effect::effect_cluster_path(game, id).and_then(|p| vfs.read(&p).ok()) else {
-        return false;
+        return EffectCode::default();
     };
-    data.chunks_exact(4)
-        .any(|w| matches!(u32::from_le_bytes([w[0], w[1], w[2], w[3]]), 0x0300_000D | 0x0304_000D))
+    let shaders = pixel_shaders(&data);
+    let has = |t: u32| shaders.iter().any(|s| s.contains(&t));
+    // 1/1.7, 2.1 and 1.08 as f32.
+    let curve = if shaders.is_empty() {
+        None
+    } else if has(0x3F16_9697) {
+        Some(ToneCurve::Sky)
+    } else if shaders.iter().any(|s| s.contains(&0x4006_6666) && s.contains(&0x3F8A_3D71)) {
+        Some(ToneCurve::Field)
+    } else {
+        Some(ToneCurve::Clamp)
+    };
+    EffectCode { discards: has(0x0300_000D) || has(0x0304_000D), curve }
 }
 
 /// The fog of a map's scene settings: its colour, distances (game units) and curve, with the 0–255 limit as a
@@ -235,7 +284,7 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
     let mut out = GpuModel { min: Vec3::splat(f32::MAX), max: Vec3::splat(f32::MIN), ..Default::default() };
     let mut texture_cache: HashMap<String, Option<TextureHandle>> = HashMap::new();
     // Per effect: pass state, whether it alpha-tests, whether it ignores fog.
-    let mut effect_cache: HashMap<String, (Option<MaterialState>, bool, bool)> = HashMap::new();
+    let mut effect_cache: HashMap<String, (Option<MaterialState>, EffectCode, bool)> = HashMap::new();
     let game = game_of_path(path);
     for (source, m) in model.meshes.iter().enumerate() {
         // The remaster draws a map's sky objects (draw object kind 1) without their node's scale and offset:
@@ -285,17 +334,23 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     aerugo_formats::effect::effect_family(&mat.effect)
                         .eq_ignore_ascii_case("phyrechrlitshader")
                 });
-            // The water shader applies its colours itself (after the cube map lookups).
-            let water = map
-                && seg_material.is_some_and(|mat| {
-                    aerugo_formats::effect::effect_family(&mat.effect)
-                        .eq_ignore_ascii_case("phyrewatershader")
-                });
+            let seg_family = seg_material
+                .map(|mat| aerugo_formats::effect::effect_family(&mat.effect).to_ascii_lowercase())
+                .unwrap_or_default();
+            // The water and ice shaders apply their colours themselves (after the cube map lookups).
+            let ice = map && seg_family == "phyreiceshader";
+            let water = map && (seg_family == "phyrewatershader" || ice);
             let tint: [f32; 4] = if water {
                 [1.0; 4]
             } else if map {
                 let (a, b) = (get4("MaterialColour"), get4("clrScaleFactor"));
-                std::array::from_fn(|k| a[k] * b[k])
+                // The additive effects shader brightens its colour by 1 + the emissiveness before the fog.
+                let e = if seg_family == "additiveeffectsshader" {
+                    get4("MaterialEmissiveness")
+                } else {
+                    [0.0; 4]
+                };
+                std::array::from_fn(|k| a[k] * b[k] * if k < 3 { 1.0 + e[k] } else { 1.0 })
             } else if character {
                 let (a, b) = (get4("MaterialColour"), get4("VertexColorOrigin"));
                 std::array::from_fn(|k| a[k] * b[k])
@@ -339,7 +394,12 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
             };
             let texture = material.and_then(|mat| mat.base_texture()).and_then(&mut texture_of);
             let water_textures = water.then(|| {
-                ["TextureSampler1", "NormalMapSampler", "NormalMap2Sampler", "CubeMapSampler"].map(|p| {
+                let names = if ice {
+                    ["SpecularMapSampler", "", "", "CubeMapSampler"]
+                } else {
+                    ["TextureSampler1", "NormalMapSampler", "NormalMap2Sampler", "CubeMapSampler"]
+                };
+                names.map(|p| {
                     material
                         .and_then(|mat| mat.textures.iter().find(|t| t.parameter == p))
                         .and_then(|t| texture_of(&t.asset))
@@ -352,42 +412,40 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 material.and_then(|mat| mat.base_texture()).map(|t| format!(", {t}")).unwrap_or_default()
             ));
             let effect_id = material.map(|m| m.effect.clone()).unwrap_or_default();
-            let (state, alpha_test, ignore_fog) =
-                *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
-                    let fx = load_effect(vfs, game, &effect_id);
-                    let ignore_fog = fx.as_ref().is_some_and(|fx| fx.switch("IGNORE_FOG"));
-                    let state = fx.and_then(|fx| fx.main_state()).map(|p| material_state(&p));
-                    if state.is_none() && !effect_id.is_empty() {
-                        out.warnings
-                            .push(format!("effect {effect_id} not found; drawing with default state"));
-                    }
-                    (state, effect_discards(vfs, game, &effect_id), ignore_fog)
-                });
+            let (state, code, ignore_fog) = *effect_cache.entry(effect_id.clone()).or_insert_with(|| {
+                let fx = load_effect(vfs, game, &effect_id);
+                let ignore_fog = fx.as_ref().is_some_and(|fx| fx.switch("IGNORE_FOG"));
+                let state = fx.and_then(|fx| fx.main_state()).map(|p| material_state(&p));
+                if state.is_none() && !effect_id.is_empty() {
+                    out.warnings.push(format!("effect {effect_id} not found; drawing with default state"));
+                }
+                (state, effect_code(vfs, game, &effect_id), ignore_fog)
+            });
             let mut material = state.unwrap_or_default();
             if map {
                 material.front_ccw = !material.front_ccw;
             }
             // The remaster's lit map shaders and character shaders write the normal target (its ambient
             // occlusion reads it); its sky, water and blended passes do not.
-            let family_lc = aerugo_formats::effect::effect_family(&effect_id).to_ascii_lowercase();
-            material.normals = material.blend.is_none()
-                && matches!(family_lc.as_str(), "phyredefaultlitshader" | "phyrechrlitshader");
-            // The remaster's sky shader never alpha-tests (a fading sky keeps its pixels); the map variants that
-            // alpha-test discard under the material's threshold (0.5 stands in until the material's own value is
-            // read). Other map parts and characters keep 0.3 until their blending and thresholds are read.
             let family = aerugo_formats::effect::effect_family(&effect_id).to_ascii_lowercase();
+            material.normals = material.blend.is_none()
+                && matches!(family.as_str(), "phyredefaultlitshader" | "phyrechrlitshader");
+            // Map parts end with the curve their shader variant has (the prerendered layers' field-curve constants
+            // only curve their fog colour; they are drawn with the field curve until that shader is ported).
             let curve = match family.as_str() {
                 _ if !map => ToneCurve::None,
-                "phyreuvanimationshader" => ToneCurve::Sky,
-                _ => ToneCurve::Field,
+                "phyreprerenderedshader" => ToneCurve::Field,
+                _ => code.curve.unwrap_or(ToneCurve::Field),
             };
-            let scalar = |name: &str| {
+            let alpha_test = code.discards;
+            let scalar_or = |name: &str, default: f32| {
                 m.materials
                     .get(seg.material as usize)
                     .and_then(|mat| mat.value(name))
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(0.0)
+                    .unwrap_or(default)
             };
+            let scalar = |name: &str| scalar_or(name, 0.0);
             let uv_scroll = [scalar("ScrollSpeed_X"), scalar("ScrollSpeed_Y")];
             let water = water_textures.map(|textures| {
                 let get3 = |name: &str| {
@@ -402,7 +460,20 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                     |t: &str| [scalar(&format!("ScrollSpeed_{t}_X")), scalar(&format!("ScrollSpeed_{t}_Y"))];
                 // Each normal map reads the base or the second coordinates, whichever set it is bound to.
                 let normal_uv2 = [6, 7].map(|i| seg.input_set("ST", i) == uv2_set && uv2_set != uv_set);
+                if ice {
+                    return Water {
+                        ice,
+                        textures,
+                        normal_uv2: [false; 2],
+                        scroll: [[0.0; 2]; 4],
+                        specular: [1.0, 1.0, 1.0, scalar("SpecularShininess")],
+                        color: colour,
+                        scale: get4("clrScaleFactor"),
+                        fog: get3("fgEff"),
+                    };
+                }
                 Water {
+                    ice,
                     textures,
                     normal_uv2,
                     scroll: [scroll("tex0"), scroll("tex1"), scroll("nml1"), scroll("nml2")],
@@ -417,13 +488,18 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 index_count: idx.len() as u32,
                 texture,
                 uv_scroll,
-                alpha_cutoff: match (curve, alpha_test) {
-                    (ToneCurve::Sky, _) => 0.0,
-                    (ToneCurve::Field, true) => 0.5,
-                    // Blended map parts whose shader never discards keep every pixel (faint ones blend in).
-                    (ToneCurve::Field, false) if material.blend.is_some() => 0.0,
+                // Map shaders that alpha-test discard where the texture's alpha is under the material's threshold
+                // (the additive effects shader tests it × the material colour's alpha); the others keep every
+                // pixel.
+                alpha_cutoff: match family.as_str() {
                     _ if character => scalar("AlphaThreshold"),
-                    _ => 0.3,
+                    _ if !map => 0.3,
+                    _ if !alpha_test => 0.0,
+                    "additiveeffectsshader" => {
+                        let a = get4("MaterialColour")[3];
+                        if a > 0.0 { scalar_or("AlphaThreshold", 0.5) / a } else { f32::INFINITY }
+                    }
+                    _ => scalar_or("AlphaThreshold", 0.5),
                 },
                 material,
                 curve,
