@@ -66,11 +66,12 @@ CPU readback for golden-image tests.
 
 Field scenes follow the remaster's shaders. Each map part ends with the colour curve its shader variant has
 (read from the variant's compiled code: the field curve, the sky curve or none), alpha-tests against its
-material's threshold, and the water and ice shaders sample their cube maps. Characters take the remaster's
-character light: an ambient plus three directional lights from the field light set the event scripts set,
-dimmed by the map's glow settings, times each character's colour and shade (the party's from the walk mesh);
-a character's alpha fades it with a blended pass. Fog stays off until a script sets its limit. After the scene:
-ambient occlusion, glow and the unsharp mask, with 8× multisampling.
+material's threshold (with multisampling, the passes that use alpha to coverage do that instead), and the water
+and ice shaders sample their cube maps. Characters take the remaster's character light: an ambient plus three
+directional lights from the field light set the event scripts set, dimmed by the map's glow settings, times each
+character's colour and shade (eased towards the walk mesh's shade where it stands); a character's alpha fades
+it with a blended pass. Fog stays off until a script sets its limit. After the scene: ambient occlusion, glow,
+the unsharp mask and the brightness setting, with 8× multisampling.
 
 The fragment shader reads its per-frame constants from one storage buffer: the scene constants, then joint
 matrices, then two slots per water or ice part, the character light's two slots, and one slot per tinted draw.
