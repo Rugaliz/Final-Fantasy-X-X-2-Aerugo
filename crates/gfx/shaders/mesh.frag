@@ -101,6 +101,12 @@ void main() {
     if (mode > 1.5 && mode < 3.5) {
         rgb += (joints[0][0].rgb - rgb) * fogShare();
     }
+    // Characters (no tone curve of their own) fade toward the fog colour as the field curve shows it.
+    if (mode < 0.5) {
+        vec3 f = joints[0][0].rgb;
+        vec3 fog = min(f, vec3(0.4)) * 2.1 + clamp(f, vec3(0.4), vec3(0.58)) * 1.08 - 0.47;
+        rgb += (fog - rgb) * fogShare();
+    }
     if ((mode > 1.5 && mode < 2.5) || mode > 3.5) {
         rgb = min(rgb, vec3(0.4)) * 2.1 + clamp(rgb, vec3(0.4), vec3(0.58)) * 1.08 - 0.47;
     } else if (mode > 2.5) {

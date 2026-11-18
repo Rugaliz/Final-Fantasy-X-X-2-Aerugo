@@ -1946,7 +1946,11 @@ impl SceneState {
                                     d.joint_base.unwrap_or(0) as f32,
                                     if d.joint_base.is_some() { 1.0 } else { 0.0 },
                                     part.alpha_cutoff,
-                                    if d.lit { 1.0 } else { part.curve.code() },
+                                    if d.lit {
+                                        1.0
+                                    } else {
+                                        part.curve.code() + if part.fog { 0.0 } else { 8.0 }
+                                    },
                                 ]
                             },
                         };
