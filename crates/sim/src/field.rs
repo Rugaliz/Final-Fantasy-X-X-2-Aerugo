@@ -600,6 +600,54 @@ pub struct Input {
     pub camera_heading: Option<f32>,
 }
 
+/// One light of the field light set: a colour (0–1) and the direction it shines in as yaw and pitch (degrees;
+/// the ambient, index 3, has none).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldLight {
+    pub color: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl FieldLight {
+    /// A light from the 0–255 colour and the angles scripts pass.
+    pub fn from_script(r: i32, g: i32, b: i32, yaw: i32, pitch: i32) -> FieldLight {
+        FieldLight { color: [r, g, b].map(|c| c as f32 / 255.0), yaw: yaw as f32, pitch: pitch as f32 }
+    }
+
+    /// The direction the light shines in (game space): (sin yaw · cos pitch, sin pitch, cos yaw · cos pitch).
+    pub fn direction(&self) -> [f32; 3] {
+        let (y, p) = (self.yaw.to_radians(), self.pitch.to_radians());
+        [y.sin() * p.cos(), p.sin(), y.cos() * p.cos()]
+    }
+}
+
+/// Fog values scripts set (natives 8038 near, 803A far, 803C limit) over the map's scene fog. The remaster's
+/// shaders see a limit of 0 (no fog) until a script sets one.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FogOverride {
+    pub near: Option<f32>,
+    pub far: Option<f32>,
+    /// Share of fog colour at most (0–1).
+    pub limit: f32,
+}
+
+/// The field's three directional lights and its ambient (index 3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldLights(pub [FieldLight; 4]);
+
+impl Default for FieldLights {
+    /// What every event start sets before its scripts run.
+    fn default() -> Self {
+        FieldLights([
+            FieldLight::from_script(0x53, 0x53, 0x53, 0x82, 0x4C),
+            FieldLight::from_script(0x37, 0x37, 0x37, 0x136, 0xE),
+            FieldLight::from_script(0x12, 0x12, 0xD, 0x82, 0x11C),
+            FieldLight::from_script(0x50, 0x5A, 0x69, 0, 0),
+        ])
+    }
+}
+
 /// The script random number stream: a multiply / xor generator with a 16-bit rotate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rng {
@@ -634,6 +682,10 @@ pub struct FieldState {
     pub ground: Option<Ground>,
     /// The map's fog from its PS2 map package (the scripts may change it).
     pub map_fog: Option<MapFog>,
+    /// The field light characters are lit by (reset at every event start, set by native 4013).
+    pub lights: FieldLights,
+    /// What the fog natives set over the map's scene fog.
+    pub fog: FogOverride,
     /// A map change the scripts asked for: target and entrance, for the session to carry out.
     pub jump: Option<(i32, i32)>,
     pub rng: Rng,
@@ -1720,8 +1772,59 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x500E, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x4013, 0x400A,
-        0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
+        0x500B, 0x500E, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017,
+        0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
+    );
+    // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
+    n.register(
+        0x4013,
+        Native::result(|g, c| {
+            let pitch = c.stack.pop_int();
+            let yaw = c.stack.pop_int();
+            let b = c.stack.pop_int();
+            let gr = c.stack.pop_int();
+            let r = c.stack.pop_int();
+            if let Some(l) = usize::try_from(c.stack.pop_int()).ok().and_then(|i| g.lights.0.get_mut(i)) {
+                *l = FieldLight::from_script(r, gr, b, yaw, pitch);
+            }
+            Value::Int(0)
+        }),
+    );
+    // Fog near, far and limit (0–255) for the remaster's shaders. (The original skips them on three maps,
+    // ids 0xCA2, 0x1E38 and 0x699, not checked here.)
+    n.register(
+        0x8038,
+        Native::result(|g, c| {
+            g.fog.near = Some(c.stack.pop_float());
+            Value::Int(1)
+        }),
+    );
+    n.register(
+        0x803A,
+        Native::result(|g, c| {
+            g.fog.far = Some(c.stack.pop_float());
+            Value::Int(1)
+        }),
+    );
+    n.register(
+        0x803C,
+        Native::result(|g, c| {
+            g.fog.limit = (c.stack.pop_float() / 255.0).clamp(0.0, 1.0);
+            Value::Int(1)
+        }),
+    );
+    // Field light colour only (0–1 floats); no FFX event calls it.
+    n.register(
+        0x4012,
+        Native::result(|g, c| {
+            let b = c.stack.pop_float();
+            let gr = c.stack.pop_float();
+            let r = c.stack.pop_float();
+            if let Some(l) = usize::try_from(c.stack.pop_int()).ok().and_then(|i| g.lights.0.get_mut(i)) {
+                l.color = [r, gr, b];
+            }
+            Value::Int(0)
+        }),
     );
     // Body hit off (1) or on (0): characters without it neither block nor bump.
     n.register(

@@ -14,8 +14,9 @@ layout(location = 7) in vec3 vTangent;
 layout(set = 0, binding = 0) uniform texture2D baseTexture;
 layout(set = 0, binding = 1) uniform sampler baseSampler;
 
-// Slot 0: scene constants (fog colour, enabled; near, far, curve, limit; eye position, time); joint matrices
-// follow, then two slots per water part.
+// Slot 0: scene constants (fog colour, enabled; near, far, curve, limit; eye position, time; character light
+// slot, enabled); joint matrices follow, then two slots per water part, then the character light's two slots
+// (direction towards light 0, its colour, light 1, colour; light 2, colour, ambient, unused).
 layout(set = 1, binding = 0) readonly buffer Joints {
     mat4 joints[];
 };
@@ -124,6 +125,16 @@ void main() {
     if ((mode > 1.5 && mode < 3.5) || mode > 5.5) {
         rgb += (joints[0][0].rgb - rgb) * fogShare();
     }
+    // Characters: the remaster's character light (ambient plus three half-Lambert lights, squared).
+    vec4 lightRef = joints[0][3];
+    if (mode < 0.5 && lightRef.y > 0.5) {
+        mat4 a = joints[uint(lightRef.x)];
+        mat4 b = joints[uint(lightRef.x) + 1u];
+        vec3 n = normalize(vNormal);
+        vec3 h = vec3(dot(a[0].xyz, n), dot(a[2].xyz, n), dot(b[0].xyz, n)) * 0.5 + 0.5;
+        h *= h;
+        rgb *= b[2].rgb + a[1].rgb * h.x + a[3].rgb * h.y + b[1].rgb * h.z;
+    }
     // Characters (no tone curve of their own) fade toward the fog colour as the field curve shows it.
     if (mode < 0.5) {
         vec3 f = joints[0][0].rgb;
@@ -132,7 +143,7 @@ void main() {
     }
     if ((mode > 1.5 && mode < 2.5) || (mode > 3.5 && mode < 4.5)) {
         rgb = min(rgb, vec3(0.4)) * 2.1 + clamp(rgb, vec3(0.4), vec3(0.58)) * 1.08 - 0.47;
-    } else if (mode > 5.5) {
+    } else if (mode > 5.5 || (mode < 0.5 && lightRef.y > 0.5)) {
         rgb = min(rgb, vec3(1.0));
     } else if (mode > 2.5) {
         vec3 s = clamp(rgb, 0.0, 1.0);

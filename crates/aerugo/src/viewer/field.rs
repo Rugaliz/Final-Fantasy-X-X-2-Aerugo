@@ -1139,7 +1139,14 @@ impl FieldView {
             joints,
             culling: true,
             mirrored: false,
-            fog: settings.as_ref().map(crate::assets::scene_fog),
+            // The map's scene fog with what the scripts set: its limit stays 0 (no fog) until they set one.
+            fog: settings.as_ref().map(|s| {
+                let mut f = crate::assets::scene_fog(s);
+                f.near = st.fog.near.unwrap_or(f.near);
+                f.far = st.fog.far.unwrap_or(f.far);
+                f.limit = st.fog.limit;
+                f
+            }),
             // Scene time: the event's ticks at 30 a second, plus the share of the next.
             time: (s.event.tick as f32 + alpha) / 30.0,
             // A map's colour-correction table is set from event code in the remaster (callers of its setter are
@@ -1147,6 +1154,9 @@ impl FieldView {
             // events are ported.
             color_correction: None,
             glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
+            character_light: self.game.then(|| {
+                crate::assets::character_light(&st.lights, settings.as_ref().map(crate::assets::scene_glow))
+            }),
         });
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;

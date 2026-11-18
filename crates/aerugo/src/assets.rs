@@ -250,8 +250,9 @@ fn effect_code(vfs: &Vfs, game: Game, id: &str) -> EffectCode {
     EffectCode { discards: has(0x0300_000D) || has(0x0304_000D), curve }
 }
 
-/// The fog of a map's scene settings: its colour, distances (game units) and curve, with the 0–255 limit as a
-/// share of fog colour. Event scripts can change it in the original (natives 0x8037–0x8041, not ported yet).
+/// The fog of a map's scene settings: its colour, distances (game units) and curve, with the stored 0–255 limit
+/// as a share of fog colour. The remaster's shaders do not use that limit: theirs is 0 (no fog) until a script
+/// sets one (natives 8038, 803A, 803C), so callers replace it.
 pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
     aerugo_gfx::Fog {
         color: s.fog_color,
@@ -259,6 +260,44 @@ pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
         far: s.fog_far,
         curve: s.fog_curve,
         limit: (s.fog_limit / 255.0).clamp(0.0, 1.0),
+    }
+}
+
+/// The remaster's character light from the field light set and the map's glow settings. Each light's colour is
+/// scaled by (1 − k) × 1.2 × 0.95 (the ambient's by × 1.05), where k dims the lights by their brightness
+/// (0.3 r + 0.5 g + 0.2 b, after that scale) against the brightest one, through the glow thresholds:
+/// k = clamp(0.5 × clamp(gain² + spread², 0.01, 1.4) × (clamp(lum / max, lower, upper) − lower) / clamp(upper −
+/// lower, 0.01, 1.1), 0.01, 0.99). Directions point towards the lights; the shade colour (white) × 0.208125
+/// adds to the ambient. (Per-character light overrides are not ported.)
+pub fn character_light(
+    lights: &aerugo_sim::field::FieldLights,
+    glow: Option<aerugo_gfx::Glow>,
+) -> aerugo_gfx::CharacterLight {
+    let g = glow.unwrap_or(aerugo_gfx::Glow { upper: 0.0, lower: 0.0, gain: 0.0, spread: 0.0 });
+    let base = |i: usize| 1.2 * if i < 3 { 0.95 } else { 1.05 };
+    let lum = |c: [f32; 3]| 0.3 * c[0] + 0.5 * c[1] + 0.2 * c[2];
+    let lums: Vec<f32> = (0..4).map(|i| lum(lights.0[i].color) * base(i)).collect();
+    let max = lums.iter().copied().fold(0.0, f32::max);
+    let span = (g.upper - g.lower).clamp(0.01, 1.1);
+    let strength = (g.gain.clamp(0.01, 0.99).powi(2) + g.spread.clamp(0.01, 0.99).powi(2)).clamp(0.01, 1.4);
+    let scale = |i: usize| {
+        let k = if max > 0.01 {
+            let x = ((lums[i] / max).clamp(g.lower, g.upper) - g.lower) / span;
+            (strength * x * 0.5).clamp(0.01, 0.99)
+        } else {
+            0.0
+        };
+        (1.0 - k) * base(i)
+    };
+    let light = |i: usize| {
+        let d = lights.0[i].direction();
+        let s = scale(i);
+        ([-d[0], -d[1], -d[2]], lights.0[i].color.map(|c| c * s))
+    };
+    let s = scale(3);
+    aerugo_gfx::CharacterLight {
+        lights: [light(0), light(1), light(2)],
+        ambient: lights.0[3].color.map(|c| c * s + 0.208125),
     }
 }
 

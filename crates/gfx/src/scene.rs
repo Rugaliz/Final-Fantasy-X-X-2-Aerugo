@@ -841,6 +841,31 @@ pub struct SceneView {
     pub color_correction: Option<crate::renderer::TextureHandle>,
     /// The remaster's glow for this scene.
     pub glow: Option<Glow>,
+    /// The light characters (parts drawn without a field curve) take; `None` leaves their colours as they are.
+    pub character_light: Option<CharacterLight>,
+}
+
+/// The remaster's character lighting: colour × (ambient + Σ colourᵢ × ((n · Lᵢ) / 2 + ½)²), clamped to 1.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CharacterLight {
+    /// Unit vectors towards each light (in `view_proj`'s world space) and the lights' colours.
+    pub lights: [([f32; 3], [f32; 3]); 3],
+    /// Ambient light (the character ambient plus the shade colour × its coefficient).
+    pub ambient: [f32; 3],
+}
+
+impl CharacterLight {
+    /// The two constant slots the fragment shader reads (see `mesh.frag`).
+    fn constants(&self) -> [[f32; 16]; 2] {
+        let mut s = [[0.0; 16]; 2];
+        for (i, (dir, col)) in self.lights.iter().enumerate() {
+            let at = i * 8;
+            s[at / 16][at % 16..at % 16 + 3].copy_from_slice(dir);
+            s[at / 16][at % 16 + 4..at % 16 + 7].copy_from_slice(col);
+        }
+        s[1][8..11].copy_from_slice(&self.ambient);
+        s
+    }
 }
 
 /// The remaster's field fog: the share of fog colour at view depth `d` is
@@ -857,7 +882,7 @@ pub struct Fog {
 
 impl Fog {
     /// The scene constants the shaders read from the first slot of the joint buffer: fog, then the eye
-    /// position and scene time.
+    /// position and scene time (the last row, the character light's slot, is filled in by the caller).
     fn constants(fog: Option<Fog>, eye: [f32; 3], time: f32) -> [f32; 16] {
         let mut c = [0.0; 16];
         c[8..11].copy_from_slice(&eye);
@@ -1703,7 +1728,10 @@ impl SceneState {
                 }
             }
         }
-        let slots = view.joints.len() + 1 + 2 * water.len();
+        // Then the character light's two slots.
+        let light_slot = 1 + view.joints.len() + 2 * water.len();
+        let light = view.character_light.map(|l| l.constants());
+        let slots = light_slot + if light.is_some() { 2 } else { 0 };
         if slots * 64 > self.joints[frame].buffer.size as usize {
             let fresh = SceneStateRef { pipeline: &self.pipeline, pool: self.pool }
                 .joint_slot(ctx, slots.next_power_of_two())?;
@@ -1715,9 +1743,16 @@ impl SceneState {
             }
         }
         if let Some(m) = self.joints[frame].buffer.mapped() {
-            let scene = Fog::constants(view.fog, eye_of(&view.view_proj), view.time);
-            for (i, j) in
-                std::iter::once(&scene).chain(view.joints.iter()).chain(water.iter().flatten()).enumerate()
+            let mut scene = Fog::constants(view.fog, eye_of(&view.view_proj), view.time);
+            if light.is_some() {
+                scene[12] = light_slot as f32;
+                scene[13] = 1.0;
+            }
+            for (i, j) in std::iter::once(&scene)
+                .chain(view.joints.iter())
+                .chain(water.iter().flatten())
+                .chain(light.iter().flatten())
+                .enumerate()
             {
                 for (k, f) in j.iter().enumerate() {
                     m[i * 64 + k * 4..i * 64 + k * 4 + 4].copy_from_slice(&f.to_le_bytes());

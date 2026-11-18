@@ -2018,10 +2018,17 @@ fn native_args(install: &Install, native: u16) -> Result<()> {
         .flat_map(|(_, a)| a.entries().iter().map(|e| e.path.clone()))
         .filter(|p| p.ends_with(".ebp") && is_script_path(p) && p.contains("/jppc/event/obj/"))
         .collect();
+    // NATIVE_ARGS_DEPTH: how many pushed constants to show (default 4); NATIVE_ARGS_EVENT: only events whose
+    // name contains this.
+    let depth: usize = std::env::var("NATIVE_ARGS_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let only = std::env::var("NATIVE_ARGS_EVENT").unwrap_or_default();
     let mut seen: BTreeMap<String, (u32, std::collections::BTreeSet<String>)> = BTreeMap::new();
     for path in &paths {
-        let Ok(script) = Script::parse(&vfs.read(path)?) else { continue };
         let event = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".ebp").to_owned();
+        if !event.contains(&only) {
+            continue;
+        }
+        let Ok(script) = Script::parse(&vfs.read(path)?) else { continue };
         for (wi, w) in script.workers.iter().enumerate() {
             let mut pushes: Vec<String> = Vec::new();
             for insn in script.walk(wi) {
@@ -2037,7 +2044,8 @@ fn native_args(install: &Install, native: u16) -> Result<()> {
                     }
                     _ if m.starts_with("push") => pushes.push(m.to_owned()),
                     _ if m.starts_with("call") && arg == native => {
-                        let key = pushes.iter().rev().take(4).rev().cloned().collect::<Vec<_>>().join(", ");
+                        let key =
+                            pushes.iter().rev().take(depth).rev().cloned().collect::<Vec<_>>().join(", ");
                         let e = seen.entry(key).or_default();
                         e.0 += 1;
                         e.1.insert(event.clone());

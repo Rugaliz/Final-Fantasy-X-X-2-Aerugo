@@ -9,7 +9,8 @@
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
 //! draws both sides of everything; `AERUGO_SHOT_CC` applies the map's colour-correction table;
 //! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer; `AERUGO_SHOT_MSAA` sets the samples per pixel;
-//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask; `AERUGO_SHOT_NOGLOW` the glow; `AERUGO_SHOT_HDAO` sets the ambient occlusion level.
+//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask; `AERUGO_SHOT_NOGLOW` the glow; `AERUGO_SHOT_HDAO` sets the ambient occlusion level;
+//! `AERUGO_SHOT_LIGHTS` = `index,r,g,b,yaw,pitch;…` sets character lights as the scripts do (`AERUGO_SHOT_NOLIGHT`: none).
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -18,6 +19,24 @@ use glam::{Mat4, Vec3};
 
 use crate::assets;
 use crate::viewer::field::{FIELD_FRAME, field_fov_y, map_place, script_camera};
+
+/// The field light as an event start leaves it, with `AERUGO_SHOT_LIGHTS` = `index,r,g,b,yaw,pitch;…` set over it
+/// as native 4013 would; `AERUGO_SHOT_NOLIGHT` leaves characters unlit.
+fn character_light(glow: Option<aerugo_gfx::Glow>) -> Option<aerugo_gfx::CharacterLight> {
+    if std::env::var("AERUGO_SHOT_NOLIGHT").is_ok() {
+        return None;
+    }
+    let mut lights = aerugo_sim::field::FieldLights::default();
+    for spec in std::env::var("AERUGO_SHOT_LIGHTS").unwrap_or_default().split(';').filter(|s| !s.is_empty()) {
+        let v: Vec<i32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if let [i, r, g, b, yaw, pitch] = v[..]
+            && let Some(l) = lights.0.get_mut(i as usize)
+        {
+            *l = aerugo_sim::field::FieldLight::from_script(r, g, b, yaw, pitch);
+        }
+    }
+    Some(assets::character_light(&lights, glow))
+}
 
 /// Picture size; `AERUGO_SHOT_SIZE` = `w,h` overrides it (captures of the original are 2560×1440).
 fn size() -> (u32, u32) {
@@ -120,8 +139,9 @@ fn map_shot() {
     let extent = (model.max - model.min).length() * 10.0;
     let (lo, hi) = (map_place().transform_point3(model.min), map_place().transform_point3(model.max));
     eprintln!("map bounds (game units) {:?} .. {:?}", lo.min(hi), lo.max(hi));
-    // The map's fog as the game screen draws it; AERUGO_SHOT_FOG = `none`, or a fixed limit (a number), with an
-    // optional `,k` scaling the fog distances, for fitting to captures.
+    // The map's fog as the game screen draws it at an event's start (limit 0: none until a script sets one);
+    // AERUGO_SHOT_FOG = `none`, `map` (the limit the map stores), or a limit (a number, as native 803C / 255
+    // would set), with an optional `,k` scaling the fog distances, for fitting to captures.
     let fog = model.scene.and_then(|s| {
         let spec = std::env::var("AERUGO_SHOT_FOG").unwrap_or_default();
         if spec == "none" {
@@ -129,8 +149,10 @@ fn map_shot() {
         }
         let mut f = assets::scene_fog(&s);
         let (limit, k) = spec.split_once(',').map_or((spec.as_str(), 1.0), |(l, k)| (l, k.parse().unwrap()));
-        if let Ok(l) = limit.parse() {
-            f.limit = l;
+        match limit.parse() {
+            Ok(l) => f.limit = l,
+            Err(_) if limit == "map" => {}
+            Err(_) => f.limit = 0.0,
         }
         f.near *= k;
         f.far *= k;
@@ -190,6 +212,7 @@ fn map_shot() {
                         .as_ref()
                         .filter(|_| std::env::var("AERUGO_SHOT_NOGLOW").is_err())
                         .map(assets::scene_glow),
+                    character_light: character_light(model.scene.as_ref().map(assets::scene_glow)),
                 },
                 size,
             )
