@@ -40,6 +40,8 @@ pub struct GraphicsSettings {
     pub sharpen: bool,
     /// The remaster's ambient occlusion: 0 off, 1 low, 2 medium, 3 high.
     pub hdao: u32,
+    /// The remaster's brightness (0–100; 50 leaves the picture as it is).
+    pub brightness: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +116,7 @@ impl Default for GraphicsSettings {
             msaa: 8,
             sharpen: true,
             hdao: 3,
+            brightness: 50,
         }
     }
 }

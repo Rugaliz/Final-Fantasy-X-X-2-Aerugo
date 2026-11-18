@@ -12,6 +12,7 @@ static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
 static CC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/colorcorrect.comp.spv"));
 static USM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unsharp.comp.spv"));
+static BRIGHT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brightness.comp.spv"));
 static GLOW_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glow.comp.spv"));
 static HDAO_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hdao.comp.spv"));
 
@@ -958,6 +959,8 @@ pub(crate) struct Viewport {
     pub depth_resolved: Option<Target>,
     /// Images and sets of the ambient occlusion (with it on).
     pub hdao: Option<HdaoTargets>,
+    /// The brightness pass's set (the colour target read and written in place).
+    pub brightness: Option<vk::DescriptorSet>,
     pub extent: vk::Extent2D,
     pub ui_set: vk::DescriptorSet,
     pub ui_id: egui::TextureId,
@@ -992,6 +995,9 @@ pub(crate) struct SceneState {
     pub hdao: Option<HdaoPass>,
     /// Patterns the ambient occlusion samples (6, 12 or 20 for the remaster's low, medium and high; 0 = off).
     pub hdao_patterns: u32,
+    /// The brightness pass (as above), and what it adds ((setting − 50) / 100; 0 skips it).
+    pub brightness_pass: Option<PostPass>,
+    pub brightness: f32,
 }
 /// The remaster's unsharp mask at its default settings (blur distance 1.2 pixels, intensity 0.45, threshold 0.04).
 const USM_DISTANCE: f32 = 1.2;
@@ -1566,6 +1572,12 @@ impl SceneState {
             pending: None,
             pending_table: None,
             color_correction: if ctx.storage_rgba8 { Some(ColorCorrection::new(device)?) } else { None },
+            brightness_pass: if ctx.storage_rgba8 {
+                Some(PostPass::new(device, BRIGHT_SPV, size_of::<f32>())?)
+            } else {
+                None
+            },
+            brightness: 0.0,
             unsharp: if ctx.storage_rgba8 {
                 Some(PostPass::new(device, USM_SPV, size_of::<UnsharpPush>())?)
             } else {
@@ -2134,7 +2146,11 @@ impl SceneState {
                 (Some(t), Some(h)) if self.hdao_patterns > 0 => Some((t, h)),
                 _ => None,
             };
-            if correct.is_some() || usm.is_some() || glow.is_some() || hdao.is_some() {
+            let bright = match (vp.brightness, &self.brightness_pass) {
+                (Some(set), Some(p)) if self.brightness != 0.0 => Some((set, p)),
+                _ => None,
+            };
+            if correct.is_some() || usm.is_some() || glow.is_some() || hdao.is_some() || bright.is_some() {
                 let to_general = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(last.0)
                     .src_access_mask(last.1)
@@ -2345,6 +2361,24 @@ impl SceneState {
                     device.cmd_dispatch(cmd, groups.0, groups.1, 1);
                 }
             }
+            if let Some((set, p)) = bright {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+                let bytes = self.brightness.to_le_bytes();
+                device.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    p.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+            }
             let to_read = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(last.0)
                 .src_access_mask(last.1)
@@ -2408,6 +2442,9 @@ impl SceneState {
             }
             if let Some(u) = &self.unsharp {
                 u.destroy(&ctx.device);
+            }
+            if let Some(b) = &self.brightness_pass {
+                b.destroy(&ctx.device);
             }
             if let Some(g) = &self.glow {
                 g.destroy(&ctx.device);

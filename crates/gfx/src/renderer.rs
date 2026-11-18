@@ -427,6 +427,12 @@ impl Renderer {
         }
     }
 
+    /// The remaster's brightness setting (0–100, 50 neutral): (setting − 50) / 100 is added to the finished
+    /// picture.
+    pub fn set_brightness(&mut self, setting: u32) {
+        self.scene.brightness = (setting.min(100) as f32 - 50.0) / 100.0;
+    }
+
     /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high (6, 12 or 20 sample
     /// patterns). Ignored where the device cannot run the compute passes.
     pub fn set_hdao(&mut self, level: u32) {
@@ -576,6 +582,12 @@ impl Renderer {
                 .ok(),
             _ => None,
         };
+        let brightness = self.scene.brightness_pass.as_ref().and_then(|p| {
+            p.sets(ctx, self.scene.pool, &[(color.view, color.view)])
+                .inspect_err(|e| log::warn!("brightness: {e:#}"))
+                .ok()
+                .and_then(|s| s.first().copied())
+        });
         let half = vk::Extent2D { width: (extent.width / 2).max(1), height: (extent.height / 2).max(1) };
         let glow = match &self.scene.glow {
             Some(g) => scratch(ctx, &[extent, half, half])
@@ -706,6 +718,7 @@ impl Renderer {
             depth,
             unsharp,
             glow,
+            brightness,
             extent,
             ui_set: set,
             ui_id,
@@ -750,6 +763,9 @@ impl Renderer {
                 if let Some(h) = vp.hdao.take() {
                     self.ctx.device.free_descriptor_sets(self.scene.pool, &h.sets).ok();
                     destroy_all(&self.ctx, [h.a, h.b]);
+                }
+                if let Some(s) = vp.brightness.take() {
+                    self.ctx.device.free_descriptor_sets(self.scene.pool, &[s]).ok();
                 }
                 vp.normal.destroy(&self.ctx);
                 destroy_all(

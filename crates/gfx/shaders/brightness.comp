@@ -1,0 +1,21 @@
+#version 450
+// The remaster's brightness setting, the last pass over the picture: (setting − 50) / 100 added to each channel.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D source;
+layout(set = 0, binding = 1) uniform sampler linearClamp;
+layout(set = 0, binding = 2, rgba8) uniform image2D target;
+
+layout(push_constant) uniform Push {
+    float add;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= imageSize(target).x || p.y >= imageSize(target).y) {
+        return;
+    }
+    vec4 c = imageLoad(target, p);
+    imageStore(target, p, vec4(clamp(c.rgb + pc.add, 0.0, 1.0), c.a));
+}
