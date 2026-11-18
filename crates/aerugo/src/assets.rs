@@ -266,7 +266,8 @@ pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
 
 /// The remaster's character light from the field light set and the map's glow settings. Each light's colour is
 /// scaled by (1 − k) × 1.2 × 0.95 (the ambient's by × 1.05), where k dims the lights by their brightness
-/// (0.3 r + 0.5 g + 0.2 b, after that scale) against the brightest one, through the glow thresholds:
+/// (0.3 r + 0.5 g + 0.2 b, after that scale) against the brightest one as already dimmed, through the glow
+/// thresholds (settled to the fixed point the remaster's repeated updates reach):
 /// k = clamp(0.5 × clamp(gain² + spread², 0.01, 1.4) × (clamp(lum / max, lower, upper) − lower) / clamp(upper −
 /// lower, 0.01, 1.1), 0.01, 0.99). Directions point towards the lights; each character's shade colour × 0.208125
 /// adds to the ambient. On four Zanarkand maps the colours are pushed away from grey (grey + 2.6 × (c − grey),
@@ -294,18 +295,27 @@ pub fn character_light(
         c.map(|x| (grey + 2.6 * (x - grey)).clamp(0.0, 1.0))
     };
     let lums: Vec<f32> = (0..4).map(|i| lum(color(i)) * base(i)).collect();
-    let max = lums.iter().copied().fold(0.0, f32::max);
     let span = (g.upper - g.lower).clamp(0.01, 1.1);
     let strength = (g.gain.clamp(0.01, 0.99).powi(2) + g.spread.clamp(0.01, 0.99).powi(2)).clamp(0.01, 1.4);
-    let scale = |i: usize| {
-        let k = if max > 0.01 {
+    // The remaster recomputes k each time the ambient is set, against the brightest light as already dimmed by
+    // the previous k; scripts set it several times, so the lights settle on that recurrence's fixed point.
+    let mut k = [0.0f32; 4];
+    for _ in 0..8 {
+        let max = (0..4).map(|i| lums[i] * (1.0 - k[i])).fold(0.0, f32::max);
+        if max <= 0.01 {
+            k = [0.0; 4];
+            break;
+        }
+        let next: [f32; 4] = std::array::from_fn(|i| {
             let x = ((lums[i] / max).clamp(g.lower, g.upper) - g.lower) / span;
             (strength * x * 0.5).clamp(0.01, 0.99)
-        } else {
-            0.0
-        };
-        (1.0 - k) * base(i)
-    };
+        });
+        if next == k {
+            break;
+        }
+        k = next;
+    }
+    let scale = |i: usize| (1.0 - k[i]) * base(i);
     let light = |i: usize| {
         let d = lights.0[i].direction();
         let s = scale(i);
@@ -642,9 +652,33 @@ mod tests {
         let l = character_light(&lights, Some(glow), "bjyt04");
         let (dir, col) = l.lights[0];
         assert!((col[0] / (75.0 / 255.0) - 1.0806).abs() < 1e-3, "{col:?}");
+        assert!((l.lights[1].1[0] / (65.0 / 255.0) - 1.0964).abs() < 1e-3, "{:?}", l.lights[1]);
         assert!((l.ambient[2] / (50.0 / 255.0) - 1.2474).abs() < 1e-3, "{:?}", l.ambient);
         // Pitch 70° shines downwards (y points down), so the light is above.
         assert!(dir[1] < -0.9, "{dir:?}");
         assert!((l.shade - 0.208125).abs() < 1e-6);
+    }
+
+    /// cdsp0700 (stronger glow settings dim more): the original's settled constants.
+    #[test]
+    fn character_light_settles_as_the_original() {
+        let lights = FieldLights([
+            FieldLight::from_script(71, 106, 174, 202, 340),
+            FieldLight::from_script(55, 95, 149, 301, 338),
+            FieldLight::from_script(0, 0, 0, 0, 0),
+            FieldLight::from_script(24, 44, 64, 0, 0),
+        ]);
+        let glow = aerugo_gfx::Glow { upper: 1.0, lower: 0.35, gain: 0.4, spread: 0.6 };
+        let l = character_light(&lights, Some(glow), "cdsp07");
+        let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-4);
+        assert!(close(l.lights[0].1, [0.234_884_7, 0.350_672_9, 0.575_632_9]), "{:?}", l.lights[0]);
+        assert!(close(l.lights[1].1, [0.181_952_9, 0.314_282_4, 0.492_927_1]), "{:?}", l.lights[1]);
+        assert!(close(l.ambient, [0.107_915_9, 0.197_845_8, 0.287_775_7]), "{:?}", l.ambient);
+        // Towards the light: the negated direction it shines in (yaw 202°, pitch 340°).
+        let d = l.lights[0].0;
+        assert!(
+            (d[0] - 0.352).abs() < 1e-3 && (d[1] - 0.342).abs() < 1e-3 && (d[2] - 0.8713).abs() < 1e-3,
+            "{d:?}"
+        );
     }
 }
