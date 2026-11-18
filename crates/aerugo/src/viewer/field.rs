@@ -1159,6 +1159,7 @@ impl FieldView {
                 let mut f = crate::assets::scene_fog(s);
                 f.near = st.fog.near.unwrap_or(f.near);
                 f.far = st.fog.far.unwrap_or(f.far);
+                f.curve = st.fog.curve.unwrap_or(f.curve);
                 f.limit = st.fog.limit;
                 f
             }),

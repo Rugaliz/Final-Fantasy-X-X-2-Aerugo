@@ -670,12 +670,13 @@ impl FieldLight {
     }
 }
 
-/// Fog values scripts set (natives 8038 near, 803A far, 803C limit) over the map's scene fog. The remaster's
-/// shaders see a limit of 0 (no fog) until a script sets one.
+/// Fog values scripts set (natives 8038 near, 803A far, 803C limit; 8037 all three and a curve of 1) over the
+/// map's scene fog. The remaster's shaders see a limit of 0 (no fog) until a script sets one.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FogOverride {
     pub near: Option<f32>,
     pub far: Option<f32>,
+    pub curve: Option<f32>,
     /// Share of fog colour at most (0–1).
     pub limit: f32,
 }
@@ -1852,6 +1853,17 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
     );
     // Fog near, far and limit (0–255) for the remaster's shaders. (The original skips them on three maps,
     // ids 0xCA2, 0x1E38 and 0x699, not checked here.)
+    n.register(
+        0x8037,
+        Native::result(|g, c| {
+            let limit = c.stack.pop_float();
+            g.fog.far = Some(c.stack.pop_float());
+            g.fog.near = Some(c.stack.pop_float());
+            g.fog.limit = (limit / 255.0).clamp(0.0, 1.0);
+            g.fog.curve = Some(1.0);
+            Value::Int(1)
+        }),
+    );
     n.register(
         0x8038,
         Native::result(|g, c| {
