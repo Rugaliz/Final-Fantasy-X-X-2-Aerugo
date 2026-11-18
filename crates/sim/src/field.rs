@@ -1232,28 +1232,64 @@ pub fn chr_radius(d: &[u8]) -> Option<f32> {
 }
 
 /// Frame counts of a model's motions by motion number (each group entry's first motion record).
-pub fn motion_frames(vfs: &Vfs, model_path: &str) -> std::collections::HashMap<u16, u32> {
-    use aerugo_formats::motion::{MotionGroup, motion_dir};
-    let Some(dir) = motion_dir(model_path) else { return Default::default() };
-    let mut paths: Vec<String> = vfs
-        .archives()
-        .flat_map(|(_, a)| {
-            a.entries()
-                .iter()
-                .filter(|e| e.path.starts_with(&dir) && e.path.ends_with(".mgrp") && e.size > 16)
-                .map(|e| e.path.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    paths.sort();
-    paths.dedup();
+pub fn motion_frames(
+    vfs: &Vfs,
+    model_path: &str,
+    model: u16,
+    event_path: Option<&str>,
+) -> std::collections::HashMap<u16, u32> {
     let mut out = std::collections::HashMap::new();
-    for path in paths {
-        let Ok(bytes) = vfs.read(&path) else { continue };
-        let Ok(group) = MotionGroup::parse(&bytes) else { continue };
+    for group in motion_groups(vfs, model_path, model, event_path) {
         for (&(number, _), record) in group.entries.iter().zip(&group.entry_motion) {
             if let Some(m) = record.and_then(|r| group.motions.get(r)) {
                 out.entry(number).or_insert(u32::from(m.frames));
+            }
+        }
+    }
+    out
+}
+
+/// The motion groups a character's motions come from: its own (`chr/…/mot/`, in file order) and then those of
+/// the event's folder that belong to it (an event's motion files hold one group per character it animates).
+pub fn motion_groups(
+    vfs: &Vfs,
+    model_path: &str,
+    model: u16,
+    event_path: Option<&str>,
+) -> Vec<aerugo_formats::motion::MotionGroup> {
+    use aerugo_formats::motion::{MotionGroup, motion_dir};
+    let files = |dir: &str| {
+        let mut paths: Vec<String> = vfs
+            .archives()
+            .flat_map(|(_, a)| {
+                a.entries()
+                    .iter()
+                    .filter(|e| {
+                        e.path.starts_with(dir)
+                            && !e.path[dir.len()..].contains('/')
+                            && e.path.ends_with(".mgrp")
+                            && e.size > 16
+                    })
+                    .map(|e| e.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    };
+    let mut out = Vec::new();
+    if let Some(dir) = motion_dir(model_path) {
+        for path in files(&dir) {
+            if let Some(groups) = vfs.read(&path).ok().and_then(|b| MotionGroup::parse_all(&b).ok()) {
+                out.extend(groups);
+            }
+        }
+    }
+    if let Some((dir, _)) = event_path.and_then(|p| p.rsplit_once('/')) {
+        for path in files(&format!("{dir}/")) {
+            if let Some(groups) = vfs.read(&path).ok().and_then(|b| MotionGroup::parse_all(&b).ok()) {
+                out.extend(groups.into_iter().filter(|g| g.chr_id == model));
             }
         }
     }
@@ -1618,7 +1654,9 @@ impl Event {
             if self.state.motion_frames.contains_key(&m) {
                 continue;
             }
-            let frames = model_path(self.game, m).map(|p| motion_frames(vfs, &p)).unwrap_or_default();
+            let frames = model_path(self.game, m)
+                .map(|p| motion_frames(vfs, &p, m, Some(&self.path)))
+                .unwrap_or_default();
             self.state.motion_frames.insert(m, frames);
             let radius = chr_path(self.game, m).and_then(|p| vfs.read(&p).ok()).and_then(|d| chr_radius(&d));
             self.state.model_radii.insert(m, radius);

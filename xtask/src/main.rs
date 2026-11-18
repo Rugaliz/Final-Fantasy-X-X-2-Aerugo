@@ -893,6 +893,25 @@ fn field_run(install: &Install, event: &str, plan: &FieldRunPlan) -> Result<()> 
             ev.set_movie_frames(ticks);
         }
         ev.step(input);
+        // FIELD_ACTORS=N: every N ticks, each actor with a model: worker, model, position, yaw, motion, visible.
+        if let Some(every) = std::env::var("FIELD_ACTORS").ok().and_then(|v| v.parse::<u32>().ok())
+            && every > 0
+            && t % every == 0
+        {
+            for (w, a) in ev.state.actors.iter().enumerate().filter(|(_, a)| a.model.is_some()) {
+                println!(
+                    "t{t} w{w} model {:04x} pos {:.1},{:.1},{:.1} yaw {:.2} motion {:?} visible {} alpha {:.2}",
+                    a.model.unwrap_or(0),
+                    a.pos[0],
+                    a.pos[1],
+                    a.pos[2],
+                    a.yaw,
+                    a.motion,
+                    a.visible,
+                    a.color[3].value
+                );
+            }
+        }
         if ev.open_menu().is_some() {
             ev.close_menu();
         }

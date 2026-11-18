@@ -254,8 +254,20 @@ pub struct MotionGroup {
 }
 
 impl MotionGroup {
+    /// The first group of a motion file.
     pub fn parse(d: &[u8]) -> Result<MotionGroup> {
-        let desc = u32_at(d, 0xC)? as usize;
+        MotionGroup::parse_at(d, u32_at(d, 0xC)? as usize)
+    }
+
+    /// Every group of a motion file: the count is at +4 and the descriptors follow one another (0x14 bytes each)
+    /// from the offset at +0xC. Event motion files hold one group per character the event animates.
+    pub fn parse_all(d: &[u8]) -> Result<Vec<MotionGroup>> {
+        let first = u32_at(d, 0xC)? as usize;
+        let count = (u32_at(d, 4)? as usize).clamp(1, 256);
+        (0..count).map(|g| MotionGroup::parse_at(d, first + g * 0x14)).collect()
+    }
+
+    fn parse_at(d: &[u8], desc: usize) -> Result<MotionGroup> {
         if desc + 0x14 > d.len() {
             return Err(MotionError::Truncated("group descriptor"));
         }

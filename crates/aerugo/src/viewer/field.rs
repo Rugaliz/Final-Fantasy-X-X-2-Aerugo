@@ -24,7 +24,7 @@ use glam::{Mat4, Vec3};
 
 use super::filelist::FileList;
 use super::maps::{best_camera, camera_view_proj, fit_layers};
-use super::models::{OrbitCamera, game_to_view, load_motions};
+use super::models::{OrbitCamera, game_to_view};
 use super::movies::{MoviePlayer, movie_ticks};
 use crate::assets::{GpuModel, load_map_model, load_model};
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
@@ -51,8 +51,12 @@ struct Session {
     map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
     /// Character models by model id (None when missing).
     actors: HashMap<u16, Option<GpuModel>>,
-    /// PS2 motions of each character model.
+    /// PS2 motions of each character model: its own groups, then the event's groups for it.
     motions: HashMap<u16, Vec<Motion>>,
+    /// Per model: motion number (the low 16 bits of the ids scripts ask for) to its index in `motions`.
+    motion_numbers: HashMap<u16, HashMap<u16, usize>>,
+    /// Per model: how many of `motions` are its own (the rest come from the event's motion files).
+    motion_own: HashMap<u16, usize>,
     /// Per worker: motion index, time in frames, translation scale.
     anim: HashMap<usize, (usize, f32, f32)>,
     notes: Vec<String>,
@@ -355,6 +359,8 @@ impl FieldView {
             layers,
             actors: HashMap::new(),
             motions: HashMap::new(),
+            motion_numbers: HashMap::new(),
+            motion_own: HashMap::new(),
             anim: HashMap::new(),
             notes,
         });
@@ -957,11 +963,25 @@ impl FieldView {
                 let path = a.model_path(s.event.game);
                 let m = path.as_ref().and_then(|p| load_model(vfs, renderer, p).ok());
                 s.actors.insert(id, m);
-                s.motions.insert(
-                    id,
-                    path.map(|p| load_motions(vfs, &p).into_iter().map(|(_, m)| m).collect())
-                        .unwrap_or_default(),
-                );
+                let own = path.as_ref().map_or(0, |p| {
+                    aerugo_sim::field::motion_groups(vfs, p, id, None).iter().map(|g| g.motions.len()).sum()
+                });
+                s.motion_own.insert(id, own);
+                let groups = path
+                    .map(|p| aerugo_sim::field::motion_groups(vfs, &p, id, Some(&s.event.path)))
+                    .unwrap_or_default();
+                let (mut list, mut numbers) = (Vec::new(), HashMap::new());
+                for g in groups {
+                    let base = list.len();
+                    for (&(number, _), record) in g.entries.iter().zip(&g.entry_motion) {
+                        if let Some(r) = record.filter(|&r| r < g.motions.len()) {
+                            numbers.entry(number).or_insert(base + r);
+                        }
+                    }
+                    list.extend(g.motions);
+                }
+                s.motions.insert(id, list);
+                s.motion_numbers.insert(id, numbers);
             }
         }
         // Advance each body's motion: the one the script asked for when it exists, else the first (idle).
@@ -971,19 +991,25 @@ impl FieldView {
                 continue;
             };
             let Some(motions) = s.motions.get(&id).filter(|m| !m.is_empty()) else { continue };
+            // The motion by its number (event motions included), else the old index guess, else the first.
+            let numbers = s.motion_numbers.get(&id);
             let want = a
                 .motion
-                .and_then(|m| usize::try_from(m & 0xFFF).ok())
-                .filter(|&m| m < motions.len())
+                .and_then(|m| numbers.and_then(|n| n.get(&((m & 0xFFFF) as u16)).copied()))
+                .or_else(|| {
+                    a.motion.and_then(|m| usize::try_from(m & 0xFFF).ok()).filter(|&m| m < motions.len())
+                })
                 .unwrap_or(0);
             let entry = s.anim.entry(w).or_insert((usize::MAX, 0.0, 1.0));
             if entry.0 != want {
+                // The translation scale from the character's first (own) motion: an event motion's root
+                // carries it to its place, which a fit on that motion would take for body size.
                 let scale = model
                     .meshes
                     .iter()
                     .filter_map(|m| m.skeleton.as_ref())
                     .max_by_key(|sk| sk.len())
-                    .map_or(1.0, |sk| fit_translation_scale(&sk.names, &sk.default_pose, &motions[want]));
+                    .map_or(1.0, |sk| fit_translation_scale(&sk.names, &sk.default_pose, &motions[0]));
                 *entry = (want, 0.0, scale);
             }
             let motion = &motions[want];
@@ -1122,6 +1148,14 @@ impl FieldView {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
                 // Y points down in the map, so a turn about Y is negated to look right after the viewer's flip.
                 let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
+                // An event's own motions are authored in the scene's frame (their root carries each character to
+                // its place): the actor's facing does not turn them (znkd0600's party all face −90° and sit round
+                // the fire only that way).
+                let event_motion = a
+                    .model
+                    .zip(s.anim.get(&w))
+                    .is_some_and(|(id, &(i, _, _))| s.motion_own.get(&id).is_some_and(|&own| i >= own));
+                let yaw = if event_motion { 0.0 } else { yaw };
                 let place = Mat4::from_translation(Vec3::from(pos)) * Mat4::from_rotation_y(-yaw);
                 let pose = a
                     .model
