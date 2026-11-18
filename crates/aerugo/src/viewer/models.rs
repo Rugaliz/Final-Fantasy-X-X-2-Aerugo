@@ -204,6 +204,7 @@ impl ModelBrowser {
                                 joint_base: Some(base),
                                 lit: self.lit,
                                 part: Some(pi),
+                                tint: None,
                             });
                         }
                     }
@@ -213,6 +214,7 @@ impl ModelBrowser {
                         joint_base: None,
                         lit: self.lit,
                         part: None,
+                        tint: None,
                     }),
                 }
                 if let (Some(sk), Some(world)) = (&m.skeleton, posed) {

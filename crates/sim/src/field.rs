@@ -78,6 +78,14 @@ pub struct Actor {
     /// Facing pitch, and the pitch moves in space go along.
     pub pitch: f32,
     pub move_pitch: f32,
+    /// How lit the character is (its material colour is × shade × 0.85 + 0.15): 1, or what native 5088 set, or for
+    /// the party the walk mesh's shade where they stand.
+    pub shade: Eased,
+    /// Native 5088 set the shade (the walk mesh no longer does).
+    pub shade_set: bool,
+    /// The character's colour and alpha (natives 5015 and 5033): its material colour and its shade colour; alpha 0
+    /// hides it.
+    pub color: [Eased; 4],
 }
 
 impl Default for Actor {
@@ -114,6 +122,9 @@ impl Default for Actor {
             turn_inc: 0.0,
             pitch: 0.0,
             move_pitch: 0.0,
+            shade: Eased::new(1.0),
+            shade_set: false,
+            color: [Eased::new(1.0); 4],
         }
     }
 }
@@ -600,6 +611,43 @@ pub struct Input {
     pub camera_heading: Option<f32>,
 }
 
+/// A value moving linearly to a target over a number of ticks (the original's interpolated character values).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Eased {
+    pub value: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Eased {
+    pub fn new(value: f32) -> Eased {
+        Eased { value, target: value, step: 0.0 }
+    }
+
+    /// Move to `target` over `frames` ticks (at once when 0 or less).
+    pub fn set(&mut self, target: f32, frames: i32) {
+        self.target = target;
+        if frames <= 0 {
+            self.value = target;
+            self.step = 0.0;
+        } else {
+            self.step = (target - self.value) / frames as f32;
+        }
+    }
+
+    fn tick(&mut self) {
+        if self.step != 0.0 {
+            self.value += self.step;
+            if (self.step > 0.0 && self.value >= self.target)
+                || (self.step < 0.0 && self.value <= self.target)
+            {
+                self.value = self.target;
+                self.step = 0.0;
+            }
+        }
+    }
+}
+
 /// One light of the field light set: a colour (0–1) and the direction it shines in as yaw and pitch (degrees;
 /// the ambient, index 3, has none).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -927,6 +975,18 @@ impl FieldState {
         for a in &mut self.actors {
             if let Some(p) = &mut a.motion_play {
                 p.3 += 1;
+            }
+            a.shade.tick();
+            for c in &mut a.color {
+                c.tick();
+            }
+            // The party take their shade from the walk mesh (the original does for characters whose data asks
+            // for it; which do is not read yet).
+            if !a.shade_set
+                && a.model.is_some_and(|m| m >> 12 == 0)
+                && let Some(s) = self.ground.as_ref().and_then(|g| g.shade_at(a.pos))
+            {
+                a.shade = Eased::new(s);
             }
         }
         if self.fade != self.fade_target {
@@ -1772,8 +1832,8 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x500E, 0x5013, 0x5014, 0x5015, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017,
-        0x4019, 0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
+        0x500B, 0x500E, 0x5013, 0x5014, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019,
+        0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
     );
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
@@ -1811,6 +1871,45 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             g.fog.limit = (c.stack.pop_float() / 255.0).clamp(0.0, 1.0);
             Value::Int(1)
+        }),
+    );
+    // A character's shade (float; the original eases to it over the given frames, not modelled).
+    n.register(
+        0x5088,
+        Native::result(|g, c| {
+            let frames = c.stack.pop_int();
+            let shade = c.stack.pop_float();
+            let w = c.worker;
+            let a = g.actor(w);
+            a.shade.set(shade, frames);
+            a.shade_set = true;
+            Value::Int(0)
+        }),
+    );
+    // A character's colour (r, g, b) and alpha, each eased over the given frames.
+    n.register(
+        0x5015,
+        Native::result(|g, c| {
+            let frames = c.stack.pop_int();
+            let b = c.stack.pop_float();
+            let gr = c.stack.pop_float();
+            let r = c.stack.pop_float();
+            let w = c.worker;
+            let a = g.actor(w);
+            for (k, v) in [r, gr, b].into_iter().enumerate() {
+                a.color[k].set(v, frames);
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5033,
+        Native::result(|g, c| {
+            let frames = c.stack.pop_int();
+            let alpha = c.stack.pop_float();
+            let w = c.worker;
+            g.actor(w).color[3].set(alpha, frames);
+            Value::Int(0)
         }),
     );
     // Field light colour only (0–1 floats); no FFX event calls it.

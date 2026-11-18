@@ -1064,55 +1064,61 @@ impl FieldView {
         };
         let mut draws = Vec::new();
         let mut joints = Vec::new();
-        let mut add =
-            |m: &GpuModel, place: Mat4, pose: Option<(&Motion, f32, f32)>, joints: &mut Vec<[f32; 16]>| {
-                for mesh in &m.meshes {
-                    match (&mesh.skeleton, mesh.skinned) {
-                        (Some(sk), true) => {
-                            let mut local = sk.default_pose.clone();
-                            if let Some((motion, time, scale)) = pose {
-                                for (i, name) in sk.names.iter().enumerate() {
-                                    if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
-                                        local[i] = motion.joint_at(j, time).matrix(scale);
-                                    }
+        let mut add = |m: &GpuModel,
+                       place: Mat4,
+                       pose: Option<(&Motion, f32, f32)>,
+                       tint: Option<aerugo_gfx::CharacterTint>,
+                       joints: &mut Vec<[f32; 16]>| {
+            for mesh in &m.meshes {
+                match (&mesh.skeleton, mesh.skinned) {
+                    (Some(sk), true) => {
+                        let mut local = sk.default_pose.clone();
+                        if let Some((motion, time, scale)) = pose {
+                            for (i, name) in sk.names.iter().enumerate() {
+                                if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
+                                    local[i] = motion.joint_at(j, time).matrix(scale);
                                 }
                             }
-                            let world = sk.world(&local);
-                            for (pi, &si) in mesh.part_segments.iter().enumerate() {
-                                let seg = &m.model.meshes[mesh.source].segments[si];
-                                let base = joints.len() as u32;
-                                joints.extend(sk.palette(&world, seg));
-                                draws.push(Draw {
-                                    mesh: mesh.mesh,
-                                    model: (place * mesh.world).to_cols_array(),
-                                    joint_base: Some(base),
-                                    lit: false,
-                                    part: Some(pi),
-                                });
-                            }
                         }
-                        _ => draws.push(Draw {
-                            mesh: mesh.mesh,
-                            model: (place * mesh.world).to_cols_array(),
-                            joint_base: None,
-                            lit: false,
-                            part: None,
-                        }),
+                        let world = sk.world(&local);
+                        for (pi, &si) in mesh.part_segments.iter().enumerate() {
+                            let seg = &m.model.meshes[mesh.source].segments[si];
+                            let base = joints.len() as u32;
+                            joints.extend(sk.palette(&world, seg));
+                            draws.push(Draw {
+                                mesh: mesh.mesh,
+                                model: (place * mesh.world).to_cols_array(),
+                                joint_base: Some(base),
+                                lit: false,
+                                part: Some(pi),
+                                tint,
+                            });
+                        }
                     }
+                    _ => draws.push(Draw {
+                        mesh: mesh.mesh,
+                        model: (place * mesh.world).to_cols_array(),
+                        joint_base: None,
+                        lit: false,
+                        part: None,
+                        tint,
+                    }),
                 }
-            };
+            }
+        };
         // The map model is in view space (game space turned half a turn about X); everything is drawn through the
         // game-to-view turn, so the map takes the inverse first (the turn is its own inverse).
         let map_place = map_place();
         if let Some(m) = &s.map {
-            add(m, map_place, None, &mut joints);
+            add(m, map_place, None, None, &mut joints);
         }
         if self.show_layers
             && let Some(m) = &s.layers
         {
-            add(m, map_place, None, &mut joints);
+            add(m, map_place, None, None, &mut joints);
         }
-        for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible) {
+        // Alpha 0 (native 5033) hides a character as the original does; under 1 it draws blended.
+        for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
                 // Y points down in the map, so a turn about Y is negated to look right after the viewer's flip.
                 let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
@@ -1122,7 +1128,16 @@ impl FieldView {
                     .and_then(|id| s.motions.get(&id))
                     .zip(s.anim.get(&w))
                     .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
-                add(m, place, pose, &mut joints);
+                // The remaster's run-time material colour: the character's colour × (shade × 0.85 + 0.15); the
+                // colour is also its shade colour.
+                let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
+                let k = a.shade.value * 0.85 + 0.15;
+                let tint = self.game.then_some(aerugo_gfx::CharacterTint {
+                    material: rgb.map(|c| c * k),
+                    shade: rgb,
+                    alpha: a.color[3].value.min(1.0),
+                });
+                add(m, place, pose, tint, &mut joints);
             }
         }
         // The map's scene settings: its fog, and its background colour behind everything.

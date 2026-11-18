@@ -368,6 +368,7 @@ impl MapBrowser {
                     joint_base: None,
                     lit: self.lit,
                     part: None,
+                    tint: None,
                 });
             }
         };
@@ -614,6 +615,7 @@ mod tests {
                     joint_base: None,
                     lit: false,
                     part: None,
+                    tint: None,
                 })
                 .collect();
             let h = 180u32;

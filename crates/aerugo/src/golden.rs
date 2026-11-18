@@ -86,6 +86,7 @@ fn effect_draws(cluster: &Cluster, model: &GpuModel, effect: &str) -> (Vec<Draw>
                 joint_base: None,
                 lit: false,
                 part: Some(part),
+                tint: None,
             });
             let seg = &source.segments[m.part_segments[part]];
             if let Some(pos) = seg.positions() {

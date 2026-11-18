@@ -16,7 +16,8 @@ layout(set = 0, binding = 1) uniform sampler baseSampler;
 
 // Slot 0: scene constants (fog colour, enabled; near, far, curve, limit; eye position, time; character light
 // slot, enabled); joint matrices follow, then two slots per water part, then the character light's two slots
-// (direction towards light 0, its colour, light 1, colour; light 2, colour, ambient, unused).
+// (direction towards light 0, its colour, light 1, colour; light 2, colour, ambient + shade coefficient, unused),
+// then one slot per tinted draw (material colour, shade colour).
 layout(set = 1, binding = 0) readonly buffer Joints {
     mat4 joints[];
 };
@@ -117,6 +118,12 @@ void main() {
         }
     }
     vec3 rgb = c.rgb;
+    // A draw's tint (params.y = ±(2 + its slot)): characters' run-time material colour and shade colour.
+    bool tinted = mode < 0.5 && abs(pc.params.y) > 1.5;
+    mat4 tint = tinted ? joints[uint(abs(pc.params.y) - 2.0)] : mat4(1.0);
+    if (tinted) {
+        rgb *= tint[0].rgb;
+    }
     if (mode > 0.5 && mode < 1.5) {
         vec3 n = normalize(vNormal);
         float d = abs(dot(n, normalize(vec3(0.4, 0.8, 0.45))));
@@ -133,7 +140,8 @@ void main() {
         vec3 n = normalize(vNormal);
         vec3 h = vec3(dot(a[0].xyz, n), dot(a[2].xyz, n), dot(b[0].xyz, n)) * 0.5 + 0.5;
         h *= h;
-        rgb *= b[2].rgb + a[1].rgb * h.x + a[3].rgb * h.y + b[1].rgb * h.z;
+        vec3 shade = tinted ? tint[1].rgb : vec3(1.0);
+        rgb *= b[2].rgb + shade * b[2].w + a[1].rgb * h.x + a[3].rgb * h.y + b[1].rgb * h.z;
     }
     // Characters (no tone curve of their own) fade toward the fog colour as the field curve shows it.
     if (mode < 0.5) {
@@ -150,7 +158,7 @@ void main() {
         s = min(s * 0.3 + pow(s, vec3(0.588235)), vec3(1.0));
         rgb = 0.5 - 0.5 * cos(s * 3.14159);
     }
-    outColor = vec4(rgb, c.a);
+    outColor = vec4(rgb, tinted ? c.a * tint[0].a : c.a);
     float len = length(vNormal);
     outNormal = vec4(len > 0.0 ? vNormal / len : vec3(0.0), mode > 1.5 ? 1.0 : 0.5);
 }

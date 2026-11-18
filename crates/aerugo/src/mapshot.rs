@@ -98,6 +98,7 @@ fn map_shot() {
             joint_base: None,
             lit: false,
             part: None,
+            tint: None,
         })
         .collect();
     let mut joints: Vec<[f32; 16]> = Vec::new();
@@ -109,6 +110,11 @@ fn map_shot() {
         let m = assets::load_model(&vfs, &mut renderer, path).unwrap();
         // As on the game screen: Y points down, so a turn about Y is negated.
         let place = Mat4::from_translation(Vec3::from(at)) * Mat4::from_rotation_y(-yaw);
+        // AERUGO_SHOT_CHR_ALPHA draws the character faded (its alpha, as native 5033 sets it).
+        let tint = std::env::var("AERUGO_SHOT_CHR_ALPHA")
+            .ok()
+            .and_then(|a| a.parse().ok())
+            .map(|alpha| aerugo_gfx::CharacterTint { material: [1.0; 3], shade: [1.0; 3], alpha });
         for mesh in &m.meshes {
             match (&mesh.skeleton, mesh.skinned) {
                 (Some(sk), true) => {
@@ -123,6 +129,7 @@ fn map_shot() {
                             joint_base: Some(base),
                             lit: false,
                             part: Some(pi),
+                            tint,
                         });
                     }
                 }
@@ -132,6 +139,7 @@ fn map_shot() {
                     joint_base: None,
                     lit: false,
                     part: None,
+                    tint,
                 }),
             }
         }

@@ -368,6 +368,15 @@ pub struct BlendState {
 }
 
 impl BlendState {
+    /// The remaster's FakeTransparent pass, which characters draw in while their alpha is under 1.
+    pub const FAKE_TRANSPARENT: BlendState = BlendState {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::OneMinusSrcAlpha,
+        op: BlendOp::Add,
+        src_alpha: BlendFactor::One,
+        dst_alpha: BlendFactor::Zero,
+        op_alpha: BlendOp::Add,
+    };
     pub const ALPHA: BlendState = BlendState {
         src: BlendFactor::SrcAlpha,
         dst: BlendFactor::OneMinusSrcAlpha,
@@ -816,6 +825,19 @@ pub struct Draw {
     pub lit: bool,
     /// Draw only this part (all when `None`).
     pub part: Option<usize>,
+    /// A character's colours (`None`: white).
+    pub tint: Option<CharacterTint>,
+}
+
+/// A character's run-time colours in the remaster's character shader.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CharacterTint {
+    /// MaterialColour: the colour is multiplied by it.
+    pub material: [f32; 3],
+    /// CharacterShadeColor: × [`CharacterLight::shade`], added to the ambient.
+    pub shade: [f32; 3],
+    /// MaterialColour's alpha: under 1 the character draws blended (the FakeTransparent pass).
+    pub alpha: f32,
 }
 
 /// A frame of the 3D viewport.
@@ -845,13 +867,16 @@ pub struct SceneView {
     pub character_light: Option<CharacterLight>,
 }
 
-/// The remaster's character lighting: colour × (ambient + Σ colourᵢ × ((n · Lᵢ) / 2 + ½)²), clamped to 1.
+/// The remaster's character lighting: colour × (ambient + shade colour × shade + Σ colourᵢ × ((n · Lᵢ) / 2 +
+/// ½)²), clamped to 1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CharacterLight {
     /// Unit vectors towards each light (in `view_proj`'s world space) and the lights' colours.
     pub lights: [([f32; 3], [f32; 3]); 3],
-    /// Ambient light (the character ambient plus the shade colour × its coefficient).
+    /// Ambient light (CharacterAmbientLight).
     pub ambient: [f32; 3],
+    /// CharacterShadeCoeff: how much of each character's shade colour adds to the ambient.
+    pub shade: f32,
 }
 
 impl CharacterLight {
@@ -864,6 +889,7 @@ impl CharacterLight {
             s[at / 16][at % 16 + 4..at % 16 + 7].copy_from_slice(col);
         }
         s[1][8..11].copy_from_slice(&self.ambient);
+        s[1][11] = self.shade;
         s
     }
 }
@@ -1686,6 +1712,11 @@ impl SceneState {
         };
         for part in &desc.parts {
             self.pipeline.get(&ctx.device, &part.material)?;
+            // Opaque parts may draw faded (a character's alpha under 1).
+            if part.material.blend.is_none() {
+                let fade = MaterialState { blend: Some(BlendState::FAKE_TRANSPARENT), ..part.material };
+                self.pipeline.get(&ctx.device, &fade)?;
+            }
         }
         let id = self.next_mesh;
         self.next_mesh += 1;
@@ -1728,10 +1759,23 @@ impl SceneState {
                 }
             }
         }
-        // Then the character light's two slots.
+        // Then the character light's two slots, then one slot per tinted draw.
         let light_slot = 1 + view.joints.len() + 2 * water.len();
         let light = view.character_light.map(|l| l.constants());
-        let slots = light_slot + if light.is_some() { 2 } else { 0 };
+        let tint_base = light_slot + if light.is_some() { 2 } else { 0 };
+        let mut tints: Vec<[f32; 16]> = Vec::new();
+        let mut tint_slot = std::collections::HashMap::new();
+        for (di, d) in view.draws.iter().enumerate() {
+            if let Some(t) = d.tint {
+                tint_slot.insert(di, (tint_base + tints.len()) as f32);
+                let mut s = [0.0; 16];
+                s[..3].copy_from_slice(&t.material);
+                s[3] = t.alpha;
+                s[4..7].copy_from_slice(&t.shade);
+                tints.push(s);
+            }
+        }
+        let slots = tint_base + tints.len();
         if slots * 64 > self.joints[frame].buffer.size as usize {
             let fresh = SceneStateRef { pipeline: &self.pipeline, pool: self.pool }
                 .joint_slot(ctx, slots.next_power_of_two())?;
@@ -1752,6 +1796,7 @@ impl SceneState {
                 .chain(view.joints.iter())
                 .chain(water.iter().flatten())
                 .chain(light.iter().flatten())
+                .chain(tints.iter())
                 .enumerate()
             {
                 for (k, f) in j.iter().enumerate() {
@@ -1933,14 +1978,18 @@ impl SceneState {
                     let m = d.model;
                     // A mirrored model matrix (some maps are exported that way) turns its triangles round too.
                     let flip = flip != (det3(&m) < 0.0);
+                    // A faded character draws its opaque parts blended, after the opaque ones.
+                    let faded = d.tint.is_some_and(|t| t.alpha < 1.0);
                     for (pi, (part, set, extra)) in mesh.parts.iter().enumerate() {
                         if d.part.is_some_and(|p| p != pi)
                             || part.index_count == 0
-                            || part.material.blend.is_some() != blended
+                            || (part.material.blend.is_some() || faded) != blended
                         {
                             continue;
                         }
-                        let mat = &part.material;
+                        let fade =
+                            MaterialState { blend: Some(BlendState::FAKE_TRANSPARENT), ..part.material };
+                        let mat = if faded && part.material.blend.is_none() { &fade } else { &part.material };
                         let Some(&pipeline) = self.pipeline.pipelines.get(&PipelineKey::from(mat)) else {
                             continue;
                         };
@@ -1986,9 +2035,15 @@ impl SceneState {
                                     part.curve.code() + if part.fog { 0.0 } else { 8.0 },
                                 ]
                             } else {
+                                // y: 0 unskinned, 1 skinned; ±(2 + its slot) with a tint (negative unskinned).
+                                let skin = d.joint_base.is_some();
+                                let y = match tint_slot.get(&di) {
+                                    Some(&slot) => (2.0 + slot) * if skin { 1.0 } else { -1.0 },
+                                    None => f32::from(u8::from(skin)),
+                                };
                                 [
                                     d.joint_base.unwrap_or(0) as f32,
-                                    if d.joint_base.is_some() { 1.0 } else { 0.0 },
+                                    y,
                                     part.alpha_cutoff,
                                     if d.lit {
                                         1.0

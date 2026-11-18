@@ -20,6 +20,8 @@ pub struct Ground {
     cells: Vec<Vec<u32>>,
     /// How far above or below the current height a floor still counts as the one to walk on.
     step: f32,
+    /// Each walk-mesh triangle's three vertex shades (0–31; empty without a walk mesh).
+    shades: Vec<[u8; 3]>,
 }
 
 impl Ground {
@@ -54,7 +56,7 @@ impl Ground {
                 }
             }
         }
-        Ground { tris, min: lo, dims, cells, step: STEP }
+        Ground { tris, min: lo, dims, cells, step: STEP, shades: Vec::new() }
     }
 
     /// Triangles of every mesh of a map model, placed in game space (the model is in view space, turned half a
@@ -99,7 +101,8 @@ impl Ground {
     /// The walk mesh of a PS2 map package (`mapout.vpa`): the section the `MAP1` header names at +0x18 holds a
     /// scale (+0xC, tenths), int16 vertices (offset at +0x18; x, y, z, pad) and triangle groups (offset at +0x1C,
     /// count at +6; each 0x10 bytes with a triangle count at +8 and the triangles' offset at +0xC; triangles are
-    /// 0x10 bytes starting with three vertex indices). Positions are vertices divided by the scale.
+    /// 0x10 bytes starting with three vertex indices, whose word at +0xC holds the three vertex shades, 5 bits each,
+    /// from bit 17). Positions are vertices divided by the scale.
     pub fn from_walk_mesh(vpa: &[u8]) -> Option<Ground> {
         let u32_at =
             |d: &[u8], at: usize| d.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -125,6 +128,7 @@ impl Ground {
             ])
         };
         let mut tris = Vec::new();
+        let mut shades = Vec::new();
         for g in 0..count {
             let at = groups + g * 0x10;
             let n = i16_at(d, at + 8)?.max(0) as usize;
@@ -136,10 +140,12 @@ impl Ground {
                     vertex(i16_at(d, at + 2)?)?,
                     vertex(i16_at(d, at + 4)?)?,
                 ]);
+                let w = u32_at(d, at + 0xC)? >> 17;
+                shades.push([0, 5, 10].map(|s| (w >> s & 31) as u8));
             }
         }
         // Every triangle of a walk mesh is walkable (only its open edges are walls), steep slopes too.
-        (!tris.is_empty()).then(|| Ground { step: WALK_MESH_STEP, ..Ground::new(tris) })
+        (!tris.is_empty()).then(|| Ground { step: WALK_MESH_STEP, shades, ..Ground::new(tris) })
     }
 
     /// The triangles (map space).
@@ -166,6 +172,36 @@ impl Ground {
             &[][..]
         };
         cell.iter().filter_map(move |&i| height_at(&self.tris[i as usize], x, z))
+    }
+
+    /// The walk mesh's shade at `p` (on the floor nearest its height): with d the distances to the triangle's
+    /// corners and w = normalize(1 − normalize(d)), |w ⊙ shades / 31| (the original's character shade).
+    pub fn shade_at(&self, p: [f32; 3]) -> Option<f32> {
+        if self.shades.is_empty() || self.dims[0] == 0 {
+            return None;
+        }
+        let cx = ((p[0] - self.min[0]) / CELL).floor();
+        let cz = ((p[2] - self.min[1]) / CELL).floor();
+        if cx < 0.0 || cz < 0.0 || cx as usize >= self.dims[0] || cz as usize >= self.dims[1] {
+            return None;
+        }
+        let (i, _) = self.cells[cz as usize * self.dims[0] + cx as usize]
+            .iter()
+            .filter_map(|&i| {
+                height_at(&self.tris[i as usize], p[0], p[2]).map(|h| (i as usize, (h - p[1]).abs()))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        let norm = |v: [f32; 3]| {
+            let l = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if l > 1e-6 { v.map(|x| x / l) } else { v }
+        };
+        let d = norm(
+            self.tris[i]
+                .map(|c| ((c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2)).sqrt()),
+        );
+        let w = norm(d.map(|x| 1.0 - x));
+        let s = self.shades[i];
+        Some((0..3).map(|k| (w[k] * f32::from(s[k]) / 31.0).powi(2)).sum::<f32>().sqrt())
     }
 
     /// Whether `p` stands on a floor (one within an ordinary step of its height).

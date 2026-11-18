@@ -267,7 +267,7 @@ pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
 /// scaled by (1 − k) × 1.2 × 0.95 (the ambient's by × 1.05), where k dims the lights by their brightness
 /// (0.3 r + 0.5 g + 0.2 b, after that scale) against the brightest one, through the glow thresholds:
 /// k = clamp(0.5 × clamp(gain² + spread², 0.01, 1.4) × (clamp(lum / max, lower, upper) − lower) / clamp(upper −
-/// lower, 0.01, 1.1), 0.01, 0.99). Directions point towards the lights; the shade colour (white) × 0.208125
+/// lower, 0.01, 1.1), 0.01, 0.99). Directions point towards the lights; each character's shade colour × 0.208125
 /// adds to the ambient. (Per-character light overrides are not ported.)
 pub fn character_light(
     lights: &aerugo_sim::field::FieldLights,
@@ -297,7 +297,8 @@ pub fn character_light(
     let s = scale(3);
     aerugo_gfx::CharacterLight {
         lights: [light(0), light(1), light(2)],
-        ambient: lights.0[3].color.map(|c| c * s + 0.208125),
+        ambient: lights.0[3].color.map(|c| c * s),
+        shade: 0.208125,
     }
 }
 
