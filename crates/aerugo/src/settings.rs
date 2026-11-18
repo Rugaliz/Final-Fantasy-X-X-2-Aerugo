@@ -38,6 +38,8 @@ pub struct GraphicsSettings {
     pub msaa: u32,
     /// Sharpen the 3D view with the remaster's unsharp mask.
     pub sharpen: bool,
+    /// The remaster's ambient occlusion: 0 off, 1 low, 2 medium, 3 high.
+    pub hdao: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +113,7 @@ impl Default for GraphicsSettings {
             validation: false,
             msaa: 8,
             sharpen: true,
+            hdao: 3,
         }
     }
 }

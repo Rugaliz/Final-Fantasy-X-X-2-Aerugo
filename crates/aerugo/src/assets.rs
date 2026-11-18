@@ -175,6 +175,7 @@ pub fn material_state(p: &PassState) -> MaterialState {
             Compare::GreaterEqual => CompareOp::GreaterOrEqual,
             Compare::Always => CompareOp::Always,
         },
+        normals: false,
     }
 }
 
@@ -366,6 +367,11 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
             if map {
                 material.front_ccw = !material.front_ccw;
             }
+            // The remaster's lit map shaders and character shaders write the normal target (its ambient
+            // occlusion reads it); its sky, water and blended passes do not.
+            let family_lc = aerugo_formats::effect::effect_family(&effect_id).to_ascii_lowercase();
+            material.normals = material.blend.is_none()
+                && matches!(family_lc.as_str(), "phyredefaultlitshader" | "phyrechrlitshader");
             // The remaster's sky shader never alpha-tests (a fading sky keeps its pixels); the map variants that
             // alpha-test discard under the material's threshold (0.5 stands in until the material's own value is
             // read). Other map parts and characters keep 0.3 until their blending and thresholds are read.

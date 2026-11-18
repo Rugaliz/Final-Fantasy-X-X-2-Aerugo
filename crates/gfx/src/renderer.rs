@@ -427,6 +427,22 @@ impl Renderer {
         }
     }
 
+    /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high (6, 12 or 20 sample
+    /// patterns). Ignored where the device cannot run the compute passes.
+    pub fn set_hdao(&mut self, level: u32) {
+        let patterns = match level {
+            0 => 0,
+            1 => 6,
+            2 => 12,
+            _ => 20,
+        };
+        if patterns != self.scene.hdao_patterns {
+            self.ctx.wait_idle();
+            self.drop_viewport();
+            self.scene.hdao_patterns = patterns;
+        }
+    }
+
     /// The UI texture showing the 3D viewport, (re)created at `size` pixels.
     pub fn viewport_texture(&mut self, size: (u32, u32)) -> Result<egui::TextureId> {
         let extent = vk::Extent2D { width: size.0.clamp(1, 16384), height: size.1.clamp(1, 16384) };
@@ -481,7 +497,13 @@ impl Renderer {
             ctx,
             DEPTH_FORMAT,
             extent,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            // Single-sample depth is sampled by the ambient occlusion directly.
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | if samples == vk::SampleCountFlags::TYPE_1 {
+                    vk::ImageUsageFlags::SAMPLED
+                } else {
+                    vk::ImageUsageFlags::empty()
+                },
             vk::ImageAspectFlags::DEPTH,
             None,
             samples,
@@ -581,8 +603,104 @@ impl Renderer {
                 .ok(),
             None => None,
         };
+        // The normal target (and its multisampled version) and, for the ambient occlusion, a resolved depth and
+        // its working images.
+        let made = (|| -> Result<_> {
+            let normal = target(
+                ctx,
+                crate::scene::NORMAL_FORMAT,
+                extent,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::SampleCountFlags::TYPE_1,
+            )?;
+            let msaa_normal = (samples != vk::SampleCountFlags::TYPE_1)
+                .then(|| {
+                    target(
+                        ctx,
+                        crate::scene::NORMAL_FORMAT,
+                        extent,
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                        vk::ImageAspectFlags::COLOR,
+                        samples,
+                    )
+                })
+                .transpose()?;
+            Ok((normal, msaa_normal))
+        })();
+        let (normal, msaa_normal) = match made {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: never used.
+                unsafe { destroy_all(ctx, [color, depth].into_iter().chain(msaa_color)) };
+                return Err(e);
+            }
+        };
+        let hdao_on = self.scene.hdao.is_some() && self.scene.hdao_patterns > 0;
+        let depth_resolved = (hdao_on && samples != vk::SampleCountFlags::TYPE_1)
+            .then(|| {
+                target(
+                    ctx,
+                    DEPTH_FORMAT,
+                    extent,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::DEPTH,
+                    vk::SampleCountFlags::TYPE_1,
+                )
+            })
+            .transpose()
+            .inspect_err(|e| log::warn!("ambient occlusion depth: {e:#}"))
+            .ok()
+            .flatten();
+        let hdao = match (&self.scene.hdao, hdao_on) {
+            (Some(h), true) if samples == vk::SampleCountFlags::TYPE_1 || depth_resolved.is_some() => {
+                let depth_view = depth_resolved.as_ref().map_or(depth.view, |d| d.view);
+                let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+                let make = || {
+                    target(
+                        ctx,
+                        crate::scene::AO_FORMAT,
+                        extent,
+                        usage,
+                        vk::ImageAspectFlags::COLOR,
+                        vk::SampleCountFlags::TYPE_1,
+                    )
+                };
+                match (make(), make()) {
+                    (Ok(a), Ok(b)) => {
+                        let views = crate::scene::HdaoViews {
+                            picture: color.view,
+                            depth: depth_view,
+                            normal: normal.view,
+                            a: a.view,
+                            b: b.view,
+                        };
+                        match h.sets(ctx, self.scene.pool, &views) {
+                            Ok(sets) => Some(crate::scene::HdaoTargets { a, b, sets }),
+                            Err(e) => {
+                                log::warn!("ambient occlusion: {e:#}");
+                                // SAFETY: never used.
+                                unsafe { destroy_all(ctx, [a, b]) };
+                                None
+                            }
+                        }
+                    }
+                    (a, b) => {
+                        // SAFETY: never used.
+                        unsafe { destroy_all(ctx, [a, b].into_iter().flatten()) };
+                        log::warn!("ambient occlusion: could not create its images");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
         self.scene.viewport = Some(Viewport {
+            normal,
+            msaa_normal,
+            depth_resolved,
+            hdao,
             color,
             msaa_color,
             depth,
@@ -629,6 +747,15 @@ impl Renderer {
                     g.x.destroy(&self.ctx);
                     g.y.destroy(&self.ctx);
                 }
+                if let Some(h) = vp.hdao.take() {
+                    self.ctx.device.free_descriptor_sets(self.scene.pool, &h.sets).ok();
+                    destroy_all(&self.ctx, [h.a, h.b]);
+                }
+                vp.normal.destroy(&self.ctx);
+                destroy_all(
+                    &self.ctx,
+                    [vp.msaa_normal.take(), vp.depth_resolved.take()].into_iter().flatten(),
+                );
             }
         }
     }
@@ -1004,4 +1131,16 @@ unsafe fn destroy_all(ctx: &Context, targets: impl IntoIterator<Item = Target>) 
         // SAFETY: guaranteed by the caller.
         unsafe { t.destroy(ctx) };
     }
+}
+
+/// A single image target (see [`Target::new`]) without an alternative view.
+fn target(
+    ctx: &Context,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    usage: vk::ImageUsageFlags,
+    aspect: vk::ImageAspectFlags,
+    samples: vk::SampleCountFlags,
+) -> Result<Target> {
+    Target::new(ctx, format, extent, usage, aspect, None, samples)
 }

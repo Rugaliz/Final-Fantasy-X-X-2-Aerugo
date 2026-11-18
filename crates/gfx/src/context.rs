@@ -158,8 +158,11 @@ impl Context {
         };
         let storage_rgba8 = rgba8.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
         let msaa_counts = limits.framebuffer_color_sample_counts & limits.framebuffer_depth_sample_counts;
-        let core =
-            vk::PhysicalDeviceFeatures::default().texture_compression_bc(true).sampler_anisotropy(anisotropy);
+        let core = vk::PhysicalDeviceFeatures::default()
+            .texture_compression_bc(true)
+            .sampler_anisotropy(anisotropy)
+            // The normal target is never blended while the colour target is.
+            .independent_blend(true);
         let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -257,11 +260,16 @@ fn pick_device(
         // SAFETY: valid physical device; the chain lives on the stack for the call.
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
         let bc = f2.features.texture_compression_bc;
+        let independent_blend = f2.features.independent_blend;
         if f13.dynamic_rendering == vk::FALSE || f13.synchronization2 == vk::FALSE {
             continue;
         }
         if bc == vk::FALSE {
             log::info!("skipping {name}: BC texture compression required");
+            continue;
+        }
+        if independent_blend == vk::FALSE {
+            log::info!("skipping {name}: independent blending required");
             continue;
         }
         if surface_fn.is_some() {

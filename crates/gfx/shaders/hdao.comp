@@ -1,0 +1,127 @@
+#version 450
+// The remaster's ambient occlusion (its HDAO setting), in three modes:
+// 0: occlusion where neighbouring normals differ — mirrored pairs of depth samples on up to 20 pattern offsets,
+//    counted when both are nearer than the centre by between the accept and reject radii — faded by fog
+//    distance; writes (occlusion, normalised depth).
+// 1: depth-aware blur of that along `axis` (9 taps).
+// 2: multiplies the picture by it.
+// The normal target's alpha tells scenery (1) from characters (0.5); each has its own parameters.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D source;
+layout(set = 0, binding = 1) uniform sampler linearClamp;
+layout(set = 0, binding = 2, rgba16f) uniform image2D aoTarget;
+layout(set = 0, binding = 3) uniform texture2D depthTex;
+layout(set = 0, binding = 4) uniform texture2D normalTex;
+layout(set = 0, binding = 5) uniform sampler pointClamp;
+layout(set = 0, binding = 6, rgba8) uniform image2D picture;
+
+layout(push_constant) uniform Push {
+    // x: mode, y: pattern count, zw: blur axis.
+    vec4 control;
+    // Fog near, far, curve, limit (the fade with distance).
+    vec4 fog;
+    // Linear depth from the depth buffer: w = depth.y / (z − depth.x); z: fade-out scale; w: edge sharpness.
+    vec4 depth;
+    // Scenery: kernel scale, reject radius, accept radius, intensity.
+    vec4 scenery;
+    // Characters: the same.
+    vec4 characters;
+    // Accept angle (scenery, characters), blur distance (scenery, characters).
+    vec4 common;
+} pc;
+
+// Pattern offsets (in pixels × kernel scale) and the sum of each pattern's four weights.
+const vec3 PATTERN[20] = vec3[](
+    vec3(1, -1, 2.65432), vec3(0, 1, 2.65432), vec3(0, 3, 1.37051), vec3(2, 1, 1.67321),
+    vec3(3, -1, 1.37051), vec3(1, -3, 1.67321), vec3(1, -5, 1.10234), vec3(3, -3, 1.21766),
+    vec3(5, -1, 0.94534), vec3(4, 1, 1.10234), vec3(2, 3, 1.21766), vec3(0, 5, 0.94534),
+    vec3(0, 7, 0.74664), vec3(2, 5, 0.93013), vec3(4, 3, 0.98623), vec3(6, 1, 0.84181),
+    vec3(7, -1, 0.74664), vec3(5, -3, 0.93013), vec3(3, -5, 0.98623), vec3(1, -7, 0.84181));
+
+// Neighbour pairs for the edge test (pixel offsets).
+const ivec4 EDGE_PAIRS[4] = ivec4[](ivec4(1, 8, -2, -9), ivec4(8, -1, -9, 0), ivec4(5, 4, -6, -5), ivec4(4, -4, -5, 3));
+
+float linearDepth(vec2 uv) {
+    float z = textureLod(sampler2D(depthTex, pointClamp), uv, 0.0).r;
+    return pc.depth.y / (z - pc.depth.x);
+}
+
+vec4 normalAt(ivec2 p, ivec2 size) {
+    return texelFetch(sampler2D(normalTex, pointClamp), clamp(p, ivec2(0), size - 1), 0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(sampler2D(normalTex, pointClamp), 0);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    vec2 texel = 1.0 / vec2(size);
+    vec2 pix = vec2(p) + 0.5;
+    vec2 uv = pix * texel;
+    int mode = int(pc.control.x + 0.5);
+    if (mode == 2) {
+        vec4 c = imageLoad(picture, p);
+        float ao = textureLod(sampler2D(source, pointClamp), uv, 0.0).x;
+        imageStore(picture, p, vec4(c.rgb * ao, c.a));
+        return;
+    }
+    vec4 n = normalAt(p, size);
+    bool scenery = n.w > 0.55;
+    if (mode == 1) {
+        vec4 c = textureLod(sampler2D(source, linearClamp), uv, 0.0);
+        float dist = scenery ? pc.common.z : pc.common.w;
+        vec2 step = texel * pc.control.zw * dist;
+        float edge = pc.depth.w * 2000.0;
+        float sum = c.x * 0.076585;
+        float weight = 0.076585;
+        const float TAPS[4] = float[](0.444893, 0.422649, 0.392902, 0.36297);
+        for (int i = 0; i < 4; i++) {
+            for (int side = -1; side <= 1; side += 2) {
+                vec4 s = textureLod(sampler2D(source, linearClamp), uv + step * float(side * (i + 1)), 0.0);
+                float w = max(1.0 - edge * abs(0.99609375 * (s.y - c.y)), 0.0) * TAPS[i];
+                sum += s.x * w;
+                weight += w;
+            }
+        }
+        float ao = sum / (weight + 0.0001);
+        imageStore(aoTarget, p, vec4(ao, c.y, 0.0, ao));
+        return;
+    }
+    float centre = linearDepth(uv);
+    float d01 = clamp(centre / 65536.0, 0.0, 1.0);
+    // Where neighbouring normals differ.
+    float angle = scenery ? pc.common.x : pc.common.y;
+    float edges = 0.0;
+    for (int i = 0; i < 4; i++) {
+        float d = dot(normalAt(p + EDGE_PAIRS[i].xy, size).xyz, normalAt(p + EDGE_PAIRS[i].zw, size).xyz);
+        edges += angle < d ? 0.0 : 1.0 - 0.25 * abs(d);
+    }
+    float edge = edges * 0.25 + 0.5;
+    if (edge <= 0.5) {
+        imageStore(aoTarget, p, vec4(1.0, d01, 0.0, 1.0));
+        return;
+    }
+    float fade = (abs(centre) - pc.fog.x) / (pc.fog.y - pc.fog.x + 0.01);
+    if (fade > 1.5) {
+        imageStore(aoTarget, p, vec4(1.0, d01, 0.0, 1.0));
+        return;
+    }
+    float near = clamp((1.5 - fade) * 2.0, 0.0, 1.0);
+    vec4 params = scenery ? pc.scenery : pc.characters;
+    float intensity = scenery ? params.w : 2.0 * n.w * params.w;
+    float occlusion = 0.0;
+    int count = int(pc.control.y + 0.5);
+    for (int k = 0; k < count && k < 20; k++) {
+        vec2 o = PATTERN[k].xy * params.x;
+        float a = centre - linearDepth((pix + o) * texel);
+        float b = centre - linearDepth((pix - o - 1.0) * texel);
+        bool hit = a < params.y && params.z < a && b < params.y && params.z < b;
+        occlusion += hit ? edge * PATTERN[k].z : 0.0;
+    }
+    float v = 1.0 - clamp(intensity * near * occlusion * 0.020051, 0.0, 1.0);
+    float distant = min(pow(clamp(fade, 0.0, 1.0), pc.fog.z), pc.fog.w) * pc.depth.z;
+    imageStore(aoTarget, p, vec4(v + distant * (1.0 - v), d01, 0.0, 1.0));
+}

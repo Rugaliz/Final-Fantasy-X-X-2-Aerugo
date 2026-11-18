@@ -35,6 +35,8 @@ layout(push_constant) uniform Push {
 } pc;
 
 layout(location = 0) out vec4 outColor;
+// World normal and a marker for the ambient occlusion: 1 scenery (field shading), 0.5 characters and the rest.
+layout(location = 1) out vec4 outNormal;
 
 // The fog share at this fragment's view depth (0 when the scene has no fog or the part ignores it).
 float fogShare() {
@@ -107,4 +109,6 @@ void main() {
         rgb = 0.5 - 0.5 * cos(s * 3.14159);
     }
     outColor = vec4(rgb, c.a);
+    float len = length(vNormal);
+    outNormal = vec4(len > 0.0 ? vNormal / len : vec3(0.0), mode > 1.5 ? 1.0 : 0.5);
 }

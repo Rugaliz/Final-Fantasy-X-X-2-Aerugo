@@ -13,9 +13,14 @@ static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv
 static CC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/colorcorrect.comp.spv"));
 static USM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unsharp.comp.spv"));
 static GLOW_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glow.comp.spv"));
+static HDAO_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hdao.comp.spv"));
 
 pub const VIEWPORT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// The second colour target: world normal and a marker (1 scenery, 0.5 characters), for the ambient occlusion.
+pub const NORMAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// The ambient occlusion's working images.
+pub(crate) const AO_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// One vertex as the mesh pipeline reads it.
 #[repr(C)]
@@ -420,6 +425,8 @@ pub struct MaterialState {
     pub depth_test: bool,
     pub depth_write: bool,
     pub depth_compare: CompareOp,
+    /// Writes the normal target (opaque map parts and characters, as the remaster's shaders that output one).
+    pub normals: bool,
 }
 
 impl Default for MaterialState {
@@ -433,6 +440,7 @@ impl Default for MaterialState {
             depth_test: true,
             depth_write: true,
             depth_compare: CompareOp::LessOrEqual,
+            normals: false,
         }
     }
 }
@@ -442,11 +450,12 @@ impl Default for MaterialState {
 pub(crate) struct PipelineKey {
     blend: Option<BlendState>,
     write_mask: u8,
+    normals: bool,
 }
 
 impl From<&MaterialState> for PipelineKey {
     fn from(m: &MaterialState) -> PipelineKey {
-        PipelineKey { blend: m.blend, write_mask: m.write_mask }
+        PipelineKey { blend: m.blend, write_mask: m.write_mask, normals: m.normals }
     }
 }
 
@@ -624,15 +633,23 @@ impl ScenePipeline {
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let b = key.blend.unwrap_or(BlendState::ALPHA);
-        let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(key.blend.is_some())
-            .src_color_blend_factor(b.src.vk())
-            .dst_color_blend_factor(b.dst.vk())
-            .color_blend_op(b.op.vk())
-            .src_alpha_blend_factor(b.src_alpha.vk())
-            .dst_alpha_blend_factor(b.dst_alpha.vk())
-            .alpha_blend_op(b.op_alpha.vk())
-            .color_write_mask(vk::ColorComponentFlags::from_raw(u32::from(key.write_mask & 0xF)))];
+        let blend_attachment = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(key.blend.is_some())
+                .src_color_blend_factor(b.src.vk())
+                .dst_color_blend_factor(b.dst.vk())
+                .color_blend_op(b.op.vk())
+                .src_alpha_blend_factor(b.src_alpha.vk())
+                .dst_alpha_blend_factor(b.dst_alpha.vk())
+                .alpha_blend_op(b.op_alpha.vk())
+                .color_write_mask(vk::ColorComponentFlags::from_raw(u32::from(key.write_mask & 0xF))),
+            // The normal target is never blended.
+            vk::PipelineColorBlendAttachmentState::default().color_write_mask(if key.normals {
+                vk::ColorComponentFlags::RGBA
+            } else {
+                vk::ColorComponentFlags::empty()
+            }),
+        ];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
         // Culling, winding and depth state vary per part without new pipelines (core in Vulkan 1.3).
         let dynamic_states = [
@@ -645,7 +662,7 @@ impl ScenePipeline {
             vk::DynamicState::DEPTH_COMPARE_OP,
         ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let formats = [VIEWPORT_FORMAT];
+        let formats = [VIEWPORT_FORMAT, NORMAL_FORMAT];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
             .depth_attachment_format(DEPTH_FORMAT);
@@ -874,6 +891,14 @@ pub(crate) struct Viewport {
     pub unsharp: Option<UnsharpTargets>,
     /// Images and sets of the glow.
     pub glow: Option<GlowTargets>,
+    /// The normal target (single-sample; with MSAA the samples are averaged into it).
+    pub normal: Target,
+    /// The multisampled normal target (with MSAA on).
+    pub msaa_normal: Option<Target>,
+    /// Depth resolved to one sample for the ambient occlusion (with MSAA and ambient occlusion on).
+    pub depth_resolved: Option<Target>,
+    /// Images and sets of the ambient occlusion (with it on).
+    pub hdao: Option<HdaoTargets>,
     pub extent: vk::Extent2D,
     pub ui_set: vk::DescriptorSet,
     pub ui_id: egui::TextureId,
@@ -904,6 +929,10 @@ pub(crate) struct SceneState {
     pub unsharp: Option<PostPass>,
     /// The glow passes (as above).
     pub glow: Option<PostPass>,
+    /// The ambient occlusion pass (as above).
+    pub hdao: Option<HdaoPass>,
+    /// Patterns the ambient occlusion samples (6, 12 or 20 for the remaster's low, medium and high; 0 = off).
+    pub hdao_patterns: u32,
 }
 /// The remaster's unsharp mask at its default settings (blur distance 1.2 pixels, intensity 0.45, threshold 0.04).
 const USM_DISTANCE: f32 = 1.2;
@@ -958,6 +987,190 @@ pub(crate) struct GlowTargets {
     pub x: Target,
     pub y: Target,
     pub sets: Vec<vk::DescriptorSet>,
+}
+
+/// The ambient occlusion's two working images and the sets of its passes: generate (into a), blur a → b,
+/// blur b → a, combine (a onto the picture).
+#[derive(Debug)]
+pub(crate) struct HdaoTargets {
+    pub a: Target,
+    pub b: Target,
+    pub sets: Vec<vk::DescriptorSet>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct HdaoPush {
+    control: [f32; 4],
+    fog: [f32; 4],
+    depth: [f32; 4],
+    scenery: [f32; 4],
+    characters: [f32; 4],
+    shared: [f32; 4],
+}
+
+/// The remaster's ambient occlusion parameters (its PostProcessManager defaults): kernel scale, reject radius,
+/// accept radius, intensity, for scenery and for characters (the same values), the accept angle and blur
+/// distance, the fade-out scale, edge sharpness and the blur's iterations.
+const HDAO_PARAMS: [f32; 4] = [1.0, 0.43, 0.003_12, 0.96];
+const HDAO_ANGLE: f32 = 0.98;
+const HDAO_BLUR: f32 = 0.9;
+const HDAO_FADE: f32 = 1.5;
+const HDAO_EDGE: f32 = 1.0;
+const HDAO_ITERATIONS: usize = 2;
+
+/// The views the ambient occlusion's passes read and write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HdaoViews {
+    pub picture: vk::ImageView,
+    pub depth: vk::ImageView,
+    pub normal: vk::ImageView,
+    pub a: vk::ImageView,
+    pub b: vk::ImageView,
+}
+
+/// The ambient occlusion's compute pass (see `hdao.comp`).
+#[derive(Debug)]
+pub(crate) struct HdaoPass {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    linear: vk::Sampler,
+    point: vk::Sampler,
+}
+
+impl HdaoPass {
+    fn new(device: &ash::Device) -> Result<HdaoPass> {
+        use vk::DescriptorType as T;
+        let bindings = [
+            (0, T::SAMPLED_IMAGE),
+            (1, T::SAMPLER),
+            (2, T::STORAGE_IMAGE),
+            (3, T::SAMPLED_IMAGE),
+            (4, T::SAMPLED_IMAGE),
+            (5, T::SAMPLER),
+            (6, T::STORAGE_IMAGE),
+        ]
+        .map(|(b, t)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(t)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(size_of::<HdaoPush>() as u32)];
+        let sampler = |filter: vk::Filter| {
+            vk::SamplerCreateInfo::default()
+                .mag_filter(filter)
+                .min_filter(filter)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        };
+        // SAFETY: valid device and create infos; objects made before a failure are left to the device's
+        // destruction (start-up only).
+        unsafe {
+            let set_layout = device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+            let layouts = [set_layout];
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&push),
+                None,
+            )?;
+            let module = crate::quad::shader_module(device, HDAO_SPV)?;
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0];
+            let linear = device.create_sampler(&sampler(vk::Filter::LINEAR), None)?;
+            let point = device.create_sampler(&sampler(vk::Filter::NEAREST), None)?;
+            Ok(HdaoPass { set_layout, layout, module, pipeline, linear, point })
+        }
+    }
+
+    /// The sets of the four passes over the views' picture with their working images, depth (sampled in
+    /// depth-read-only layout) and normals.
+    pub(crate) fn sets(
+        &self,
+        ctx: &Context,
+        pool: vk::DescriptorPool,
+        views: &HdaoViews,
+    ) -> Result<Vec<vk::DescriptorSet>> {
+        let HdaoViews { picture, depth, normal, a, b } = *views;
+        // (sampled source, storage AO target) per pass; unused bindings still need valid views.
+        let passes = [(b, a), (a, b), (b, a), (a, b)];
+        let layouts = vec![self.set_layout; passes.len()];
+        // SAFETY: valid pool and layout.
+        let sets = unsafe {
+            ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
+            )
+        }
+        .context("no room for ambient occlusion sets")?;
+        let general = vk::ImageLayout::GENERAL;
+        for (&set, &(source, target)) in sets.iter().zip(&passes) {
+            let img = |v: vk::ImageView, l: vk::ImageLayout| {
+                [vk::DescriptorImageInfo::default().image_view(v).image_layout(l)]
+            };
+            let smp = |s: vk::Sampler| [vk::DescriptorImageInfo::default().sampler(s)];
+            let infos = [
+                (0, vk::DescriptorType::SAMPLED_IMAGE, img(source, general)),
+                (1, vk::DescriptorType::SAMPLER, smp(self.linear)),
+                (2, vk::DescriptorType::STORAGE_IMAGE, img(target, general)),
+                (
+                    3,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    img(depth, vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL),
+                ),
+                (
+                    4,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    img(normal, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                ),
+                (5, vk::DescriptorType::SAMPLER, smp(self.point)),
+                (6, vk::DescriptorType::STORAGE_IMAGE, img(picture, general)),
+            ];
+            let writes: Vec<_> = infos
+                .iter()
+                .map(|(b, t, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*b)
+                        .descriptor_type(*t)
+                        .image_info(info)
+                })
+                .collect();
+            // SAFETY: the sets are new.
+            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        }
+        Ok(sets)
+    }
+
+    /// # Safety
+    /// The pass must not be in use.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_shader_module(self.module, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.linear, None);
+            device.destroy_sampler(self.point, None);
+        }
+    }
 }
 
 /// The remaster's glow settings for a scene (from the map's scene settings).
@@ -1232,8 +1445,9 @@ const MAX_ANISOTROPY: f32 = 16.0;
 const EXTRA_SETS: u32 = 256;
 /// Colour-correction sets (one per viewport size and table in use).
 const CC_SETS: u32 = 64;
-/// Unsharp-mask sets (three per viewport) and glow sets (five per viewport), with room for a viewport change.
-const USM_SETS: u32 = 16;
+/// Unsharp-mask sets (three per viewport), glow sets (five) and ambient occlusion sets (four), with room for a
+/// viewport change.
+const USM_SETS: u32 = 32;
 
 impl SceneState {
     pub fn new(ctx: &Context, frames: usize) -> Result<SceneState> {
@@ -1242,15 +1456,15 @@ impl SceneState {
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32 + CC_SETS + USM_SETS,
+                descriptor_count: SCENE_SETS + EXTRA_SETS * WATER_TEXTURES as u32 + CC_SETS + USM_SETS * 3,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: SCENE_SETS + CC_SETS + USM_SETS,
+                descriptor_count: SCENE_SETS + CC_SETS + USM_SETS * 2,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: CC_SETS + USM_SETS,
+                descriptor_count: CC_SETS + USM_SETS * 2,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1303,6 +1517,8 @@ impl SceneState {
             } else {
                 None
             },
+            hdao: if ctx.storage_rgba8 { Some(HdaoPass::new(device)?) } else { None },
+            hdao_patterns: 0,
         };
         for _ in 0..frames {
             let slot = state.joint_slot(ctx, 256)?;
@@ -1533,17 +1749,42 @@ impl SceneState {
                 .image(vp.depth.image)
                 .subresource_range(depth_range),
         ];
-        if let Some(ms) = &vp.msaa_color {
+        // The other colour targets start each frame undefined (the normal target was last sampled).
+        let color_target = |image: vk::Image| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                )
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(image)
+                .subresource_range(color_range)
+        };
+        for image in [
+            Some(vp.normal.image),
+            vp.msaa_color.as_ref().map(|t| t.image),
+            vp.msaa_normal.as_ref().map(|t| t.image),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            barriers.push(color_target(image));
+        }
+        if let Some(d) = &vp.depth_resolved {
             barriers.push(
                 vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .image(ms.image)
-                    .subresource_range(color_range),
+                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .image(d.image)
+                    .subresource_range(depth_range),
             );
         }
         let extent = vp.extent;
@@ -1562,7 +1803,7 @@ impl SceneState {
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: view.clear } });
             // With MSAA the samples are averaged into the viewport image at the end of the pass.
-            let color = [match &vp.msaa_color {
+            let color = match &vp.msaa_color {
                 Some(ms) => attachment
                     .image_view(ms.view)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -1570,15 +1811,42 @@ impl SceneState {
                     .resolve_image_view(vp.color.view)
                     .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
                 None => attachment.image_view(vp.color.view).store_op(vk::AttachmentStoreOp::STORE),
-            }];
+            };
+            let normal = vk::RenderingAttachmentInfo::default()
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } });
+            let normal = match &vp.msaa_normal {
+                Some(ms) => normal
+                    .image_view(ms.view)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(vp.normal.view)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                None => normal.image_view(vp.normal.view).store_op(vk::AttachmentStoreOp::STORE),
+            };
+            let color = [color, normal];
+            // Depth is kept for the ambient occlusion: resolved to one sample with MSAA, else stored.
+            let hdao_on = vp.hdao.is_some() && self.hdao.is_some() && self.hdao_patterns > 0;
             let depth = vk::RenderingAttachmentInfo::default()
                 .image_view(vp.depth.view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .store_op(if hdao_on && vp.depth_resolved.is_none() {
+                    vk::AttachmentStoreOp::STORE
+                } else {
+                    vk::AttachmentStoreOp::DONT_CARE
+                })
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
                 });
+            let depth = match (&vp.depth_resolved, hdao_on) {
+                (Some(d), true) => depth
+                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                    .resolve_image_view(d.view)
+                    .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                _ => depth,
+            };
             let rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D { offset: vk::Offset2D::default(), extent })
                 .layer_count(1)
@@ -1759,7 +2027,11 @@ impl SceneState {
                     .image(image)
                     .subresource_range(color_range)
             };
-            if correct.is_some() || usm.is_some() || glow.is_some() {
+            let hdao = match (&vp.hdao, &self.hdao) {
+                (Some(t), Some(h)) if self.hdao_patterns > 0 => Some((t, h)),
+                _ => None,
+            };
+            if correct.is_some() || usm.is_some() || glow.is_some() || hdao.is_some() {
                 let to_general = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(last.0)
                     .src_access_mask(last.1)
@@ -1801,6 +2073,81 @@ impl SceneState {
                 device.cmd_dispatch(cmd, size.0.div_ceil(8), size.1.div_ceil(8), 1);
             };
             let half = ((extent.width / 2).max(1), (extent.height / 2).max(1));
+            if let Some((t, h)) = hdao {
+                // Normals and depth become sampled images; the working images start undefined.
+                let depth_image = vp.depth_resolved.as_ref().map_or(vp.depth.image, |d| d.image);
+                let images = [
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(vp.normal.image)
+                        .subresource_range(color_range),
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(
+                            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                                | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                        )
+                        .src_access_mask(
+                            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        )
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .image(depth_image)
+                        .subresource_range(depth_range),
+                    fresh(t.a.image),
+                    fresh(t.b.image),
+                ];
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&images),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, h.pipeline);
+                // The fade with distance follows the scene's fog (far away without one).
+                let fog =
+                    view.fog.map_or([1.0e9, 1.0e9 + 1.0, 1.0, 0.0], |f| [f.near, f.far, f.curve, f.limit]);
+                let (a, b) = depth_from(&view.view_proj);
+                let push = |mode: f32, axis: [f32; 2]| HdaoPush {
+                    control: [mode, self.hdao_patterns as f32, axis[0], axis[1]],
+                    fog,
+                    depth: [a, b, HDAO_FADE, HDAO_EDGE],
+                    scenery: HDAO_PARAMS,
+                    characters: HDAO_PARAMS,
+                    shared: [HDAO_ANGLE, HDAO_ANGLE, HDAO_BLUR, HDAO_BLUR],
+                };
+                let run = |set: vk::DescriptorSet, p: HdaoPush| {
+                    let bytes = std::slice::from_raw_parts(
+                        (&p as *const HdaoPush).cast::<u8>(),
+                        size_of::<HdaoPush>(),
+                    );
+                    device.cmd_push_constants(cmd, h.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        h.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                    );
+                };
+                run(t.sets[0], push(0.0, [0.0, 0.0]));
+                for _ in 0..HDAO_ITERATIONS {
+                    run(t.sets[1], push(1.0, [1.0, 0.0]));
+                    run(t.sets[2], push(1.0, [0.0, 1.0]));
+                }
+                run(t.sets[3], push(2.0, [0.0, 0.0]));
+            }
             if let Some((t, g, settings)) = glow {
                 // The glow map from the scene as drawn (before colour correction).
                 let images = [fresh(t.map.image), fresh(t.x.image), fresh(t.y.image)];
@@ -1938,6 +2285,14 @@ impl SceneState {
                     g.x.destroy(ctx);
                     g.y.destroy(ctx);
                 }
+                vp.normal.destroy(ctx);
+                for mut t in [vp.msaa_normal.take(), vp.depth_resolved.take()].into_iter().flatten() {
+                    t.destroy(ctx);
+                }
+                if let Some(mut h) = vp.hdao.take() {
+                    h.a.destroy(ctx);
+                    h.b.destroy(ctx);
+                }
             }
         }
         // SAFETY: the device is idle; sets are freed with the pool.
@@ -1953,6 +2308,9 @@ impl SceneState {
             }
             if let Some(g) = &self.glow {
                 g.destroy(&ctx.device);
+            }
+            if let Some(h) = &self.hdao {
+                h.destroy(&ctx.device);
             }
         }
     }
@@ -1997,6 +2355,16 @@ impl SceneStateRef<'_> {
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
         Ok(JointSlot { buffer, set })
     }
+}
+
+/// For a perspective view-projection (column-major): (a, b) with clip z = a·w + b, so a depth-buffer value z
+/// is at view depth w = b / (z − a).
+fn depth_from(m: &[f32; 16]) -> (f32, f32) {
+    let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
+    let (z, w) = (row(2), row(3));
+    let ww = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+    let a = if ww > 0.0 { (z[0] * w[0] + z[1] * w[1] + z[2] * w[2]) / ww } else { 0.0 };
+    (a, z[3] - a * w[3])
 }
 
 /// The eye of a perspective view-projection (column-major): the point where clip x, y and w are all zero.

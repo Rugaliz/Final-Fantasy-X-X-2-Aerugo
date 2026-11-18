@@ -137,6 +137,7 @@ impl App {
             Err(e) => log::warn!("multisampling: {e:#}"),
         }
         renderer.set_sharpen(settings.graphics.sharpen);
+        renderer.set_hdao(settings.graphics.hdao);
 
         let mut egui = EguiSdl::new();
         egui.ui_scale = settings.ui.scale;
@@ -418,6 +419,9 @@ impl App {
         if new.graphics.sharpen != old.graphics.sharpen {
             self.renderer.set_sharpen(new.graphics.sharpen);
         }
+        if new.graphics.hdao != old.graphics.hdao {
+            self.renderer.set_hdao(new.graphics.hdao);
+        }
         if new.ui.scale != old.ui.scale {
             self.egui.ui_scale = new.ui.scale;
         }
@@ -475,6 +479,7 @@ fn without_untouched_overrides(current: &Settings, launch: &Settings, file: &Set
         ),
         msaa: keep(&current.graphics.msaa, &launch.graphics.msaa, &file.graphics.msaa),
         sharpen: keep(&current.graphics.sharpen, &launch.graphics.sharpen, &file.graphics.sharpen),
+        hdao: keep(&current.graphics.hdao, &launch.graphics.hdao, &file.graphics.hdao),
     };
     out.game.dir = keep(&current.game.dir, &launch.game.dir, &file.game.dir);
     out
@@ -604,6 +609,14 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings, info: &RenderInfo) {
         },
     );
     ui.checkbox(&mut settings.graphics.sharpen, "Sharpen (the remaster's unsharp mask)");
+    let level = |n: u32| ["Off", "Low", "Medium", "High"][n.min(3) as usize];
+    egui::ComboBox::from_label("Ambient occlusion (HDAO)")
+        .selected_text(level(settings.graphics.hdao))
+        .show_ui(ui, |ui| {
+            for n in 0..4 {
+                ui.selectable_value(&mut settings.graphics.hdao, n, level(n));
+            }
+        });
     ui.add(egui::Slider::new(&mut settings.ui.scale, 0.5..=3.0).text("Interface scale"));
 
     ui.separator();

@@ -9,7 +9,7 @@
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
 //! draws both sides of everything; `AERUGO_SHOT_CC` applies the map's colour-correction table;
 //! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer; `AERUGO_SHOT_MSAA` sets the samples per pixel;
-//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask; `AERUGO_SHOT_NOGLOW` the glow.
+//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask; `AERUGO_SHOT_NOGLOW` the glow; `AERUGO_SHOT_HDAO` sets the ambient occlusion level.
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -59,6 +59,8 @@ fn map_shot() {
     renderer.set_msaa(msaa).unwrap();
     // The unsharp mask is on as in the captures; AERUGO_SHOT_NOSHARPEN turns it off.
     renderer.set_sharpen(std::env::var("AERUGO_SHOT_NOSHARPEN").is_err());
+    // AERUGO_SHOT_HDAO = ambient occlusion level (0 off … 3 high, the default as in the captures).
+    renderer.set_hdao(std::env::var("AERUGO_SHOT_HDAO").ok().and_then(|v| v.parse().ok()).unwrap_or(3));
     let mut vfs = Vfs::new();
     vfs.mount_install(&inst).unwrap();
     let model = assets::load_map_model(&vfs, &mut renderer, map).unwrap();
