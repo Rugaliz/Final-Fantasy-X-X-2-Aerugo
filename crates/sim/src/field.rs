@@ -1872,8 +1872,8 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x500E, 0x5013, 0x5014, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019,
-        0x401A, 0x403B, 0x6003, 0x6021, 0x5001, 0x5010
+        0x500B, 0x5013, 0x5014, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A,
+        0x403B, 0x6003, 0x6021, 0x5001, 0x5010
     );
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
@@ -1932,6 +1932,16 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             let shade = c.stack.pop_float();
             let w = c.worker;
             g.actor(w).shade.set(shade, frames);
+            Value::Int(0)
+        }),
+    );
+    // On the ground (1) or not (0): the original's ground flag, which also switches the walk-mesh shade.
+    n.register(
+        0x500E,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            let w = c.worker;
+            g.actor(w).shade_from_ground = on;
             Value::Int(0)
         }),
     );
