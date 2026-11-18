@@ -981,12 +981,14 @@ impl FieldState {
             for c in &mut a.color {
                 c.tick();
             }
-            // Characters take their shade from the walk mesh where they stand, unless a script switched it off.
+            // Characters take their shade from the walk mesh where they stand, unless a script switched it off,
+            // closing a third of the gap each tick (the original eases to it over three frames, re-aimed every
+            // frame).
             if a.shade_from_ground
                 && a.model.is_some()
                 && let Some(s) = self.ground.as_ref().and_then(|g| g.shade_at(a.pos))
             {
-                a.shade = Eased::new(s);
+                a.shade = Eased::new(a.shade.value + (s - a.shade.value) / 3.0);
             }
         }
         if self.fade != self.fade_target {

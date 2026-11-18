@@ -244,6 +244,20 @@ fn height_at(t: &[[f32; 3]; 3], x: f32, z: f32) -> Option<f32> {
 mod tests {
     use super::*;
 
+    /// bjyt04's walk-mesh triangle under Tidus (vertex shades 20, 25, 25): the shade the original's
+    /// distance weighting gives there.
+    #[test]
+    fn walk_mesh_shade() {
+        let tri = [[-100.7, -0.6, 141.9], [-96.6, 0.0, 125.7], [-104.6, -0.0, 135.2]];
+        let ground = Ground { shades: vec![[20, 25, 25]], ..Ground::new(vec![tri]) };
+        let s = ground.shade_at([-97.27, -0.1, 128.16]).unwrap();
+        assert!((s - 0.8005).abs() < 1e-3, "{s}");
+        // Full shades are full light anywhere on the triangle.
+        let lit = Ground { shades: vec![[31, 31, 31]], ..Ground::new(vec![tri]) };
+        assert!((lit.shade_at([-100.0, 0.0, 133.0]).unwrap() - 1.0).abs() < 1e-5);
+        assert!(Ground::new(vec![tri]).shade_at([-100.0, 0.0, 133.0]).is_none());
+    }
+
     fn quad(y: f32, x0: f32, x1: f32) -> Vec<[[f32; 3]; 3]> {
         vec![[[x0, y, 0.0], [x1, y, 0.0], [x1, y, 100.0]], [[x0, y, 0.0], [x1, y, 100.0], [x0, y, 100.0]]]
     }
