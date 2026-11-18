@@ -22,7 +22,7 @@ use crate::viewer::field::{FIELD_FRAME, field_fov_y, map_place, script_camera};
 
 /// The field light as an event start leaves it, with `AERUGO_SHOT_LIGHTS` = `index,r,g,b,yaw,pitch;…` set over it
 /// as native 4013 would; `AERUGO_SHOT_NOLIGHT` leaves characters unlit.
-fn character_light(glow: Option<aerugo_gfx::Glow>) -> Option<aerugo_gfx::CharacterLight> {
+fn character_light(glow: Option<aerugo_gfx::Glow>, map: &str) -> Option<aerugo_gfx::CharacterLight> {
     if std::env::var("AERUGO_SHOT_NOLIGHT").is_ok() {
         return None;
     }
@@ -35,7 +35,7 @@ fn character_light(glow: Option<aerugo_gfx::Glow>) -> Option<aerugo_gfx::Charact
             *l = aerugo_sim::field::FieldLight::from_script(r, g, b, yaw, pitch);
         }
     }
-    Some(assets::character_light(&lights, glow))
+    Some(assets::character_light(&lights, glow, map))
 }
 
 /// Picture size; `AERUGO_SHOT_SIZE` = `w,h` overrides it (captures of the original are 2560×1440).
@@ -220,7 +220,7 @@ fn map_shot() {
                         .as_ref()
                         .filter(|_| std::env::var("AERUGO_SHOT_NOGLOW").is_err())
                         .map(assets::scene_glow),
-                    character_light: character_light(model.scene.as_ref().map(assets::scene_glow)),
+                    character_light: character_light(model.scene.as_ref().map(assets::scene_glow), map),
                 },
                 size,
             )

@@ -1170,7 +1170,11 @@ impl FieldView {
             color_correction: None,
             glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
             character_light: self.game.then(|| {
-                crate::assets::character_light(&st.lights, settings.as_ref().map(crate::assets::scene_glow))
+                crate::assets::character_light(
+                    &st.lights,
+                    settings.as_ref().map(crate::assets::scene_glow),
+                    s.event.map_model.as_deref().unwrap_or(""),
+                )
             }),
         });
         // Message windows over the view, placed in the original's 512 × 448 frame.

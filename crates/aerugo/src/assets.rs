@@ -268,15 +268,31 @@ pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
 /// (0.3 r + 0.5 g + 0.2 b, after that scale) against the brightest one, through the glow thresholds:
 /// k = clamp(0.5 × clamp(gain² + spread², 0.01, 1.4) × (clamp(lum / max, lower, upper) − lower) / clamp(upper −
 /// lower, 0.01, 1.1), 0.01, 0.99). Directions point towards the lights; each character's shade colour × 0.208125
-/// adds to the ambient. (Per-character light overrides are not ported.)
+/// adds to the ambient. On four Zanarkand maps the colours are pushed away from grey (grey + 2.6 × (c − grey),
+/// clamped) for that brightness, and on three of them for the ambient itself. `map` is the map's path or name
+/// (e.g. containing `znkd08`). (Per-character light overrides are not ported.)
 pub fn character_light(
     lights: &aerugo_sim::field::FieldLights,
     glow: Option<aerugo_gfx::Glow>,
+    map: &str,
 ) -> aerugo_gfx::CharacterLight {
     let g = glow.unwrap_or(aerugo_gfx::Glow { upper: 0.0, lower: 0.0, gain: 0.0, spread: 0.0 });
     let base = |i: usize| 1.2 * if i < 3 { 0.95 } else { 1.05 };
     let lum = |c: [f32; 3]| 0.3 * c[0] + 0.5 * c[1] + 0.2 * c[2];
-    let lums: Vec<f32> = (0..4).map(|i| lum(lights.0[i].color) * base(i)).collect();
+    let vivid = |i: usize| {
+        let names: &[&str] =
+            if i < 3 { &["znkd10", "znkd14", "znkd08", "znkd09"] } else { &["znkd14", "znkd08", "znkd09"] };
+        names.iter().any(|n| map.contains(n))
+    };
+    let color = |i: usize| {
+        let c = lights.0[i].color;
+        if !vivid(i) {
+            return c;
+        }
+        let grey = (c[0] + c[1] + c[2]) * 0.333;
+        c.map(|x| (grey + 2.6 * (x - grey)).clamp(0.0, 1.0))
+    };
+    let lums: Vec<f32> = (0..4).map(|i| lum(color(i)) * base(i)).collect();
     let max = lums.iter().copied().fold(0.0, f32::max);
     let span = (g.upper - g.lower).clamp(0.01, 1.1);
     let strength = (g.gain.clamp(0.01, 0.99).powi(2) + g.spread.clamp(0.01, 0.99).powi(2)).clamp(0.01, 1.4);
@@ -297,7 +313,7 @@ pub fn character_light(
     let s = scale(3);
     aerugo_gfx::CharacterLight {
         lights: [light(0), light(1), light(2)],
-        ambient: lights.0[3].color.map(|c| c * s),
+        ambient: color(3).map(|c| c * s),
         shade: 0.208125,
     }
 }
@@ -602,4 +618,30 @@ pub fn load_texture(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<Te
         .map_err(|e| e.to_string())?;
     let desc = texture_desc(&t, cluster.texture_data()).ok_or("unsupported format")?;
     renderer.create_texture(&desc).map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aerugo_sim::field::{FieldLight, FieldLights};
+
+    /// bjyt0400's lights and glow settings give the scales the original's character constants showed (light 0
+    /// 1.0806, ambient 1.2474 against colour / 255), and its directions point towards the lights.
+    #[test]
+    fn character_light_matches_the_original() {
+        let lights = FieldLights([
+            FieldLight::from_script(75, 85, 125, 0, 70),
+            FieldLight::from_script(65, 70, 80, 230, 23),
+            FieldLight::from_script(0, 0, 0, 0, 0),
+            FieldLight::from_script(30, 34, 50, 0, 0),
+        ]);
+        let glow = aerugo_gfx::Glow { upper: 1.0, lower: 0.35, gain: 0.12, spread: 0.3 };
+        let l = character_light(&lights, Some(glow), "bjyt04");
+        let (dir, col) = l.lights[0];
+        assert!((col[0] / (75.0 / 255.0) - 1.0806).abs() < 1e-3, "{col:?}");
+        assert!((l.ambient[2] / (50.0 / 255.0) - 1.2474).abs() < 1e-3, "{:?}", l.ambient);
+        // Pitch 70° shines downwards (y points down), so the light is above.
+        assert!(dir[1] < -0.9, "{dir:?}");
+        assert!((l.shade - 0.208125).abs() < 1e-6);
+    }
 }
