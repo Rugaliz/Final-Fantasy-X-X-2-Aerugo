@@ -391,6 +391,7 @@ impl MapBrowser {
             fog: None,
             time: 0.0,
             color_correction: l.model.as_ref().and_then(|m| m.color_correction),
+            glow: l.model.as_ref().and_then(|m| m.scene).as_ref().map(crate::assets::scene_glow),
         });
     }
 
@@ -631,6 +632,7 @@ mod tests {
                         fog: None,
                         time: 0.0,
                         color_correction: None,
+                        glow: None,
                     };
                     let px = renderer.render_offscreen(view, (w, h)).unwrap();
                     let share = edge_clear_share(&px, w, h);

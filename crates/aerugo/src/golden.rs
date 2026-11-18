@@ -116,6 +116,7 @@ fn view(draws: Vec<Draw>, min: Vec3, max: Vec3, culling: bool, mirrored: bool) -
         fog: None,
         time: 0.0,
         color_correction: None,
+        glow: None,
     }
 }
 

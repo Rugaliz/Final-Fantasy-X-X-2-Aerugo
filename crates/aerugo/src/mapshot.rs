@@ -7,9 +7,9 @@
 //! `d,d,…;ty,ty,…` renders one picture per screen distance and vertical clip offset (out-<d>-<ty>.png), for
 //! fitting the projection to a capture; `AERUGO_SHOT_CAMS` = a file of `name;eye;focus;d` lines renders one
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
-//! draws both sides of everything; `AERUGO_SHOT_NOCC` leaves out the map's colour correction;
+//! draws both sides of everything; `AERUGO_SHOT_CC` applies the map's colour-correction table;
 //! `AERUGO_SHOT_VALIDATE` runs under the Vulkan validation layer; `AERUGO_SHOT_MSAA` sets the samples per pixel;
-//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask.
+//! `AERUGO_SHOT_NOSHARPEN` leaves out the unsharp mask; `AERUGO_SHOT_NOGLOW` the glow.
 
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
@@ -176,10 +176,16 @@ fn map_shot() {
                     mirrored: false,
                     fog,
                     time: std::env::var("AERUGO_SHOT_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0),
-                    // AERUGO_SHOT_NOCC leaves out the map's colour correction.
+                    // Off as on the game screen; AERUGO_SHOT_CC applies the map's colour-correction table.
                     color_correction: model
                         .color_correction
-                        .filter(|_| std::env::var("AERUGO_SHOT_NOCC").is_err()),
+                        .filter(|_| std::env::var("AERUGO_SHOT_CC").is_ok()),
+                    // AERUGO_SHOT_NOGLOW leaves out the map's glow.
+                    glow: model
+                        .scene
+                        .as_ref()
+                        .filter(|_| std::env::var("AERUGO_SHOT_NOGLOW").is_err())
+                        .map(assets::scene_glow),
                 },
                 size,
             )

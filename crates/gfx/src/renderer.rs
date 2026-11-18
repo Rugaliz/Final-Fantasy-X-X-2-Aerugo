@@ -535,48 +535,51 @@ impl Renderer {
             .image_info(&info)];
         // SAFETY: the set is new.
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
-        // The unsharp mask's blur images (failures leave the view unsharpened).
+        // Scratch images of the post-processing passes (failures leave the view without that pass).
         let unsharp = match (&self.scene.unsharp, self.sharpen) {
-            (Some(u), true) => {
-                let blur = || {
-                    Target::new(
-                        ctx,
-                        VIEWPORT_FORMAT,
-                        extent,
-                        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-                        vk::ImageAspectFlags::COLOR,
-                        None,
-                        vk::SampleCountFlags::TYPE_1,
-                    )
-                };
-                match (blur(), blur()) {
-                    (Ok(mut a), Ok(mut b)) => {
-                        match u.sets(ctx, self.scene.pool, color.view, a.view, b.view) {
-                            Ok(sets) => Some(crate::scene::UnsharpTargets { a, b, sets }),
-                            Err(e) => {
-                                log::warn!("unsharp mask: {e:#}");
-                                // SAFETY: never used.
-                                unsafe {
-                                    a.destroy(ctx);
-                                    b.destroy(ctx);
-                                }
-                                None
-                            }
+            (Some(u), true) => scratch(ctx, &[extent, extent])
+                .and_then(|mut t| {
+                    let (b, a) = (t.pop().expect("two images"), t.pop().expect("two images"));
+                    let pairs = [(color.view, a.view), (a.view, b.view), (b.view, color.view)];
+                    match u.sets(ctx, self.scene.pool, &pairs) {
+                        Ok(sets) => Ok(crate::scene::UnsharpTargets { a, b, sets }),
+                        Err(e) => {
+                            // SAFETY: never used.
+                            unsafe { destroy_all(ctx, [a, b]) };
+                            Err(e)
                         }
                     }
-                    (a, b) => {
-                        for t in [a, b] {
-                            match t {
-                                // SAFETY: never used.
-                                Ok(mut t) => unsafe { t.destroy(ctx) },
-                                Err(e) => log::warn!("unsharp mask: {e:#}"),
-                            }
-                        }
-                        None
-                    }
-                }
-            }
+                })
+                .inspect_err(|e| log::warn!("unsharp mask: {e:#}"))
+                .ok(),
             _ => None,
+        };
+        let half = vk::Extent2D { width: (extent.width / 2).max(1), height: (extent.height / 2).max(1) };
+        let glow = match &self.scene.glow {
+            Some(g) => scratch(ctx, &[extent, half, half])
+                .and_then(|mut t| {
+                    let y = t.pop().expect("three images");
+                    let x = t.pop().expect("three images");
+                    let map = t.pop().expect("three images");
+                    let pairs = [
+                        (color.view, map.view),
+                        (map.view, x.view),
+                        (x.view, y.view),
+                        (y.view, x.view),
+                        (x.view, color.view),
+                    ];
+                    match g.sets(ctx, self.scene.pool, &pairs) {
+                        Ok(sets) => Ok(crate::scene::GlowTargets { map, x, y, sets }),
+                        Err(e) => {
+                            // SAFETY: never used.
+                            unsafe { destroy_all(ctx, [map, x, y]) };
+                            Err(e)
+                        }
+                    }
+                })
+                .inspect_err(|e| log::warn!("glow: {e:#}"))
+                .ok(),
+            None => None,
         };
         let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
         self.scene.viewport = Some(Viewport {
@@ -584,6 +587,7 @@ impl Renderer {
             msaa_color,
             depth,
             unsharp,
+            glow,
             extent,
             ui_set: set,
             ui_id,
@@ -618,6 +622,12 @@ impl Renderer {
                     self.ctx.device.free_descriptor_sets(self.scene.pool, &u.sets).ok();
                     u.a.destroy(&self.ctx);
                     u.b.destroy(&self.ctx);
+                }
+                if let Some(mut g) = vp.glow.take() {
+                    self.ctx.device.free_descriptor_sets(self.scene.pool, &g.sets).ok();
+                    g.map.destroy(&self.ctx);
+                    g.x.destroy(&self.ctx);
+                    g.y.destroy(&self.ctx);
                 }
             }
         }
@@ -961,4 +971,37 @@ pub(crate) unsafe fn image_barrier(
     let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
     // SAFETY: guaranteed by the caller.
     unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
+/// RGBA8 images a compute pass can write and sample, one per size (all or none).
+fn scratch(ctx: &Context, sizes: &[vk::Extent2D]) -> Result<Vec<Target>> {
+    let mut out = Vec::with_capacity(sizes.len());
+    for &size in sizes {
+        match Target::new(
+            ctx,
+            VIEWPORT_FORMAT,
+            size,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            None,
+            vk::SampleCountFlags::TYPE_1,
+        ) {
+            Ok(t) => out.push(t),
+            Err(e) => {
+                // SAFETY: never used.
+                unsafe { destroy_all(ctx, out) };
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// # Safety
+/// The GPU must not use the images.
+unsafe fn destroy_all(ctx: &Context, targets: impl IntoIterator<Item = Target>) {
+    for mut t in targets {
+        // SAFETY: guaranteed by the caller.
+        unsafe { t.destroy(ctx) };
+    }
 }

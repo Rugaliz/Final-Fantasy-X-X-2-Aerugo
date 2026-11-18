@@ -238,6 +238,7 @@ impl ModelBrowser {
                 fog: None,
                 time: 0.0,
                 color_correction: None,
+                glow: None,
             });
             if self.show_bones {
                 self.draw_bones(ui, &response, view_proj, &overlay);

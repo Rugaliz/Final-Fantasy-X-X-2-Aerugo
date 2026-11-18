@@ -1142,7 +1142,11 @@ impl FieldView {
             fog: settings.as_ref().map(crate::assets::scene_fog),
             // Scene time: the event's ticks at 30 a second, plus the share of the next.
             time: (s.event.tick as f32 + alpha) / 30.0,
-            color_correction: s.map.as_ref().and_then(|m| m.color_correction),
+            // A map's colour-correction table is set from event code in the remaster (callers of its setter are
+            // scene code, not map loading); the cdsp07 capture shows the table not applied. Off until those
+            // events are ported.
+            color_correction: None,
+            glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
         });
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;

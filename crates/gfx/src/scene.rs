@@ -12,6 +12,7 @@ static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
 static CC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/colorcorrect.comp.spv"));
 static USM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unsharp.comp.spv"));
+static GLOW_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glow.comp.spv"));
 
 pub const VIEWPORT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -813,6 +814,8 @@ pub struct SceneView {
     /// The map's colour-correction table (256×1; each channel of the finished picture is looked up in that
     /// channel), as the remaster applies it with its colour correction setting on.
     pub color_correction: Option<crate::renderer::TextureHandle>,
+    /// The remaster's glow for this scene.
+    pub glow: Option<Glow>,
 }
 
 /// The remaster's field fog: the share of fog colour at view depth `d` is
@@ -869,6 +872,8 @@ pub(crate) struct Viewport {
     pub depth: Target,
     /// Images and sets of the unsharp mask (with sharpening on).
     pub unsharp: Option<UnsharpTargets>,
+    /// Images and sets of the glow.
+    pub glow: Option<GlowTargets>,
     pub extent: vk::Extent2D,
     pub ui_set: vk::DescriptorSet,
     pub ui_id: egui::TextureId,
@@ -896,7 +901,9 @@ pub(crate) struct SceneState {
     /// The colour-correction pass (`None` where the device cannot write RGBA8 images from compute shaders).
     pub color_correction: Option<ColorCorrection>,
     /// The unsharp-mask passes (as above).
-    pub unsharp: Option<Unsharp>,
+    pub unsharp: Option<PostPass>,
+    /// The glow passes (as above).
+    pub glow: Option<PostPass>,
 }
 /// The remaster's unsharp mask at its default settings (blur distance 1.2 pixels, intensity 0.45, threshold 0.04).
 const USM_DISTANCE: f32 = 1.2;
@@ -912,10 +919,21 @@ struct UnsharpPush {
     sharpen: f32,
 }
 
-/// Compute passes sharpening the viewport like the remaster's unsharp mask: blur vertically into one image,
-/// horizontally into another, then sharpen the viewport in place.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GlowPush {
+    step: [f32; 2],
+    scale: f32,
+    gain: f32,
+    lower: f32,
+    upper: f32,
+    mode: f32,
+}
+
+/// A compute pass over viewport-sized images: a sampled source, a clamped linear sampler and a storage target,
+/// with push constants (the unsharp mask and the glow are made of these).
 #[derive(Debug)]
-pub(crate) struct Unsharp {
+pub(crate) struct PostPass {
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     module: vk::ShaderModule,
@@ -923,16 +941,39 @@ pub(crate) struct Unsharp {
     sampler: vk::Sampler,
 }
 
-/// The two blur images of a viewport and the sets of the three passes.
+/// The two blur images of a viewport and the sets of the unsharp mask's three passes: color → a, a → b, b
+/// sharpens color.
 #[derive(Debug)]
 pub(crate) struct UnsharpTargets {
     pub a: Target,
     pub b: Target,
-    pub sets: [vk::DescriptorSet; 3],
+    pub sets: Vec<vk::DescriptorSet>,
 }
 
-impl Unsharp {
-    fn new(device: &ash::Device) -> Result<Unsharp> {
+/// The glow's images of a viewport (the full-size glow map, two half-size blur images) and the sets of its five
+/// passes: color → map (threshold), map → x, x → y, y → x, x → color (added).
+#[derive(Debug)]
+pub(crate) struct GlowTargets {
+    pub map: Target,
+    pub x: Target,
+    pub y: Target,
+    pub sets: Vec<vk::DescriptorSet>,
+}
+
+/// The remaster's glow settings for a scene (from the map's scene settings).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glow {
+    /// Luminance where glow starts (no glow below).
+    pub lower: f32,
+    /// Luminance of full glow.
+    pub upper: f32,
+    pub gain: f32,
+    /// Widens the blur's output scale (spread + 1).
+    pub spread: f32,
+}
+
+impl PostPass {
+    fn new(device: &ash::Device, spv: &[u8], push_size: usize) -> Result<PostPass> {
         let bindings = [
             (0, vk::DescriptorType::SAMPLED_IMAGE),
             (1, vk::DescriptorType::SAMPLER),
@@ -947,7 +988,7 @@ impl Unsharp {
         });
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(size_of::<UnsharpPush>() as u32)];
+            .size(push_size as u32)];
         // SAFETY: valid device and create infos; objects made before a failure are left to the device's
         // destruction (start-up only).
         unsafe {
@@ -960,7 +1001,7 @@ impl Unsharp {
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&push),
                 None,
             )?;
-            let module = crate::quad::shader_module(device, USM_SPV)?;
+            let module = crate::quad::shader_module(device, spv)?;
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
@@ -981,28 +1022,26 @@ impl Unsharp {
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
                 None,
             )?;
-            Ok(Unsharp { set_layout, layout, module, pipeline, sampler })
+            Ok(PostPass { set_layout, layout, module, pipeline, sampler })
         }
     }
 
-    /// Sets for the passes over `color` with blur images `a` and `b`: color → a, a → b, b sharpens color.
+    /// One set per (source, target) pair of views.
     pub(crate) fn sets(
         &self,
         ctx: &Context,
         pool: vk::DescriptorPool,
-        color: vk::ImageView,
-        a: vk::ImageView,
-        b: vk::ImageView,
-    ) -> Result<[vk::DescriptorSet; 3]> {
-        let layouts = [self.set_layout; 3];
+        pairs: &[(vk::ImageView, vk::ImageView)],
+    ) -> Result<Vec<vk::DescriptorSet>> {
+        let layouts = vec![self.set_layout; pairs.len()];
         // SAFETY: valid pool and layout.
         let sets = unsafe {
             ctx.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
             )
         }
-        .context("no room for the unsharp-mask sets")?;
-        for (set, (source, target)) in sets.iter().zip([(color, a), (a, b), (b, color)]) {
+        .context("no room for post-processing sets")?;
+        for (set, &(source, target)) in sets.iter().zip(pairs) {
             let sampled = [vk::DescriptorImageInfo::default()
                 .image_view(source)
                 .image_layout(vk::ImageLayout::GENERAL)];
@@ -1030,7 +1069,7 @@ impl Unsharp {
             // SAFETY: the sets are new.
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
         }
-        Ok([sets[0], sets[1], sets[2]])
+        Ok(sets)
     }
 
     /// # Safety
@@ -1193,8 +1232,8 @@ const MAX_ANISOTROPY: f32 = 16.0;
 const EXTRA_SETS: u32 = 256;
 /// Colour-correction sets (one per viewport size and table in use).
 const CC_SETS: u32 = 64;
-/// Unsharp-mask sets (three per viewport).
-const USM_SETS: u32 = 6;
+/// Unsharp-mask sets (three per viewport) and glow sets (five per viewport), with room for a viewport change.
+const USM_SETS: u32 = 16;
 
 impl SceneState {
     pub fn new(ctx: &Context, frames: usize) -> Result<SceneState> {
@@ -1254,7 +1293,16 @@ impl SceneState {
             pending: None,
             pending_table: None,
             color_correction: if ctx.storage_rgba8 { Some(ColorCorrection::new(device)?) } else { None },
-            unsharp: if ctx.storage_rgba8 { Some(Unsharp::new(device)?) } else { None },
+            unsharp: if ctx.storage_rgba8 {
+                Some(PostPass::new(device, USM_SPV, size_of::<UnsharpPush>())?)
+            } else {
+                None
+            },
+            glow: if ctx.storage_rgba8 {
+                Some(PostPass::new(device, GLOW_SPV, size_of::<GlowPush>())?)
+            } else {
+                None
+            },
         };
         for _ in 0..frames {
             let slot = state.joint_slot(ctx, 256)?;
@@ -1677,13 +1725,41 @@ impl SceneState {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
-            // Post-processing in place on the viewport image (GENERAL layout): colour correction, then the
-            // unsharp mask.
+            // Post-processing in place on the viewport image (GENERAL layout), in the remaster's order: the glow
+            // map from the scene, colour correction, the glow added, then the unsharp mask.
             let usm = match (&vp.unsharp, &self.unsharp) {
                 (Some(t), Some(u)) => Some((t, u)),
                 _ => None,
             };
-            if correct.is_some() || usm.is_some() {
+            let glow = match (&vp.glow, &self.glow, view.glow) {
+                (Some(t), Some(g), Some(settings)) => Some((t, g, settings)),
+                _ => None,
+            };
+            // Each compute pass reads what the one before wrote.
+            let compute_to_compute = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )];
+            // Scratch images start each frame undefined.
+            let fresh = |image: vk::Image| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    )
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(image)
+                    .subresource_range(color_range)
+            };
+            if correct.is_some() || usm.is_some() || glow.is_some() {
                 let to_general = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(last.0)
                     .src_access_mask(last.1)
@@ -1708,39 +1784,80 @@ impl SceneState {
                 );
             }
             let groups = (extent.width.div_ceil(8), extent.height.div_ceil(8));
+            let glow_pass = |g: &PostPass, set: vk::DescriptorSet, push: GlowPush, size: (u32, u32)| {
+                let bytes = std::slice::from_raw_parts(
+                    (&push as *const GlowPush).cast::<u8>(),
+                    size_of::<GlowPush>(),
+                );
+                device.cmd_push_constants(cmd, g.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    g.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                device.cmd_dispatch(cmd, size.0.div_ceil(8), size.1.div_ceil(8), 1);
+            };
+            let half = ((extent.width / 2).max(1), (extent.height / 2).max(1));
+            if let Some((t, g, settings)) = glow {
+                // The glow map from the scene as drawn (before colour correction).
+                let images = [fresh(t.map.image), fresh(t.x.image), fresh(t.y.image)];
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&images),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, g.pipeline);
+                let push = GlowPush {
+                    step: [0.0, 0.0],
+                    scale: 1.0,
+                    gain: 0.0,
+                    lower: settings.lower,
+                    upper: settings.upper,
+                    mode: 0.0,
+                };
+                glow_pass(g, t.sets[0], push, (extent.width, extent.height));
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                );
+            }
             if let Some((pipeline, layout, set)) = correct {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
                 device.cmd_dispatch(cmd, groups.0, groups.1, 1);
             }
+            if let Some((t, g, settings)) = glow {
+                // Half-size blurs: across and down × (spread + 1), across again, then down × gain added onto the
+                // picture (steps in half-size texels).
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, g.pipeline);
+                let across = [1.0 / half.0 as f32, 0.0];
+                let down = [0.0, 1.0 / half.1 as f32];
+                let s = settings.spread + 1.0;
+                let passes = [
+                    (1, across, s, 0.0, 1.0, half),
+                    (2, down, s, 0.0, 1.0, half),
+                    (3, across, 1.0, 0.0, 1.0, half),
+                    (4, down, 1.0, settings.gain, 2.0, (extent.width, extent.height)),
+                ];
+                for (i, (set, step, scale, gain, mode, size)) in passes.into_iter().enumerate() {
+                    if i > 0 {
+                        device.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&compute_to_compute),
+                        );
+                    }
+                    let push = GlowPush { step, scale, gain, lower: 0.0, upper: 0.0, mode };
+                    glow_pass(g, t.sets[set], push, size);
+                }
+            }
             if let Some((t, u)) = usm {
-                // Each pass reads what the one before wrote.
-                let compute_to_compute = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(
-                        vk::AccessFlags2::SHADER_SAMPLED_READ
-                            | vk::AccessFlags2::SHADER_STORAGE_READ
-                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    )];
-                let blur_images: Vec<_> = [t.a.image, t.b.image]
-                    .into_iter()
-                    .map(|image| {
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .src_access_mask(vk::AccessFlags2::NONE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_WRITE
-                                    | vk::AccessFlags2::SHADER_SAMPLED_READ,
-                            )
-                            .old_layout(vk::ImageLayout::UNDEFINED)
-                            .new_layout(vk::ImageLayout::GENERAL)
-                            .image(image)
-                            .subresource_range(color_range)
-                    })
-                    .collect();
+                let blur_images = [fresh(t.a.image), fresh(t.b.image)];
                 device.cmd_pipeline_barrier2(
                     cmd,
                     &vk::DependencyInfo::default()
@@ -1816,6 +1933,11 @@ impl SceneState {
                     u.a.destroy(ctx);
                     u.b.destroy(ctx);
                 }
+                if let Some(mut g) = vp.glow.take() {
+                    g.map.destroy(ctx);
+                    g.x.destroy(ctx);
+                    g.y.destroy(ctx);
+                }
             }
         }
         // SAFETY: the device is idle; sets are freed with the pool.
@@ -1828,6 +1950,9 @@ impl SceneState {
             }
             if let Some(u) = &self.unsharp {
                 u.destroy(&ctx.device);
+            }
+            if let Some(g) = &self.glow {
+                g.destroy(&ctx.device);
             }
         }
     }

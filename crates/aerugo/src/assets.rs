@@ -212,6 +212,11 @@ pub fn scene_fog(s: &mesh::SceneSettings) -> aerugo_gfx::Fog {
     }
 }
 
+/// The glow of a map's scene settings (thresholds, gain and spread).
+pub fn scene_glow(s: &mesh::SceneSettings) -> aerugo_gfx::Glow {
+    aerugo_gfx::Glow { upper: s.glow[0], lower: s.glow[1], gain: s.glow[2], spread: s.glow[3] }
+}
+
 /// Load a model cluster and everything it references.
 pub fn load_model(vfs: &Vfs, renderer: &mut Renderer, path: &str) -> Result<GpuModel, String> {
     load(vfs, renderer, path, false)
