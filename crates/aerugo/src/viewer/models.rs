@@ -1,12 +1,12 @@
 //! Model browser: any `*.dae.phyre` model of both games in a 3D viewport with an orbit camera.
 
 use aerugo_debug_ui::egui;
-use aerugo_gfx::{Draw, Renderer, SceneView};
+use aerugo_gfx::Renderer;
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
 
 use super::filelist::FileList;
-use crate::assets::{GpuModel, load_model};
+use crate::assets::{ModelInfo, read_model_info};
 
 /// The games keep the PS2 convention of Y pointing down; viewers turn the world half a turn around X so up
 /// is up (a rotation, so triangle winding is unchanged).
@@ -83,13 +83,10 @@ impl OrbitCamera {
 #[derive(Debug)]
 pub struct ModelBrowser {
     files: Option<FileList>,
-    loaded: Option<(String, Result<GpuModel, String>)>,
+    loaded: Option<(String, Result<ModelInfo, String>)>,
     camera: OrbitCamera,
-    lit: bool,
     culling: bool,
     background: [f32; 3],
-    /// Draw skinned meshes through their skeleton (default pose) instead of the stored bind pose.
-    skinning: bool,
     show_bones: bool,
     /// (mesh, joint) being rotated by the test sliders.
     selected: Option<(usize, usize)>,
@@ -103,6 +100,8 @@ pub struct ModelBrowser {
     /// Interpolate between frames (off shows the 30 Hz steps).
     interpolate: bool,
     translation_scale: f32,
+    /// Drawing with the model's own effects.
+    phyre: crate::phyre::field::FieldRenderer,
 }
 
 impl ModelBrowser {
@@ -111,10 +110,8 @@ impl ModelBrowser {
             files: None,
             loaded: None,
             camera: OrbitCamera::framing(Vec3::splat(-1.0), Vec3::splat(1.0)),
-            lit: true,
             culling: true,
             background: [0.18, 0.19, 0.22],
-            skinning: true,
             show_bones: false,
             selected: None,
             test_rotation: [0.0; 3],
@@ -125,26 +122,25 @@ impl ModelBrowser {
             speed: 1.0,
             interpolate: true,
             translation_scale: 0.01,
+            phyre: Default::default(),
         }
     }
 
     pub fn close(&mut self, renderer: &mut Renderer) {
-        if let Some((_, Ok(m))) = self.loaded.take() {
-            m.destroy(renderer);
-        }
+        self.loaded = None;
+        self.phyre.clear(renderer);
         renderer.release_viewport();
     }
 
     fn open(&mut self, vfs: &Vfs, renderer: &mut Renderer, path: String) {
-        if let Some((_, Ok(m))) = self.loaded.take() {
-            m.destroy(renderer);
-        }
+        self.loaded = None;
+        self.phyre.clear(renderer);
         self.selected = None;
         self.test_rotation = [0.0; 3];
         self.motions = load_motions(vfs, &path);
         self.motion = None;
         self.time = 0.0;
-        let result = load_model(vfs, renderer, &path);
+        let result = read_model_info(vfs, &path);
         if let Ok(m) = &result {
             self.camera = OrbitCamera::framing(m.min, m.max);
         }
@@ -187,71 +183,66 @@ impl ModelBrowser {
             let response = ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
             self.camera.handle(ui, &response);
             let view_proj = self.camera.view_proj(size.x / size.y.max(1.0));
-            let mut draws = Vec::new();
-            let mut joints = Vec::new();
+            // Bones for the overlay, in the pose being drawn.
             let mut overlay = Vec::new();
-            for (mi, m) in model.meshes.iter().enumerate() {
-                let posed = self.posed_world(mi, m);
-                match (&m.skeleton, &posed) {
-                    (Some(sk), Some(world)) if self.skinning && m.skinned => {
-                        for (pi, &si) in m.part_segments.iter().enumerate() {
-                            let seg = &model.model.meshes[m.source].segments[si];
-                            let base = joints.len() as u32;
-                            joints.extend(sk.palette(world, seg));
-                            draws.push(Draw {
-                                mesh: m.mesh,
-                                model: m.world.to_cols_array(),
-                                joint_base: Some(base),
-                                lit: self.lit,
-                                part: Some(pi),
-                                tint: None,
-                            });
-                        }
-                    }
-                    _ => draws.push(Draw {
-                        mesh: m.mesh,
-                        model: m.world.to_cols_array(),
-                        joint_base: None,
-                        lit: self.lit,
-                        part: None,
-                        tint: None,
-                    }),
-                }
-                if let (Some(sk), Some(world)) = (&m.skeleton, posed) {
+            for (mi, mesh) in model.model.meshes.iter().enumerate() {
+                if let (Some(sk), Some(world)) = (&model.skeletons[mi], self.posed_world(mi, model)) {
+                    let place = Mat4::from_cols_array(&mesh.world);
                     overlay.push((
                         mi,
                         sk.parents.clone(),
                         sk.names.clone(),
                         world
                             .iter()
-                            .map(|w| m.world.transform_point3(Vec3::new(w[12], w[13], w[14])))
+                            .map(|w| place.transform_point3(Vec3::new(w[12], w[13], w[14])))
                             .collect::<Vec<_>>(),
                     ));
                 }
             }
+            // The model with its own effects, lit by the field's event-start light set, in the file's space.
+            let locals: Vec<Vec<[f32; 16]>> = (0..model.model.meshes.len())
+                .map(|mi| self.posed_local(mi, model).unwrap_or_default())
+                .collect();
+            let pose = |mi: usize, _: &aerugo_formats::skeleton::Skeleton| {
+                locals.get(mi).cloned().unwrap_or_default()
+            };
+            let path = self.loaded.as_ref().map(|(p, _)| p.as_str()).unwrap_or_default();
+            let actor = crate::phyre::field::ActorDraw {
+                path,
+                world: Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0)),
+                pose: &pose,
+                material: [1.0; 4],
+                shade: [1.0; 3],
+            };
+            let cl = crate::assets::character_light(&aerugo_sim::field::FieldLights::default(), None, "");
+            let light = crate::phyre::field::Lighting {
+                lights: cl.lights,
+                ambient: cl.ambient,
+                shade_coeff: cl.shade,
+            };
+            let mut scene =
+                crate::phyre::scene::SceneConstants::from_view_proj(view_proj, px.0 as f32, px.1 as f32);
             let [r, g, b] = self.background;
-            renderer.submit_scene(SceneView {
-                view_proj: view_proj.to_cols_array(),
-                clear: [r, g, b, 1.0],
-                draws,
-                joints,
-                culling: self.culling,
-                mirrored: false,
-                fog: None,
-                time: 0.0,
-                color_correction: None,
-                glow: None,
-                character_light: None,
-            });
+            scene.background = [r, g, b];
+            let actors = [actor];
+            let objects = crate::phyre::field::Objects { map: None, models: &[], actors: &actors };
+            let msaa = renderer.msaa();
+            let culling = self.culling;
+            if let Some(frame) =
+                self.phyre.frame(vfs, renderer, &objects, &scene, &light, px, msaa, None, 4.0, !culling)
+            {
+                renderer.submit_frame(frame);
+            }
             if self.show_bones {
                 self.draw_bones(ui, &response, view_proj, &overlay);
             }
         });
     }
 
-    /// World matrices of a mesh's joints in the current pose (default pose plus the test rotation).
-    fn posed_world(&self, mi: usize, m: &crate::assets::GpuMeshInstance) -> Option<Vec<[f32; 16]>> {
-        let sk = m.skeleton.as_ref()?;
+    /// Local joint matrices of a mesh's skeleton in the current pose (default pose or the motion, plus the test
+    /// rotation).
+    fn posed_local(&self, mi: usize, m: &ModelInfo) -> Option<Vec<[f32; 16]>> {
+        let sk = m.skeletons.get(mi)?.as_ref()?;
         let mut local = sk.default_pose.clone();
         if let Some((_, motion)) = self.motion.and_then(|i| self.motions.get(i)) {
             let frame = if self.interpolate { self.time } else { self.time.floor() };
@@ -271,7 +262,13 @@ impl ModelBrowser {
             let rot = Mat4::from_euler(glam::EulerRot::XYZ, x, y, z);
             *l = (Mat4::from_cols_array(l) * rot).to_cols_array();
         }
-        Some(sk.world(&local))
+        Some(local)
+    }
+
+    /// World matrices of a mesh's joints in the current pose.
+    fn posed_world(&self, mi: usize, m: &ModelInfo) -> Option<Vec<[f32; 16]>> {
+        let sk = m.skeletons.get(mi)?.as_ref()?;
+        Some(sk.world(&self.posed_local(mi, m)?))
     }
 
     #[allow(clippy::type_complexity)]
@@ -362,7 +359,7 @@ impl ModelBrowser {
         self.motion = Some(index);
         self.time = 0.0;
         if let (Some((_, Ok(m))), Some((_, motion))) = (&self.loaded, self.motions.get(index))
-            && let Some(sk) = m.meshes.iter().filter_map(|x| x.skeleton.as_ref()).max_by_key(|s| s.len())
+            && let Some(sk) = m.skeletons.iter().flatten().max_by_key(|s| s.len())
         {
             self.translation_scale =
                 aerugo_formats::motion::fit_translation_scale(&sk.names, &sk.default_pose, motion);
@@ -410,16 +407,12 @@ impl ModelBrowser {
     fn info_ui(&mut self, ui: &mut egui::Ui) {
         self.motion_ui(ui);
         ui.separator();
-        ui.checkbox(&mut self.lit, "Lighting");
         ui.checkbox(&mut self.culling, "Face culling");
-        ui.checkbox(&mut self.skinning, "Skinning (default pose)").on_hover_text(
-            "Off: the stored bind-pose vertices. On: vertices moved by the skeleton in its default pose.",
-        );
         ui.checkbox(&mut self.show_bones, "Bones")
             .on_hover_text("Click a joint to select it for the rotation test.");
         if let Some((_, Ok(m))) = &self.loaded
             && let Some((mi, sk)) =
-                m.meshes.iter().enumerate().find_map(|(i, x)| x.skeleton.as_ref().map(|s| (i, s)))
+                m.skeletons.iter().enumerate().find_map(|(i, x)| x.as_ref().map(|s| (i, s)))
         {
             let current = self.selected.filter(|&(s, _)| s == mi).map(|(_, j)| j);
             let label = current
@@ -462,26 +455,29 @@ impl ModelBrowser {
             Ok(m) => {
                 ui.label(format!(
                     "{} meshes · {} vertices · {} triangles · {} textures",
-                    m.meshes.len(),
+                    m.model.meshes.len(),
                     m.vertices,
                     m.triangles,
-                    m.textures.len()
+                    m.textures
                 ));
                 let size = m.max - m.min;
                 ui.label(format!("size {:.2} × {:.2} × {:.2}", size.x, size.y, size.z));
-                for w in &m.warnings {
-                    ui.colored_label(ui.visuals().warn_fg_color, w);
-                }
-                for mesh in &m.meshes {
+                for (mi, mesh) in m.model.meshes.iter().enumerate() {
+                    let skinned = m.skeletons[mi].is_some();
                     egui::CollapsingHeader::new(format!(
                         "{}{}",
                         mesh.name,
-                        if mesh.skinned { " (skinned)" } else { "" }
+                        if skinned { " (skinned)" } else { "" }
                     ))
-                    .id_salt(mesh.mesh)
+                    .id_salt(mi)
                     .show(ui, |ui| {
-                        for (p, fx) in mesh.parts.iter().zip(&mesh.part_effects) {
-                            ui.label(p).on_hover_text(format!("effect {fx}"));
+                        for seg in &mesh.segments {
+                            let effect = mesh
+                                .materials
+                                .get(seg.material as usize)
+                                .map_or("", |mat| mat.effect.as_str());
+                            ui.label(format!("{} triangles", seg.index_count / 3))
+                                .on_hover_text(format!("effect {effect}"));
                         }
                     });
                 }

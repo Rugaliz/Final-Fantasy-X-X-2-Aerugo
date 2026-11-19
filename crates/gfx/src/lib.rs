@@ -16,9 +16,6 @@ pub mod texture;
 pub use context::{Context, ContextOptions, FloatControls, validation_error_count};
 pub use quad::{Quad, QuadPipeline};
 pub use renderer::{EguiFrame, FrameInput, Renderer, TextureHandle};
-pub use scene::{
-    BlendFactor, BlendOp, BlendState, CharacterLight, CharacterTint, CompareOp, CullMode, Draw, Fog, Glow,
-    MaterialState, MeshDesc, MeshHandle, MeshPart, SceneVertex, SceneView, ToneCurve, WATER_TEXTURES, Water,
-};
+pub use scene::VIEWPORT_FORMAT;
 pub use swapchain::PresentMode;
 pub use texture::{TexFormat, Texture, TextureDesc};

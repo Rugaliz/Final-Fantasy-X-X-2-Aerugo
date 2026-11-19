@@ -8,11 +8,9 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Context, ContextOptions};
 use crate::quad::{Quad, QuadPipeline};
-use crate::scene::{
-    DEPTH_FORMAT, MeshDesc, MeshHandle, SceneState, SceneView, Target, VIEWPORT_FORMAT, Viewport,
-};
+use crate::scene::{SceneState, Target, VIEWPORT_FORMAT, Viewport};
 use crate::swapchain::{PresentMode, Swapchain, color_range};
-use crate::texture::{TexFormat, Texture, TextureDesc};
+use crate::texture::{Texture, TextureDesc};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 /// Descriptor sets available for textures shown in the UI.
@@ -132,10 +130,6 @@ pub struct Renderer {
     scene: SceneState,
     /// Drawing with the games' own (translated) shaders.
     game: crate::game::GameState,
-    white: Option<TextureHandle>,
-    /// What water parts sample where a texture is missing (black, flat normal, flat normal, white cube); parts
-    /// without water bind these too.
-    water_defaults: Option<[TextureHandle; crate::scene::WATER_TEXTURES]>,
     /// Samples per pixel of the 3D viewport (1 = no multisampling).
     samples: vk::SampleCountFlags,
     /// Sharpen the 3D viewport with the remaster's unsharp mask.
@@ -232,9 +226,9 @@ impl Renderer {
         .context("creating the egui renderer")?;
 
         let ui_textures = UiTextures::new(device)?;
-        let scene = SceneState::new(&ctx, FRAMES_IN_FLIGHT)?;
+        let scene = SceneState::default();
 
-        let mut renderer = Self {
+        let renderer = Self {
             swapchain,
             frames,
             frame_index: 0,
@@ -244,8 +238,6 @@ impl Renderer {
             ui_textures,
             scene,
             game: Default::default(),
-            white: None,
-            water_defaults: None,
             samples: vk::SampleCountFlags::TYPE_1,
             sharpen: false,
             textures: HashMap::new(),
@@ -255,38 +247,6 @@ impl Renderer {
             needs_recreate: false,
             ctx,
         };
-        let white = [255u8; 4];
-        renderer.white = Some(renderer.create_texture(&TextureDesc {
-            format: TexFormat::Rgba8,
-            width: 1,
-            height: 1,
-            levels: 1,
-            layers: 1,
-            cube: false,
-            data: vec![&white],
-            name: "white",
-        })?);
-        let pixel = |r: &mut Self, rgba: &[u8; 4], cube: bool, name: &str| {
-            let layers = if cube { 6 } else { 1 };
-            r.create_texture(&TextureDesc {
-                format: TexFormat::Rgba8,
-                width: 1,
-                height: 1,
-                levels: 1,
-                layers,
-                cube,
-                data: vec![rgba.as_slice(); layers as usize],
-                name,
-            })
-        };
-        let black = pixel(&mut renderer, &[0, 0, 0, 0], false, "black")?;
-        let flat = pixel(&mut renderer, &[128, 128, 255, 255], false, "flat normal")?;
-        let cube = pixel(&mut renderer, &[255; 4], true, "white cube")?;
-        let defaults = [black, flat, flat, cube];
-        let views = defaults.map(|h| renderer.textures[&h.0].texture.view);
-        renderer.scene.default_extra = views;
-        renderer.scene.extra_set(&renderer.ctx, views)?;
-        renderer.water_defaults = Some(defaults);
         Ok(renderer)
     }
 
@@ -369,36 +329,8 @@ impl Renderer {
                 device.destroy_image_view(view, None);
             }
         }
-        self.scene.forget_view(&self.ctx, entry.texture.view);
         // SAFETY: the device is idle.
         unsafe { entry.texture.destroy(&self.ctx) };
-    }
-
-    /// Upload a mesh. Parts without a texture sample white.
-    pub fn create_mesh(&mut self, desc: &MeshDesc<'_>) -> Result<MeshHandle> {
-        let mut sets = Vec::with_capacity(desc.parts.len());
-        let defaults = self.water_defaults.context("no default textures")?;
-        for part in &desc.parts {
-            let view_of = |h: TextureHandle| -> Result<vk::ImageView> {
-                Ok(self.textures.get(&h.0).context("unknown texture")?.texture.view)
-            };
-            let view = view_of(part.texture.or(self.white).context("no white texture")?)?;
-            let set = self.scene.material_set(&self.ctx, view)?;
-            let mut views = self.scene.default_extra;
-            if let Some(w) = &part.water {
-                for (i, t) in w.textures.iter().enumerate() {
-                    views[i] = view_of(t.unwrap_or(defaults[i]))?;
-                }
-            }
-            sets.push((set, self.scene.extra_set(&self.ctx, views)?));
-        }
-        self.scene.create_mesh(&self.ctx, desc, sets)
-    }
-
-    /// Destroy a mesh (waits for the GPU).
-    pub fn destroy_mesh(&mut self, mesh: MeshHandle) {
-        self.ctx.wait_idle();
-        self.scene.destroy_mesh(&self.ctx, mesh);
     }
 
     /// Multisample the 3D viewport with up to `samples` per pixel (1 turns it off; the remaster's high setting is
@@ -410,29 +342,17 @@ impl Renderer {
 
     pub fn set_msaa(&mut self, samples: u32) -> Result<u32> {
         let wanted = samples.clamp(1, 64).next_power_of_two();
-        let count = [64u32, 32, 16, 8, 4, 2]
-            .into_iter()
-            .find(|&n| n <= wanted && self.ctx.msaa_counts.contains(vk::SampleCountFlags::from_raw(n)))
-            .unwrap_or(1);
-        let flags = vk::SampleCountFlags::from_raw(count);
-        if flags != self.samples {
-            self.ctx.wait_idle();
-            self.drop_viewport();
-            // SAFETY: the device is idle, so no pipeline is in use.
-            unsafe { self.scene.pipeline.set_samples(&self.ctx.device, flags) }?;
-            self.samples = flags;
+        let mut flags = vk::SampleCountFlags::from_raw(wanted);
+        while flags != vk::SampleCountFlags::TYPE_1 && !self.ctx.msaa_counts.contains(flags) {
+            flags = vk::SampleCountFlags::from_raw(flags.as_raw() >> 1);
         }
-        Ok(count)
+        self.samples = flags;
+        Ok(flags.as_raw())
     }
 
-    /// Sharpen the 3D view with the remaster's unsharp mask (its "UnSharpMask" setting); ignored where the
-    /// device cannot run the compute passes.
+    /// The remaster's unsharp mask setting.
     pub fn set_sharpen(&mut self, on: bool) {
-        if on != self.sharpen {
-            self.ctx.wait_idle();
-            self.drop_viewport();
-            self.sharpen = on;
-        }
+        self.sharpen = on;
     }
 
     /// The remaster's brightness setting (0–100, 50 neutral): (setting − 50) / 100 is added to the finished
@@ -441,32 +361,15 @@ impl Renderer {
         self.scene.brightness = (setting.min(100) as f32 - 50.0) / 100.0;
     }
 
-    /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high (6, 12 or 20 sample
-    /// patterns). Ignored where the device cannot run the compute passes.
+    /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high.
+    pub fn set_hdao(&mut self, level: u32) {
+        self.scene.hdao_level = level.min(3);
+    }
+
     /// The post-processing settings: HDAO level (0 off, 1–3), the unsharp mask, and the brightness offset
     /// ((setting − 50) / 100).
     pub fn post_settings(&self) -> (u32, bool, f32) {
-        let level = match self.scene.hdao_patterns {
-            0 => 0,
-            6 => 1,
-            12 => 2,
-            _ => 3,
-        };
-        (level, self.sharpen, self.scene.brightness)
-    }
-
-    pub fn set_hdao(&mut self, level: u32) {
-        let patterns = match level {
-            0 => 0,
-            1 => 6,
-            2 => 12,
-            _ => 20,
-        };
-        if patterns != self.scene.hdao_patterns {
-            self.ctx.wait_idle();
-            self.drop_viewport();
-            self.scene.hdao_patterns = patterns;
-        }
+        (self.scene.hdao_level, self.sharpen, self.scene.brightness)
     }
 
     /// The UI texture showing the 3D viewport, (re)created at `size` pixels.
@@ -483,7 +386,7 @@ impl Renderer {
         // The scene writes display-ready values; the UI renderer takes texture samples as linear and encodes
         // its output for a non-sRGB swapchain, so it samples the viewport through an sRGB view (which decodes
         // them) to show the scene unchanged.
-        let mut color = Target::new(
+        let color = Target::new(
             ctx,
             VIEWPORT_FORMAT,
             extent,
@@ -500,53 +403,6 @@ impl Renderer {
             Some(vk::Format::R8G8B8A8_SRGB),
             vk::SampleCountFlags::TYPE_1,
         )?;
-        let samples = self.samples;
-        let msaa = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
-            Target::new(
-                ctx,
-                VIEWPORT_FORMAT,
-                extent,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
-                vk::ImageAspectFlags::COLOR,
-                None,
-                samples,
-            )
-        });
-        let msaa_color = match msaa.transpose() {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: never used.
-                unsafe { color.destroy(ctx) };
-                return Err(e);
-            }
-        };
-        let depth = match Target::new(
-            ctx,
-            DEPTH_FORMAT,
-            extent,
-            // Single-sample depth is sampled by the ambient occlusion directly.
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                | if samples == vk::SampleCountFlags::TYPE_1 {
-                    vk::ImageUsageFlags::SAMPLED
-                } else {
-                    vk::ImageUsageFlags::empty()
-                },
-            vk::ImageAspectFlags::DEPTH,
-            None,
-            samples,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                // SAFETY: never used.
-                unsafe {
-                    color.destroy(ctx);
-                    if let Some(mut m) = msaa_color {
-                        m.destroy(ctx);
-                    }
-                }
-                return Err(e);
-            }
-        };
         // Start in the layout the UI samples from.
         crate::scene::one_time_submit(ctx, |cmd| {
             // SAFETY: recording; the image is ours.
@@ -585,161 +441,9 @@ impl Renderer {
         // SAFETY: the set is new.
         unsafe { ctx.device.update_descriptor_sets(&write, &[]) };
         // Scratch images of the post-processing passes (failures leave the view without that pass).
-        let unsharp = match (&self.scene.unsharp, self.sharpen) {
-            (Some(u), true) => scratch(ctx, &[extent, extent])
-                .and_then(|mut t| {
-                    let (b, a) = (t.pop().expect("two images"), t.pop().expect("two images"));
-                    let pairs = [(color.view, a.view), (a.view, b.view), (b.view, color.view)];
-                    match u.sets(ctx, self.scene.pool, &pairs) {
-                        Ok(sets) => Ok(crate::scene::UnsharpTargets { a, b, sets }),
-                        Err(e) => {
-                            // SAFETY: never used.
-                            unsafe { destroy_all(ctx, [a, b]) };
-                            Err(e)
-                        }
-                    }
-                })
-                .inspect_err(|e| log::warn!("unsharp mask: {e:#}"))
-                .ok(),
-            _ => None,
-        };
-        let brightness = self.scene.brightness_pass.as_ref().and_then(|p| {
-            p.sets(ctx, self.scene.pool, &[(color.view, color.view)])
-                .inspect_err(|e| log::warn!("brightness: {e:#}"))
-                .ok()
-                .and_then(|s| s.first().copied())
-        });
-        let half = vk::Extent2D { width: (extent.width / 2).max(1), height: (extent.height / 2).max(1) };
-        let glow = match &self.scene.glow {
-            Some(g) => scratch(ctx, &[extent, half, half])
-                .and_then(|mut t| {
-                    let y = t.pop().expect("three images");
-                    let x = t.pop().expect("three images");
-                    let map = t.pop().expect("three images");
-                    let pairs = [
-                        (color.view, map.view),
-                        (map.view, x.view),
-                        (x.view, y.view),
-                        (y.view, x.view),
-                        (x.view, color.view),
-                    ];
-                    match g.sets(ctx, self.scene.pool, &pairs) {
-                        Ok(sets) => Ok(crate::scene::GlowTargets { map, x, y, sets }),
-                        Err(e) => {
-                            // SAFETY: never used.
-                            unsafe { destroy_all(ctx, [map, x, y]) };
-                            Err(e)
-                        }
-                    }
-                })
-                .inspect_err(|e| log::warn!("glow: {e:#}"))
-                .ok(),
-            None => None,
-        };
-        // The normal target (and its multisampled version) and, for the ambient occlusion, a resolved depth and
-        // its working images.
-        let made = (|| -> Result<_> {
-            let normal = target(
-                ctx,
-                crate::scene::NORMAL_FORMAT,
-                extent,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                vk::ImageAspectFlags::COLOR,
-                vk::SampleCountFlags::TYPE_1,
-            )?;
-            let msaa_normal = (samples != vk::SampleCountFlags::TYPE_1)
-                .then(|| {
-                    target(
-                        ctx,
-                        crate::scene::NORMAL_FORMAT,
-                        extent,
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
-                        vk::ImageAspectFlags::COLOR,
-                        samples,
-                    )
-                })
-                .transpose()?;
-            Ok((normal, msaa_normal))
-        })();
-        let (normal, msaa_normal) = match made {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: never used.
-                unsafe { destroy_all(ctx, [color, depth].into_iter().chain(msaa_color)) };
-                return Err(e);
-            }
-        };
-        let hdao_on = self.scene.hdao.is_some() && self.scene.hdao_patterns > 0;
-        let depth_resolved = (hdao_on && samples != vk::SampleCountFlags::TYPE_1)
-            .then(|| {
-                target(
-                    ctx,
-                    DEPTH_FORMAT,
-                    extent,
-                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::DEPTH,
-                    vk::SampleCountFlags::TYPE_1,
-                )
-            })
-            .transpose()
-            .inspect_err(|e| log::warn!("ambient occlusion depth: {e:#}"))
-            .ok()
-            .flatten();
-        let hdao = match (&self.scene.hdao, hdao_on) {
-            (Some(h), true) if samples == vk::SampleCountFlags::TYPE_1 || depth_resolved.is_some() => {
-                let depth_view = depth_resolved.as_ref().map_or(depth.view, |d| d.view);
-                let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
-                let make = || {
-                    target(
-                        ctx,
-                        crate::scene::AO_FORMAT,
-                        extent,
-                        usage,
-                        vk::ImageAspectFlags::COLOR,
-                        vk::SampleCountFlags::TYPE_1,
-                    )
-                };
-                match (make(), make()) {
-                    (Ok(a), Ok(b)) => {
-                        let views = crate::scene::HdaoViews {
-                            picture: color.view,
-                            depth: depth_view,
-                            normal: normal.view,
-                            a: a.view,
-                            b: b.view,
-                        };
-                        match h.sets(ctx, self.scene.pool, &views) {
-                            Ok(sets) => Some(crate::scene::HdaoTargets { a, b, sets }),
-                            Err(e) => {
-                                log::warn!("ambient occlusion: {e:#}");
-                                // SAFETY: never used.
-                                unsafe { destroy_all(ctx, [a, b]) };
-                                None
-                            }
-                        }
-                    }
-                    (a, b) => {
-                        // SAFETY: never used.
-                        unsafe { destroy_all(ctx, [a, b].into_iter().flatten()) };
-                        log::warn!("ambient occlusion: could not create its images");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
         let ui_id = self.egui.as_mut().expect("egui renderer lives until drop").add_user_texture(set);
         self.scene.viewport = Some(Viewport {
-            normal,
-            msaa_normal,
-            depth_resolved,
-            hdao,
             color,
-            msaa_color,
-            depth,
-            unsharp,
-            glow,
-            brightness,
             extent,
             ui_set: set,
             ui_id,
@@ -761,119 +465,12 @@ impl Renderer {
             if let Some(egui) = self.egui.as_mut() {
                 egui.remove_user_texture(vp.ui_id);
             }
-            self.scene.forget_view(&self.ctx, vp.color.view);
             // SAFETY: callers waited for the device.
             unsafe {
                 self.ctx.device.free_descriptor_sets(self.ui_textures.pool, &[vp.ui_set]).ok();
                 vp.color.destroy(&self.ctx);
-                if let Some(mut m) = vp.msaa_color.take() {
-                    m.destroy(&self.ctx);
-                }
-                vp.depth.destroy(&self.ctx);
-                if let Some(mut u) = vp.unsharp.take() {
-                    self.ctx.device.free_descriptor_sets(self.scene.pool, &u.sets).ok();
-                    u.a.destroy(&self.ctx);
-                    u.b.destroy(&self.ctx);
-                }
-                if let Some(mut g) = vp.glow.take() {
-                    self.ctx.device.free_descriptor_sets(self.scene.pool, &g.sets).ok();
-                    g.map.destroy(&self.ctx);
-                    g.x.destroy(&self.ctx);
-                    g.y.destroy(&self.ctx);
-                }
-                if let Some(h) = vp.hdao.take() {
-                    self.ctx.device.free_descriptor_sets(self.scene.pool, &h.sets).ok();
-                    destroy_all(&self.ctx, [h.a, h.b]);
-                }
-                if let Some(s) = vp.brightness.take() {
-                    self.ctx.device.free_descriptor_sets(self.scene.pool, &[s]).ok();
-                }
-                vp.normal.destroy(&self.ctx);
-                destroy_all(
-                    &self.ctx,
-                    [vp.msaa_normal.take(), vp.depth_resolved.take()].into_iter().flatten(),
-                );
             }
         }
-    }
-
-    /// Draw `view` at `size` pixels right away (no window needed) and return the RGBA8 pixels, rows top to
-    /// bottom. Uses (and resizes) the viewport target.
-    pub fn render_offscreen(&mut self, view: SceneView, size: (u32, u32)) -> Result<Vec<u8>> {
-        self.viewport_texture(size)?;
-        self.ctx.wait_idle();
-        let extent = self.scene.viewport.as_ref().expect("viewport was just created").extent;
-        let bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
-        let mut buffer = crate::scene::Buffer::new(
-            &self.ctx,
-            bytes,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::GpuToCpu,
-        )?;
-        self.scene.pending_table = self.table_view(&view);
-        self.scene.pending = Some(view);
-        let (ctx, scene) = (&self.ctx, &mut self.scene);
-        let mut recorded = Ok(());
-        let submitted = crate::scene::one_time_submit(ctx, |cmd| {
-            recorded = scene.record(ctx, cmd, 0);
-            let image = scene.viewport.as_ref().expect("viewport exists").color.image;
-            let device = &ctx.device;
-            // SAFETY: recording outside a render pass; the image and buffer belong to this device and the buffer
-            // holds the whole image.
-            unsafe {
-                image_barrier(
-                    device,
-                    cmd,
-                    image,
-                    (
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::PipelineStageFlags2::ALL_COMMANDS,
-                        vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    ),
-                    (
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::PipelineStageFlags2::COPY,
-                        vk::AccessFlags2::TRANSFER_READ,
-                    ),
-                );
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
-                device.cmd_copy_image_to_buffer(
-                    cmd,
-                    image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    buffer.buffer,
-                    &[region],
-                );
-                image_barrier(
-                    device,
-                    cmd,
-                    image,
-                    (
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::PipelineStageFlags2::COPY,
-                        vk::AccessFlags2::TRANSFER_READ,
-                    ),
-                    (
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                        vk::AccessFlags2::SHADER_SAMPLED_READ,
-                    ),
-                );
-            }
-        });
-        let pixels = buffer.mapped().map(|m| m[..bytes as usize].to_vec());
-        // SAFETY: the submission has completed (one_time_submit waits).
-        unsafe { buffer.destroy(&self.ctx) };
-        submitted?;
-        recorded?;
-        pixels.context("readback buffer is not host visible")
     }
 
     /// Translate-ready program (the games' shaders as SPIR-V, with their bindings and vertex layout).
@@ -988,17 +585,6 @@ impl Renderer {
         submitted?;
         recorded?;
         pixels.context("readback buffer is not host visible")
-    }
-
-    /// Draw `view` into the viewport this frame.
-    pub fn submit_scene(&mut self, view: SceneView) {
-        self.scene.pending_table = self.table_view(&view);
-        self.scene.pending = Some(view);
-    }
-
-    /// The view of a scene's colour-correction table.
-    fn table_view(&self, view: &SceneView) -> Option<vk::ImageView> {
-        view.color_correction.and_then(|h| self.textures.get(&h.0)).map(|e| e.texture.view)
     }
 
     pub fn context(&self) -> &Context {
@@ -1118,16 +704,7 @@ impl Renderer {
                 cmd,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            if !record_game(
-                &mut self.game,
-                &mut self.scene,
-                &self.textures,
-                &self.ctx,
-                cmd,
-                self.frame_index,
-            )? {
-                self.scene.record(&self.ctx, cmd, self.frame_index)?;
-            }
+            record_game(&mut self.game, &mut self.scene, &self.textures, &self.ctx, cmd, self.frame_index)?;
             image_barrier(
                 &device,
                 cmd,
@@ -1247,10 +824,7 @@ impl Drop for Renderer {
             self.destroy_texture(TextureHandle(handle));
         }
         // SAFETY: the device is idle.
-        unsafe {
-            self.game.destroy(&self.ctx);
-            self.scene.destroy(&self.ctx);
-        }
+        unsafe { self.game.destroy(&self.ctx) };
         let device = &self.ctx.device;
         // SAFETY: the device is idle; every object below was created from it and is destroyed once.
         unsafe {
@@ -1293,49 +867,4 @@ pub(crate) unsafe fn image_barrier(
     let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
     // SAFETY: guaranteed by the caller.
     unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
-}
-
-/// RGBA8 images a compute pass can write and sample, one per size (all or none).
-fn scratch(ctx: &Context, sizes: &[vk::Extent2D]) -> Result<Vec<Target>> {
-    let mut out = Vec::with_capacity(sizes.len());
-    for &size in sizes {
-        match Target::new(
-            ctx,
-            VIEWPORT_FORMAT,
-            size,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-            None,
-            vk::SampleCountFlags::TYPE_1,
-        ) {
-            Ok(t) => out.push(t),
-            Err(e) => {
-                // SAFETY: never used.
-                unsafe { destroy_all(ctx, out) };
-                return Err(e);
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// # Safety
-/// The GPU must not use the images.
-unsafe fn destroy_all(ctx: &Context, targets: impl IntoIterator<Item = Target>) {
-    for mut t in targets {
-        // SAFETY: guaranteed by the caller.
-        unsafe { t.destroy(ctx) };
-    }
-}
-
-/// A single image target (see [`Target::new`]) without an alternative view.
-fn target(
-    ctx: &Context,
-    format: vk::Format,
-    extent: vk::Extent2D,
-    usage: vk::ImageUsageFlags,
-    aspect: vk::ImageAspectFlags,
-    samples: vk::SampleCountFlags,
-) -> Result<Target> {
-    Target::new(ctx, format, extent, usage, aspect, None, samples)
 }

@@ -95,7 +95,9 @@ impl GameModel {
                         continue;
                     }
                     let p = mesh::texture_cluster_path(path, &t.asset);
-                    let h = crate::assets::load_texture(vfs, renderer, &p).ok();
+                    let h = crate::assets::load_texture(vfs, renderer, &p)
+                        .map_err(|e| log::warn!("{p}: {e}"))
+                        .ok();
                     textures.insert(t.asset.clone(), h);
                 }
             }
@@ -183,6 +185,8 @@ pub fn segment_draws(
     let fseg: &Segment = &source.segments[seg.source];
     let Some(material) = source.materials.get(fseg.material as usize) else { return Vec::new() };
     let Some(cluster) = effect_cluster_path(model.game, &material.effect) else { return Vec::new() };
+    // Effects without one shader per light count take their only one.
+    let shader = if programs.has_pass(vfs, &cluster, pass, shader, 0) { shader } else { 0 };
     let mut out = Vec::new();
     for index in 0.. {
         let key = ProgramKey { cluster: cluster.clone(), pass: pass.to_owned(), shader, index };
@@ -221,14 +225,13 @@ fn draw(
         for r in &shader.resources {
             match r.kind {
                 aerugo_formats::dxbc::ResourceKind::Texture => {
-                    let tex = material
-                        .textures
-                        .iter()
-                        .find(|t| t.parameter == r.name)
-                        .and_then(|t| model.textures.get(&t.asset).copied().flatten());
-                    match tex {
-                        Some(h) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
-                        None => missing.push(format!("texture {}", r.name)),
+                    let binding = material.textures.iter().find(|t| t.parameter == r.name);
+                    match binding.map(|t| (t, model.textures.get(&t.asset).copied().flatten())) {
+                        Some((_, Some(h))) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
+                        Some((t, None)) => {
+                            missing.push(format!("texture {} ({} not loaded)", r.name, t.asset))
+                        }
+                        None => missing.push(format!("texture {} in {}", r.name, model.path)),
                     }
                 }
                 aerugo_formats::dxbc::ResourceKind::Sampler => {

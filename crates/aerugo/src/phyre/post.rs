@@ -368,8 +368,16 @@ impl PostChain {
         let an = s.anisotropy;
         let m = TargetRef::Target(color);
         let tex = ImageRef::Target;
-        ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
-        ops.push(GameOp::Resolve { src: normal_ms, dst: TargetRef::Target(t.normal) });
+        // Without multisampling the scene targets are copied instead of resolved.
+        let resolve = |src: TargetHandle, dst: TargetHandle| {
+            if msaa > 1 {
+                GameOp::Resolve { src, dst: TargetRef::Target(dst) }
+            } else {
+                GameOp::Copy { src, dst: TargetRef::Target(dst) }
+            }
+        };
+        ops.push(resolve(color, t.resolved));
+        ops.push(resolve(normal_ms, t.normal));
         // HDAO (renderHDAO 695ba0), after the depth resolve (698110: only with 2, 4 or 8 samples).
         if s.hdao > 0 && matches!(msaa, 2 | 4 | 8) {
             let depth_name = format!("DepthBuffer{msaa}");
@@ -489,7 +497,7 @@ impl PostChain {
                 ops,
             );
             self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
-            ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
+            ops.push(resolve(color, t.resolved));
         }
         // Glow (render 694f10: prepareGlowMap 694c60, then the loops a1de20).
         if let Some([upper, lower, gain, spread]) = s.glow {
@@ -590,7 +598,7 @@ impl PostChain {
                     ops,
                 );
             }
-            ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
+            ops.push(resolve(color, t.resolved));
         }
         // Unsharp mask (renderUSM 697670): the picture copied down to a quarter, blurred both ways, applied.
         if s.unsharp {
@@ -674,7 +682,7 @@ impl PostChain {
                 ops,
             );
             self.copy(vfs, renderer, programs, game, tex(t.usm), m, full, scene, an, ops);
-            ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
+            ops.push(resolve(color, t.resolved));
         }
         // SMAA (copyDepthBuffer 696af0 with the quality setting at +0x1231c).
         if s.smaa > 0 {
@@ -767,7 +775,7 @@ impl PostChain {
                 ops,
             );
             self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
-            ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
+            ops.push(resolve(color, t.resolved));
         }
         // Brightness (renderBright 695440).
         self.set("bright", "g_brightPara", floats(&[s.brightness]));
@@ -789,7 +797,7 @@ impl PostChain {
             ops,
         );
         self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
-        ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(t.resolved) });
+        ops.push(resolve(color, t.resolved));
         // To the screen.
         self.set("copy", "UvScaleBias", floats(&[1.0, 1.0, 0.0, 0.0]));
         self.pass(

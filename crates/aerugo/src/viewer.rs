@@ -19,8 +19,6 @@ use aerugo_vfs::{Install, Language, Vfs};
 use field::FieldView;
 use maps::MapBrowser;
 use models::ModelBrowser;
-#[cfg(test)]
-pub(crate) use models::OrbitCamera;
 use movies::MoviePlayer;
 use scripts::ScriptBrowser;
 use sounds::SoundBrowser;

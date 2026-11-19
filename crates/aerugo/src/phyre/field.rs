@@ -32,12 +32,21 @@ pub fn character_world(pos: [f32; 3], yaw: f32) -> Mat4 {
 pub struct ActorDraw<'a> {
     pub path: &'a str,
     pub world: Mat4,
-    /// Local joint matrices for a skeleton (its pose this frame).
-    pub pose: &'a dyn Fn(&Skeleton) -> Vec<[f32; 16]>,
+    /// Local joint matrices for a mesh's skeleton (mesh index, skeleton) this frame.
+    pub pose: &'a dyn Fn(usize, &Skeleton) -> Vec<[f32; 16]>,
     /// MaterialColour (colour × shade factor, alpha).
     pub material: [f32; 4],
     /// CharacterShadeColor.
     pub shade: [f32; 3],
+}
+
+/// What a frame draws: the map (drawn ten times its file size), plain models with their own placement (in the
+/// remaster's space) and characters.
+#[derive(Default)]
+pub struct Objects<'a> {
+    pub map: Option<&'a str>,
+    pub models: &'a [(&'a str, Mat4)],
+    pub actors: &'a [ActorDraw<'a>],
 }
 
 /// The character light constants.
@@ -105,20 +114,24 @@ impl FieldRenderer {
         }
     }
 
+    /// A frame of `objects` seen with `scene`'s camera: through the post chain when `post` is given, else
+    /// resolved and copied to the screen. `both_sides` draws every face (a viewer option).
     #[allow(clippy::too_many_arguments)]
     pub fn frame(
         &mut self,
         vfs: &Vfs,
         renderer: &mut Renderer,
-        map: Option<&str>,
-        actors: &[ActorDraw<'_>],
+        objects: &Objects<'_>,
         scene: &SceneConstants,
         light: &Lighting,
         size: (u32, u32),
         msaa: u32,
-        post: &super::post::PostSettings,
+        post: Option<&super::post::PostSettings>,
+        anisotropy: f32,
+        both_sides: bool,
     ) -> Option<GameFrame> {
-        let anisotropy = post.anisotropy;
+        let map = objects.map;
+        let actors = objects.actors;
         let [color, normal, depth, resolved] = self.targets(renderer, size, msaa)?;
         let bg = scene.background;
         let mut ops = vec![
@@ -165,6 +178,39 @@ impl FieldRenderer {
                 }
             }
         }
+        for &(path, place) in objects.models {
+            if !self.model(vfs, renderer, path) {
+                continue;
+            }
+            let model = self.models[path].as_ref().expect("loaded above");
+            for mesh in &model.meshes {
+                let source = &model.model.meshes[mesh.source];
+                let world = place * Mat4::from_cols_array(&source.world);
+                let object = object_values(world, scene.view, scene.projection);
+                let values = |name: &str| scene.value(name).or_else(|| object(name));
+                for seg in &mesh.segments {
+                    let fseg = &source.segments[seg.source];
+                    let Some(material) = source.materials.get(fseg.material as usize) else { continue };
+                    let Some((pass, transparent)) = main_pass(vfs, model.game, material) else { continue };
+                    let draws = segment_draws(
+                        vfs,
+                        renderer,
+                        &mut self.programs,
+                        model,
+                        mesh,
+                        seg,
+                        &pass,
+                        0,
+                        &values,
+                        anisotropy,
+                        viewport,
+                        &mut missing,
+                    );
+                    let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
+                    if transparent { later.extend(draws) } else { ops.extend(draws) }
+                }
+            }
+        }
         for a in actors {
             if !self.model(vfs, renderer, a.path) {
                 continue;
@@ -174,7 +220,7 @@ impl FieldRenderer {
                 let source = &model.model.meshes[mesh.source];
                 let world = a.world * Mat4::from_cols_array(&source.world);
                 let object = object_values(world, scene.view, scene.projection);
-                let joints = mesh.skeleton.as_ref().map(|sk| sk.world(&(a.pose)(sk)));
+                let joints = mesh.skeleton.as_ref().map(|sk| sk.world(&(a.pose)(mesh.source, sk)));
                 for seg in &mesh.segments {
                     let fseg = &source.segments[seg.source];
                     let Some(material) = source.materials.get(fseg.material as usize) else { continue };
@@ -209,21 +255,38 @@ impl FieldRenderer {
             }
         }
         ops.extend(later);
-        let _ = resolved;
-        let game = map.map_or(aerugo_formats::Game::Ffx, crate::assets::game_of_path);
-        self.post.run(
-            vfs,
-            renderer,
-            &mut self.programs,
-            game,
-            (color, normal, depth),
-            size,
-            msaa,
-            size,
-            scene,
-            post,
-            &mut ops,
-        );
+        if both_sides {
+            for op in &mut ops {
+                if let GameOp::Draw(d) = op {
+                    d.state.raster.cull = 1;
+                }
+            }
+        }
+        let game = map.or(objects.models.first().map(|m| m.0)).or(actors.first().map(|a| a.path));
+        let game = game.map_or(aerugo_formats::Game::Ffx, crate::assets::game_of_path);
+        match post {
+            Some(post) => self.post.run(
+                vfs,
+                renderer,
+                &mut self.programs,
+                game,
+                (color, normal, depth),
+                size,
+                msaa,
+                size,
+                scene,
+                post,
+                &mut ops,
+            ),
+            None => {
+                if msaa > 1 {
+                    ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(resolved) });
+                    ops.push(GameOp::Copy { src: resolved, dst: TargetRef::Output });
+                } else {
+                    ops.push(GameOp::Copy { src: color, dst: TargetRef::Output });
+                }
+            }
+        }
         for m in missing {
             if self.reported.insert(m.clone()) {
                 log::info!("game shaders: nothing supplies {m}");

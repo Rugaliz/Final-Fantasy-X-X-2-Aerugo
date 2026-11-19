@@ -6,7 +6,7 @@
 //! `ViewProjection2` is the same perspective with OpenGL's depth range. (Checked value for value against the
 //! original's constants in cdsp0700: View, Projection, ViewProjection, ViewProjection2, ViewInverse.)
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 
 use super::Value;
 
@@ -54,6 +54,38 @@ impl SceneConstants {
             view: Mat4::look_at_rh(eye, focus, Vec3::Y),
             projection: Mat4::perspective_rh(fov_y, aspect, NEAR, FAR),
             projection_gl: Mat4::perspective_rh_gl(fov_y, aspect, NEAR, FAR),
+            near: NEAR,
+            far: FAR,
+            viewport: [width, height],
+            ambient: [0.0; 3],
+            fog_color: [0.0; 3],
+            fog_near: 0.0,
+            fog_far: 0.0,
+            fog_curve: 0.0,
+            fog_limit: 0.0,
+            time: 0.0,
+            background: [0.0; 3],
+        }
+    }
+
+    /// Constants for a viewer camera given as a view-projection in the old convention (Vulkan clip space, y
+    /// flipped, game space): the remaster's space takes it as its projection with no separate view, and no fog.
+    pub fn from_view_proj(view_proj: Mat4, width: f32, height: f32) -> SceneConstants {
+        let flip = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+        let hd = Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
+        let projection = flip * view_proj * hd;
+        let inv = projection.inverse();
+        // The eye: where the clip w and xy vanish (the camera centre of a projective matrix).
+        let e = inv * Vec4::new(0.0, 0.0, 1.0, 0.0);
+        let eye = if e.w.abs() > 1e-6 { e.truncate() / e.w } else { Vec3::ZERO };
+        // OpenGL's depth range, as the scene camera's: z_gl = 2·z − w.
+        let gl =
+            Mat4::from_cols(Vec4::X, Vec4::Y, Vec4::new(0.0, 0.0, 2.0, 0.0), Vec4::new(0.0, 0.0, -1.0, 1.0));
+        SceneConstants {
+            eye,
+            view: Mat4::IDENTITY,
+            projection,
+            projection_gl: gl * projection,
             near: NEAR,
             far: FAR,
             viewport: [width, height],

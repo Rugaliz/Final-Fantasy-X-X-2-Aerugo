@@ -164,7 +164,9 @@ impl Context {
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true)
-            .shader_demote_to_helper_invocation(true);
+            .shader_demote_to_helper_invocation(true)
+            // Direct3D lets a pixel shader read fewer components than the vertex shader writes.
+            .maintenance4(true);
         let mut fc = vk::PhysicalDeviceFloatControlsProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fc);
         // SAFETY: valid physical device; the chain lives on the stack for the call.
@@ -309,6 +311,7 @@ fn pick_device(
         if f12.vulkan_memory_model == vk::FALSE
             || f12.buffer_device_address == vk::FALSE
             || f13.shader_demote_to_helper_invocation == vk::FALSE
+            || f13.maintenance4 == vk::FALSE
             || f11.shader_draw_parameters == vk::FALSE
         {
             log::info!("skipping {name}: the features the games' translated shaders need are missing");

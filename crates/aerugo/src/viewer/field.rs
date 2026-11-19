@@ -13,7 +13,7 @@ use aerugo_debug_ui::egui;
 use aerugo_formats::Game;
 use aerugo_formats::motion::{Motion, fit_translation_scale, ps2_joint};
 use aerugo_formats::phyre::Cluster;
-use aerugo_gfx::{Draw, Renderer, SceneView};
+use aerugo_gfx::Renderer;
 use aerugo_script::Wait;
 use aerugo_sim::FixedTimestep;
 use aerugo_sim::field::collision::Ground;
@@ -26,7 +26,7 @@ use super::filelist::FileList;
 use super::maps::{best_camera, camera_view_proj, fit_layers};
 use super::models::{OrbitCamera, game_to_view};
 use super::movies::{MoviePlayer, movie_ticks};
-use crate::assets::{GpuModel, load_map_model, load_model};
+use crate::assets::{ModelInfo, read_model_info};
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +41,8 @@ enum CameraMode {
 
 struct Session {
     event: Event,
-    map: Option<GpuModel>,
-    layers: Option<GpuModel>,
+    map: Option<ModelInfo>,
+    layers: Option<ModelInfo>,
     /// Where a loaded save had the player, applied once the player is known.
     restore_position: Option<[f32; 3]>,
     /// Events a map change could lead to (when more than one).
@@ -50,7 +50,7 @@ struct Session {
     /// Stored cameras of the map's 2D layers.
     map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
     /// Character models by model id (None when missing).
-    actors: HashMap<u16, Option<GpuModel>>,
+    actors: HashMap<u16, Option<ModelInfo>>,
     /// PS2 motions of each character model: its own groups, then the event's groups for it.
     motions: HashMap<u16, Vec<Motion>>,
     /// Per model: motion number (the low 16 bits of the ids scripts ask for) to its index in `motions`.
@@ -178,7 +178,7 @@ pub fn script_camera(eye: [f32; 3], focus: [f32; 3], fov_y: f32, roll: f32, exte
 }
 
 /// A map model's bounds in view space (for framing the orbit camera on it).
-fn map_view_bounds(m: &GpuModel) -> (Vec3, Vec3) {
+fn map_view_bounds(m: &ModelInfo) -> (Vec3, Vec3) {
     let t = game_to_view() * map_place();
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for i in 0..8 {
@@ -295,12 +295,6 @@ impl FieldView {
         self.movie.close(renderer, audio);
         if let Some(mut s) = self.session.take() {
             s.phyre.clear(renderer);
-            for m in [s.map, s.layers].into_iter().flatten() {
-                m.destroy(renderer);
-            }
-            for m in s.actors.into_values().flatten() {
-                m.destroy(renderer);
-            }
         }
     }
 
@@ -316,9 +310,9 @@ impl FieldView {
             }
         };
         let mut notes = Vec::new();
-        let mut load = |p: &Option<String>| -> Option<GpuModel> {
+        let mut load = |p: &Option<String>| -> Option<ModelInfo> {
             let p = p.as_ref()?;
-            match load_map_model(vfs, renderer, p) {
+            match read_model_info(vfs, p) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     notes.push(format!("{p}: {e}"));
@@ -972,7 +966,7 @@ impl FieldView {
                 && !s.actors.contains_key(&id)
             {
                 let path = a.model_path(s.event.game);
-                let m = path.as_ref().and_then(|p| load_model(vfs, renderer, p).ok());
+                let m = path.as_ref().and_then(|p| read_model_info(vfs, p).ok());
                 s.actors.insert(id, m);
                 let own = path.as_ref().map_or(0, |p| {
                     aerugo_sim::field::motion_groups(vfs, p, id, None).iter().map(|g| g.motions.len()).sum()
@@ -1016,9 +1010,9 @@ impl FieldView {
                 // The translation scale from the character's first (own) motion: an event motion's root
                 // carries it to its place, which a fit on that motion would take for body size.
                 let scale = model
-                    .meshes
+                    .skeletons
                     .iter()
-                    .filter_map(|m| m.skeleton.as_ref())
+                    .flatten()
                     .max_by_key(|sk| sk.len())
                     .map_or(1.0, |sk| fit_translation_scale(&sk.names, &sk.default_pose, &motions[0]));
                 *entry = (want, 0.0, scale);
@@ -1099,117 +1093,25 @@ impl FieldView {
             (CameraMode::Map, _, _, Some(vp)) => vp,
             _ => self.orbit.view_proj(aspect),
         };
-        let mut draws = Vec::new();
-        let mut joints = Vec::new();
-        let mut add = |m: &GpuModel,
-                       place: Mat4,
-                       pose: Option<(&Motion, f32, f32)>,
-                       tint: Option<aerugo_gfx::CharacterTint>,
-                       joints: &mut Vec<[f32; 16]>| {
-            for mesh in &m.meshes {
-                match (&mesh.skeleton, mesh.skinned) {
-                    (Some(sk), true) => {
-                        let mut local = sk.default_pose.clone();
-                        if let Some((motion, time, scale)) = pose {
-                            for (i, name) in sk.names.iter().enumerate() {
-                                if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
-                                    local[i] = motion.joint_at(j, time).matrix(scale);
-                                }
-                            }
-                        }
-                        let world = sk.world(&local);
-                        for (pi, &si) in mesh.part_segments.iter().enumerate() {
-                            let seg = &m.model.meshes[mesh.source].segments[si];
-                            let base = joints.len() as u32;
-                            joints.extend(sk.palette(&world, seg));
-                            draws.push(Draw {
-                                mesh: mesh.mesh,
-                                model: (place * mesh.world).to_cols_array(),
-                                joint_base: Some(base),
-                                lit: false,
-                                part: Some(pi),
-                                tint,
-                            });
-                        }
-                    }
-                    _ => draws.push(Draw {
-                        mesh: mesh.mesh,
-                        model: (place * mesh.world).to_cols_array(),
-                        joint_base: None,
-                        lit: false,
-                        part: None,
-                        tint,
-                    }),
-                }
-            }
-        };
-        // The map model is in view space (game space turned half a turn about X); everything is drawn through the
-        // game-to-view turn, so the map takes the inverse first (the turn is its own inverse).
-        let map_place = map_place();
-        if let Some(m) = &s.map {
-            add(m, map_place, None, None, &mut joints);
-        }
-        if self.show_layers
-            && let Some(m) = &s.layers
-        {
-            add(m, map_place, None, None, &mut joints);
-        }
-        // Alpha 0 (native 5033) hides a character as the original does; under 1 it draws blended.
-        for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
-            if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
-                let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
-                let place = character_place(pos, yaw);
-                let event_motion = a
-                    .model
-                    .zip(s.anim.get(&w))
-                    .is_some_and(|(id, &(i, _, _))| s.motion_own.get(&id).is_some_and(|&own| i >= own));
-                let pose = a
-                    .model
-                    .and_then(|id| s.motions.get(&id))
-                    .zip(s.anim.get(&w))
-                    .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
-                // The remaster's run-time material colour: the character's colour × (shade × 0.85 + 0.15); the
-                // colour is also its shade colour.
-                let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
-                // The walk-mesh shade is taken where the character is drawn: for an event motion that is where
-                // its root (joint 1) has carried it, not the actor's own position.
-                let shade = pose
-                    .filter(|_| event_motion && a.shade_from_ground)
-                    .and_then(|(m, t, sc)| {
-                        let root = Vec3::from(m.joint_at(1, t).translation) * sc;
-                        let at = place.transform_point3(root).to_array();
-                        st.ground.as_ref().and_then(|g| g.shade_at(at))
-                    })
-                    .unwrap_or(a.shade.value);
-                let k = shade * 0.85 + 0.15;
-                let tint = self.game.then_some(aerugo_gfx::CharacterTint {
-                    material: rgb.map(|c| c * k),
-                    shade: rgb,
-                    alpha: a.color[3].value.min(1.0),
-                });
-                add(m, place, pose, tint, &mut joints);
-            }
-        }
-        // The map's scene settings: its fog, and its background colour behind everything.
+        // Everything is drawn with the remaster's own shaders: the game screen's script camera as the original's,
+        // the viewer's other cameras through their view-projection.
         let settings = s.map.as_ref().and_then(|m| m.scene);
-        let clear = match (settings, self.game) {
-            (Some(st), true) => [st.background[0], st.background[1], st.background[2], 1.0],
-            (None, true) => [0.0, 0.0, 0.0, 1.0],
-            (_, false) => [0.05, 0.05, 0.08, 1.0],
+        let mut scene = match (self.game, self.camera_mode, cam_eye, cam_focus) {
+            (true, CameraMode::Script, Some(eye), Some(focus)) => {
+                crate::phyre::scene::SceneConstants::camera(
+                    Vec3::from(eye),
+                    Vec3::from(focus),
+                    st.camera.screen_distance,
+                    px.0 as f32,
+                    px.1 as f32,
+                )
+            }
+            _ => crate::phyre::scene::SceneConstants::from_view_proj(view_proj, px.0 as f32, px.1 as f32),
         };
-        // The game screen with a script camera draws with the remaster's own shaders.
-        if self.game
-            && self.camera_mode == CameraMode::Script
-            && let (Some(eye), Some(focus)) = (cam_eye, cam_focus)
-        {
-            let mut scene = crate::phyre::scene::SceneConstants::camera(
-                Vec3::from(eye),
-                Vec3::from(focus),
-                st.camera.screen_distance,
-                px.0 as f32,
-                px.1 as f32,
-            );
-            if let Some(set) = settings.as_ref() {
+        match settings.as_ref().filter(|_| self.game) {
+            Some(set) => {
+                // The map's fog with what the scripts set (its limit stays 0, no fog, until they set one) and its
+                // background colour.
                 let f = crate::assets::scene_fog(set);
                 scene.fog_color = f.color;
                 scene.fog_near = st.fog.near.unwrap_or(f.near);
@@ -1218,143 +1120,122 @@ impl FieldView {
                 scene.fog_limit = st.fog.limit;
                 scene.background = [set.background[0], set.background[1], set.background[2]];
             }
-            scene.time = (s.event.tick as f32 + alpha) / 30.0;
-            let cl = crate::assets::character_light(
-                &st.lights,
-                settings.as_ref().map(crate::assets::scene_glow),
-                s.event.map_model.as_deref().unwrap_or(""),
-            );
-            let lighting = crate::phyre::field::Lighting {
-                lights: cl.lights,
-                ambient: cl.ambient,
-                shade_coeff: cl.shade,
-            };
-            let mut paths = Vec::new();
-            for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
-                let (Some(id), Some(path)) = (a.model, a.model_path(s.event.game)) else { continue };
-                let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
-                let pose = s
-                    .motions
-                    .get(&id)
-                    .zip(s.anim.get(&w))
-                    .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
-                let event_motion = s
-                    .anim
-                    .get(&w)
-                    .is_some_and(|&(i, _, _)| s.motion_own.get(&id).is_some_and(|&own| i >= own));
-                let place = character_place(pos, yaw);
-                let shade = pose
-                    .filter(|_| event_motion && a.shade_from_ground)
-                    .and_then(|(m, t, sc)| {
-                        let root = Vec3::from(m.joint_at(1, t).translation) * sc;
-                        st.ground.as_ref().and_then(|g| g.shade_at(place.transform_point3(root).to_array()))
-                    })
-                    .unwrap_or(a.shade.value);
-                let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
-                let k = shade * 0.85 + 0.15;
-                paths.push((
-                    path,
-                    crate::phyre::field::character_world(pos, yaw),
-                    pose,
-                    rgb,
-                    k,
-                    a.color[3].value.min(1.0),
-                ));
-            }
-            let poses: Vec<_> = paths
-                .iter()
-                .map(|(_, _, pose, ..)| {
-                    let pose = *pose;
-                    move |sk: &aerugo_formats::skeleton::Skeleton| {
-                        let mut local = sk.default_pose.clone();
-                        if let Some((motion, time, scale)) = pose {
-                            for (i, name) in sk.names.iter().enumerate() {
-                                if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
-                                    local[i] = motion.joint_at(j, time).matrix(scale);
-                                }
+            None if self.game => {}
+            None => scene.background = [0.05, 0.05, 0.08],
+        }
+        // Scene time: the event's ticks at 30 a second, plus the share of the next.
+        scene.time = (s.event.tick as f32 + alpha) / 30.0;
+        let cl = crate::assets::character_light(
+            &st.lights,
+            settings.as_ref().map(crate::assets::scene_glow),
+            s.event.map_model.as_deref().unwrap_or(""),
+        );
+        let lighting =
+            crate::phyre::field::Lighting { lights: cl.lights, ambient: cl.ambient, shade_coeff: cl.shade };
+        // Alpha 0 (native 5033) hides a character as the original does; under 1 it draws blended.
+        let mut paths = Vec::new();
+        for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
+            let (Some(id), Some(path)) = (a.model, a.model_path(s.event.game)) else { continue };
+            let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
+            let pose = s
+                .motions
+                .get(&id)
+                .zip(s.anim.get(&w))
+                .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
+            let event_motion =
+                s.anim.get(&w).is_some_and(|&(i, _, _)| s.motion_own.get(&id).is_some_and(|&own| i >= own));
+            let place = character_place(pos, yaw);
+            // The walk-mesh shade is taken where the character is drawn: for an event motion that is where its
+            // root (joint 1) has carried it, not the actor's own position.
+            let shade = pose
+                .filter(|_| event_motion && a.shade_from_ground)
+                .and_then(|(m, t, sc)| {
+                    let root = Vec3::from(m.joint_at(1, t).translation) * sc;
+                    st.ground.as_ref().and_then(|g| g.shade_at(place.transform_point3(root).to_array()))
+                })
+                .unwrap_or(a.shade.value);
+            // The remaster's run-time material colour: the character's colour × (shade × 0.85 + 0.15); the
+            // colour is also its shade colour.
+            let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
+            let k = shade * 0.85 + 0.15;
+            paths.push((
+                path,
+                crate::phyre::field::character_world(pos, yaw),
+                pose,
+                rgb,
+                k,
+                a.color[3].value.min(1.0),
+            ));
+        }
+        let poses: Vec<_> = paths
+            .iter()
+            .map(|(_, _, pose, ..)| {
+                let pose = *pose;
+                move |_: usize, sk: &aerugo_formats::skeleton::Skeleton| {
+                    let mut local = sk.default_pose.clone();
+                    if let Some((motion, time, scale)) = pose {
+                        for (i, name) in sk.names.iter().enumerate() {
+                            if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
+                                local[i] = motion.joint_at(j, time).matrix(scale);
                             }
                         }
-                        local
                     }
-                })
-                .collect();
-            let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
-                .iter()
-                .zip(&poses)
-                .map(|((path, world, _, rgb, k, alpha), pose)| crate::phyre::field::ActorDraw {
-                    path,
-                    world: *world,
-                    pose,
-                    material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
-                    shade: *rgb,
-                })
-                .collect();
-            let msaa = renderer.msaa();
-            let (hdao, unsharp, brightness) = renderer.post_settings();
-            let post = crate::phyre::post::PostSettings {
-                hdao,
-                glow: settings.as_ref().map(|set| {
-                    let g = crate::assets::scene_glow(set);
-                    [g.upper, g.lower, g.gain, g.spread]
-                }),
-                unsharp,
-                // The remaster's SMAA4 setting (quality 4) and anisotropy (the original holds 4 at run time).
-                smaa: 4,
-                brightness,
-                anisotropy: 4.0,
-            };
-            if let Some(frame) = s.phyre.frame(
-                vfs,
-                renderer,
-                s.event.map_model.as_deref(),
-                &actors,
-                &scene,
-                &lighting,
-                px,
-                msaa,
-                &post,
-            ) {
-                // AERUGO_FRAME_DUMP=<file>: the frame is written in the oracle's capture form whenever the file
-                // does not exist (delete it to take another).
-                if let Ok(path) = std::env::var("AERUGO_FRAME_DUMP")
-                    && !std::path::Path::new(&path).exists()
-                    && let Err(e) = crate::phyre::dump_frame(&frame, &s.phyre.programs.hashes(), &path)
-                {
-                    log::warn!("frame dump: {e}");
+                    local
                 }
-                renderer.submit_frame(frame);
+            })
+            .collect();
+        let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
+            .iter()
+            .zip(&poses)
+            .map(|((path, world, _, rgb, k, alpha), pose)| crate::phyre::field::ActorDraw {
+                path,
+                world: *world,
+                pose,
+                material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
+                shade: *rgb,
+            })
+            .collect();
+        let msaa = renderer.msaa();
+        let (hdao, unsharp, brightness) = renderer.post_settings();
+        let post = crate::phyre::post::PostSettings {
+            hdao,
+            glow: settings.as_ref().map(|set| {
+                let g = crate::assets::scene_glow(set);
+                [g.upper, g.lower, g.gain, g.spread]
+            }),
+            unsharp,
+            // The remaster's SMAA4 setting (quality 4) and anisotropy (the original holds 4 at run time).
+            smaa: 4,
+            brightness,
+            anisotropy: 4.0,
+        };
+        // The map's 2D layers sit where the map does (ten times their file size).
+        let layers: Vec<(&str, Mat4)> = s
+            .event
+            .map_layers
+            .as_deref()
+            .filter(|_| self.show_layers && s.layers.is_some())
+            .map(|p| (p, Mat4::from_scale(Vec3::splat(10.0))))
+            .into_iter()
+            .collect();
+        let objects = crate::phyre::field::Objects {
+            map: s.event.map_model.as_deref(),
+            models: &layers,
+            actors: &actors,
+        };
+        let post = self.game.then_some(&post);
+        if let Some(frame) =
+            s.phyre.frame(vfs, renderer, &objects, &scene, &lighting, px, msaa, post, 4.0, false)
+        {
+            // AERUGO_FRAME_DUMP=<file>: the frame is written in the oracle's capture form whenever the file does not
+            // exist (delete it to take another).
+            if let Ok(path) = std::env::var("AERUGO_FRAME_DUMP")
+                && !std::path::Path::new(&path).exists()
+                && let Err(e) = crate::phyre::dump_frame(&frame, &s.phyre.programs.hashes(), &path)
+            {
+                log::warn!("frame dump: {e}");
             }
-        } else {
-            renderer.submit_scene(SceneView {
-                view_proj: view_proj.to_cols_array(),
-                clear,
-                draws,
-                joints,
-                culling: true,
-                mirrored: false,
-                // The map's scene fog with what the scripts set: its limit stays 0 (no fog) until they set one.
-                fog: settings.as_ref().map(|s| {
-                    let mut f = crate::assets::scene_fog(s);
-                    f.near = st.fog.near.unwrap_or(f.near);
-                    f.far = st.fog.far.unwrap_or(f.far);
-                    f.curve = st.fog.curve.unwrap_or(f.curve);
-                    f.limit = st.fog.limit;
-                    f
-                }),
-                // Scene time: the event's ticks at 30 a second, plus the share of the next.
-                time: (s.event.tick as f32 + alpha) / 30.0,
-                // The remaster loads a map's colour-correction table but switches the pass off at start-up; only its
-                // debug tweak menu turns it on (the cdsp07 capture shows the table not applied).
-                color_correction: None,
-                glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
-                character_light: self.game.then(|| {
-                    crate::assets::character_light(
-                        &st.lights,
-                        settings.as_ref().map(crate::assets::scene_glow),
-                        s.event.map_model.as_deref().unwrap_or(""),
-                    )
-                }),
-            });
+            renderer.submit_frame(frame);
         }
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;

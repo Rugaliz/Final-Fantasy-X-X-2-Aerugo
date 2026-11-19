@@ -5,13 +5,13 @@
 use aerugo_debug_ui::egui;
 use aerugo_formats::camera::{Camera, Projection, read_cameras};
 use aerugo_formats::phyre::Cluster;
+use aerugo_gfx::Renderer;
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
-use aerugo_gfx::{Draw, Renderer, SceneView};
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
 
 use super::models::{OrbitCamera, game_to_view};
-use crate::assets::{GpuModel, load_model};
+use crate::assets::{ModelInfo, read_model_info};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MapEntry {
@@ -44,8 +44,8 @@ const RATIOS: [Ratio; 5] = [
 #[derive(Debug)]
 struct Loaded {
     entry: MapEntry,
-    model: Option<GpuModel>,
-    layers: Option<GpuModel>,
+    model: Option<ModelInfo>,
+    layers: Option<ModelInfo>,
     cameras: Vec<Camera>,
     /// Design aspect of the layers through each camera.
     design: Vec<f32>,
@@ -70,8 +70,9 @@ pub struct MapBrowser {
     mode: AspectMode,
     ratio: Ratio,
     follow: [f32; 2],
-    lit: bool,
     culling: bool,
+    /// Drawing with the maps' own effects.
+    phyre: crate::phyre::field::FieldRenderer,
 }
 
 impl MapBrowser {
@@ -91,17 +92,14 @@ impl MapBrowser {
             mode: AspectMode::Crop,
             ratio: Ratio::Window,
             follow: [0.0, 0.0],
-            lit: false,
             culling: true,
+            phyre: Default::default(),
         }
     }
 
     pub fn close(&mut self, renderer: &mut Renderer) {
-        if let Some(l) = self.loaded.take() {
-            for m in [l.model, l.layers].into_iter().flatten() {
-                m.destroy(renderer);
-            }
-        }
+        self.loaded = None;
+        self.phyre.clear(renderer);
         renderer.release_viewport();
     }
 
@@ -139,14 +137,11 @@ impl MapBrowser {
     fn open(&mut self, vfs: &Vfs, renderer: &mut Renderer, entry: MapEntry) {
         self.close(renderer);
         let mut errors = Vec::new();
-        let mut load = |p: &Option<String>| -> Option<GpuModel> {
+        let mut load = |p: &Option<String>| -> Option<ModelInfo> {
             let p = p.as_ref()?;
-            match load_model(vfs, renderer, p) {
-                Ok(m) if !m.meshes.is_empty() => Some(m),
-                Ok(m) => {
-                    m.destroy(renderer);
-                    None
-                }
+            match read_model_info(vfs, p) {
+                Ok(m) if !m.model.meshes.is_empty() => Some(m),
+                Ok(_) => None,
                 Err(e) => {
                     errors.push(format!("{p}: {e}"));
                     None
@@ -238,7 +233,7 @@ impl MapBrowser {
             self.open(vfs, renderer, entry);
         }
         egui::Panel::right("map-info").resizable(true).default_size(280.0).show(ui, |ui| self.info_ui(ui));
-        egui::CentralPanel::default_margins().show(ui, |ui| self.viewport_ui(ui, renderer));
+        egui::CentralPanel::default_margins().show(ui, |ui| self.viewport_ui(ui, vfs, renderer));
     }
 
     fn info_ui(&mut self, ui: &mut egui::Ui) {
@@ -252,7 +247,6 @@ impl MapBrowser {
         }
         ui.checkbox(&mut self.show_model, "3D model").on_disabled_hover_text("none");
         ui.checkbox(&mut self.show_layers, "2D layers");
-        ui.checkbox(&mut self.lit, "Viewer lighting");
         ui.checkbox(&mut self.culling, "Face culling");
         ui.separator();
         ui.label("View");
@@ -292,16 +286,16 @@ impl MapBrowser {
         }
     }
 
-    fn viewport_ui(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer) {
+    fn viewport_ui(&mut self, ui: &mut egui::Ui, vfs: &Vfs, renderer: &mut Renderer) {
         // The loaded map is moved out while the camera state (other fields) is updated.
         let loaded = self.loaded.take();
         if let Some(l) = &loaded {
-            self.viewport_body(ui, renderer, l);
+            self.viewport_body(ui, vfs, renderer, l);
         }
         self.loaded = loaded;
     }
 
-    fn viewport_body(&mut self, ui: &mut egui::Ui, renderer: &mut Renderer, l: &Loaded) {
+    fn viewport_body(&mut self, ui: &mut egui::Ui, vfs: &Vfs, renderer: &mut Renderer, l: &Loaded) {
         let avail = ui.available_size();
         // Letterbox the viewport to the chosen ratio so crop and fit can be seen at any shape.
         let size = match self.ratio {
@@ -359,42 +353,29 @@ impl MapBrowser {
                 Mat4::from_cols_array(&crop.matrix()) * base
             }
         };
-        let mut draws = Vec::new();
-        let mut add = |m: &GpuModel| {
-            for mesh in &m.meshes {
-                draws.push(Draw {
-                    mesh: mesh.mesh,
-                    model: mesh.world.to_cols_array(),
-                    joint_base: None,
-                    lit: self.lit,
-                    part: None,
-                    tint: None,
-                });
-            }
-        };
+        // The map and its layers, drawn with their own effects in the layer programs' space.
+        let mut models: Vec<(&str, Mat4)> = Vec::new();
         if self.show_model
-            && let Some(m) = &l.model
+            && l.model.is_some()
+            && let Some(p) = &l.entry.model
         {
-            add(m);
+            models.push((p, layer_space()));
         }
         if self.show_layers
-            && let Some(m) = &l.layers
+            && l.layers.is_some()
+            && let Some(p) = &l.entry.layers
         {
-            add(m);
+            models.push((p, Mat4::IDENTITY));
         }
-        renderer.submit_scene(SceneView {
-            view_proj: view_proj.to_cols_array(),
-            clear: [0.0, 0.0, 0.0, 1.0],
-            draws,
-            joints: Vec::new(),
-            culling: self.culling,
-            mirrored: false,
-            fog: None,
-            time: 0.0,
-            color_correction: l.model.as_ref().and_then(|m| m.color_correction),
-            glow: l.model.as_ref().and_then(|m| m.scene).as_ref().map(crate::assets::scene_glow),
-            character_light: None,
-        });
+        let scene = layer_scene(view_proj, px.0 as f32, px.1 as f32);
+        let objects = crate::phyre::field::Objects { map: None, models: &models, actors: &[] };
+        let light = crate::phyre::field::Lighting::default();
+        let msaa = renderer.msaa();
+        if let Some(frame) =
+            self.phyre.frame(vfs, renderer, &objects, &scene, &light, px, msaa, None, 4.0, !self.culling)
+        {
+            renderer.submit_frame(frame);
+        }
     }
 
     fn fly(&mut self, ui: &egui::Ui, response: &egui::Response) {
@@ -436,6 +417,25 @@ pub(super) fn best_camera(fitted: &[Option<(f32, f32)>]) -> usize {
 
 /// A camera's view-projection. With a fitted frustum the frame is exactly the background (which may sit off
 /// the camera's axis); otherwise the camera's own field of view at the `design` aspect.
+/// The layer programs scale a vertex's z by −10 before any matrix and take its depth from `ViewProjection2` without
+/// `World` (their vertex code), while the stored layer cameras frame the file's coordinates. The maps view therefore
+/// draws in the programs' space: layers with no world transform, the map model taken into that space, and the camera
+/// taking the space back to the file's.
+fn layer_space() -> Mat4 {
+    Mat4::from_scale(Vec3::new(1.0, 1.0, -10.0))
+}
+
+/// Scene constants for a file-space view-projection, in the layer programs' space.
+fn layer_scene(view_proj: Mat4, width: f32, height: f32) -> crate::phyre::scene::SceneConstants {
+    // `from_view_proj` takes game space (x and y turned round); undo that so the space is the programs'.
+    let turn = Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
+    crate::phyre::scene::SceneConstants::from_view_proj(
+        view_proj * layer_space().inverse() * turn,
+        width,
+        height,
+    )
+}
+
 pub(super) fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 4]>) -> Mat4 {
     let world = Mat4::from_cols_array(&cam.world);
     let view = world.inverse();
@@ -479,7 +479,7 @@ pub(super) fn camera_view_proj(cam: &Camera, design: f32, frustum: Option<[f32; 
 /// Field of view and frame shape that make the 2D background exactly fill a camera's frame. The background is
 /// the layer farthest from the camera (foreground layers may reach past the frame); the fit is a perspective
 /// from the camera's position, looking down its −Z axis.
-pub(super) fn fit_layers(cam: &Camera, layers: Option<&GpuModel>) -> Option<[f32; 4]> {
+pub(super) fn fit_layers(cam: &Camera, layers: Option<&crate::assets::ModelInfo>) -> Option<[f32; 4]> {
     let layers = layers?;
     let view = Mat4::from_cols_array(&cam.world).inverse();
     // Half-height tangent of the camera's own view.
@@ -542,9 +542,12 @@ mod tests {
 
     const CLEAR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
     /// Single-screen backgrounds that frame cleanly at all four ratios in crop and fit.
-    const KNOWN_GOOD: [&str; 2] = ["X guad/guad02", "X azit/azit00"];
-    /// How many layered maps framed cleanly when this test was written (a regression floor).
-    const MIN_CLEAN: usize = 27;
+    const KNOWN_GOOD: [&str; 2] = ["X guad/guad02", "X kami/kami01"];
+    /// How many layered maps frame cleanly with the layers' own programs (a regression floor). Fewer than with
+    /// Aerugo's former shader (27): the programs divide depth by w themselves, so where a fitted camera sees a
+    /// layer edge-on through its own eye (azit00's wall reaches w = 0) those triangles are lost, as they would be
+    /// in the original.
+    const MIN_CLEAN: usize = 20;
 
     /// Share of the image's outermost columns (left and right) that show the clear colour.
     fn edge_clear_share(px: &[u8], w: u32, h: u32) -> f64 {
@@ -580,6 +583,7 @@ mod tests {
             MapBrowser::list(&vfs).into_iter().filter(|e| e.layers.is_some()).collect();
         assert!(entries.len() > 150, "{} layered maps", entries.len());
         let mut browser = MapBrowser::new();
+        let mut phyre = crate::phyre::field::FieldRenderer::default();
         let (mut checked, mut skipped, mut bad, mut clean) =
             (0, Vec::new(), Vec::<String>::new(), Vec::new());
         for entry in entries {
@@ -596,28 +600,16 @@ mod tests {
             let View::Scene(best) = browser.view else {
                 panic!(
                     "{label}: no scene view (layers {}, cameras {:?})",
-                    l.layers.as_ref().map_or(0, |m| m.meshes.len()),
+                    l.layers.as_ref().map_or(0, |m| m.model.meshes.len()),
                     l.cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
                 )
             };
             let frustum = l.frusta.get(best).copied().flatten();
-            let (Some(layers), Some(cam), Some(&design)) =
-                (&l.layers, l.cameras.get(best), l.design.get(best))
+            let (Some(_), Some(cam), Some(&design)) = (&l.layers, l.cameras.get(best), l.design.get(best))
             else {
                 panic!("{label}: no layers or camera");
             };
-            let draws: Vec<Draw> = layers
-                .meshes
-                .iter()
-                .map(|m| Draw {
-                    mesh: m.mesh,
-                    model: m.world.to_cols_array(),
-                    joint_base: None,
-                    lit: false,
-                    part: None,
-                    tint: None,
-                })
-                .collect();
+            let layers_path = l.entry.layers.clone().unwrap();
             let h = 180u32;
             for aspect in [4.0f32 / 3.0, 16.0 / 9.0, 21.0 / 9.0, 32.0 / 9.0] {
                 let w = (h as f32 * aspect).round() as u32;
@@ -625,20 +617,35 @@ mod tests {
                     let c = clip_transform(design, w as f32 / h as f32, mode, [0.0, 0.0]);
                     let view_proj =
                         Mat4::from_cols_array(&c.matrix()) * camera_view_proj(cam, design, frustum);
-                    let view = SceneView {
-                        view_proj: view_proj.to_cols_array(),
-                        clear: CLEAR,
-                        draws: draws.clone(),
-                        joints: Vec::new(),
-                        culling: true,
-                        mirrored: false,
-                        fog: None,
-                        time: 0.0,
-                        color_correction: None,
-                        glow: None,
-                        character_light: None,
-                    };
-                    let px = renderer.render_offscreen(view, (w, h)).unwrap();
+                    let mut scene = layer_scene(view_proj, w as f32, h as f32);
+                    scene.background = [CLEAR[0], CLEAR[1], CLEAR[2]];
+                    let models = [(layers_path.as_str(), Mat4::IDENTITY)];
+                    let objects = crate::phyre::field::Objects { map: None, models: &models, actors: &[] };
+                    let frame = phyre
+                        .frame(
+                            &vfs,
+                            &mut renderer,
+                            &objects,
+                            &scene,
+                            &crate::phyre::field::Lighting::default(),
+                            (w, h),
+                            1,
+                            None,
+                            4.0,
+                            false,
+                        )
+                        .unwrap();
+                    let px = renderer.render_frame_offscreen(frame, (w, h)).unwrap();
+                    // AERUGO_MAPS_DUMP=<dir>: write each render (for looking at a failure).
+                    if let Ok(dir) = std::env::var("AERUGO_MAPS_DUMP") {
+                        let name =
+                            format!("{dir}/{}-{aspect:.2}-{mode:?}.png", label.replace(['/', ' '], "_"));
+                        let file = std::fs::File::create(name).unwrap();
+                        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+                        enc.set_color(png::ColorType::Rgba);
+                        enc.set_depth(png::BitDepth::Eight);
+                        enc.write_header().and_then(|mut wr| wr.write_image_data(&px)).unwrap();
+                    }
                     let share = edge_clear_share(&px, w, h);
                     // Crop fills the frame at every ratio; fit leaves bars beside a frame narrower than the view.
                     match mode {
@@ -663,11 +670,17 @@ mod tests {
             }
         }
         browser.close(&mut renderer);
+        phyre.clear(&mut renderer);
         eprintln!(
             "{checked} layered maps rendered at 4:3, 16:9, 21:9 and 32:9 (crop and fit); {} skipped",
             skipped.len()
         );
-        eprintln!("{} of {} maps frame their background cleanly at every ratio", clean.len(), checked);
+        eprintln!(
+            "{} of {} maps frame their background cleanly at every ratio: {}",
+            clean.len(),
+            checked,
+            clean.join(", ")
+        );
         // Fitting the frame from the layers alone works for single-screen backgrounds; maps with several screens
         // or scrolling backgrounds need the game's own camera control (later milestones). These must keep working:
         for want in KNOWN_GOOD {

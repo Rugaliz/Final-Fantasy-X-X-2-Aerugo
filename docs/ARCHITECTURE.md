@@ -7,7 +7,7 @@
 | `aerugo` | The executable: command line, settings, launcher, application loop |
 | `aerugo-platform` | SDL3 window and events, user directories, frame limiter |
 | `aerugo-vfs` | Finding the game installation, reading the VBF archives, the virtual file system |
-| `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
+| `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, the games' programs and render states, frame recording, egui drawing |
 | `aerugo-dxbc` | Translating the games' compiled Direct3D 11 shaders to SPIR-V (dxbc-spirv, built from `third_party/`) |
 | `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures, models, motions, sound banks and events, scripts |
 | `aerugo-script` | The script machine: workers, priority levels, requests, natives with a coverage tracker |
@@ -57,22 +57,21 @@ layered on top for development overrides. The archive format is described in
 
 ## Rendering
 
-Vulkan 1.3 through `ash`: dynamic rendering, synchronization2, two frames in flight. Shaders are written in
-GLSL and compiled to SPIR-V at build time. The renderer never waits on the simulation; it only reads
-snapshots.
+Vulkan 1.3 through `ash`: dynamic rendering, synchronization2, two frames in flight. The renderer never waits on the
+simulation; it only reads snapshots.
 
-Mesh parts carry a material state read from the game's effect clusters (blending, culling, depth); pipelines are
-built per blend state and the rest is Vulkan 1.3 dynamic state. A headless renderer draws scenes offscreen with
-CPU readback for golden-image tests.
+Scenes are drawn with the games' own compiled Direct3D 11 programs, read from the effect clusters and translated to
+SPIR-V by `aerugo-dxbc` (DXVK's dxbc-spirv, with DXVK's binding layout and float controls). Each pipeline takes its
+pass's stored Direct3D state as it is (rasterizer, depth-stencil and blend descriptions, the input layout from the
+pass's stream descriptions), and each program's constant buffers are filled by variable name from its own
+reflection data: the material's values, the scene camera and fog, the object's world and skin matrices, the light
+set. Samplers are converted from the materials' sampler states the way the original's runtime converts them. A value
+no source supplies stays zero and is logged, and a draw whose program samples a texture nothing binds is left out
+with a warning.
 
-Field scenes follow the remaster's shaders. Each map part ends with the colour curve its shader variant has
-(read from the variant's compiled code: the field curve, the sky curve or none), alpha-tests against its
-material's threshold (with multisampling, the passes that use alpha to coverage do that instead), and the water
-and ice shaders sample their cube maps. Characters take the remaster's character light: an ambient plus three
-directional lights from the field light set the event scripts set, dimmed by the map's glow settings, times each
-character's colour and shade (eased towards the walk mesh's shade where it stands); a character's alpha fades
-it with a blended pass. Fog stays off until a script sets its limit. After the scene: ambient occlusion, glow,
-the unsharp mask and the brightness setting, with 8× multisampling.
-
-The fragment shader reads its per-frame constants from one storage buffer: the scene constants, then joint
-matrices, then two slots per water or ice part, the character light's two slots, and one slot per tinted draw.
+A frame is a list of operations (set targets, clear, draw, resolve, copy) built by the field renderer
+(`aerugo::phyre`) and recorded by `aerugo-gfx`. After the scene the post chain replays the original's passes in its
+order with the post effects' own programs: ambient occlusion, glow, unsharp mask, SMAA and brightness. Aerugo's own
+GLSL (compiled to SPIR-V at build time) is only for its test quads; egui draws the interface. A headless renderer
+draws frames offscreen with CPU readback for tests, and local checks write frames in the oracle's capture form to
+compare with the original's draw by draw.
