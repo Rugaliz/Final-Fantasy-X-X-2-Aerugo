@@ -60,6 +60,8 @@ struct Session {
     /// Per worker: motion index, time in frames, translation scale.
     anim: HashMap<usize, (usize, f32, f32)>,
     notes: Vec<String>,
+    /// Drawing with the remaster's own shaders (the game screen).
+    phyre: crate::phyre::field::FieldRenderer,
 }
 
 pub struct FieldView {
@@ -291,7 +293,8 @@ impl FieldView {
 
     pub fn close(&mut self, renderer: &mut Renderer, audio: Option<&AudioOutput>) {
         self.movie.close(renderer, audio);
-        if let Some(s) = self.session.take() {
+        if let Some(mut s) = self.session.take() {
+            s.phyre.clear(renderer);
             for m in [s.map, s.layers].into_iter().flatten() {
                 m.destroy(renderer);
             }
@@ -370,6 +373,7 @@ impl FieldView {
             motion_own: HashMap::new(),
             anim: HashMap::new(),
             notes,
+            phyre: Default::default(),
         });
         self.last = None;
         self.clock.reset();
@@ -1193,36 +1197,145 @@ impl FieldView {
             (None, true) => [0.0, 0.0, 0.0, 1.0],
             (_, false) => [0.05, 0.05, 0.08, 1.0],
         };
-        renderer.submit_scene(SceneView {
-            view_proj: view_proj.to_cols_array(),
-            clear,
-            draws,
-            joints,
-            culling: true,
-            mirrored: false,
-            // The map's scene fog with what the scripts set: its limit stays 0 (no fog) until they set one.
-            fog: settings.as_ref().map(|s| {
-                let mut f = crate::assets::scene_fog(s);
-                f.near = st.fog.near.unwrap_or(f.near);
-                f.far = st.fog.far.unwrap_or(f.far);
-                f.curve = st.fog.curve.unwrap_or(f.curve);
-                f.limit = st.fog.limit;
-                f
-            }),
-            // Scene time: the event's ticks at 30 a second, plus the share of the next.
-            time: (s.event.tick as f32 + alpha) / 30.0,
-            // The remaster loads a map's colour-correction table but switches the pass off at start-up; only its
-            // debug tweak menu turns it on (the cdsp07 capture shows the table not applied).
-            color_correction: None,
-            glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
-            character_light: self.game.then(|| {
-                crate::assets::character_light(
-                    &st.lights,
-                    settings.as_ref().map(crate::assets::scene_glow),
-                    s.event.map_model.as_deref().unwrap_or(""),
-                )
-            }),
-        });
+        // The game screen with a script camera draws with the remaster's own shaders.
+        if self.game
+            && self.camera_mode == CameraMode::Script
+            && let (Some(eye), Some(focus)) = (cam_eye, cam_focus)
+        {
+            let mut scene = crate::phyre::scene::SceneConstants::camera(
+                Vec3::from(eye),
+                Vec3::from(focus),
+                st.camera.screen_distance,
+                px.0 as f32,
+                px.1 as f32,
+            );
+            if let Some(set) = settings.as_ref() {
+                let f = crate::assets::scene_fog(set);
+                scene.fog_color = f.color;
+                scene.fog_near = st.fog.near.unwrap_or(f.near);
+                scene.fog_far = st.fog.far.unwrap_or(f.far);
+                scene.fog_curve = st.fog.curve.unwrap_or(f.curve);
+                scene.fog_limit = st.fog.limit;
+                scene.background = [set.background[0], set.background[1], set.background[2]];
+            }
+            scene.time = (s.event.tick as f32 + alpha) / 30.0;
+            let cl = crate::assets::character_light(
+                &st.lights,
+                settings.as_ref().map(crate::assets::scene_glow),
+                s.event.map_model.as_deref().unwrap_or(""),
+            );
+            let lighting = crate::phyre::field::Lighting {
+                lights: cl.lights,
+                ambient: cl.ambient,
+                shade_coeff: cl.shade,
+            };
+            let mut paths = Vec::new();
+            for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
+                let (Some(id), Some(path)) = (a.model, a.model_path(s.event.game)) else { continue };
+                let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
+                let pose = s
+                    .motions
+                    .get(&id)
+                    .zip(s.anim.get(&w))
+                    .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
+                let event_motion = s
+                    .anim
+                    .get(&w)
+                    .is_some_and(|&(i, _, _)| s.motion_own.get(&id).is_some_and(|&own| i >= own));
+                let place = character_place(pos, yaw);
+                let shade = pose
+                    .filter(|_| event_motion && a.shade_from_ground)
+                    .and_then(|(m, t, sc)| {
+                        let root = Vec3::from(m.joint_at(1, t).translation) * sc;
+                        st.ground.as_ref().and_then(|g| g.shade_at(place.transform_point3(root).to_array()))
+                    })
+                    .unwrap_or(a.shade.value);
+                let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
+                let k = shade * 0.85 + 0.15;
+                paths.push((
+                    path,
+                    crate::phyre::field::character_world(pos, yaw),
+                    pose,
+                    rgb,
+                    k,
+                    a.color[3].value.min(1.0),
+                ));
+            }
+            let poses: Vec<_> = paths
+                .iter()
+                .map(|(_, _, pose, ..)| {
+                    let pose = *pose;
+                    move |sk: &aerugo_formats::skeleton::Skeleton| {
+                        let mut local = sk.default_pose.clone();
+                        if let Some((motion, time, scale)) = pose {
+                            for (i, name) in sk.names.iter().enumerate() {
+                                if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
+                                    local[i] = motion.joint_at(j, time).matrix(scale);
+                                }
+                            }
+                        }
+                        local
+                    }
+                })
+                .collect();
+            let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
+                .iter()
+                .zip(&poses)
+                .map(|((path, world, _, rgb, k, alpha), pose)| crate::phyre::field::ActorDraw {
+                    path,
+                    world: *world,
+                    pose,
+                    material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
+                    shade: *rgb,
+                })
+                .collect();
+            let msaa = renderer.msaa();
+            // The remaster's anisotropy setting (its own default is 16).
+            if let Some(frame) = s.phyre.frame(
+                vfs,
+                renderer,
+                s.event.map_model.as_deref(),
+                &actors,
+                &scene,
+                &lighting,
+                px,
+                msaa,
+                16.0,
+            ) {
+                renderer.submit_frame(frame);
+            }
+        } else {
+            renderer.submit_scene(SceneView {
+                view_proj: view_proj.to_cols_array(),
+                clear,
+                draws,
+                joints,
+                culling: true,
+                mirrored: false,
+                // The map's scene fog with what the scripts set: its limit stays 0 (no fog) until they set one.
+                fog: settings.as_ref().map(|s| {
+                    let mut f = crate::assets::scene_fog(s);
+                    f.near = st.fog.near.unwrap_or(f.near);
+                    f.far = st.fog.far.unwrap_or(f.far);
+                    f.curve = st.fog.curve.unwrap_or(f.curve);
+                    f.limit = st.fog.limit;
+                    f
+                }),
+                // Scene time: the event's ticks at 30 a second, plus the share of the next.
+                time: (s.event.tick as f32 + alpha) / 30.0,
+                // The remaster loads a map's colour-correction table but switches the pass off at start-up; only its
+                // debug tweak menu turns it on (the cdsp07 capture shows the table not applied).
+                color_correction: None,
+                glow: settings.as_ref().filter(|_| self.game).map(crate::assets::scene_glow),
+                character_light: self.game.then(|| {
+                    crate::assets::character_light(
+                        &st.lights,
+                        settings.as_ref().map(crate::assets::scene_glow),
+                        s.event.map_model.as_deref().unwrap_or(""),
+                    )
+                }),
+            });
+        }
         // Message windows over the view, placed in the original's 512 × 448 frame.
         let rect = response.rect;
         for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {

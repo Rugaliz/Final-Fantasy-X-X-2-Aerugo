@@ -403,6 +403,11 @@ impl Renderer {
 
     /// Multisample the 3D viewport with up to `samples` per pixel (1 turns it off; the remaster's high setting is
     /// 8). Takes the largest count the device supports up to that; returns the count in use.
+    /// Samples per pixel of the 3D viewport.
+    pub fn msaa(&self) -> u32 {
+        self.samples.as_raw()
+    }
+
     pub fn set_msaa(&mut self, samples: u32) -> Result<u32> {
         let wanted = samples.clamp(1, 64).next_power_of_two();
         let count = [64u32, 32, 16, 8, 4, 2]

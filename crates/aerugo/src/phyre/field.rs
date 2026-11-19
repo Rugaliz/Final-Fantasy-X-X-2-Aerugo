@@ -1,0 +1,253 @@
+//! A field frame as the remaster draws it with its own shaders: the map and the characters into an
+//! multisampled colour target and a second target (the normals the ambient occlusion reads), then resolved.
+//!
+//! Map instances: World = 10 × the instance's node world (measured in the original's constants). Characters:
+//! World = translation to the position (in the remaster's space) × a turn of yaw − 90° about Y × diag(1, −1, −1)
+//! (traced), the lit character effect's shader with three lights, `BoneTransforms` = World × the skin palette,
+//! the field light set's three lights (directions towards the light, in the remaster's space) and the character
+//! light constants. Opaque parts draw first, then the parts whose effect pass is transparent, in submission
+//! order (the original's sorting of transparent parts is not traced yet).
+
+use std::collections::HashMap;
+
+use aerugo_formats::skeleton::Skeleton;
+use aerugo_gfx::Renderer;
+use aerugo_gfx::game::{GameFrame, GameOp, TargetDesc, TargetHandle, TargetRef};
+use aerugo_vfs::Vfs;
+use glam::{Mat4, Vec3};
+
+use super::Programs;
+use super::Value;
+use super::model::{GameModel, main_pass, object_values, segment_draws};
+use super::scene::{SceneConstants, to_hd};
+
+/// The remaster's World for a character standing at `pos` (game space) facing `yaw`.
+pub fn character_world(pos: [f32; 3], yaw: f32) -> Mat4 {
+    Mat4::from_translation(to_hd(Vec3::from(pos)))
+        * Mat4::from_rotation_y(yaw - std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0))
+}
+
+/// One character to draw.
+pub struct ActorDraw<'a> {
+    pub path: &'a str,
+    pub world: Mat4,
+    /// Local joint matrices for a skeleton (its pose this frame).
+    pub pose: &'a dyn Fn(&Skeleton) -> Vec<[f32; 16]>,
+    /// MaterialColour (colour × shade factor, alpha).
+    pub material: [f32; 4],
+    /// CharacterShadeColor.
+    pub shade: [f32; 3],
+}
+
+/// The character light constants.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Lighting {
+    /// Directions towards each light (game space) and colours.
+    pub lights: [([f32; 3], [f32; 3]); 3],
+    pub ambient: [f32; 3],
+    pub shade_coeff: f32,
+}
+
+/// Field drawing state: programs, uploaded models and the frame's targets.
+#[derive(Debug, Default)]
+pub struct FieldRenderer {
+    pub programs: Programs,
+    models: HashMap<String, Option<GameModel>>,
+    targets: Option<((u32, u32, u32), [TargetHandle; 4])>,
+    /// Values the shaders read that nothing supplied (logged once each).
+    reported: std::collections::HashSet<String>,
+}
+
+impl FieldRenderer {
+    fn model(&mut self, vfs: &Vfs, renderer: &mut Renderer, path: &str) -> bool {
+        if !self.models.contains_key(path) {
+            let m = GameModel::load(vfs, renderer, path).map_err(|e| log::warn!("{path}: {e}")).ok();
+            self.models.insert(path.to_owned(), m);
+        }
+        self.models.get(path).is_some_and(Option::is_some)
+    }
+
+    fn targets(&mut self, renderer: &mut Renderer, size: (u32, u32), msaa: u32) -> Option<[TargetHandle; 4]> {
+        let key = (size.0, size.1, msaa);
+        if let Some((k, t)) = self.targets
+            && k == key
+        {
+            return Some(t);
+        }
+        if let Some((_, old)) = self.targets.take() {
+            for t in old {
+                renderer.destroy_target(t);
+            }
+        }
+        let mut make = |format, samples| {
+            renderer
+                .create_target(&TargetDesc { width: size.0, height: size.1, dxgi_format: format, samples })
+                .map_err(|e| log::warn!("field target: {e:#}"))
+                .ok()
+        };
+        let t = [make(28, msaa)?, make(28, msaa)?, make(44, msaa)?, make(28, 1)?];
+        self.targets = Some((key, t));
+        Some(t)
+    }
+
+    /// Release everything (the models, the targets).
+    pub fn clear(&mut self, renderer: &mut Renderer) {
+        for m in std::mem::take(&mut self.models).into_values().flatten() {
+            m.destroy(renderer);
+        }
+        if let Some((_, t)) = self.targets.take() {
+            for t in t {
+                renderer.destroy_target(t);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame(
+        &mut self,
+        vfs: &Vfs,
+        renderer: &mut Renderer,
+        map: Option<&str>,
+        actors: &[ActorDraw<'_>],
+        scene: &SceneConstants,
+        light: &Lighting,
+        size: (u32, u32),
+        msaa: u32,
+        anisotropy: f32,
+    ) -> Option<GameFrame> {
+        let [color, normal, depth, resolved] = self.targets(renderer, size, msaa)?;
+        let bg = scene.background;
+        let mut ops = vec![
+            GameOp::ClearColor(TargetRef::Target(color), [bg[0], bg[1], bg[2], 1.0]),
+            GameOp::ClearDepth(depth, 1.0, 0, 3),
+            GameOp::ClearColor(TargetRef::Target(normal), [1.0; 4]),
+            GameOp::SetTargets {
+                colors: vec![TargetRef::Target(color), TargetRef::Target(normal)],
+                depth: Some(depth),
+            },
+        ];
+        let viewport = [0.0, 0.0, size.0 as f32, size.1 as f32, 0.0, 1.0];
+        let mut missing = Vec::new();
+        let mut later = Vec::new();
+        if let Some(path) = map
+            && self.model(vfs, renderer, path)
+        {
+            let model = self.models[path].as_ref().expect("loaded above");
+            for mesh in &model.meshes {
+                let source = &model.model.meshes[mesh.source];
+                let world = Mat4::from_scale(Vec3::splat(10.0)) * Mat4::from_cols_array(&source.world);
+                let object = object_values(world, scene.view, scene.projection);
+                let values = |name: &str| scene.value(name).or_else(|| object(name));
+                for seg in &mesh.segments {
+                    let fseg = &source.segments[seg.source];
+                    let Some(material) = source.materials.get(fseg.material as usize) else { continue };
+                    let Some((pass, transparent)) = main_pass(vfs, model.game, material) else { continue };
+                    let draws = segment_draws(
+                        vfs,
+                        renderer,
+                        &mut self.programs,
+                        model,
+                        mesh,
+                        seg,
+                        &pass,
+                        0,
+                        &values,
+                        anisotropy,
+                        viewport,
+                        &mut missing,
+                    );
+                    let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
+                    if transparent { later.extend(draws) } else { ops.extend(draws) }
+                }
+            }
+        }
+        for a in actors {
+            if !self.model(vfs, renderer, a.path) {
+                continue;
+            }
+            let model = self.models[a.path].as_ref().expect("loaded above");
+            for mesh in &model.meshes {
+                let source = &model.model.meshes[mesh.source];
+                let world = a.world * Mat4::from_cols_array(&source.world);
+                let object = object_values(world, scene.view, scene.projection);
+                let joints = mesh.skeleton.as_ref().map(|sk| sk.world(&(a.pose)(sk)));
+                for seg in &mesh.segments {
+                    let fseg = &source.segments[seg.source];
+                    let Some(material) = source.materials.get(fseg.material as usize) else { continue };
+                    let Some((pass, transparent)) = main_pass(vfs, model.game, material) else { continue };
+                    let bones: Option<Vec<Mat4>> =
+                        mesh.skeleton.as_ref().zip(joints.as_ref()).map(|(sk, j)| {
+                            sk.palette(j, fseg).iter().map(|m| world * Mat4::from_cols_array(m)).collect()
+                        });
+                    let values = |name: &str| {
+                        scene
+                            .value(name)
+                            .or_else(|| object(name))
+                            .or_else(|| character_value(name, a, light, &bones))
+                    };
+                    let draws = segment_draws(
+                        vfs,
+                        renderer,
+                        &mut self.programs,
+                        model,
+                        mesh,
+                        seg,
+                        &pass,
+                        3,
+                        &values,
+                        anisotropy,
+                        viewport,
+                        &mut missing,
+                    );
+                    let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
+                    if transparent || a.material[3] < 1.0 { later.extend(draws) } else { ops.extend(draws) }
+                }
+            }
+        }
+        ops.extend(later);
+        ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(resolved) });
+        ops.push(GameOp::Copy { src: resolved, dst: TargetRef::Output });
+        for m in missing {
+            if self.reported.insert(m.clone()) {
+                log::info!("game shaders: nothing supplies {m}");
+            }
+        }
+        Some(GameFrame { ops })
+    }
+}
+
+/// Values only characters take: their lights, colours and bones.
+fn character_value(
+    name: &str,
+    a: &ActorDraw<'_>,
+    light: &Lighting,
+    bones: &Option<Vec<Mat4>>,
+) -> Option<Value> {
+    let f = |v: &[f32]| Some(Value::Floats(v.to_vec()));
+    let light_part = |i: usize, member: &str| -> Option<Value> {
+        let (dir, color) = light.lights.get(i)?;
+        match member {
+            "m_direction" => f(&to_hd(Vec3::from(*dir)).to_array()),
+            "m_colorIntensity" => f(color),
+            _ => None,
+        }
+    };
+    if let Some(rest) = name.strip_prefix("Light")
+        && let Some((i, member)) = rest.split_once('.')
+        && let Ok(i) = i.parse::<usize>()
+    {
+        return light_part(i, member);
+    }
+    match name {
+        "BoneTransforms" => bones.clone().map(Value::Matrices),
+        "MaterialColour" => f(&a.material),
+        "CharacterShadeColor" => f(&a.shade),
+        "CharacterAmbientLight" => f(&light.ambient),
+        "CharacterShadeCoeff" => f(&[light.shade_coeff]),
+        // The PS2 light matrices with no point lights: colour 1 from (0, 1, 0) (the remaster's default).
+        "LgtMatVec" => f(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "LgtMatClr" => f(&[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        _ => None,
+    }
+}

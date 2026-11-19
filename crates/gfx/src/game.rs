@@ -560,6 +560,7 @@ pub(crate) struct GameState {
     zero: Option<Buffer>,
     uniform_align: u64,
     depth_fallback: bool,
+    skipped: std::collections::HashSet<ProgramHandle>,
     pub pending: Option<GameFrame>,
 }
 
@@ -1363,6 +1364,8 @@ impl GameState {
                     let mut buffer_infos = Vec::new();
                     let mut image_infos = Vec::new();
                     let mut writes_meta = Vec::new();
+                    // A draw that samples a texture nobody bound is left out (logged once per program).
+                    let mut skip = false;
                     for &(stage, binding, kind) in &bindings {
                         let set = sets[stage.set()];
                         match kind {
@@ -1416,7 +1419,8 @@ impl GameState {
                                 let reg = binding - BINDING_SRV;
                                 let r = draw.images.iter().find(|i| i.0 == stage && i.1 == reg).map(|i| i.2);
                                 let Some((_, view, _)) = r.and_then(|r| self.image_of(r, out)) else {
-                                    return Err(anyhow!("draw samples t{reg} but no image is bound"));
+                                    skip = true;
+                                    break;
                                 };
                                 image_infos.push(
                                     vk::DescriptorImageInfo::default()
@@ -1431,6 +1435,12 @@ impl GameState {
                                 ));
                             }
                         }
+                    }
+                    if skip {
+                        if self.skipped.insert(draw.program) {
+                            log::warn!("game draw left out: its program samples a texture that is not bound");
+                        }
+                        continue;
                     }
                     let writes: Vec<_> = writes_meta
                         .iter()

@@ -37,6 +37,8 @@ pub struct GpuSegment {
 pub struct GpuMesh {
     pub source: usize,
     pub segments: Vec<GpuSegment>,
+    /// The mesh's skeleton (skinned meshes).
+    pub skeleton: Option<aerugo_formats::skeleton::Skeleton>,
 }
 
 /// A model cluster uploaded for drawing with the games' shaders.
@@ -97,7 +99,9 @@ impl GameModel {
                     textures.insert(t.asset.clone(), h);
                 }
             }
-            meshes.push(GpuMesh { source: mi, segments });
+            let skeleton = aerugo_formats::skeleton::read_skeleton(&cluster, m.mesh)
+                .filter(|_| m.segments.iter().any(|s| s.stream("SkinIndices").is_some()));
+            meshes.push(GpuMesh { source: mi, segments, skeleton });
         }
         Ok(GameModel { path: path.to_owned(), game, model, meshes, textures, buffers })
     }

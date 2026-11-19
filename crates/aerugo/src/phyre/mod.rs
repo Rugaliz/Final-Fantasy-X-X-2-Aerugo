@@ -5,6 +5,7 @@
 // Parts of this module are used only by the game-shot check until the field draws with it.
 #![allow(dead_code)]
 
+pub mod field;
 pub mod model;
 pub mod scene;
 
