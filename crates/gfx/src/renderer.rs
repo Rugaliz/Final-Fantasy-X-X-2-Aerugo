@@ -130,6 +130,8 @@ pub struct Renderer {
     egui: Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
     ui_textures: UiTextures,
     scene: SceneState,
+    /// Drawing with the games' own (translated) shaders.
+    game: crate::game::GameState,
     white: Option<TextureHandle>,
     /// What water parts sample where a texture is missing (black, flat normal, flat normal, white cube); parts
     /// without water bind these too.
@@ -241,6 +243,7 @@ impl Renderer {
             egui: Some(egui),
             ui_textures,
             scene,
+            game: Default::default(),
             white: None,
             water_defaults: None,
             samples: vk::SampleCountFlags::TYPE_1,
@@ -470,6 +473,7 @@ impl Renderer {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
                 | if self.ctx.storage_rgba8 {
                     vk::ImageUsageFlags::STORAGE
                 } else {
@@ -855,6 +859,120 @@ impl Renderer {
         pixels.context("readback buffer is not host visible")
     }
 
+    /// Translate-ready program (the games' shaders as SPIR-V, with their bindings and vertex layout).
+    pub fn create_program(&mut self, desc: &crate::game::ProgramDesc) -> Result<crate::game::ProgramHandle> {
+        self.game.create_program(&self.ctx, desc)
+    }
+
+    /// A device-local vertex or index buffer with `data`.
+    pub fn create_buffer(&mut self, data: &[u8], index: bool) -> Result<crate::game::BufferHandle> {
+        self.game.create_buffer(&self.ctx, data, index)
+    }
+
+    pub fn destroy_buffer(&mut self, buffer: crate::game::BufferHandle) {
+        self.ctx.wait_idle();
+        self.game.destroy_buffer(&self.ctx, buffer);
+    }
+
+    pub fn create_target(&mut self, desc: &crate::game::TargetDesc) -> Result<crate::game::TargetHandle> {
+        self.game.create_target(&self.ctx, desc)
+    }
+
+    pub fn destroy_target(&mut self, target: crate::game::TargetHandle) {
+        self.ctx.wait_idle();
+        self.game.destroy_target(&self.ctx, target);
+    }
+
+    /// The device's 32-bit float controls (for translating shaders).
+    pub fn float_controls(&self) -> crate::context::FloatControls {
+        self.ctx.float_controls
+    }
+
+    /// Draw `frame` (the games' shaders) into the viewport this frame, instead of a scene view.
+    pub fn submit_frame(&mut self, frame: crate::game::GameFrame) {
+        self.game.pending = Some(frame);
+    }
+
+    /// Draw a game frame at `size` right away and return the RGBA8 pixels (rows top to bottom).
+    pub fn render_frame_offscreen(
+        &mut self,
+        frame: crate::game::GameFrame,
+        size: (u32, u32),
+    ) -> Result<Vec<u8>> {
+        self.viewport_texture(size)?;
+        self.ctx.wait_idle();
+        let extent = self.scene.viewport.as_ref().expect("viewport was just created").extent;
+        let bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
+        let mut buffer = crate::scene::Buffer::new(
+            &self.ctx,
+            bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::GpuToCpu,
+        )?;
+        self.game.pending = Some(frame);
+        let mut recorded = Ok(false);
+        let (game, scene, textures, ctx) = (&mut self.game, &mut self.scene, &self.textures, &self.ctx);
+        let submitted = crate::scene::one_time_submit(ctx, |cmd| {
+            recorded = record_game(game, scene, textures, ctx, cmd, 0);
+            let image = scene.viewport.as_ref().expect("viewport exists").color.image;
+            let device = &ctx.device;
+            // SAFETY: recording outside rendering; the image and buffer belong to this device.
+            unsafe {
+                image_barrier(
+                    device,
+                    cmd,
+                    image,
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        vk::AccessFlags2::MEMORY_WRITE,
+                    ),
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer.buffer,
+                    &[region],
+                );
+                image_barrier(
+                    device,
+                    cmd,
+                    image,
+                    (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    ),
+                );
+            }
+        });
+        let pixels = buffer.mapped().map(|m| m[..bytes as usize].to_vec());
+        // SAFETY: the submission has completed (one_time_submit waits).
+        unsafe { buffer.destroy(&self.ctx) };
+        submitted?;
+        recorded?;
+        pixels.context("readback buffer is not host visible")
+    }
+
     /// Draw `view` into the viewport this frame.
     pub fn submit_scene(&mut self, view: SceneView) {
         self.scene.pending_table = self.table_view(&view);
@@ -983,7 +1101,16 @@ impl Renderer {
                 cmd,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            self.scene.record(&self.ctx, cmd, self.frame_index)?;
+            if !record_game(
+                &mut self.game,
+                &mut self.scene,
+                &self.textures,
+                &self.ctx,
+                cmd,
+                self.frame_index,
+            )? {
+                self.scene.record(&self.ctx, cmd, self.frame_index)?;
+            }
             image_barrier(
                 &device,
                 cmd,
@@ -1060,6 +1187,38 @@ impl Renderer {
     }
 }
 
+/// Record the pending game frame into the viewport (if both exist); true when it was recorded.
+fn record_game(
+    game: &mut crate::game::GameState,
+    scene: &mut SceneState,
+    textures: &HashMap<u64, TextureEntry>,
+    ctx: &Context,
+    cmd: vk::CommandBuffer,
+    frame: usize,
+) -> Result<bool> {
+    if game.pending.is_none() {
+        return Ok(false);
+    }
+    let Some(vp) = scene.viewport.as_mut() else {
+        game.pending = None;
+        return Ok(false);
+    };
+    let lookup = |h: TextureHandle| textures.get(&h.0).map(|e| (e.texture.image, e.texture.raw_view));
+    let out = crate::game::Output {
+        image: vp.color.image,
+        view: vp.color.view,
+        format: crate::scene::VIEWPORT_FORMAT,
+        extent: vp.extent,
+        layout: vp.color_layout,
+        textures: &lookup,
+    };
+    let recorded = game.record(ctx, cmd, frame, &out)?;
+    if recorded {
+        vp.color_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    }
+    Ok(recorded)
+}
+
 impl Drop for Renderer {
     fn drop(&mut self) {
         self.ctx.wait_idle();
@@ -1071,7 +1230,10 @@ impl Drop for Renderer {
             self.destroy_texture(TextureHandle(handle));
         }
         // SAFETY: the device is idle.
-        unsafe { self.scene.destroy(&self.ctx) };
+        unsafe {
+            self.game.destroy(&self.ctx);
+            self.scene.destroy(&self.ctx);
+        }
         let device = &self.ctx.device;
         // SAFETY: the device is idle; every object below was created from it and is destroyed once.
         unsafe {

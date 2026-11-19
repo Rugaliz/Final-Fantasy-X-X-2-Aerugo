@@ -5,6 +5,7 @@
 
 pub mod aspect;
 pub mod context;
+pub mod game;
 pub mod offscreen;
 pub mod quad;
 pub mod renderer;
@@ -12,7 +13,7 @@ pub mod scene;
 pub mod swapchain;
 pub mod texture;
 
-pub use context::{Context, ContextOptions, validation_error_count};
+pub use context::{Context, ContextOptions, FloatControls, validation_error_count};
 pub use quad::{Quad, QuadPipeline};
 pub use renderer::{EguiFrame, FrameInput, Renderer, TextureHandle};
 pub use scene::{

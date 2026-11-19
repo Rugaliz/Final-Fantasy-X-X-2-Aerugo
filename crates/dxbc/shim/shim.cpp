@@ -174,8 +174,10 @@ extern "C" {
 // Translates `code` (a DXBC container). For a pixel shader, `prev` may hold the vertex shader it is drawn with,
 // whose outputs its inputs are matched against. On success returns 0 and sets `*words`/`*count` (free with
 // aerugo_dxbc_free); on failure returns 1 and sets `*error` to a message (free with aerugo_dxbc_free_text).
+// `float_controls`: bit 0 independent denorm modes, 1 RTE32, 2 RTZ32, 3 denorm flush 32, 4 denorm preserve 32,
+// 5 signed zero / inf / nan preserve 32 (the device's VkPhysicalDeviceFloatControlsProperties).
 int aerugo_dxbc_to_spirv(const uint8_t* code, size_t size, const uint8_t* prev, size_t prev_size,
-                         uint32_t** words, size_t* count, char** error) {
+                         uint32_t float_controls, uint32_t** words, size_t* count, char** error) {
   *words = nullptr;
   *count = 0;
   *error = nullptr;
@@ -208,6 +210,15 @@ int aerugo_dxbc_to_spirv(const uint8_t* code, size_t size, const uint8_t* prev, 
   spirv::SpirvBuilder::Options options = {};
   options.includeDebugNames = true;
   options.floatControls2 = false;
+  // As DXVK: only with independent denorm modes, RTE and denorm flush for 32-bit floats all supported.
+  auto fc = [&](uint32_t bit) { return (float_controls & (1u << bit)) != 0u; };
+  if (fc(0) && fc(1) && fc(3)) {
+    if (fc(1)) options.supportedRoundModesF32 |= ir::RoundMode::eNearestEven;
+    if (fc(2)) options.supportedRoundModesF32 |= ir::RoundMode::eZero;
+    if (fc(3)) options.supportedDenormModesF32 |= ir::DenormMode::eFlush;
+    if (fc(4)) options.supportedDenormModesF32 |= ir::DenormMode::ePreserve;
+  }
+  options.supportsZeroInfNanPreserveF32 = fc(5);
   Mapping mapping(stage);
   spirv::SpirvBuilder spv(builder, mapping, options);
   spv.buildSpirvBinary();

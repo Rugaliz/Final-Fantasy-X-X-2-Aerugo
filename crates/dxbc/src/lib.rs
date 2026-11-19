@@ -36,6 +36,7 @@ unsafe extern "C" {
         size: usize,
         prev: *const u8,
         prev_size: usize,
+        float_controls: u32,
         words: *mut *mut u32,
         count: *mut usize,
         error: *mut *mut c_char,
@@ -48,9 +49,38 @@ fn is_dxbc(code: &[u8]) -> bool {
     code.len() >= 32 && code.starts_with(b"DXBC")
 }
 
+/// The device's 32-bit float controls (`VkPhysicalDeviceFloatControlsProperties`); the translated shaders ask
+/// for Direct3D's rounding and denormal behaviour where the device offers it, as DXVK does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FloatControls {
+    pub independent_denorm: bool,
+    pub rte32: bool,
+    pub rtz32: bool,
+    pub flush_denorm32: bool,
+    pub preserve_denorm32: bool,
+    pub preserve_inf_nan32: bool,
+}
+
+impl FloatControls {
+    fn bits(&self) -> u32 {
+        [
+            self.independent_denorm,
+            self.rte32,
+            self.rtz32,
+            self.flush_denorm32,
+            self.preserve_denorm32,
+            self.preserve_inf_nan32,
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| u32::from(b) << i)
+        .sum()
+    }
+}
+
 /// Translates one shader to SPIR-V words. `previous` is the vertex shader a pixel shader is drawn with: its
 /// outputs are matched with the pixel shader's inputs (pass `None` for other stages).
-pub fn to_spirv(code: &[u8], previous: Option<&[u8]>) -> Result<Vec<u32>, Error> {
+pub fn to_spirv(code: &[u8], previous: Option<&[u8]>, float: &FloatControls) -> Result<Vec<u32>, Error> {
     if !is_dxbc(code) || previous.is_some_and(|p| !is_dxbc(p)) {
         return Err(Error::NotDxbc);
     }
@@ -65,6 +95,7 @@ pub fn to_spirv(code: &[u8], previous: Option<&[u8]>) -> Result<Vec<u32>, Error>
             code.len(),
             prev_ptr,
             prev_len,
+            float.bits(),
             &mut words,
             &mut count,
             &mut error,
@@ -95,7 +126,7 @@ mod tests {
 
     #[test]
     fn rejects_other_data() {
-        assert!(matches!(to_spirv(b"not a shader", None), Err(Error::NotDxbc)));
+        assert!(matches!(to_spirv(b"not a shader", None, &FloatControls::default()), Err(Error::NotDxbc)));
     }
 
     /// Every pass of every effect of both games translates, pixel shaders linked to their vertex shaders.
@@ -124,7 +155,7 @@ mod tests {
                     }
                     pairs += 1;
                     for (code, prev) in [(vs, None), (ps, Some(vs.as_slice()))] {
-                        match to_spirv(code, prev) {
+                        match to_spirv(code, prev, &FloatControls::default()) {
                             Ok(w) if w.first() == Some(&0x0723_0203) => {}
                             Ok(_) => failures.push(format!("{path} ({}): no SPIR-V header", sp.kind)),
                             Err(e) => failures.push(format!("{path} ({}): {e}", sp.kind)),

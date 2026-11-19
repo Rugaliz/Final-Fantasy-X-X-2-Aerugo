@@ -151,21 +151,57 @@ impl Default for PassState {
     }
 }
 
-/// The compiled programs of one shader pass: Direct3D 11 bytecode (DXBC containers).
+/// One element of a vertex program's input layout (`PStreamInputDescD3D11`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputElement {
+    /// Direct3D semantic (`POSITION`, `TEXCOORD`, …) and index.
+    pub semantic: String,
+    pub index: u32,
+    /// The mesh stream that feeds it (`Vertex`, `SkinnableVertex`, `ST`, `SkinIndices`, …).
+    pub stream: String,
+    pub dxgi_format: u32,
+    pub slot: u32,
+}
+
+/// A pass's complete Direct3D 11 state (`PShaderPassStateD3D11`): rasterizer, depth-stencil and blend
+/// descriptions with their own numbering (floats as bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3dState {
+    /// FillMode, CullMode, FrontCounterClockwise, DepthBias, DepthBiasClamp, SlopeScaledDepthBias,
+    /// DepthClipEnable, ScissorEnable, MultisampleEnable, AntialiasedLineEnable.
+    pub raster: [u32; 10],
+    /// DepthEnable, DepthWriteMask, DepthFunc, StencilEnable, StencilReadMask, StencilWriteMask, then the front
+    /// and back faces' StencilFailOp, StencilDepthFailOp, StencilPassOp, StencilFunc.
+    pub depth: [u32; 14],
+    /// AlphaToCoverageEnable, IndependentBlendEnable.
+    pub blend: [u32; 2],
+    /// Per render target: BlendEnable, SrcBlend, DestBlend, BlendOp, SrcBlendAlpha, DestBlendAlpha,
+    /// BlendOpAlpha, RenderTargetWriteMask.
+    pub targets: [[u32; 8]; 8],
+    pub stencil_ref: u32,
+}
+
+/// The compiled programs of one shader pass: Direct3D 11 bytecode (DXBC containers), the vertex program's input
+/// layout and the pass's state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassPrograms {
     pub vertex: Option<Vec<u8>>,
     pub fragment: Option<Vec<u8>>,
+    pub inputs: Vec<InputElement>,
+    pub state: D3dState,
 }
 
 /// One scene pass an effect variant can be drawn in (`Opaque`, `Transparent`, `ZPrePass`, `Shadow`, ...).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScenePass {
     pub kind: String,
-    /// State of each shader pass, in order.
+    /// State of each shader pass of the first shader, in order.
     pub passes: Vec<PassState>,
-    /// Programs of each shader pass, in the same order.
+    /// Programs of each shader pass of the first shader, in the same order.
     pub programs: Vec<PassPrograms>,
+    /// Every shader of the scene pass (the lit effects have one per number of lights, 0 to 3), each with the
+    /// programs of its shader passes.
+    pub shaders: Vec<Vec<PassPrograms>>,
 }
 
 /// What Aerugo reads from an effect variant.
@@ -246,9 +282,82 @@ fn program_code(c: &Cluster, program: ObjectId) -> Option<Vec<u8>> {
     (code.len() == len && code.starts_with(b"DXBC")).then(|| code.to_vec())
 }
 
+fn input_layout(c: &Cluster, program: ObjectId) -> Vec<InputElement> {
+    c.array_targets(program, "m_inputLayout")
+        .into_iter()
+        .filter_map(|e| {
+            Some(InputElement {
+                semantic: c.string(e, "m_semantic")?,
+                index: c.u32(e, "m_semanticIndex").unwrap_or(0),
+                stream: match c.pointer(e, "m_renderType") {
+                    Some(crate::phyre::Pointer::User(u)) => c.user_string(u),
+                    _ => String::new(),
+                },
+                dxgi_format: c.u32(e, "m_d3dFormat").unwrap_or(0),
+                slot: c.u32(e, "m_inputSlot").unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+fn d3d_state(c: &Cluster, pass: ObjectId) -> D3dState {
+    let u = |name: &str| c.u32(pass, &format!("m_state.{name}")).unwrap_or(0);
+    let byte = |name: &str| {
+        c.field(pass, &format!("m_state.{name}")).and_then(|b| b.first().copied()).map_or(0, u32::from)
+    };
+    let raster = [
+        "FillMode",
+        "CullMode",
+        "FrontCounterClockwise",
+        "DepthBias",
+        "DepthBiasClamp",
+        "SlopeScaledDepthBias",
+        "DepthClipEnable",
+        "ScissorEnable",
+        "MultisampleEnable",
+        "AntialiasedLineEnable",
+    ]
+    .map(|n| u(&format!("m_rasterDesc.{n}")));
+    let mut depth = [0u32; 14];
+    for (i, n) in ["DepthEnable", "DepthWriteMask", "DepthFunc", "StencilEnable"].iter().enumerate() {
+        depth[i] = u(&format!("m_depthDesc.{n}"));
+    }
+    depth[4] = byte("m_depthDesc.StencilReadMask");
+    depth[5] = byte("m_depthDesc.StencilWriteMask");
+    for (f, face) in ["FrontFace", "BackFace"].iter().enumerate() {
+        for (i, n) in
+            ["StencilFailOp", "StencilDepthFailOp", "StencilPassOp", "StencilFunc"].iter().enumerate()
+        {
+            depth[6 + f * 4 + i] = u(&format!("m_depthDesc.{face}.{n}"));
+        }
+    }
+    let blend = [u("m_blendDesc.AlphaToCoverageEnable"), u("m_blendDesc.IndependentBlendEnable")];
+    // The eight render-target descriptions follow one another, 32 bytes apart, from the first one's members.
+    let mut targets = [[0u32; 8]; 8];
+    if let Some(m) = c.member(pass, "m_state.m_blendDesc.RenderTarget.BlendEnable") {
+        let bytes = c.object_bytes(pass);
+        for (t, target) in targets.iter_mut().enumerate() {
+            for (i, v) in target.iter_mut().enumerate() {
+                let at = m.offset as usize + t * 32 + i * 4;
+                *v = if i == 7 {
+                    bytes.get(at).copied().map_or(0, u32::from)
+                } else {
+                    bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+                };
+            }
+        }
+    }
+    D3dState { raster, depth, blend, targets, stencil_ref: byte("m_stencilRef") }
+}
+
 fn pass_programs(c: &Cluster, pass: ObjectId) -> PassPrograms {
     let code = |name: &str| c.target(pass, name).and_then(|p| program_code(c, p));
-    PassPrograms { vertex: code("m_vertexProgram"), fragment: code("m_fragmentProgram") }
+    PassPrograms {
+        vertex: code("m_vertexProgram"),
+        fragment: code("m_fragmentProgram"),
+        inputs: c.target(pass, "m_vertexProgram").map(|p| input_layout(c, p)).unwrap_or_default(),
+        state: d3d_state(c, pass),
+    }
 }
 
 /// Read the first effect variant of an effect cluster.
@@ -262,12 +371,17 @@ pub fn read_effect(c: &Cluster) -> Option<Effect> {
                 Some(crate::phyre::Pointer::User(u)) => c.user_string(u),
                 _ => String::new(),
             };
-            let shader_passes =
-                c.array_targets(sp, "m_shaders").first().map(|&shader| c.array_targets(shader, "m_passes"));
-            let shader_passes = shader_passes.unwrap_or_default();
-            let passes = shader_passes.iter().map(|&p| pass_state(c, p)).collect();
-            let programs = shader_passes.iter().map(|&p| pass_programs(c, p)).collect();
-            ScenePass { kind, passes, programs }
+            let shaders: Vec<Vec<ObjectId>> = c
+                .array_targets(sp, "m_shaders")
+                .into_iter()
+                .map(|shader| c.array_targets(shader, "m_passes"))
+                .collect();
+            let first = shaders.first().cloned().unwrap_or_default();
+            let passes = first.iter().map(|&p| pass_state(c, p)).collect();
+            let programs = first.iter().map(|&p| pass_programs(c, p)).collect();
+            let shaders =
+                shaders.iter().map(|ps| ps.iter().map(|&p| pass_programs(c, p)).collect()).collect();
+            ScenePass { kind, passes, programs, shaders }
         })
         .collect();
     let parameters = c
@@ -317,12 +431,25 @@ mod tests {
 
     #[test]
     fn main_pass_prefers_opaque_or_transparent() {
-        let opaque =
-            ScenePass { kind: "Opaque".into(), passes: vec![PassState::default()], programs: vec![] };
-        let shadow =
-            ScenePass { kind: "Shadow".into(), passes: vec![PassState::default()], programs: vec![] };
+        let opaque = ScenePass {
+            kind: "Opaque".into(),
+            passes: vec![PassState::default()],
+            programs: vec![],
+            shaders: vec![],
+        };
+        let shadow = ScenePass {
+            kind: "Shadow".into(),
+            passes: vec![PassState::default()],
+            programs: vec![],
+            shaders: vec![],
+        };
         let blended = PassState { blend: Some(Blend::ALPHA), ..PassState::default() };
-        let transparent = ScenePass { kind: "Transparent".into(), passes: vec![blended], programs: vec![] };
+        let transparent = ScenePass {
+            kind: "Transparent".into(),
+            passes: vec![blended],
+            programs: vec![],
+            shaders: vec![],
+        };
         let e = Effect { scene_passes: vec![shadow.clone(), opaque], parameters: vec![], switches: vec![] };
         assert_eq!(e.main_pass().unwrap().kind, "Opaque");
         assert!(!e.is_transparent());

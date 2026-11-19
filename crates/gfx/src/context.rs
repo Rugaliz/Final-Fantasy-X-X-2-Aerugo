@@ -38,6 +38,19 @@ pub struct Context {
     pub storage_rgba8: bool,
     /// Sample counts usable for multisampled colour and depth targets together.
     pub msaa_counts: vk::SampleCountFlags,
+    /// 32-bit float controls the device offers (for translating the games' shaders as DXVK does).
+    pub float_controls: FloatControls,
+}
+
+/// 32-bit float behaviour a device can set per shader (`VkPhysicalDeviceFloatControlsProperties`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FloatControls {
+    pub independent_denorm: bool,
+    pub rte32: bool,
+    pub rtz32: bool,
+    pub flush_denorm32: bool,
+    pub preserve_denorm32: bool,
+    pub preserve_inf_nan32: bool,
 }
 
 impl std::fmt::Debug for Context {
@@ -142,8 +155,28 @@ impl Context {
             .queue_priorities(&priorities)];
         let device_exts: Vec<*const c_char> =
             if surface_fn.is_some() { vec![ash::khr::swapchain::NAME.as_ptr()] } else { vec![] };
-        let mut features13 =
-            vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
+        // The games' translated shaders (SPIR-V 1.6 from dxbc-spirv) use the Vulkan memory model, physical
+        // storage buffer addressing, demote-to-helper and draw parameters; Direct3D's depth clip off is depth clamp.
+        let mut features11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .vulkan_memory_model(true)
+            .buffer_device_address(true);
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .synchronization2(true)
+            .shader_demote_to_helper_invocation(true);
+        let mut fc = vk::PhysicalDeviceFloatControlsProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fc);
+        // SAFETY: valid physical device; the chain lives on the stack for the call.
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let float_controls = FloatControls {
+            independent_denorm: fc.denorm_behavior_independence != vk::ShaderFloatControlsIndependence::NONE,
+            rte32: fc.shader_rounding_mode_rte_float32 == vk::TRUE,
+            rtz32: fc.shader_rounding_mode_rtz_float32 == vk::TRUE,
+            flush_denorm32: fc.shader_denorm_flush_to_zero_float32 == vk::TRUE,
+            preserve_denorm32: fc.shader_denorm_preserve_float32 == vk::TRUE,
+            preserve_inf_nan32: fc.shader_signed_zero_inf_nan_preserve_float32 == vk::TRUE,
+        };
         // The games' textures are BC1–BC3; every desktop GPU supports them. Anisotropic filtering where available
         // (the remaster's high setting is 16×).
         // SAFETY: valid physical device.
@@ -162,12 +195,15 @@ impl Context {
             .texture_compression_bc(true)
             .sampler_anisotropy(anisotropy)
             // The normal target is never blended while the colour target is.
-            .independent_blend(true);
+            .independent_blend(true)
+            .depth_clamp(supported.depth_clamp == vk::TRUE);
         let mut features2 = vk::PhysicalDeviceFeatures2::default().features(core);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&device_exts)
             .push_next(&mut features2)
+            .push_next(&mut features11)
+            .push_next(&mut features12)
             .push_next(&mut features13);
         // SAFETY: physical device and queue family were validated by pick_device.
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
@@ -200,6 +236,7 @@ impl Context {
             max_anisotropy,
             storage_rgba8,
             msaa_counts,
+            float_controls,
         })
     }
 
@@ -255,13 +292,26 @@ fn pick_device(
             log::info!("skipping {name}: Vulkan 1.3 required");
             continue;
         }
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13);
+        let mut f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f11)
+            .push_next(&mut f12)
+            .push_next(&mut f13);
         // SAFETY: valid physical device; the chain lives on the stack for the call.
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
         let bc = f2.features.texture_compression_bc;
         let independent_blend = f2.features.independent_blend;
         if f13.dynamic_rendering == vk::FALSE || f13.synchronization2 == vk::FALSE {
+            continue;
+        }
+        if f12.vulkan_memory_model == vk::FALSE
+            || f12.buffer_device_address == vk::FALSE
+            || f13.shader_demote_to_helper_invocation == vk::FALSE
+            || f11.shader_draw_parameters == vk::FALSE
+        {
+            log::info!("skipping {name}: the features the games' translated shaders need are missing");
             continue;
         }
         if bc == vk::FALSE {

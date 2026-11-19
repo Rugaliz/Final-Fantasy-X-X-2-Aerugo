@@ -116,13 +116,43 @@ impl Segment {
     }
 }
 
+/// A Phyre sampler state (`PSamplerState`): GL-style filters (0 nearest, 1 linear, 2–5 the mipmapped
+/// combinations), wrap modes, LOD bias, anisotropy, border colour (RGBA bytes) and flags (bit 6: comparison).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SamplerState {
+    pub min_filter: u8,
+    pub mag_filter: u8,
+    pub wrap: [u8; 3],
+    pub lod_bias: f32,
+    pub max_anisotropy: f32,
+    pub border: [u8; 4],
+    pub flags: u32,
+}
+
+/// Read a `PSamplerState` object (or one derived from it).
+pub fn sampler_state(cluster: &Cluster, id: ObjectId) -> SamplerState {
+    let b = |n: &str| cluster.u32(id, n).unwrap_or(0) as u8;
+    let border = cluster.u32(id, "m_borderColor").unwrap_or(0).to_le_bytes();
+    SamplerState {
+        min_filter: b("m_minFilter"),
+        mag_filter: b("m_magFilter"),
+        wrap: [b("m_wrapS"), b("m_wrapT"), b("m_wrapR")],
+        lod_bias: cluster.f32(id, "m_lodBias").unwrap_or(0.0),
+        max_anisotropy: cluster.f32(id, "m_maxAnisotropy").unwrap_or(1.0),
+        border,
+        flags: cluster.u32(id, "m_flags").unwrap_or(0),
+    }
+}
+
 /// A texture bound to a material parameter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextureBinding {
     /// Shader parameter name (`TextureSampler`, `NormalMapSampler`, …).
     pub parameter: String,
     /// Asset id of the texture (`PS3Data/…/name.dds`), see [`texture_cluster_path`].
     pub asset: String,
+    /// The sampler state the material gives it.
+    pub sampler: Option<SamplerState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -133,6 +163,8 @@ pub struct Material {
     /// The material's numeric shader parameters by name (`MaterialColour`, `AlphaThreshold`, ...), as many floats
     /// as each takes.
     pub values: Vec<(String, Vec<f32>)>,
+    /// The material's sampler-state parameters by name (`TextureSamplerState`, `globalSamplerState`, …).
+    pub samplers: Vec<(String, SamplerState)>,
 }
 
 impl Material {
@@ -187,6 +219,8 @@ const TRIANGLE_LIST: u32 = 2;
 const INDEX_U32: u32 = 8;
 /// Parameter types of texture samplers: 2D, and cube maps.
 const TEXTURE_PARAMETERS: [u32; 2] = [66, 68];
+/// Parameter type of sampler states.
+const SAMPLER_PARAMETER: u32 = 71;
 
 /// Archive path of the texture cluster for a texture asset id (`PS3Data/chr/x/tex/a.dds` →
 /// `<game>_data/gamedata/ps3data/chr/x/tex/d3d11/a.dds.phyre`). `model_path` is the model's archive path, used
@@ -261,10 +295,27 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
     };
     let mut textures = Vec::new();
     let mut values = Vec::new();
+    let mut samplers = Vec::new();
     if let Some(buffer) = cluster.target(mat, "m_parameterBuffer") {
         let bytes = cluster.object_bytes(buffer);
         for def in cluster.array_targets(buffer, "m_tweakableShaderParameterDefinitions") {
-            if !cluster.u32(def, "m_parameterType").is_some_and(|t| TEXTURE_PARAMETERS.contains(&t)) {
+            let kind = cluster.u32(def, "m_parameterType");
+            if kind == Some(SAMPLER_PARAMETER) {
+                // A sampler state: a pointer 8 bytes into its value.
+                let (Some(name), Some(loc)) =
+                    (cluster.string(def, "m_name"), cluster.u32(def, "m_bufferLoc"))
+                else {
+                    continue;
+                };
+                if let Some(Pointer::Object { target, .. }) =
+                    cluster.pointer_at(buffer, (loc & 0xF_FFFF) + 8, 0)
+                    && cluster.class_name(target).starts_with("PSamplerState")
+                {
+                    samplers.push((name, sampler_state(cluster, target)));
+                }
+                continue;
+            }
+            if !kind.is_some_and(|t| TEXTURE_PARAMETERS.contains(&t)) {
                 // Numbers sit in the buffer object at their buffer offset (the object's header fills offsets no
                 // parameter uses); values past the object's end were left out of the file.
                 let u16_at = |f: &[u8]| u16::from_le_bytes([f[0], f[1]]) as usize;
@@ -299,13 +350,22 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
                     _ => None,
                 };
                 if let Some(asset) = asset {
-                    textures.push(TextureBinding { parameter: parameter.clone(), asset });
+                    // The value's sampler slot (8 bytes in) points at its sampler state.
+                    let sampler = match cluster.pointer_at(buffer, base + 8, 0) {
+                        Some(Pointer::Object { target, .. })
+                            if cluster.class_name(target).starts_with("PSamplerState") =>
+                        {
+                            Some(sampler_state(cluster, target))
+                        }
+                        _ => None,
+                    };
+                    textures.push(TextureBinding { parameter: parameter.clone(), asset, sampler });
                     break;
                 }
             }
         }
     }
-    Material { effect, textures, values }
+    Material { effect, textures, values, samplers }
 }
 
 fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, MeshError> {

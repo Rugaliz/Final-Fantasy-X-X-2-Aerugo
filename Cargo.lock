@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "aerugo-audio",
  "aerugo-debug-ui",
+ "aerugo-dxbc",
  "aerugo-formats",
  "aerugo-gfx",
  "aerugo-platform",

@@ -4,10 +4,13 @@ mod app;
 mod assets;
 mod cli;
 #[cfg(test)]
+mod gameshot;
+#[cfg(test)]
 mod golden;
 mod launcher;
 #[cfg(test)]
 mod mapshot;
+mod phyre;
 mod scene;
 mod settings;
 mod viewer;

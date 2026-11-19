@@ -78,6 +78,8 @@ pub struct TextureDesc<'a> {
 pub struct Texture {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// The whole texture as Direct3D samples it (no channel swizzle; the same view unless `view` swizzles).
+    pub raw_view: vk::ImageView,
     pub format: TexFormat,
     pub width: u32,
     pub height: u32,
@@ -142,6 +144,7 @@ impl Texture {
         let mut texture = Texture {
             image,
             view: vk::ImageView::null(),
+            raw_view: vk::ImageView::null(),
             format: desc.format,
             width: w,
             height: h,
@@ -164,6 +167,21 @@ impl Texture {
             unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset()) }?;
             texture.allocation = Some(alloc);
             texture.view = texture.create_view(ctx, None, None)?;
+            texture.raw_view = if desc.format != TexFormat::R8 {
+                texture.view
+            } else {
+                let info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(if texture.cube {
+                        vk::ImageViewType::CUBE
+                    } else {
+                        vk::ImageViewType::TYPE_2D
+                    })
+                    .format(desc.format.to_vk())
+                    .subresource_range(full_range(levels, layers));
+                // SAFETY: the image is bound to memory.
+                unsafe { device.create_image_view(&info, None) }?
+            };
             upload(ctx, image, levels, layers, total, &regions, &desc.data)
         })();
         if let Err(e) = result {
@@ -290,9 +308,13 @@ impl Texture {
     pub unsafe fn destroy(&mut self, ctx: &Context) {
         // SAFETY: guaranteed by the caller; null handles are ignored by Vulkan.
         unsafe {
+            if self.raw_view != self.view {
+                ctx.device.destroy_image_view(self.raw_view, None);
+            }
             ctx.device.destroy_image_view(self.view, None);
             ctx.device.destroy_image(self.image, None);
         }
+        self.raw_view = vk::ImageView::null();
         if let Some(a) = self.allocation.take() {
             ctx.allocator().lock().expect("allocator lock").free(a).ok();
         }
