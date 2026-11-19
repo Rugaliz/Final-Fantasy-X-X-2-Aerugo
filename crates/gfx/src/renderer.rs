@@ -443,6 +443,18 @@ impl Renderer {
 
     /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high (6, 12 or 20 sample
     /// patterns). Ignored where the device cannot run the compute passes.
+    /// The post-processing settings: HDAO level (0 off, 1–3), the unsharp mask, and the brightness offset
+    /// ((setting − 50) / 100).
+    pub fn post_settings(&self) -> (u32, bool, f32) {
+        let level = match self.scene.hdao_patterns {
+            0 => 0,
+            6 => 1,
+            12 => 2,
+            _ => 3,
+        };
+        (level, self.sharpen, self.scene.brightness)
+    }
+
     pub fn set_hdao(&mut self, level: u32) {
         let patterns = match level {
             0 => 0,

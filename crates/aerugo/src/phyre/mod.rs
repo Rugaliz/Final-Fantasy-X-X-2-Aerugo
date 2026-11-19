@@ -7,6 +7,7 @@
 
 pub mod field;
 pub mod model;
+pub mod post;
 pub mod scene;
 
 use std::collections::HashMap;

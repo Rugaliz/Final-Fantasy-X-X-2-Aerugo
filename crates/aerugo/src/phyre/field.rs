@@ -53,6 +53,7 @@ pub struct Lighting {
 #[derive(Debug, Default)]
 pub struct FieldRenderer {
     pub programs: Programs,
+    post: super::post::PostChain,
     models: HashMap<String, Option<GameModel>>,
     targets: Option<((u32, u32, u32), [TargetHandle; 4])>,
     /// Values the shaders read that nothing supplied (logged once each).
@@ -93,6 +94,7 @@ impl FieldRenderer {
 
     /// Release everything (the models, the targets).
     pub fn clear(&mut self, renderer: &mut Renderer) {
+        self.post.clear(renderer);
         for m in std::mem::take(&mut self.models).into_values().flatten() {
             m.destroy(renderer);
         }
@@ -114,8 +116,9 @@ impl FieldRenderer {
         light: &Lighting,
         size: (u32, u32),
         msaa: u32,
-        anisotropy: f32,
+        post: &super::post::PostSettings,
     ) -> Option<GameFrame> {
+        let anisotropy = post.anisotropy;
         let [color, normal, depth, resolved] = self.targets(renderer, size, msaa)?;
         let bg = scene.background;
         let mut ops = vec![
@@ -206,8 +209,21 @@ impl FieldRenderer {
             }
         }
         ops.extend(later);
-        ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(resolved) });
-        ops.push(GameOp::Copy { src: resolved, dst: TargetRef::Output });
+        let _ = resolved;
+        let game = map.map_or(aerugo_formats::Game::Ffx, crate::assets::game_of_path);
+        self.post.run(
+            vfs,
+            renderer,
+            &mut self.programs,
+            game,
+            (color, normal, depth),
+            size,
+            msaa,
+            size,
+            scene,
+            post,
+            &mut ops,
+        );
         for m in missing {
             if self.reported.insert(m.clone()) {
                 log::info!("game shaders: nothing supplies {m}");

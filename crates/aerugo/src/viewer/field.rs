@@ -1290,7 +1290,19 @@ impl FieldView {
                 })
                 .collect();
             let msaa = renderer.msaa();
-            // The remaster's anisotropy setting (its own default is 16).
+            let (hdao, unsharp, brightness) = renderer.post_settings();
+            let post = crate::phyre::post::PostSettings {
+                hdao,
+                glow: settings.as_ref().map(|set| {
+                    let g = crate::assets::scene_glow(set);
+                    [g.upper, g.lower, g.gain, g.spread]
+                }),
+                unsharp,
+                // The remaster's SMAA4 setting (quality 4) and anisotropy (the original holds 4 at run time).
+                smaa: 4,
+                brightness,
+                anisotropy: 4.0,
+            };
             if let Some(frame) = s.phyre.frame(
                 vfs,
                 renderer,
@@ -1300,8 +1312,16 @@ impl FieldView {
                 &lighting,
                 px,
                 msaa,
-                16.0,
+                &post,
             ) {
+                // AERUGO_FRAME_DUMP=<file>: the frame is written in the oracle's capture form whenever the file
+                // does not exist (delete it to take another).
+                if let Ok(path) = std::env::var("AERUGO_FRAME_DUMP")
+                    && !std::path::Path::new(&path).exists()
+                    && let Err(e) = crate::phyre::dump_frame(&frame, &s.phyre.programs.hashes(), &path)
+                {
+                    log::warn!("frame dump: {e}");
+                }
                 renderer.submit_frame(frame);
             }
         } else {
