@@ -1,0 +1,22 @@
+[package]
+name = "aerugo-dxbc"
+description = "Translates the games' Direct3D 11 shaders (DXBC) to SPIR-V through dxbc-spirv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+thiserror.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[dev-dependencies]
+aerugo-formats.workspace = true
+aerugo-vfs.workspace = true
+
+[lints]
+workspace = true

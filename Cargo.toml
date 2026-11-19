@@ -11,6 +11,7 @@ members = [
     "crates/video",
     "crates/formats",
     "crates/script",
+    "crates/dxbc",
     "xtask",
 ]
 default-members = ["crates/aerugo"]
@@ -34,11 +35,13 @@ aerugo-audio = { path = "crates/audio" }
 aerugo-video = { path = "crates/video" }
 aerugo-formats = { path = "crates/formats" }
 aerugo-script = { path = "crates/script" }
+aerugo-dxbc = { path = "crates/dxbc" }
 
 # external (licences checked by deny.toml)
 anyhow = "1.0"
 ash = "0.38"
 ash-window = "0.13"
+cc = "1.2"
 clap = { version = "4.6", features = ["derive"] }
 dirs = "7.0"
 egui = "0.36"

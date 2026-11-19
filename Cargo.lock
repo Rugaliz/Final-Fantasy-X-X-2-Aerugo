@@ -59,6 +59,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aerugo-dxbc"
+version = "0.1.0"
+dependencies = [
+ "aerugo-formats",
+ "aerugo-vfs",
+ "cc",
+ "thiserror",
+]
+
+[[package]]
 name = "aerugo-formats"
 version = "0.1.0"
 dependencies = [

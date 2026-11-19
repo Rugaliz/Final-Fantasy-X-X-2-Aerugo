@@ -69,7 +69,9 @@ Settings are stored in `settings.toml` in your config folder (`~/.config/aerugo`
 
 ## License
 
-Aerugo's source code is released under the [MIT License](LICENSE).
+Aerugo's source code is released under the [MIT License](LICENSE). It includes
+[dxbc-spirv](https://github.com/doitsujin/dxbc-spirv) (MIT) and two SPIR-V headers from
+[SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) in `third_party/`, under their own licences.
 
 FINAL FANTASY is a registered trademark of Square Enix Holdings Co., Ltd. Aerugo is an independent
 fan project and is not affiliated with, endorsed by, or sponsored by Square Enix. All game content

@@ -109,6 +109,17 @@ named `Opaque`, `Transparent`, `ZPrePass`, `Shadow`, …). Each scene pass has s
 enumerations (`CullMode` 1 none, 2 front, 3 back; blend factors 1 zero, 2 one, 5 source alpha, 6 inverse source
 alpha, …; blend operations 1 add, 2 subtract, 3 reverse subtract, 4 min, 5 max).
 
+A shader pass (`PShaderPassD3D11`) names its programs (`m_vertexProgram`, `m_fragmentProgram`, also geometry and
+compute). A program (`PShaderProgramD3D11`) keeps its compiled bytecode, a DXBC container, in `m_compiledCode`
+(a byte array), the size of its global constant buffer (`m_constantBufferSize`) and that buffer's slot
+(`m_globalConstantBufferIndex`); a vertex program also has its input layout (`m_inputLayout`: per stream the
+semantic, semantic index, DXGI format and input slot). The pass maps each parameter to its place in the
+constant buffers and texture slots of each stage (`m_vertexParameterLocation`, `m_fragmentParameterLocation`,
+`m_fragmentTexParameterLocation`, …), and a parameter definition (`PShaderParameterDefinition`) has its name,
+type and constant-buffer location. Sampler states are `PSamplerStateD3D11` objects (filters, wrap modes, LOD
+bias, anisotropy). Both games together have 2,299 distinct vertex/pixel program pairs; Aerugo translates them
+to SPIR-V with dxbc-spirv (see `crates/dxbc`).
+
 Aerugo draws a material with the state of the first shader pass of its `Opaque` or `Transparent` scene pass: opaque
 parts first, blended parts after. Almost every model material culls front faces with clockwise fronts, i.e. it draws
 counter-clockwise triangles as the original sees them; the renderer derives the winding on screen from the

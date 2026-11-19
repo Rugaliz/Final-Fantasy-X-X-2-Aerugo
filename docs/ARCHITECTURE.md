@@ -8,6 +8,7 @@
 | `aerugo-platform` | SDL3 window and events, user directories, frame limiter |
 | `aerugo-vfs` | Finding the game installation, reading the VBF archives, the virtual file system |
 | `aerugo-gfx` | Vulkan: instance, device, swapchain, frame pacing, pipelines, egui drawing |
+| `aerugo-dxbc` | Translating the games' compiled Direct3D 11 shaders to SPIR-V (dxbc-spirv, built from `third_party/`) |
 | `aerugo-formats` | Readers for the games' data formats: text encoding, data tables, Phyre clusters, textures, models, motions, sound banks and events, scripts |
 | `aerugo-script` | The script machine: workers, priority levels, requests, natives with a coverage tracker |
 | `aerugo-sim` | Simulation runtime: fixed tick, snapshots, interpolation; field events (script, actors, messages, camera, player), saves |
@@ -24,7 +25,7 @@ More crates arrive with later milestones: one crate per game.
 - Game logic (the simulation and, later, the game crates) never depends on graphics, audio or the window.
   It communicates through plain data: per-tick **snapshots** of what should be on screen, and event queues.
   This keeps the logic deterministic and testable without a GPU.
-- `unsafe` code is limited to `aerugo-gfx`, `aerugo-platform` and thin FFI wrappers. Every `unsafe` block
+- `unsafe` code is limited to `aerugo-gfx`, `aerugo-platform` and thin FFI wrappers (`aerugo-dxbc`). Every `unsafe` block
   carries a `SAFETY:` comment.
 
 ## Time: fixed tick, interpolated frames

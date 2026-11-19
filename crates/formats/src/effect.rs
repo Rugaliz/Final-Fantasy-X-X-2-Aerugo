@@ -1,6 +1,6 @@
-//! Effects: the compiled shader clusters materials refer to (`shaders/d3d11/<name>.fx#<variant>.phyre`). Aerugo
-//! does not run the compiled shaders; it reads what the fixed-function stages need (blending, depth, culling)
-//! for the pass a material is drawn in, and the names of the material parameters. See `docs/formats/phyre.md`.
+//! Effects: the compiled shader clusters materials refer to (`shaders/d3d11/<name>.fx#<variant>.phyre`): for
+//! each pass a material is drawn in, its fixed-function state (blending, depth, culling) and its compiled
+//! Direct3D 11 programs, and the names of the material parameters. See `docs/formats/phyre.md`.
 
 use crate::Game;
 use crate::phyre::{Cluster, ObjectId};
@@ -151,12 +151,21 @@ impl Default for PassState {
     }
 }
 
+/// The compiled programs of one shader pass: Direct3D 11 bytecode (DXBC containers).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassPrograms {
+    pub vertex: Option<Vec<u8>>,
+    pub fragment: Option<Vec<u8>>,
+}
+
 /// One scene pass an effect variant can be drawn in (`Opaque`, `Transparent`, `ZPrePass`, `Shadow`, ...).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScenePass {
     pub kind: String,
     /// State of each shader pass, in order.
     pub passes: Vec<PassState>,
+    /// Programs of each shader pass, in the same order.
+    pub programs: Vec<PassPrograms>,
 }
 
 /// What Aerugo reads from an effect variant.
@@ -229,6 +238,19 @@ fn pass_state(c: &Cluster, pass: ObjectId) -> PassState {
     }
 }
 
+/// The bytecode of a shader program object (its `m_compiledCode` array).
+fn program_code(c: &Cluster, program: ObjectId) -> Option<Vec<u8>> {
+    let len = c.array_count(program, "m_compiledCode")? as usize;
+    let a = c.array(program, "m_compiledCode", 4)?;
+    let code = c.array_bytes(program, a, len);
+    (code.len() == len && code.starts_with(b"DXBC")).then(|| code.to_vec())
+}
+
+fn pass_programs(c: &Cluster, pass: ObjectId) -> PassPrograms {
+    let code = |name: &str| c.target(pass, name).and_then(|p| program_code(c, p));
+    PassPrograms { vertex: code("m_vertexProgram"), fragment: code("m_fragmentProgram") }
+}
+
 /// Read the first effect variant of an effect cluster.
 pub fn read_effect(c: &Cluster) -> Option<Effect> {
     let variant = *c.objects("PEffectVariant").first()?;
@@ -240,14 +262,12 @@ pub fn read_effect(c: &Cluster) -> Option<Effect> {
                 Some(crate::phyre::Pointer::User(u)) => c.user_string(u),
                 _ => String::new(),
             };
-            let passes = c
-                .array_targets(sp, "m_shaders")
-                .first()
-                .map(|&shader| {
-                    c.array_targets(shader, "m_passes").into_iter().map(|p| pass_state(c, p)).collect()
-                })
-                .unwrap_or_default();
-            ScenePass { kind, passes }
+            let shader_passes =
+                c.array_targets(sp, "m_shaders").first().map(|&shader| c.array_targets(shader, "m_passes"));
+            let shader_passes = shader_passes.unwrap_or_default();
+            let passes = shader_passes.iter().map(|&p| pass_state(c, p)).collect();
+            let programs = shader_passes.iter().map(|&p| pass_programs(c, p)).collect();
+            ScenePass { kind, passes, programs }
         })
         .collect();
     let parameters = c
@@ -297,10 +317,12 @@ mod tests {
 
     #[test]
     fn main_pass_prefers_opaque_or_transparent() {
-        let opaque = ScenePass { kind: "Opaque".into(), passes: vec![PassState::default()] };
-        let shadow = ScenePass { kind: "Shadow".into(), passes: vec![PassState::default()] };
+        let opaque =
+            ScenePass { kind: "Opaque".into(), passes: vec![PassState::default()], programs: vec![] };
+        let shadow =
+            ScenePass { kind: "Shadow".into(), passes: vec![PassState::default()], programs: vec![] };
         let blended = PassState { blend: Some(Blend::ALPHA), ..PassState::default() };
-        let transparent = ScenePass { kind: "Transparent".into(), passes: vec![blended] };
+        let transparent = ScenePass { kind: "Transparent".into(), passes: vec![blended], programs: vec![] };
         let e = Effect { scene_passes: vec![shadow.clone(), opaque], parameters: vec![], switches: vec![] };
         assert_eq!(e.main_pass().unwrap().kind, "Opaque");
         assert!(!e.is_transparent());
