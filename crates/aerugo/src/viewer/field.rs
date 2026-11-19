@@ -152,6 +152,13 @@ pub fn map_place() -> Mat4 {
     Mat4::from_scale(Vec3::new(-10.0, -10.0, 10.0))
 }
 
+/// Where a character model goes in game space, standing at `pos` and facing `yaw`. The remaster's world matrix
+/// for a character is a turn of yaw − 90° about Y after negating Y and Z, at the position with x and y negated
+/// (its frame is game space turned half round Z); brought into game space that is a turn of −yaw − 90° about Y.
+pub fn character_place(pos: [f32; 3], yaw: f32) -> Mat4 {
+    Mat4::from_translation(Vec3::from(pos)) * Mat4::from_rotation_y(-yaw - std::f32::consts::FRAC_PI_2)
+}
+
 /// The scene camera's view and projection in the field frame (before the aspect policy): eye and focus in game
 /// space, the vertical field of view, the roll, and the map's extent in game units (which keeps the whole map
 /// inside the far plane however close the focus is).
@@ -1146,17 +1153,12 @@ impl FieldView {
         // Alpha 0 (native 5033) hides a character as the original does; under 1 it draws blended.
         for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
             if let Some(Some(m)) = a.model.and_then(|id| s.actors.get(&id)) {
-                // Y points down in the map, so a turn about Y is negated to look right after the viewer's flip.
                 let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
-                // An event's own motions are authored in the scene's frame (their root carries each character to
-                // its place): the actor's facing does not turn them (znkd0600's party all face −90° and sit round
-                // the fire only that way).
+                let place = character_place(pos, yaw);
                 let event_motion = a
                     .model
                     .zip(s.anim.get(&w))
                     .is_some_and(|(id, &(i, _, _))| s.motion_own.get(&id).is_some_and(|&own| i >= own));
-                let yaw = if event_motion { 0.0 } else { yaw };
-                let place = Mat4::from_translation(Vec3::from(pos)) * Mat4::from_rotation_y(-yaw);
                 let pose = a
                     .model
                     .and_then(|id| s.motions.get(&id))
@@ -1170,8 +1172,8 @@ impl FieldView {
                 let shade = pose
                     .filter(|_| event_motion && a.shade_from_ground)
                     .and_then(|(m, t, sc)| {
-                        let root = m.joint_at(1, t).translation;
-                        let at = [pos[0] + root[0] * sc, pos[1] + root[1] * sc, pos[2] + root[2] * sc];
+                        let root = Vec3::from(m.joint_at(1, t).translation) * sc;
+                        let at = place.transform_point3(root).to_array();
                         st.ground.as_ref().and_then(|g| g.shade_at(at))
                     })
                     .unwrap_or(a.shade.value);

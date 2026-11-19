@@ -488,10 +488,11 @@ fn load(vfs: &Vfs, renderer: &mut Renderer, path: &str, map: bool) -> Result<Gpu
                 }
                 (state, effect_code(vfs, game, &effect_id), ignore_fog)
             });
+            // The effects' raster states are the remaster's (Direct3D, its own world); Aerugo draws in game space
+            // (a proper rotation of the remaster's world for maps and characters alike), where every mesh's front
+            // faces are the other winding.
             let mut material = state.unwrap_or_default();
-            if map {
-                material.front_ccw = !material.front_ccw;
-            }
+            material.front_ccw = !material.front_ccw;
             // The remaster's lit map shaders and character shaders write the normal target (its ambient
             // occlusion reads it); its sky, water and blended passes do not.
             let family = aerugo_formats::effect::effect_family(&effect_id).to_ascii_lowercase();

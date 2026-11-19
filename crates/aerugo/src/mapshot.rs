@@ -3,7 +3,8 @@
 //!
 //! Needs `AERUGO_GAME_DIR`, a Vulkan device and `AERUGO_SHOT` = `map path;eye x,y,z;focus x,y,z;screen
 //! distance;out.png` (game-space points, as the recordings give them). Skipped without them. Optional:
-//! `AERUGO_SHOT_CHR` = `model path;x,y,z;yaw` adds a character in its default pose; `AERUGO_SHOT_SWEEP` =
+//! `AERUGO_SHOT_CHR` = `model path;x,y,z;yaw` adds a character in its default pose (`AERUGO_SHOT_CHR_MOTION` =
+//! a motion index poses it at that motion's first frame; `AERUGO_DEBUG_WORLD` prints its matrices); `AERUGO_SHOT_SWEEP` =
 //! `d,d,…;ty,ty,…` renders one picture per screen distance and vertical clip offset (out-<d>-<ty>.png), for
 //! fitting the projection to a capture; `AERUGO_SHOT_CAMS` = a file of `name;eye;focus;d` lines renders one
 //! picture per camera (out-<name>.png); `AERUGO_SHOT_SIZE` = `w,h` sets the picture size; `AERUGO_SHOT_NOCULL`
@@ -16,10 +17,10 @@
 use aerugo_gfx::aspect::{AspectMode, clip_transform};
 use aerugo_gfx::{ContextOptions, Draw, Renderer, SceneView};
 use aerugo_vfs::{Vfs, install_from_env};
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 
 use crate::assets;
-use crate::viewer::field::{FIELD_FRAME, field_fov_y, map_place, script_camera};
+use crate::viewer::field::{FIELD_FRAME, character_place, field_fov_y, map_place, script_camera};
 
 /// The field light as an event start leaves it, with `AERUGO_SHOT_LIGHTS` = `index,r,g,b,yaw,pitch;…` set over it
 /// as native 4013 would; `AERUGO_SHOT_NOLIGHT` leaves characters unlit.
@@ -113,21 +114,59 @@ fn map_shot() {
         let at = point(it.next().unwrap());
         let yaw: f32 = it.next().map_or(0.0, |y| y.parse().unwrap());
         let m = assets::load_model(&vfs, &mut renderer, path).unwrap();
-        // As on the game screen: Y points down, so a turn about Y is negated.
-        let place = Mat4::from_translation(Vec3::from(at)) * Mat4::from_rotation_y(-yaw);
+        let place = character_place(at, yaw);
         // AERUGO_SHOT_CHR_ALPHA draws the character faded (its alpha, as native 5033 sets it).
         let tint = std::env::var("AERUGO_SHOT_CHR_ALPHA")
             .ok()
             .and_then(|a| a.parse().ok())
             .map(|alpha| aerugo_gfx::CharacterTint { material: [1.0; 3], shade: [1.0; 3], alpha });
         for mesh in &m.meshes {
+            if std::env::var("AERUGO_DEBUG_WORLD").is_ok() {
+                eprintln!("mesh {} world {:?}", mesh.name, mesh.world.to_cols_array());
+            }
             match (&mesh.skeleton, mesh.skinned) {
                 (Some(sk), true) => {
-                    let world = sk.world(&sk.default_pose);
+                    // AERUGO_SHOT_CHR_MOTION = index into the character's own motions: pose it at that motion's
+                    // first frame (as the field does), and print each part's first skinning matrix.
+                    let mut local = sk.default_pose.clone();
+                    if let Some(k) =
+                        std::env::var("AERUGO_SHOT_CHR_MOTION").ok().and_then(|v| v.parse::<usize>().ok())
+                    {
+                        let motions: Vec<aerugo_formats::motion::Motion> =
+                            aerugo_sim::field::motion_groups(&vfs, path, 0, None)
+                                .into_iter()
+                                .flat_map(|g| g.motions)
+                                .collect();
+                        if let Some(motion) = motions.get(k) {
+                            let scale = aerugo_formats::motion::fit_translation_scale(
+                                &sk.names,
+                                &sk.default_pose,
+                                &motions[0],
+                            );
+                            for (i, name) in sk.names.iter().enumerate() {
+                                if let Some(j) = aerugo_formats::motion::ps2_joint(name)
+                                    .filter(|&j| j < motion.joints as usize)
+                                {
+                                    local[i] = motion.joint_at(j, 0.0).matrix(scale);
+                                }
+                            }
+                        }
+                    }
+                    let world = sk.world(&local);
                     for (pi, &si) in mesh.part_segments.iter().enumerate() {
                         let seg = &m.model.meshes[mesh.source].segments[si];
                         let base = joints.len() as u32;
-                        joints.extend(sk.palette(&world, seg));
+                        let palette = sk.palette(&world, seg);
+                        if std::env::var("AERUGO_DEBUG_WORLD").is_ok()
+                            && let Some(p0) = palette.first()
+                        {
+                            let full = place * mesh.world * Mat4::from_cols_array(p0);
+                            eprintln!(
+                                "part {pi} bone0 (game space, rows) {:?}",
+                                full.transpose().to_cols_array()
+                            );
+                        }
+                        joints.extend(palette);
                         draws.push(Draw {
                             mesh: mesh.mesh,
                             model: (place * mesh.world).to_cols_array(),
