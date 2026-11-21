@@ -200,6 +200,37 @@ fn ffx_event_path(n: i32) -> Option<String> {
 
 /// A joint of the character engine's pose: rotations in turns, translations in 1/4096 file units (the engine
 /// multiplies them by the model's scale and 4096), scales.
+/// A model's part matrices from its PS2 bones (as the character engine composes them each frame: a bone's world
+/// is its parent's × its own local matrix, the motion's values where a motion sets the joint and the `.chr`
+/// defaults elsewhere): World for skinned parts, World × the part's bone for rigid ones.
+fn rig_parts(
+    rig: &aerugo_sim::field::ChrRig,
+    pose: Option<&(Vec<Option<[f32; 9]>>, f32)>,
+    world: Mat4,
+) -> Vec<Mat4> {
+    let mut bones: Vec<Mat4> = Vec::with_capacity(rig.bones.len());
+    for (i, b) in rig.bones.iter().enumerate() {
+        let local = match pose.and_then(|(j, scale)| j.get(i).copied().flatten().map(|v| (v, *scale))) {
+            Some((v, scale)) => engine_joint(v).matrix(scale),
+            None => aerugo_formats::motion::JointPose {
+                rotation: b.rotation,
+                translation: b.translation,
+                scale: b.scale,
+            }
+            .matrix(1.0),
+        };
+        let parent = b.parent.and_then(|p| bones.get(p).copied()).unwrap_or(Mat4::IDENTITY);
+        bones.push(parent * Mat4::from_cols_array(&local));
+    }
+    rig.part_bones
+        .iter()
+        .zip(&rig.skinned)
+        .map(|(&b, &skinned)| {
+            if skinned { world } else { world * bones.get(usize::from(b)).copied().unwrap_or(Mat4::IDENTITY) }
+        })
+        .collect()
+}
+
 fn engine_joint(v: [f32; 9]) -> aerugo_formats::motion::JointPose {
     let tau = std::f32::consts::TAU;
     aerugo_formats::motion::JointPose {
@@ -1112,7 +1143,8 @@ impl FieldView {
             let scale = st.model_motion_scales.get(&id).copied().flatten().unwrap_or(0.001);
             let pose = a.player.as_ref().map(|p| (p.pose(), scale));
             let event_motion = a.player.as_ref().and_then(|p| p.motion_file).is_some_and(|k| k.0 == 1);
-            let place = character_place(pos, yaw);
+            let drawn = [pos[0] + a.draw_offset[0], pos[1] + a.draw_offset[1], pos[2] + a.draw_offset[2]];
+            let place = character_place(drawn, yaw);
             // The walk-mesh shade is taken where the character is drawn: for an event motion that is where its
             // root (joint 1) has carried it, not the actor's own position.
             let shade = pose
@@ -1127,9 +1159,15 @@ impl FieldView {
             // colour is also its shade colour.
             let rgb = [a.color[0].value, a.color[1].value, a.color[2].value];
             let k = shade * 0.85 + 0.15;
+            let world = crate::phyre::field::character_world(drawn, yaw);
+            let rig = st.model_rigs.get(&id).cloned().flatten();
+            let (parts, all_skinned) = match &rig {
+                Some(r) => (rig_parts(r, pose.as_ref(), world), r.skinned.iter().all(|&s| s)),
+                None => (Vec::new(), false),
+            };
             paths.push((
                 path,
-                crate::phyre::field::character_world(pos, yaw),
+                (world, parts, all_skinned),
                 pose,
                 rgb,
                 k,
@@ -1156,14 +1194,18 @@ impl FieldView {
         let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
             .iter()
             .zip(&poses)
-            .map(|((path, world, _, rgb, k, alpha, (face, layers)), pose)| crate::phyre::field::ActorDraw {
-                path,
-                world: *world,
-                pose,
-                material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
-                shade: *rgb,
-                face: *face,
-                face_layers: layers,
+            .map(|((path, (world, parts, all_skinned), _, rgb, k, alpha, (face, layers)), pose)| {
+                crate::phyre::field::ActorDraw {
+                    path,
+                    world: *world,
+                    parts: parts.clone(),
+                    all_skinned: *all_skinned,
+                    pose,
+                    material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
+                    shade: *rgb,
+                    face: *face,
+                    face_layers: layers,
+                }
             })
             .collect();
         let msaa = renderer.msaa();
@@ -1190,6 +1232,7 @@ impl FieldView {
             .into_iter()
             .collect();
         let objects = crate::phyre::field::Objects {
+            hidden_map_groups: st.hidden_map_groups,
             map: s.event.map_model.as_deref(),
             map_poses: &s.event.state.keyframes.poses,
             texture_animations: s.event.state.texture_animations.as_ref(),

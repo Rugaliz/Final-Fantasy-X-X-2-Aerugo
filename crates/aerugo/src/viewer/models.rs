@@ -215,6 +215,8 @@ impl ModelBrowser {
             let actor = crate::phyre::field::ActorDraw {
                 path,
                 world: Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0)),
+                parts: Vec::new(),
+                all_skinned: false,
                 pose: &pose,
                 material: [1.0; 4],
                 shade: [1.0; 3],
@@ -233,6 +235,7 @@ impl ModelBrowser {
             scene.background = [r, g, b];
             let actors = [actor];
             let objects = crate::phyre::field::Objects {
+                hidden_map_groups: 0,
                 map: None,
                 map_poses: &[],
                 texture_animations: None,

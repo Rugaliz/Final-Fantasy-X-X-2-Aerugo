@@ -77,6 +77,9 @@ pub struct Segment {
     pub max_index: u32,
     /// For skinned segments: skin index → (hierarchy matrix, skeleton matrix).
     pub skin_bones: Vec<(u16, u16)>,
+    /// The PS2 model part this segment belongs to (`m_modeIndex`): a character's part matrices go to the
+    /// instances whose segments name the part.
+    pub part: i32,
     /// The instance's input bindings for this segment (inputs not listed read set 0).
     pub inputs: Vec<StreamInput>,
 }
@@ -200,6 +203,8 @@ pub struct Mesh {
     pub kind: i32,
     /// The PS2 display object it belongs to (`m_objID`): keyframes on that object move and turn it.
     pub object: i32,
+    /// The map group it belongs to (`m_groupID`): a map draws only the groups switched on.
+    pub group: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -436,6 +441,7 @@ fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, Me
         indices: start..start + len,
         max_index: cluster.u32(seg, "m_indexData.m_maximumIndex").unwrap_or(0),
         skin_bones,
+        part: cluster.u32(seg, "m_modeIndex").unwrap_or(0) as i32,
         inputs: Vec::new(),
     })
 }
@@ -546,6 +552,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             .unwrap_or(([0.0; 3], [0.0; 3]));
         let kind = cluster.u32(inst, "m_DObjKind").unwrap_or(0) as i32;
         let object = cluster.u32(inst, "m_objID").unwrap_or(0) as i32;
+        let group = cluster.u32(inst, "m_groupID").unwrap_or(0) as i32;
         meshes.push(Mesh {
             name: cluster.string(inst, "m_name").unwrap_or_default(),
             instance: inst,
@@ -557,6 +564,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             bounds_size,
             kind,
             object,
+            group,
         });
     }
     Ok(Model { meshes })

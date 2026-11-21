@@ -30,10 +30,47 @@ pub fn character_world(pos: [f32; 3], yaw: f32) -> Mat4 {
         * Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0))
 }
 
+/// Each mesh instance's World from the model's part matrices, as the character engine hands them to the
+/// remaster every frame: all instances take World when every part is skinned; otherwise each part's matrix
+/// goes to the instances with a segment of that part, or to the instance numbered like the part when none has
+/// one (later parts win). None: the instance is not placed by a part.
+pub fn instance_worlds(
+    meshes: &[aerugo_formats::mesh::Mesh],
+    parts: &[Mat4],
+    all_skinned: bool,
+    world: Mat4,
+) -> Vec<Option<Mat4>> {
+    if parts.is_empty() {
+        return vec![None; meshes.len()];
+    }
+    if all_skinned {
+        return vec![Some(world); meshes.len()];
+    }
+    let mut out = vec![None; meshes.len()];
+    for (k, m) in parts.iter().enumerate() {
+        let mut hit = false;
+        for (i, mesh) in meshes.iter().enumerate() {
+            if mesh.segments.iter().any(|s| s.part == k as i32) {
+                out[i] = Some(*m);
+                hit = true;
+            }
+        }
+        if !hit && let Some(slot) = out.get_mut(k) {
+            *slot = Some(*m);
+        }
+    }
+    out
+}
+
 /// One character to draw.
 pub struct ActorDraw<'a> {
     pub path: &'a str,
     pub world: Mat4,
+    /// The model's part matrices (World for a skinned part, World × its bone for a rigid one), and whether every
+    /// part is skinned; empty when the model's PS2 parts are not known (each instance then takes World × its own
+    /// node matrix).
+    pub parts: Vec<Mat4>,
+    pub all_skinned: bool,
     /// Local joint matrices for a mesh's skeleton (mesh index, skeleton) this frame.
     pub pose: &'a dyn Fn(usize, &Skeleton) -> Vec<[f32; 16]>,
     /// MaterialColour (colour × shade factor, alpha).
@@ -90,6 +127,8 @@ pub struct Objects<'a> {
     pub texture_animations: Option<&'a aerugo_sim::field::texture_animation::TextureAnimations>,
     pub models: &'a [(&'a str, Mat4)],
     pub actors: &'a [ActorDraw<'a>],
+    /// Map groups not drawn (bit per mesh instance group).
+    pub hidden_map_groups: u32,
 }
 
 /// The character light constants.
@@ -217,6 +256,9 @@ impl FieldRenderer {
             let model = self.models[path].as_ref().expect("loaded above");
             for mesh in &model.meshes {
                 let source = &model.model.meshes[mesh.source];
+                if objects.hidden_map_groups >> (source.group as u32 & 31) & 1 != 0 {
+                    continue;
+                }
                 let world = Mat4::from_scale(Vec3::splat(10.0)) * Mat4::from_cols_array(&source.world);
                 let world = usize::try_from(source.object)
                     .ok()
@@ -298,9 +340,11 @@ impl FieldRenderer {
                 continue;
             }
             let model = self.models[a.path].as_ref().expect("loaded above");
+            let placed = instance_worlds(&model.model.meshes, &a.parts, a.all_skinned, a.world);
             for mesh in &model.meshes {
                 let source = &model.model.meshes[mesh.source];
-                let world = a.world * Mat4::from_cols_array(&source.world);
+                let world =
+                    placed[mesh.source].unwrap_or_else(|| a.world * Mat4::from_cols_array(&source.world));
                 let object = object_values(world, scene.view, scene.projection);
                 let joints = mesh.skeleton.as_ref().map(|sk| sk.world(&(a.pose)(mesh.source, sk)));
                 for seg in &mesh.segments {

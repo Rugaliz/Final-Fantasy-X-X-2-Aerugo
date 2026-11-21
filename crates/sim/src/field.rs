@@ -29,6 +29,8 @@ pub struct Actor {
     pub model: Option<u16>,
     /// Position in the map's space (Y points down).
     pub pos: [f32; 3],
+    /// Added to the position where the model is drawn (native 5016; the character's +0x6c).
+    pub draw_offset: [f32; 3],
     pub yaw: f32,
     pub visible: bool,
     /// Motion id requested by the script (played by the renderer when it has the motion).
@@ -131,6 +133,7 @@ impl Default for Actor {
         Actor {
             model: None,
             pos: [0.0; 3],
+            draw_offset: [0.0; 3],
             yaw: 0.0,
             visible: true,
             motion: None,
@@ -1000,6 +1003,11 @@ pub type ModelFace = (Option<std::sync::Arc<face::FaceData>>, Option<std::sync::
 /// Everything natives act on.
 #[derive(Debug, Clone, Default)]
 pub struct FieldState {
+    /// The engine's scene number (the event number) when known.
+    pub scene: Option<u16>,
+    /// Map groups not drawn (bit per mesh instance `m_groupID`): group 3 from the map's load; native 8000 turns
+    /// groups on and off.
+    pub hidden_map_groups: u32,
     pub actors: Vec<Actor>,
     pub windows: [Window; 8],
     pub camera: CameraState,
@@ -1068,6 +1076,8 @@ pub struct FieldState {
     pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
     /// Each model's motion translation scale (`.chr` data).
     pub model_motion_scales: std::collections::HashMap<u16, Option<f32>>,
+    /// Models' PS2 bones and parts (from their `.chr` data).
+    pub model_rigs: std::collections::HashMap<u16, Option<std::sync::Arc<ChrRig>>>,
     /// Collision radii of models by id (None: no character data).
     pub model_radii: std::collections::HashMap<u16, Option<f32>>,
     /// Movie files by number (the game's video list).
@@ -1295,6 +1305,11 @@ impl FieldState {
         let actors = &self.actors;
         let follow = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos));
         self.camera.process(follow);
+        // The map's frame push (90bf10): group 3 is always off, scene 0x8a keeps group 8 on.
+        if self.scene == Some(0x8A) {
+            self.hidden_map_groups &= !0x100;
+        }
+        self.hidden_map_groups |= 1 << 3;
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
             w.choice_live = w.choice_live.saturating_sub(1);
@@ -1487,6 +1502,7 @@ impl FieldState {
         self.model_radii.insert(m, chr.as_deref().and_then(chr_radius));
         self.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
         self.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
+        self.model_rigs.insert(m, chr.as_deref().and_then(chr_rig).map(std::sync::Arc::new));
         self.model_joints.insert(m, chr.as_deref().and_then(chr_joints).unwrap_or(0));
         self.model_relations.insert(
             m,
@@ -1789,6 +1805,13 @@ impl FileTable {
     pub fn event_script(&self, n: usize) -> Option<String> {
         self.path(0xC, n * 18).filter(|p| p.ends_with(".ebp"))
     }
+
+    /// The event number of a script (the engine's scene number), by its path.
+    pub fn event_number(&self, script: &str) -> Option<u16> {
+        (0..0x400usize)
+            .find(|&n| self.event_script(n).is_some_and(|p| p.eq_ignore_ascii_case(script)))
+            .map(|n| n as u16)
+    }
 }
 
 /// Whether the engine can read a character's resident motion files: its number is in its type's list
@@ -1840,6 +1863,90 @@ pub fn chr_radius(d: &[u8]) -> Option<f32> {
     }
     let info = u32_at(0x58)? as usize;
     u32_at(info + 4).map(f32::from_bits).filter(|r| r.is_finite() && *r > 0.0)
+}
+
+/// One bone of a character's PS2 model: its parent (None: hangs on the model's root) and the rotation (radians),
+/// translation and scale it has until a motion sets it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigBone {
+    pub parent: Option<usize>,
+    pub rotation: [f32; 3],
+    pub translation: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+/// A character's PS2 model bones and parts, as the engine sets them up from the `.chr` model block (offset at
+/// 0x10): the bone each part hangs on, and the parts drawn skinned (the others are rigid and move with their
+/// bone).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChrRig {
+    pub bones: Vec<RigBone>,
+    pub part_bones: Vec<u16>,
+    pub skinned: Vec<bool>,
+}
+
+/// The character engine's pi (3.141592, short of the nearest f32 to pi) and twice it, as its angle code uses them.
+#[allow(clippy::approx_constant)]
+const ENGINE_PI: f32 = 3.141592;
+const ENGINE_TAU: f32 = 6.283184;
+/// The same pi as a double, as the model loader's degree conversion uses it.
+#[allow(clippy::approx_constant)]
+const ENGINE_PI_F64: f64 = 3.141592;
+
+/// An angle brought within half a turn with the engine's constants (829800).
+fn ps2_wrap_angle(mut a: f32) -> f32 {
+    while a > ENGINE_PI {
+        a -= ENGINE_TAU;
+    }
+    while a < -ENGINE_PI {
+        a += ENGINE_TAU;
+    }
+    a
+}
+
+/// A character's bones and parts from its `.chr` data. The model block holds the part count (+6), skinned part
+/// count (+8), bone count (+10), the part list (+0x10, 0x28-byte records, 0x18 for model ids 0x831..0x1313; the
+/// part's bone is the first u16), the skinned part list (+0x14, 12-byte records, part number at +2) and the bone
+/// table (+0x1c, 20 bytes: u16 parent (its own index: the root), i16 rotation X/Y/Z in hundredths of a degree,
+/// i16 translation in thousandths, i16 scale in 1/4096 kept as whole numbers); offsets are from the block.
+pub fn chr_rig(d: &[u8]) -> Option<ChrRig> {
+    let u16_at = |o: usize| d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let i16_at = |o: usize| u16_at(o).map(|v| v as i16);
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let model = u32_at(0x10)?;
+    let ident = u16_at(model + 4)?;
+    let (parts, skinned_count, bone_count) = (u16_at(model + 6)?, u16_at(model + 8)?, u16_at(model + 10)?);
+    let stride = if ident > 0x830 && ident < 0x1314 { 0x18 } else { 0x28 };
+    let list = model + u32_at(model + 0x10)?;
+    let part_bones =
+        (0..usize::from(parts)).map(|k| u16_at(list + k * stride)).collect::<Option<Vec<_>>>()?;
+    let skin_list = model + u32_at(model + 0x14)?;
+    let mut skinned = vec![false; usize::from(parts)];
+    for k in 0..usize::from(skinned_count) {
+        if let Some(flag) = skinned.get_mut(usize::from(u16_at(skin_list + k * 12 + 2)?)) {
+            *flag = true;
+        }
+    }
+    let table = model + u32_at(model + 0x1c)?;
+    let bones = (0..usize::from(bone_count))
+        .map(|i| {
+            let at = table + i * 20;
+            let parent = usize::from(u16_at(at)?);
+            let v = |k: usize| i16_at(at + 2 + k * 2);
+            let angle = |k: usize| {
+                v(k).map(|x| ps2_wrap_angle((f64::from(x) / 100.0 * ENGINE_PI_F64 / 180.0) as f32))
+            };
+            let scale =
+                |k: usize| v(k).map(|x| ((i32::from(x) + ((i32::from(x) >> 31) & 0xFFF)) >> 12) as f32);
+            Some(RigBone {
+                parent: (parent != i).then_some(parent),
+                rotation: [angle(0)?, angle(1)?, angle(2)?],
+                translation: [v(3)? as f32 / 1000.0, v(4)? as f32 / 1000.0, v(5)? as f32 / 1000.0],
+                scale: [scale(6)?, scale(7)?, scale(8)?],
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ChrRig { bones, part_bones, skinned })
 }
 
 /// A character's PS2 model joint count from its `.chr` data (the model block at the offset at 0x10, count at +10).
@@ -2070,6 +2177,11 @@ impl Event {
             .flatten()
             .map(|(table, m)| map_paths_by_number(vfs, &table, m));
         let (map_model, map_layers) = by_number.unwrap_or_else(|| map_paths(vfs, game, &name));
+        if game == Game::Ffx {
+            state.scene = FileTable::load(vfs).and_then(|t| t.event_number(path));
+        }
+        // The map's group mask at load: every group but 3 (all of them only under a debug option).
+        state.hidden_map_groups = 1 << 3;
         state.texture_animations =
             map_model.as_deref().and_then(|m| texture_animation::TextureAnimations::load(vfs, m));
         if game == Game::Ffx {
@@ -2630,12 +2742,22 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     second!(0x8002, 0x800D);
-    // Map switch: returns the first argument.
+    // Map group on (non-zero) or off; returns the group. Scene 0x188 keeps group 14 on.
     n.register(
         0x8000,
         Native::result(|g, c| {
-            let v = take(g, c, 0x8000);
-            v.first().copied().unwrap_or(Value::Int(0))
+            let mut on = c.stack.pop_int();
+            let group = c.stack.pop_int();
+            if g.scene == Some(0x188) && group == 14 {
+                on = 1;
+            }
+            let bit = 1u32 << (group as u32 & 31);
+            if on == 0 {
+                g.hidden_map_groups |= bit;
+            } else {
+                g.hidden_map_groups &= !bit;
+            }
+            Value::Int(group)
         }),
     );
 }
@@ -2671,7 +2793,20 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     fixed!(1; 0x801D, 0x801E, 0x801F);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
-    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x5087, 0x5016, 0x504E);
+    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x5087, 0x504E);
+    // The model's drawing offset from its position (x, y, z), for a worker with a character.
+    n.register(
+        0x5016,
+        Native::result(|g, c| {
+            let z = c.stack.pop_float();
+            let y = c.stack.pop_float();
+            let x = c.stack.pop_float();
+            if g.actors.get(c.worker).is_some_and(|a| a.model.is_some()) {
+                g.actor(c.worker).draw_offset = [x, y, z];
+            }
+            Value::Int(0)
+        }),
+    );
     fixed!(1; 0x0196, 0x01C9);
     // Map display objects: 0197 binds the worker to one; 0198(object, track, once) and 0199(track, once; the bound
     // object) attach a keyframe track, for bound workers only (result 1, else 0).
@@ -5158,6 +5293,38 @@ mod tests {
     }
 
     /// Events load the map their header names: the attract demo and the opening share znkd06.
+    /// The attract scene's weapons: rigid parts on bones, the sword's blade bone turned a quarter turn about Z.
+    #[test]
+    fn weapon_rigs_from_their_chr_data() {
+        let Some(inst) = aerugo_vfs::install_from_env() else { return };
+        let mut vfs = Vfs::new();
+        if vfs.mount_install(&inst).is_err() {
+            return;
+        }
+        let rig = |n: &str| {
+            let d = vfs.read(&format!("ffx_ps2/ffx/master/jppc/chr/wep/{n}/mdl/{n}.chr")).unwrap();
+            chr_rig(&d).expect("rig")
+        };
+        let w001 = rig("w001");
+        assert_eq!(w001.part_bones, [4, 2, 3]);
+        assert_eq!(w001.skinned, [false, false, false]);
+        assert_eq!(w001.bones.len(), 5);
+        assert_eq!(w001.bones[0].parent, None);
+        assert_eq!(
+            w001.bones.iter().map(|b| b.parent).collect::<Vec<_>>()[1..],
+            [Some(0), Some(1), Some(2), Some(2)]
+        );
+        assert!((w001.bones[1].rotation[2] - 89.99f32.to_radians()).abs() < 1e-4);
+        assert_eq!(w001.bones[1].scale, [1.0; 3]);
+        assert_eq!(rig("w041").part_bones, [3]);
+        let w011 = rig("w011");
+        assert_eq!(
+            (w011.part_bones.as_slice(), w011.skinned.as_slice()),
+            ([3, 2, 1].as_slice(), [true; 3].as_slice())
+        );
+        assert!((w011.bones[6].translation[0] - 6.268).abs() < 1e-6);
+    }
+
     #[test]
     fn events_find_their_maps() {
         let Some(inst) = aerugo_vfs::install_from_env() else { return };
