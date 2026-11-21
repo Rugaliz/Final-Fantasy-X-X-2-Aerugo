@@ -37,3 +37,24 @@ Their full meanings are documented as the message system is implemented.
   only in the game's font; the converter shows it as unmapped.
 - A few FFX-2 Traditional Chinese strings contain a doubled prefix (`04 04 xx`). The game consumes such a sequence
   as one three-byte character, and so does the decoder (as a *malformed* token kept byte for byte).
+
+## Font descriptions (`*.ftc`)
+
+`FTCX` files (`menu/base.ftc` per language, extra pages per event) describe a font for the text layout; the HD
+remaster draws the glyphs from its own textures (`menu_<lang>/base_ftc/d3d11/font_0_<page>` and `shadow_0_<page>`)
+but takes positions and widths from these files (`aerugo_formats::ftc`).
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | 4 bytes | `FTCX` |
+| 4 | u16 | version (200 and later carry the width table) |
+| 8 | u16 | font slot (0 Japanese base font, 4 base font of the other languages) |
+| 0x10 | u32 | glyph count (width table length) |
+| 0x20 | u32 | offset of the PS2 glyph image (empty in the PC files) |
+| 0x24 | u32 | its size |
+| 0x28 | u16 | PS2 image width (the base font: 128) |
+| 0x2a | u16 | PS2 image height (234) |
+| 0x30 | u32 | offset of the width table: one byte per glyph, in quarter texels |
+
+Glyph `i` sits in a 14 × 18 cell at column `(i mod 18) / 2`, row `i / 18`, on page `i mod 2` (even glyphs on the
+first texture, odd ones on the second). Texture coordinates are texel positions divided by the PS2 image size.

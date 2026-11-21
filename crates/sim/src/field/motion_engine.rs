@@ -860,7 +860,7 @@ mod tests {
             if c.rotation {
                 // Rotations settle on the target within a turn.
                 let d = (c.current - c.target).rem_euclid(1.0);
-                assert!(d < 1e-5 || d > 1.0 - 1e-5, "channel {i}: {} vs {}", c.current, c.target);
+                assert!(!(1e-5..=1.0 - 1e-5).contains(&d), "channel {i}: {} vs {}", c.current, c.target);
             } else {
                 assert_eq!(c.current.to_bits(), c.target.to_bits(), "channel {i}");
             }

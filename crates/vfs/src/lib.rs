@@ -4,6 +4,7 @@
 pub mod fs;
 pub mod install;
 pub mod lang;
+pub mod ps2;
 pub mod vbf;
 pub mod vdf;
 
