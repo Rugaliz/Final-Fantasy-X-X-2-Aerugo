@@ -1347,7 +1347,8 @@ fn carry_over(image: &mut [u8], target: i32, entrance: i32) {
 
 /// The frame of a game box: deep blue, half see-through, with a light edge (the look of FFX's windows).
 /// The open message windows as the game's 2D layer draws them, for an output of `px` pixels, and which windows
-/// those are. Only system windows (frame type 0) are drawn so far; the frames of the other types are not traced.
+/// those are. Frame types 0 (system windows), 1 and 2 (dialogue, no frame) are drawn; the shape-built frames of
+/// the other types are not ported yet.
 fn message_canvas(
     st: &aerugo_sim::field::FieldState,
     font: &aerugo_formats::ftc::Ftc,
@@ -1362,16 +1363,18 @@ fn message_canvas(
     for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {
         let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
         let frame_type = usize::from(w.style.unwrap_or(0));
-        if msg.bytes.is_empty() || frame_type != 0 {
+        if msg.bytes.is_empty() || frame_type > 2 {
             continue;
         }
         drawn.push(i);
-        let (tw, th) = msgwin::measure(&msg.bytes, font, &metrics);
-        let placement = msgwin::place(frame_type, w.align, w.x, w.y, tw, th);
+        let kind = msgwin::TextKind::from_flags(w.flags);
+        let (tw, th) = msgwin::measure(&msg.bytes, font, &metrics, kind, frame_type);
+        let placement = msgwin::place(&metrics, frame_type, w.align, w.x, w.y, tw, th);
         let draw = msgwin::WindowDraw {
             bytes: &msg.bytes,
             placement,
             frame_type,
+            kind,
             shown: w.shown,
             choice: (msg.choices > 0).then_some(w.choice),
             time,
