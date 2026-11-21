@@ -70,6 +70,8 @@ pub struct Actor {
     pub run_threshold: f32,
     /// The speed the character engine moves the body at this tick (the player's push or the running move's).
     pub engine_speed: f32,
+    /// The character engine's mode (5013): 0 on the ground, 2 in water.
+    pub chr_mode: u8,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
     /// Move state per script level: a level's move waits while a higher level runs.
@@ -105,6 +107,8 @@ const DEFAULT_MOTION_SLOTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 /// The value a slot set to −1 takes (by slot).
 const MOTION_SLOT_DEFAULTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
 const DEFAULT_RUN_THRESHOLD: f32 = 18.0;
+/// The water level an event starts with (Sg_EventjumpInit).
+const WATER_LEVEL_AT_START: f32 = 1_000_000.0;
 
 /// A character's own motion lists from its `.chr` data (header entries 5, 6 and 7: on the ground, the second
 /// list, in water), motion ids indexed by a slot value under 0x1000.
@@ -146,6 +150,7 @@ impl Default for Actor {
             motion_slots: DEFAULT_MOTION_SLOTS,
             run_threshold: DEFAULT_RUN_THRESHOLD,
             engine_speed: 0.0,
+            chr_mode: 0,
             level: 0,
             moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
@@ -800,6 +805,9 @@ pub struct FieldState {
     pub control: PlayerControl,
     /// Frame counts of each model's motions by motion number, as the host loads them.
     pub motion_frames: std::collections::HashMap<u16, std::collections::HashMap<u16, u32>>,
+    /// The water level (4001; far below everything at an event's start): a swimming character deeper than one
+    /// below it takes its diving slot.
+    pub water_level: f32,
     /// Each model's own motion lists (`.chr` data).
     pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
     /// Collision radii of models by id (None: no character data).
@@ -1145,7 +1153,7 @@ impl FieldState {
                 a.steer_walk_end(st, self.ground.as_ref());
             }
         }
-        let (mut player_speed, mut swimming_player) = (0.0, None);
+        let mut player_speed = 0.0;
         // The player covers last tick's push, then this tick's input makes the next one (only while the
         // player has control).
         if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
@@ -1169,7 +1177,9 @@ impl FieldState {
                     a.yaw = dz.atan2(dx);
                 }
             }
-            let push = self.control.tick(self.input.stick, self.input.walk, swimming);
+            // The water speed while the character engine is in water (mode 2, as Sg_ControlPlayer reads it).
+            let in_water = self.actors[p].chr_mode == 2;
+            let push = self.control.tick(self.input.stick, self.input.walk, in_water);
             player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
             if let Some(push) = push.filter(|_| self.user_control) {
                 // Forward is where the camera looks; right is a quarter turn clockwise from it seen from above.
@@ -1179,17 +1189,15 @@ impl FieldState {
                 self.player_step =
                     Some([(right[0] * x + fwd[0] * y) * push.step, (right[1] * x + fwd[1] * y) * push.step]);
             }
-            swimming_player = swimming.then_some(p);
         }
-        self.engine_motions(player_speed, swimming_player);
+        self.engine_motions(player_speed);
     }
 
     /// The character engine's own motions (chr_motion_update): a body bound to a character with no script
     /// motion playing stands, walks or runs by the speed the engine moves it at (the running move's, or the
     /// player's push), picking its standing, walking or running slot; a slot under 0x1000 picks from the model's
-    /// own list. (Bodies in water take other slots by the water level, which is not modelled: they keep their
-    /// motion.)
-    fn engine_motions(&mut self, player_speed: f32, swimming_player: Option<usize>) {
+    /// own list.
+    fn engine_motions(&mut self, player_speed: f32) {
         for w in 0..self.actors.len() {
             let a = &self.actors[w];
             let Some(model) = a.model else { continue };
@@ -1217,23 +1225,30 @@ impl FieldState {
                 None => 0.0,
             };
             self.actors[w].engine_speed = speed;
-            if Some(w) == swimming_player || self.motion_playing(&self.actors[w]) {
+            if self.motion_playing(&self.actors[w]) {
                 continue;
             }
             let a = &self.actors[w];
-            let slot = if speed == 0.0 {
-                0
-            } else if speed <= a.run_threshold {
-                1
-            } else {
-                2
+            // On the ground: standing, walking or running; in water (Ch_CalcMain): still, or diving below one under
+            // the water level, else swimming at the surface.
+            let (group, slot) = match a.chr_mode {
+                0 if speed == 0.0 => (0, 0),
+                0 if speed <= a.run_threshold => (0, 1),
+                0 => (0, 2),
+                2 if speed == 0.0 => (2, 16),
+                2 if self.water_level + 1.0 <= a.pos[1] => (2, 19),
+                2 => (2, 18),
+                _ => continue,
             };
             let value = a.motion_slots[slot];
             let id = if value & 0xFFFF < 0x1000 {
+                // 837d00: the model's list for the group, else the first of its ground list.
                 let lists = self.model_motion_lists.get(&model).and_then(|l| l.as_ref());
-                match lists.and_then(|l| l[0].get(value as usize)).copied() {
-                    Some(id) if id != 0 => id as i32,
-                    _ => continue,
+                let pick =
+                    |g: usize, i: usize| lists.and_then(|l| l[g].get(i)).copied().filter(|&id| id != 0);
+                match pick(group, value as usize).or_else(|| if group != 0 { pick(0, 0) } else { None }) {
+                    Some(id) => id as i32,
+                    None => continue,
                 }
             } else {
                 value
@@ -1576,6 +1591,7 @@ impl Event {
             })
             .collect();
         let mut state = FieldState {
+            water_level: WATER_LEVEL_AT_START,
             actors,
             entrances: script.entrances(),
             data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
@@ -2005,8 +2021,8 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x5013, 0x5014, 0x5017, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B,
-        0x6003, 0x6021, 0x5001, 0x5010
+        0x500B, 0x5014, 0x5017, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003,
+        0x6021, 0x5001, 0x5010
     );
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
@@ -3554,6 +3570,22 @@ pub fn register(n: &mut Natives<FieldState>) {
             let old = a.run_threshold;
             a.run_threshold = if v <= 0.0 { DEFAULT_RUN_THRESHOLD } else { v };
             Value::Float(old)
+        }),
+    );
+    // The character engine's mode (5013: 0 on the ground, 2 in water) and the water level (4001).
+    n.register(
+        0x5013,
+        Native::result(|g, c| {
+            let m = c.stack.pop_int();
+            g.actor(c.worker).chr_mode = m as u8;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x4001,
+        Native::result(|g, c| {
+            g.water_level = c.stack.pop_float();
+            Value::Int(0)
         }),
     );
     // Stopping the motion (chr_motion_stop): the character engine picks its own again.
