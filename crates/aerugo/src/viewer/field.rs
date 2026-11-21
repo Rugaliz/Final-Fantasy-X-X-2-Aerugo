@@ -54,6 +54,9 @@ struct Session {
     notes: Vec<String>,
     /// Drawing with the remaster's own shaders (the game screen).
     phyre: crate::phyre::field::FieldRenderer,
+    /// The 2D layer (message windows) and the base font it lays text out with.
+    ui: crate::phyre::ui::UiRenderer,
+    font: Option<Option<aerugo_formats::ftc::Ftc>>,
 }
 
 pub struct FieldView {
@@ -61,6 +64,8 @@ pub struct FieldView {
     session: Option<Session>,
     error: Option<String>,
     lang: Language,
+    /// The graphics clock (the choice cursor sways with it).
+    started: std::time::Instant,
     clock: FixedTimestep,
     last: Option<Instant>,
     paused: bool,
@@ -231,6 +236,7 @@ impl FieldView {
             session: None,
             error: None,
             lang,
+            started: std::time::Instant::now(),
             clock: FixedTimestep::new(30, 4),
             last: None,
             paused: false,
@@ -379,6 +385,8 @@ impl FieldView {
             actors: HashMap::new(),
             notes,
             phyre: Default::default(),
+            ui: Default::default(),
+            font: None,
         });
         self.last = None;
         self.clock.reset();
@@ -1189,9 +1197,29 @@ impl FieldView {
             actors: &actors,
         };
         let post = self.game.then_some(&post);
-        if let Some(frame) =
+        // Windows the game's 2D layer drew (the rest keep the stand-in).
+        let mut drawn_windows: Vec<usize> = Vec::new();
+        if let Some(mut frame) =
             s.phyre.frame(vfs, renderer, &objects, &scene, &lighting, px, msaa, post, 4.0, false)
         {
+            if self.game {
+                let lang = self.lang;
+                let font = s.font.get_or_insert_with(|| {
+                    let code = lang.master_code();
+                    [
+                        format!("ffx_ps2/ffx/master/{code}pc/menu/base.ftc"),
+                        format!("ffx_ps2/ffx/master/new_{code}pc/menu/base.ftc"),
+                    ]
+                    .iter()
+                    .find_map(|p| vfs.read(p).ok().and_then(|d| aerugo_formats::ftc::Ftc::parse(&d).ok()))
+                });
+                if let Some(font) = font.as_ref() {
+                    let (canvas, drawn) =
+                        message_canvas(st, font, px, lang, self.started.elapsed().as_secs_f32());
+                    s.ui.draw(vfs, renderer, &mut s.phyre.programs, &canvas, lang.code(), px, &mut frame);
+                    drawn_windows = drawn;
+                }
+            }
             // AERUGO_FRAME_DUMP=<file>: the frame is written in the oracle's capture form whenever the file does not
             // exist (delete it to take another).
             if let Ok(path) = std::env::var("AERUGO_FRAME_DUMP")
@@ -1202,9 +1230,10 @@ impl FieldView {
             }
             renderer.submit_frame(frame);
         }
-        // Message windows over the view, placed in the original's 512 × 448 frame.
+        // Message windows over the view, placed in the original's 512 × 448 frame (the stand-in when the game's
+        // 2D layer is not drawn).
         let rect = response.rect;
-        for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {
+        for (i, w) in st.windows.iter().enumerate().filter(|(i, w)| w.open && !drawn_windows.contains(i)) {
             let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
             // Revealed so far; the last lines of a choice message are its choices.
             let shown: String = msg.text.chars().take(w.shown).collect();
@@ -1317,6 +1346,41 @@ fn carry_over(image: &mut [u8], target: i32, entrance: i32) {
 }
 
 /// The frame of a game box: deep blue, half see-through, with a light edge (the look of FFX's windows).
+/// The open message windows as the game's 2D layer draws them, for an output of `px` pixels, and which windows
+/// those are. Only system windows (frame type 0) are drawn so far; the frames of the other types are not traced.
+fn message_canvas(
+    st: &aerugo_sim::field::FieldState,
+    font: &aerugo_formats::ftc::Ftc,
+    px: (u32, u32),
+    lang: Language,
+    time: f32,
+) -> (aerugo_sim::ui2d::Canvas, Vec<usize>) {
+    use aerugo_sim::msgwin;
+    let mut canvas = aerugo_sim::ui2d::Canvas::new();
+    let mut drawn = Vec::new();
+    let metrics = msgwin::Metrics::new(px.0, px.1);
+    for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {
+        let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
+        let frame_type = usize::from(w.style.unwrap_or(0));
+        if msg.bytes.is_empty() || frame_type != 0 {
+            continue;
+        }
+        drawn.push(i);
+        let (tw, th) = msgwin::measure(&msg.bytes, font, &metrics);
+        let placement = msgwin::place(frame_type, w.align, w.x, w.y, tw, th);
+        let draw = msgwin::WindowDraw {
+            bytes: &msg.bytes,
+            placement,
+            frame_type,
+            shown: w.shown,
+            choice: (msg.choices > 0).then_some(w.choice),
+            time,
+        };
+        msgwin::draw(&mut canvas, font, &metrics, &draw, lang == Language::Japanese);
+    }
+    (canvas, drawn)
+}
+
 fn game_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(18, 32, 92, 215))

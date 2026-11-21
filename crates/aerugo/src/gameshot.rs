@@ -122,7 +122,7 @@ fn game_shot() {
     ops.extend(later);
     ops.push(GameOp::Resolve { src: color, dst: TargetRef::Target(resolved) });
     ops.push(GameOp::Copy { src: resolved, dst: TargetRef::Output });
-    let frame = GameFrame { ops };
+    let frame = GameFrame { ops, transient: Vec::new() };
     let mut missing_count: HashMap<String, usize> = HashMap::new();
     for m in missing {
         *missing_count.entry(m).or_default() += 1;

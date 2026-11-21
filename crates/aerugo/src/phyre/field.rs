@@ -396,7 +396,7 @@ impl FieldRenderer {
                 log::info!("game shaders: nothing supplies {m}");
             }
         }
-        Some(GameFrame { ops })
+        Some(GameFrame { ops, transient: Vec::new() })
     }
 }
 

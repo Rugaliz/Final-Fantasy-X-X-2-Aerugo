@@ -79,6 +79,11 @@ pub struct ProgramHandle(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferHandle(u32);
 
+impl BufferHandle {
+    /// The frame's transient data ([`GameFrame::transient`]).
+    pub const TRANSIENT: BufferHandle = BufferHandle(u32::MAX);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetHandle(u32);
 
@@ -313,6 +318,9 @@ pub enum GameOp {
 #[derive(Debug, Clone, Default)]
 pub struct GameFrame {
     pub ops: Vec<GameOp>,
+    /// Vertex and index data made for this frame only (the 2D layer's quads); draws reach it through
+    /// [`BufferHandle::TRANSIENT`] at their byte offsets.
+    pub transient: Vec<u8>,
 }
 
 /// A render target's description (DXGI format, size, samples).
@@ -542,6 +550,8 @@ struct PipelineKey {
 struct FrameRes {
     pool: vk::DescriptorPool,
     uniforms: Option<Buffer>,
+    /// This frame slot's copy of the frame's transient vertex and index data.
+    transient: Option<Buffer>,
 }
 
 const FRAME_SETS: u32 = 4096;
@@ -1030,7 +1040,7 @@ impl GameState {
         self.layouts.insert(image, layout);
     }
 
-    fn frame_res(&mut self, ctx: &Context, frame: usize, uniform_bytes: u64) -> Result<()> {
+    fn frame_res(&mut self, ctx: &Context, frame: usize, uniform_bytes: u64, transient: &[u8]) -> Result<()> {
         while self.frames.len() <= frame {
             self.frames.push(FrameRes::default());
         }
@@ -1071,6 +1081,23 @@ impl GameState {
                 MemoryLocation::CpuToGpu,
             )?);
         }
+        if !transient.is_empty() {
+            if res.transient.as_ref().is_none_or(|b| b.size < transient.len() as u64) {
+                if let Some(mut old) = res.transient.take() {
+                    // SAFETY: as above, the slot's last use has completed.
+                    unsafe { old.destroy(ctx) };
+                }
+                res.transient = Some(Buffer::new(
+                    ctx,
+                    (transient.len() as u64).next_power_of_two().max(1 << 16),
+                    vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                )?);
+            }
+            if let Some(m) = res.transient.as_mut().and_then(|b| b.mapped()) {
+                m[..transient.len()].copy_from_slice(transient);
+            }
+        }
         Ok(())
     }
 
@@ -1091,7 +1118,8 @@ impl GameState {
             .filter_map(|o| if let GameOp::Draw(d) = o { Some(d) } else { None })
             .flat_map(|d| d.constants.iter().map(|c| (c.2.len() as u64).div_ceil(align) * align))
             .sum();
-        self.frame_res(ctx, frame, uniform_bytes.max(256))?;
+        self.frame_res(ctx, frame, uniform_bytes.max(256), &game.transient)?;
+        let transient = self.frames[frame].transient.as_ref().map(|b| b.buffer);
         self.layouts.insert(out.image, out.layout);
         let device = ctx.device.clone();
         let mut uniform_at = 0u64;
@@ -1525,7 +1553,12 @@ impl GameState {
                         for &slot in &slots {
                             let vb = draw.vertex_buffers.iter().find(|b| b.slot == slot);
                             let (buffer, offset, stride) = match vb.and_then(|b| {
-                                self.buffers.get(&b.buffer.0).map(|x| (x.buffer, b.offset, b.stride))
+                                let buffer = if b.buffer == BufferHandle::TRANSIENT {
+                                    transient
+                                } else {
+                                    self.buffers.get(&b.buffer.0).map(|x| x.buffer)
+                                };
+                                buffer.map(|x| (x, b.offset, b.stride))
                             }) {
                                 Some(x) => x,
                                 // An unbound slot reads zeros, as in Direct3D 11.
@@ -1540,7 +1573,15 @@ impl GameState {
                                 Some(&[u64::from(stride)]),
                             );
                         }
-                        match draw.index.and_then(|i| self.buffers.get(&i.buffer.0).map(|b| (b.buffer, i))) {
+                        let index = draw.index.and_then(|i| {
+                            let buffer = if i.buffer == BufferHandle::TRANSIENT {
+                                transient
+                            } else {
+                                self.buffers.get(&i.buffer.0).map(|b| b.buffer)
+                            };
+                            buffer.map(|b| (b, i))
+                        });
+                        match index {
                             Some((buffer, i)) => {
                                 device.cmd_bind_index_buffer(
                                     cmd,
@@ -1608,6 +1649,9 @@ impl GameState {
                 }
                 if let Some(mut u) = f.uniforms.take() {
                     u.destroy(ctx);
+                }
+                if let Some(mut t) = f.transient.take() {
+                    t.destroy(ctx);
                 }
             }
         }

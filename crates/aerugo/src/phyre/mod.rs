@@ -9,6 +9,7 @@ pub mod field;
 pub mod model;
 pub mod post;
 pub mod scene;
+pub mod ui;
 
 use std::collections::HashMap;
 use std::rc::Rc;

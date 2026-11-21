@@ -514,6 +514,9 @@ pub struct Message {
     pub reveal: Vec<RevealPart>,
     /// The text starts with {09:30}: it shows at once.
     pub instant: bool,
+    /// The message as stored (up to its NUL): what the 2D layer measures and draws. Empty for messages made at
+    /// run time.
+    pub bytes: Vec<u8>,
 }
 
 /// A piece of a message's text reveal.
@@ -1477,7 +1480,8 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
         .map(|i| {
             let word = |k: usize| data.get(k..k + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
             let off = usize::from(word(i * 8));
-            let tokens = text::string_at(data, off).map(|s| text::decode(s, charset)).unwrap_or_default();
+            let bytes = text::string_at(data, off).unwrap_or_default().to_vec();
+            let tokens = text::decode(&bytes, charset);
             let text = tokens
                 .iter()
                 .filter_map(|t| match *t {
@@ -1494,6 +1498,7 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
                 choices: (word(i * 8 + 2) >> 8) as u8,
                 reveal,
                 instant,
+                bytes,
             }
         })
         .collect()
@@ -2674,6 +2679,7 @@ fn runtime_message(text: &str) -> Message {
         choices: 0,
         reveal: reveal_parts(&tokens),
         instant: true,
+        bytes: Vec::new(),
     }
 }
 
@@ -2753,7 +2759,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
             id,
             Native {
                 init: Some(|g, c| {
-                    let _align = c.stack.pop_int();
+                    let align = c.stack.pop_int();
                     let y = c.stack.pop_int();
                     let x = c.stack.pop_int();
                     let cancel = c.stack.pop_int();
@@ -2766,6 +2772,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
                     g.windows[w].message = usize::try_from(msg).ok();
                     g.windows[w].x = x;
                     g.windows[w].y = y;
+                    g.windows[w].align = align;
                     g.windows[w].flags = 0;
                     open_window(g, &c.memory.global[0], w, true);
                     c.scratch[0] = w as i32;
@@ -4645,6 +4652,7 @@ mod tests {
                 choices: 0,
                 reveal: vec![RevealPart::Chars(11)],
                 instant: false,
+                bytes: Vec::new(),
             }],
             ..FieldState::default()
         };

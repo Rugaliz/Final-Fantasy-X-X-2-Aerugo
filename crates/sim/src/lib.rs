@@ -9,6 +9,7 @@ pub mod encounter;
 pub mod field;
 pub mod follow_camera;
 pub mod items;
+pub mod msgwin;
 pub mod save;
 pub mod snapshot;
 pub mod test_scene;
