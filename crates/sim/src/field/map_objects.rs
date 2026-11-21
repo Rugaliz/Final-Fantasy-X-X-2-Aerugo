@@ -195,6 +195,8 @@ pub struct Keyframes {
     pub poses: Vec<ObjectPose>,
     /// Per texture animation slot: the frame the keyframes last picked.
     pub texture_frames: Vec<Option<u32>>,
+    /// The slots whose frame the keyframes set on the last update (passed on to the remaster's animations).
+    pub texture_frames_set: Vec<bool>,
 }
 
 const SLOTS: usize = 64;
@@ -206,6 +208,7 @@ impl Keyframes {
             count: 0,
             poses: vec![ObjectPose::default(); objects.objects.len()],
             texture_frames: vec![None; objects.texture_slots.len()],
+            texture_frames_set: vec![false; objects.texture_slots.len()],
         }
     }
 
@@ -307,6 +310,7 @@ impl Keyframes {
     /// One frame: every active slot sets its target from the current key at the time it last advanced to, then
     /// advances to `clock`.
     pub fn update(&mut self, objects: &MapObjects, clock: u32) {
+        self.texture_frames_set.iter_mut().for_each(|s| *s = false);
         // The original keeps the last share through slots without a current key.
         let mut t = 0.0f32;
         for i in 0..SLOTS {
@@ -348,6 +352,7 @@ impl Keyframes {
                     let frame = k.end[0] as i32;
                     if frame >= 0 && objects.texture_slots[target].frames.get(frame as usize).is_some() {
                         self.texture_frames[target] = Some(frame as u32);
+                        self.texture_frames_set[target] = true;
                     }
                     self.advance(objects, i, clock);
                 }

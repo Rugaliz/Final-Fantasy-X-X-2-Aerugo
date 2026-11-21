@@ -368,8 +368,13 @@ impl MapBrowser {
             models.push((p, Mat4::IDENTITY));
         }
         let scene = layer_scene(view_proj, px.0 as f32, px.1 as f32);
-        let objects =
-            crate::phyre::field::Objects { map: None, map_poses: &[], models: &models, actors: &[] };
+        let objects = crate::phyre::field::Objects {
+            map: None,
+            map_poses: &[],
+            texture_animations: None,
+            models: &models,
+            actors: &[],
+        };
         let light = crate::phyre::field::Lighting::default();
         let msaa = renderer.msaa();
         if let Some(frame) =
@@ -624,6 +629,7 @@ mod tests {
                     let objects = crate::phyre::field::Objects {
                         map: None,
                         map_poses: &[],
+                        texture_animations: None,
                         models: &models,
                         actors: &[],
                     };

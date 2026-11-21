@@ -47,6 +47,8 @@ pub struct Objects<'a> {
     pub map: Option<&'a str>,
     /// What the map's keyframes set on its display objects (by `m_objID`).
     pub map_poses: &'a [aerugo_sim::field::map_objects::ObjectPose],
+    /// The map's texture animations (its materials' swap textures).
+    pub texture_animations: Option<&'a aerugo_sim::field::texture_animation::TextureAnimations>,
     pub models: &'a [(&'a str, Mat4)],
     pub actors: &'a [ActorDraw<'a>],
 }
@@ -69,6 +71,8 @@ pub struct FieldRenderer {
     targets: Option<((u32, u32, u32), [TargetHandle; 4])>,
     /// Values the shaders read that nothing supplied (logged once each).
     reported: std::collections::HashSet<String>,
+    /// Texture animation swap textures by archive path, as they are first shown.
+    swaps: HashMap<String, Option<aerugo_gfx::TextureHandle>>,
 }
 
 impl FieldRenderer {
@@ -113,6 +117,9 @@ impl FieldRenderer {
             for t in t {
                 renderer.destroy_target(t);
             }
+        }
+        for h in std::mem::take(&mut self.swaps).into_values().flatten() {
+            renderer.destroy_texture(h);
         }
     }
 
@@ -165,6 +172,18 @@ impl FieldRenderer {
                     let fseg = &source.segments[seg.source];
                     let Some(material) = source.materials.get(fseg.material as usize) else { continue };
                     let Some((pass, transparent)) = main_pass(vfs, model.game, material) else { continue };
+                    // A material naming a texture animation shows the animation's current swap texture.
+                    let id = &material.tex_anim_id;
+                    let swap = (!id.is_empty() && !id.contains("Mat_CTA"))
+                        .then(|| objects.texture_animations.and_then(|t| t.texture(id)))
+                        .flatten()
+                        .and_then(|p| {
+                            *self.swaps.entry(p.to_owned()).or_insert_with(|| {
+                                crate::assets::load_texture(vfs, renderer, p)
+                                    .map_err(|e| log::warn!("{p}: {e}"))
+                                    .ok()
+                            })
+                        });
                     let draws = segment_draws(
                         vfs,
                         renderer,
@@ -177,6 +196,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
+                        swap,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
@@ -210,6 +230,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
+                        None,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
@@ -253,6 +274,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
+                        None,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));

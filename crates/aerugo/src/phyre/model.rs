@@ -179,6 +179,7 @@ pub fn segment_draws(
     values: &Values<'_>,
     anisotropy: f32,
     viewport: [f32; 6],
+    swap: Option<aerugo_gfx::TextureHandle>,
     missing: &mut Vec<String>,
 ) -> Vec<GameDraw> {
     let source = &model.model.meshes[mesh.source];
@@ -192,7 +193,7 @@ pub fn segment_draws(
         let key = ProgramKey { cluster: cluster.clone(), pass: pass.to_owned(), shader, index };
         let Some(p) = programs.get(vfs, renderer, &key) else { break };
         let empty = programs.empty_texture(renderer);
-        out.push(draw(&p, model, material, fseg, seg, values, anisotropy, viewport, empty, missing));
+        out.push(draw(&p, model, material, fseg, seg, values, anisotropy, viewport, empty, swap, missing));
         if !programs.has_pass(vfs, &cluster, pass, shader, index + 1) {
             break;
         }
@@ -216,6 +217,7 @@ fn draw(
     anisotropy: f32,
     viewport: [f32; 6],
     empty: Option<aerugo_gfx::TextureHandle>,
+    swap: Option<aerugo_gfx::TextureHandle>,
     missing: &mut Vec<String>,
 ) -> GameDraw {
     let mut constants = Vec::new();
@@ -232,6 +234,11 @@ fn draw(
         for r in &shader.resources {
             match r.kind {
                 aerugo_formats::dxbc::ResourceKind::Texture => {
+                    // The texture animation's current swap texture takes the material's `TextureSampler`.
+                    if let (true, Some(h)) = (r.name == "TextureSampler", swap) {
+                        images.push((stage, r.bind_point, ImageRef::Texture(h)));
+                        continue;
+                    }
                     let binding = material.textures.iter().find(|t| t.parameter == r.name);
                     match binding.map(|t| (t, model.textures.get(&t.asset).copied().flatten())) {
                         Some((_, Some(h))) => images.push((stage, r.bind_point, ImageRef::Texture(h))),

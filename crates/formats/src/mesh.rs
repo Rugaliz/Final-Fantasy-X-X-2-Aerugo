@@ -165,6 +165,8 @@ pub struct Material {
     pub values: Vec<(String, Vec<f32>)>,
     /// The material's sampler-state parameters by name (`TextureSamplerState`, `globalSamplerState`, …).
     pub samplers: Vec<(String, SamplerState)>,
+    /// The texture animation that drives its `TextureSampler` (`m_texAnimID`; empty for none).
+    pub tex_anim_id: String,
 }
 
 impl Material {
@@ -367,7 +369,8 @@ fn material(cluster: &Cluster, mat: ObjectId) -> Material {
             }
         }
     }
-    Material { effect, textures, values, samplers }
+    let tex_anim_id = cluster.string(mat, "m_texAnimID").unwrap_or_default();
+    Material { effect, textures, values, samplers, tex_anim_id }
 }
 
 fn segment(cluster: &Cluster, index: usize, seg: ObjectId) -> Result<Segment, MeshError> {

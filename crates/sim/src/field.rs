@@ -16,6 +16,7 @@ use aerugo_vfs::{Language, Vfs};
 
 pub mod collision;
 pub mod map_objects;
+pub mod texture_animation;
 
 use collision::Ground;
 
@@ -738,6 +739,8 @@ pub struct FieldState {
     /// The PS2 map's display objects and keyframe tracks, and the keyframe slots playing them.
     pub map_objects: Option<std::sync::Arc<map_objects::MapObjects>>,
     pub keyframes: map_objects::Keyframes,
+    /// The remaster's texture animations of the map (its materials' swap textures).
+    pub texture_animations: Option<texture_animation::TextureAnimations>,
     /// The field light characters are lit by (reset at every event start, set by native 4013).
     pub lights: FieldLights,
     /// What the fog natives set over the map's scene fog.
@@ -1492,6 +1495,8 @@ impl Event {
             state.messages = decode_event_text(&bytes, &cs);
         }
         let (map_model, map_layers) = map_paths(vfs, game, &name);
+        state.texture_animations =
+            map_model.as_deref().and_then(|m| texture_animation::TextureAnimations::load(vfs, m));
         if game == Game::Ffx {
             state.items = crate::items::ItemTables::load(vfs, lang);
             state.encounters = vfs
@@ -1579,6 +1584,20 @@ impl Event {
         // The map's keyframes play once a frame after the scripts and characters, on a clock of two ticks a frame.
         if let Some(m) = self.state.map_objects.clone() {
             self.state.keyframes.update(&m, (self.tick * 2) as u32);
+            // Texture slots whose keyframes picked a frame stop the remaster's animation of the frame's name.
+            if let Some(t) = &mut self.state.texture_animations {
+                for (slot, set) in self.state.keyframes.texture_frames_set.iter().enumerate() {
+                    if let (true, Some(frame)) = (*set, self.state.keyframes.texture_frames[slot])
+                        && let Some(name) = m.texture_slots[slot].frames.get(frame as usize)
+                    {
+                        t.set_frame(name, frame);
+                    }
+                }
+            }
+        }
+        // The remaster's own animations step by the frame time (a 30 Hz frame here).
+        if let Some(t) = &mut self.state.texture_animations {
+            t.update(1.0 / 30.0);
         }
         self.walk_encounters(before);
         self.tick += 1;

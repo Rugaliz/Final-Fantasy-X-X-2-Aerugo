@@ -1221,6 +1221,7 @@ impl FieldView {
         let objects = crate::phyre::field::Objects {
             map: s.event.map_model.as_deref(),
             map_poses: &s.event.state.keyframes.poses,
+            texture_animations: s.event.state.texture_animations.as_ref(),
             models: &layers,
             actors: &actors,
         };
