@@ -7,6 +7,7 @@
 pub mod camera_move;
 pub mod control;
 pub mod encounter;
+pub mod event_camera;
 pub mod field;
 pub mod follow_camera;
 pub mod items;

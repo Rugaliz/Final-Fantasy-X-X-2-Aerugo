@@ -49,6 +49,12 @@ enum Command {
     },
     /// Parse every motion group of both games.
     CheckMotions,
+    /// Every native FFX's scripts reach (event and battle scripts), with call counts and whether Aerugo ports
+    /// it, registers only a stand-in, or lacks it; `--missing` lists only the natives still to port.
+    Natives {
+        #[arg(long)]
+        missing: bool,
+    },
     /// Decode FSB5 samples and compare them with ffmpeg's Xbox IMA decoder, sample for sample.
     FsbCompare {
         /// Archive path filter for banks (e.g. "sound_pc/voice/us").
@@ -339,6 +345,7 @@ fn main() -> Result<()> {
         Command::OracleTrack { dir, run, worker, frames } => oracle_track(&dir, run, worker, frames),
         Command::MotionFit { model, mgrp } => motion_fit(&install, &model, &mgrp),
         Command::CheckMotions => check_motions(&install),
+        Command::Natives { missing } => native_status(&install, missing),
         Command::FsbCompare { filter, every, samples } => {
             fsb_compare(&install, &filter, every.max(1), samples)
         }
@@ -2510,6 +2517,60 @@ fn motion_fit(install: &Install, model: &str, mgrp: &str) -> Result<()> {
                 / pairs.len().max(1) as f32;
             println!("  order {name} sign {sign:+}: mean error {err:.4}");
         }
+    }
+    Ok(())
+}
+
+fn native_status(install: &Install, missing_only: bool) -> Result<()> {
+    use aerugo_formats::Game;
+    use aerugo_formats::script::{Operand, Script, is_script_path, native};
+    use std::collections::{BTreeMap, BTreeSet};
+    // id → (event calls, event scripts, battle calls, battle scripts)
+    let mut uses: BTreeMap<u16, [usize; 4]> = BTreeMap::new();
+    for archive in open_all(install)? {
+        for e in archive.entries().iter().filter(|e| is_script_path(&e.path) && !e.path.contains("ffx2")) {
+            let Ok(data) = archive.read(e) else { continue };
+            let Ok(script) = Script::parse(&data) else { continue };
+            let event = e.path.ends_with(".ebp");
+            let mut seen = BTreeSet::new();
+            for w in 0..script.workers.len() {
+                for insn in script.walk(w) {
+                    if insn.info().operand != Operand::Native {
+                        continue;
+                    }
+                    let Some(id) = insn.operand else { continue };
+                    let u = uses.entry(id).or_default();
+                    let k = if event { 0 } else { 2 };
+                    u[k] += 1;
+                    if seen.insert(id) {
+                        u[k + 1] += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut natives = aerugo_script::natives::Natives::<aerugo_sim::field::FieldState>::new(Game::Ffx);
+    aerugo_sim::field::register(&mut natives);
+    let mut counts = [[0usize; 3]; 2];
+    for (&id, u) in &uses {
+        let status = if !natives.implemented(id) {
+            0
+        } else if natives.is_stub(id) {
+            1
+        } else {
+            2
+        };
+        let kind = usize::from(u[1] == 0);
+        counts[kind][status] += 1;
+        if missing_only && status == 2 {
+            continue;
+        }
+        let name = ["missing", "stub", "ported"][status];
+        let n = native(Game::Ffx, id);
+        println!("{id:04x}\t{name}\t{}\t{}\t{}\t{}\t{}", u[0], u[1], u[2], u[3], n.display(id));
+    }
+    for (kind, c) in ["event scripts", "battle scripts only"].iter().zip(counts) {
+        eprintln!("{kind}: {} ported, {} stubs, {} missing", c[2], c[1], c[0]);
     }
     Ok(())
 }

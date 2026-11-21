@@ -14,10 +14,14 @@ use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
 
+pub mod cam_natives;
+pub mod chr_cache;
 pub mod collision;
 pub mod face;
 pub mod map_objects;
 pub mod motion_engine;
+pub mod rng_streams;
+pub mod screen_fx;
 pub mod texture_animation;
 
 use collision::Ground;
@@ -59,6 +63,18 @@ pub struct Actor {
     pub no_body_hit: bool,
     /// The map display object this worker is bound to (0197), which its 0198/0199 keyframe requests act for.
     pub display_object: Option<u16>,
+    /// What the worker is bound to (the original's worker +0xaa and +0xa8): 0 nothing, 1 a character model
+    /// (0001), 2 the camera (0002), 3 (0003), 4 (0004) and 5 (0197) display objects; and the bound number.
+    pub bind_kind: u8,
+    pub bind_id: u16,
+    /// Character values natives set for engine parts (the character's +0x182 byte (5017), +0x183 byte (5029),
+    /// +0x726 short (505f), +0x17c shadow value (5085)) and its flag word bits 0 (5057), 3 (5087), 11 (502a)
+    /// and 20 (5069).
+    pub chr_mode_182: i8,
+    pub chr_byte_183: i8,
+    pub chr_motion_726: i16,
+    pub chr_shadow_17c: f32,
+    pub chr_flags: u32,
     /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
     /// height difference unless both test it.
     pub height_test: bool,
@@ -149,6 +165,13 @@ impl Default for Actor {
             bumped: false,
             no_body_hit: false,
             display_object: None,
+            bind_kind: 0,
+            bind_id: 0,
+            chr_mode_182: 0,
+            chr_byte_183: 0,
+            chr_motion_726: 0,
+            chr_shadow_17c: 0.0,
+            chr_flags: 0,
             height_test: true,
             player: None,
             motion_slots: DEFAULT_MOTION_SLOTS,
@@ -961,6 +984,32 @@ pub struct FogOverride {
     pub curve: Option<f32>,
     /// Share of fog colour at most (0–1).
     pub limit: f32,
+    /// The limit as scripts set it (0–255), which 803d reads back.
+    pub limit_raw: f32,
+}
+
+/// Values natives set for parts of the engine: event flag bits, sound switches, the character ID effect
+/// tables, the cloth wind, screen and shape switches.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngineValues {
+    /// The event flags byte (bit 5: 00f2).
+    pub event_flags: u8,
+    /// Sound switches (0151 sets bit n).
+    pub sound_switches: u32,
+    /// Event bits (017a sets bit n; an event effect load clears them).
+    pub event_bits: u32,
+    /// Set by 017a(9) and cleared by 017a(10) on scene 0x5e, room 0x186.
+    pub event_switch_9: bool,
+    /// The event's 2D shapes are drawn (023f).
+    pub shapes_on: i32,
+    /// The screen copy switch (4014).
+    pub screen_copy: bool,
+    /// Character ID effect variables (4017) and the current set's effect bytes (403b).
+    pub id_vars: Vec<i32>,
+    pub id_effects: [u8; 8],
+    pub id_set: usize,
+    /// The cloth wind (4036).
+    pub cloth_wind: [f32; 3],
 }
 
 /// The field's three directional lights and its ambient (index 3).
@@ -1000,9 +1049,52 @@ impl Rng {
 /// A model's face animation data (`.chr`) and its face sprites (the remaster's).
 pub type ModelFace = (Option<std::sync::Arc<face::FaceData>>, Option<std::sync::Arc<face::CharFace>>);
 
+/// The guide map's placement: its mode (0–3 a corner at 128, 4 the centre at 256), size and centre in the PS2
+/// frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuideMap {
+    pub mode: i32,
+    pub size: i32,
+    pub pos: (i32, i32),
+}
+
+impl GuideMap {
+    pub fn set_mode(&mut self, mode: i32) {
+        self.mode = mode;
+        let (size, pos) = match mode {
+            0 => (0x80, (0x50, 0x40)),
+            1 => (0x80, (0x1B0, 0x40)),
+            2 => (0x80, (0x50, 0x160)),
+            3 => (0x80, (0x1B0, 0x160)),
+            4 => (0x100, (0x100, 0xD0)),
+            _ => return,
+        };
+        self.size = size;
+        self.pos = pos;
+    }
+}
+
+/// The magic effect file loaded (−1 none) and its state value (−1 none), which the effect natives keep; a count
+/// one magic effect starts (−1 off) and the coin it sets for 6080.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagicState {
+    pub file: i32,
+    pub slot: i32,
+    pub stop_count: i32,
+    pub coin: bool,
+}
+
+impl Default for MagicState {
+    fn default() -> Self {
+        MagicState { file: -1, slot: -1, stop_count: -1, coin: false }
+    }
+}
+
 /// Everything natives act on.
 #[derive(Debug, Clone, Default)]
 pub struct FieldState {
+    /// Values natives set for engine parts, kept as the original keeps them.
+    pub engine: EngineValues,
     /// The engine's scene number (the event number) when known.
     pub scene: Option<u16>,
     /// Map groups not drawn (bit per mesh instance `m_groupID`): group 3 from the map's load; native 8000 turns
@@ -1011,6 +1103,25 @@ pub struct FieldState {
     pub actors: Vec<Actor>,
     pub windows: [Window; 8],
     pub camera: CameraState,
+    /// The event camera system's memory.
+    pub cam: crate::event_camera::CamMem,
+    /// Each worker's camera handle (the original's worker +0x3c), 0 until a camera native first needs one.
+    pub cam_slots: Vec<u32>,
+    /// The worker the script header names (+0x18; its camera handles are of the event camera's kind).
+    pub camera_worker: u16,
+    /// The event's character worker count as the machine keeps it (header +0x36 less +0x1c, +0x16 and +0x14).
+    pub chr_worker_count: i32,
+    /// The game's random streams (the camera's shakes use stream 9).
+    pub rng_streams: rng_streams::RngStreams,
+    /// The magic effect state other natives look at.
+    pub magic: MagicState,
+    /// The character data cache's entries.
+    pub chr_cache: chr_cache::ChrCache,
+    /// The guide map (the field's small map), when the field has one.
+    pub guide_map: Option<GuideMap>,
+    /// The event machine's 32-entry table that native 1000 fills (8 bytes each: x / 8 with bit 7, y / 4, the
+    /// worker, a value). Nothing in the remaster reads it.
+    pub point_table: [[u8; 8]; 32],
     /// The event's messages, decoded.
     pub messages: Vec<Message>,
     /// Item, treasure and equipment tables (FFX).
@@ -1088,10 +1199,13 @@ pub struct FieldState {
     /// while it is open. The result scripts read afterwards.
     pub menu: Option<MenuRequest>,
     pub menu_result: i32,
-    /// The screen fade: 0 clear, 1 black, moving towards `fade_target` by `fade_step` a tick.
-    pub fade: f32,
-    pub fade_target: f32,
-    pub fade_step: f32,
+    /// The screen effect channels (fades, colour fade and filter, motion blur, accumulation).
+    pub screen: screen_fx::ScreenFx,
+    /// The screen copy entries (4015) and their switch bits.
+    pub screen_copies: [i32; 4],
+    pub screen_copy_bits: u32,
+    /// The accumulation's two script bytes (401b, 401c).
+    pub accumulation_bytes: [u8; 2],
     /// Encounter areas (btl.bin), the walking counters, battle random streams, an area scripts set in place
     /// of the save image's, and encounters switched off by the host.
     pub encounters: Option<Arc<crate::encounter::EncounterTable>>,
@@ -1286,14 +1400,7 @@ impl FieldState {
                 a.shade = Eased::new(a.shade.value + (s - a.shade.value) / 3.0);
             }
         }
-        if self.fade != self.fade_target {
-            let d = self.fade_target - self.fade;
-            self.fade = if d.abs() <= self.fade_step {
-                self.fade_target
-            } else {
-                self.fade + self.fade_step * d.signum()
-            };
-        }
+        self.screen.frame();
         if let Some(m) = self.movie.as_mut().filter(|m| m.playing) {
             m.elapsed += 1;
             if let Some(f) = m.frames.filter(|&f| !m.looping && m.elapsed > f) {
@@ -1302,9 +1409,11 @@ impl FieldState {
             }
         }
         self.camera.update();
+        self.cam_frame();
         let actors = &self.actors;
         let follow = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos));
         self.camera.process(follow);
+        self.cam_publish();
         // The map's frame push (90bf10): group 3 is always off, scene 0x8a keeps group 8 on.
         if self.scene == Some(0x8A) {
             self.hidden_map_groups &= !0x100;
@@ -2159,6 +2268,12 @@ impl Event {
             entrances: script.entrances(),
             data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
             kinds: script.workers.iter().map(|w| w.kind).collect(),
+            cam_slots: vec![0; script.workers.len()],
+            camera_worker: script.header_u16(0x18).unwrap_or(0xFFFF),
+            chr_worker_count: {
+                let h = |at| i32::from(script.header_u16(at).unwrap_or(0));
+                h(0x36) - h(0x1c) - h(0x16) - h(0x14)
+            },
             vfs: Some(vfs.clone()),
             game: Some(game),
             event_path: path.to_owned(),
@@ -2180,6 +2295,7 @@ impl Event {
         if game == Game::Ffx {
             state.scene = FileTable::load(vfs).and_then(|t| t.event_number(path));
         }
+        state.screen.mode_0x102 = state.scene == Some(0x102);
         // The map's group mask at load: every group but 3 (all of them only under a debug option).
         state.hidden_map_groups = 1 << 3;
         state.texture_animations =
@@ -2455,18 +2571,43 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    float_back!(0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x00E4);
+    float_back!(0x006D, 0x006E);
+    // A turn block value of all nine levels (the worker's level blocks, stride 0x44): 006f the rate (what 002e
+    // sets for the running level), 00e4 the other rate (00e3's), 0070 the value 002f sets, 0071 the next one;
+    // each returns its value.
+    macro_rules! all_levels {
+        ($id:expr, $as:expr) => {
+            n.register(
+                $id,
+                Native::result(|g, c| {
+                    let v = c.stack.pop_float();
+                    for lvl in 0..9 {
+                        keep(g, $as, level_key(c.worker, lvl), vec![Value::Float(v)]);
+                    }
+                    Value::Float(v)
+                }),
+            );
+        };
+    }
+    all_levels!(0x006F, 0x002E);
+    all_levels!(0x00E4, 0x00E3);
+    all_levels!(0x0070, 0x002F);
+    all_levels!(0x0071, 0x0071);
+    // (The turn update reads the 002f / 0071 values only once the level blocks are ported whole.)
+    for id in [0x0070, 0x0071] {
+        n.mark_stub(id);
+    }
     // One int, returned (0074 worker setting, 00bb/00bc/00f3 field settings, 0116 actor flag).
     macro_rules! int_back {
         ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 let v = c.stack.pop_int();
                 keep(g, $id, c.worker, vec![Value::Int(v)]);
                 Value::Int(v)
             }));
         )*};
     }
-    int_back!(0x0074, 0x00BB, 0x00BC, 0x00F3, 0x017A);
+    int_back!(0x0074, 0x00F3);
     // One float kept, nothing useful returned (per-level move settings: 002e, 002f, 0030).
     macro_rules! float_set {
         ($($id:expr),*) => {$(
@@ -2478,6 +2619,8 @@ fn register_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     float_set!(0x002F, 0x0030, 0x002C);
+    n.mark_stub(0x002F);
+    n.mark_stub(0x0030);
     // Per-level turn and steering rates (002e the turn rate, 00e3 the other one, 002b the steering rate): kept
     // by worker and level.
     macro_rules! level_float_set {
@@ -2502,14 +2645,14 @@ fn register_settings(n: &mut Natives<FieldState>) {
     // One int kept, 1 returned (0007, 0151).
     macro_rules! int_one {
         ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 let v = c.stack.pop_int();
                 keep(g, $id, c.worker, vec![Value::Int(v)]);
                 Value::Int(1)
             }));
         )*};
     }
-    int_one!(0x0007, 0x0151);
+    int_one!(0x0007);
     // The entrance and the area id in the save image.
     n.register(
         0x0010,
@@ -2582,13 +2725,13 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
     // Returning 0.
     macro_rules! zero {
         ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 take(g, c, $id);
                 Value::Int(0)
             }));
         )*};
     }
-    zero!(0x500B, 0x5014, 0x5017, 0x5057, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021);
+    zero!(0x500B, 0x5014, 0x6003, 0x6021);
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
         0x4013,
@@ -2634,7 +2777,9 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
     n.register(
         0x803C,
         Native::result(|g, c| {
-            g.fog.limit = (c.stack.pop_float() / 255.0).clamp(0.0, 1.0);
+            let v = c.stack.pop_float();
+            g.fog.limit_raw = v;
+            g.fog.limit = (v / 255.0).clamp(0.0, 1.0);
             Value::Int(1)
         }),
     );
@@ -2735,7 +2880,7 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
     // Map layer animations (on/off by the second argument): return it.
     macro_rules! second {
         ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 let v = take(g, c, $id);
                 v.get(1).copied().unwrap_or(Value::Int(0))
             }));
@@ -2781,19 +2926,19 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     }
     macro_rules! fixed {
         ($ret:expr; $($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 take(g, c, $id);
                 Value::Int($ret)
             }));
         )*};
     }
-    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x0119, 0x0004);
+    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x0119);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
     fixed!(0; 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     fixed!(1; 0x801D, 0x801E, 0x801F);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
-    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x5087, 0x504E);
+    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x504E);
     // The model's drawing offset from its position (x, y, z), for a worker with a character.
     n.register(
         0x5016,
@@ -2814,12 +2959,18 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
         0x0197,
         Native::result(|g, c| {
             let id = c.stack.pop_int();
-            g.actor(c.worker).display_object = Some(id as u16);
+            let a = g.actor(c.worker);
+            a.display_object = Some(id as u16);
+            a.bind_kind = 5;
+            a.bind_id = id as u16;
             Value::Int(0)
         }),
     );
     fn attach(g: &mut FieldState, c: &NativeCall<'_>, object: Option<i32>, track: i32, once: i32) -> Value {
-        let Some(own) = g.actors.get(c.worker).and_then(|a| a.display_object) else { return Value::Int(0) };
+        let Some(own) = g.actors.get(c.worker).filter(|a| a.bind_kind == 5).and_then(|a| a.display_object)
+        else {
+            return Value::Int(0);
+        };
         if let Some(m) = g.map_objects.clone() {
             let object = object.unwrap_or(i32::from(own));
             g.keyframes.attach_object(&m, object as usize, track as usize, once as u16, (c.frame * 2) as u32);
@@ -2867,7 +3018,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     // 5029.
     macro_rules! swap {
         ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
+            n.register_stub($id, Native::result(|g, c| {
                 let old = g.settings.get(&($id, c.worker)).and_then(|v| v.first().copied());
                 take(g, c, $id);
                 match old {
@@ -2878,7 +3029,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    swap!(0x5009, 0x502A, 0x5029);
+    swap!(0x5009);
     fixed!(1; 0x8010, 0x8030);
     // A message variable (window, slot, kind, value) for the window's text; returns the window.
     n.register(0x009E, Native::result(|g, c| Value::Int(int(&take(g, c, 0x009E), 0))));
@@ -2974,6 +3125,10 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     n.register(0xC02F, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0xC02F), 0) != 0))));
     // Returns its int argument (01e6: int, float, float).
     n.register(0x01E6, Native::result(|g, c| Value::Int(int(&take(g, c, 0x01E6), 0))));
+    // Results that only follow from the arguments: the engine parts behind them are not ported yet.
+    for id in [0x4034, 0x8009, 0x007F, 0x00CB, 0x00E7, 0x009E, 0x00FD, 0x013E, 0x01D4, 0xC02F, 0x01E6] {
+        n.mark_stub(id);
+    }
     // (0102/0105 load sound banks and wait for the loader: replayed until sound loading is ported.)
     // Wait n ticks (the call ends the worker's turn).
     n.register(
@@ -3133,15 +3288,107 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(on))
         }),
     );
-    // Fade the screen in (4004) or out to black (4005) over n ticks.
-    fn fade(g: &mut FieldState, c: &mut NativeCall<'_>, target: f32) -> Value {
-        let ticks = c.stack.pop_int().max(1) as f32;
-        g.fade_target = target;
-        g.fade_step = 1.0 / ticks;
+    // Screen fades over n frames: 4004 in from black, 4005 out to black, 4006 in from white, 4007 out to white.
+    fn fade(g: &mut FieldState, c: &mut NativeCall<'_>, fade_in: bool, white: bool) -> Value {
+        let frames = c.stack.pop_int() as i16;
+        g.screen.fade(frames, fade_in, white);
         Value::Int(0)
     }
-    n.register(0x4004, Native::result(|g, c| fade(g, c, 0.0)));
-    n.register(0x4005, Native::result(|g, c| fade(g, c, 1.0)));
+    n.register(0x4004, Native::result(|g, c| fade(g, c, true, false)));
+    n.register(0x4005, Native::result(|g, c| fade(g, c, false, false)));
+    n.register(0x4006, Native::result(|g, c| fade(g, c, true, true)));
+    n.register(0x4007, Native::result(|g, c| fade(g, c, false, true)));
+    // A colour fade (frames, r, g, b): from the colour to clear.
+    n.register(
+        0x4003,
+        Native::result(|g, c| {
+            let b = c.stack.pop_int() as u8;
+            let gr = c.stack.pop_int() as u8;
+            let r = c.stack.pop_int() as u8;
+            let frames = c.stack.pop_int() as i16;
+            g.screen.colour_fade(frames, [r, gr, b]);
+            Value::Int(0)
+        }),
+    );
+    // A colour filter (r, g, b, strength; 0 off): 4008 normal, 4009 the other blend; 400c turns it off.
+    fn filter(g: &mut FieldState, c: &mut NativeCall<'_>, mode: u8) -> Value {
+        let v = c.stack.pop_int() as i16;
+        let b = c.stack.pop_int() as u8;
+        let gr = c.stack.pop_int() as u8;
+        let r = c.stack.pop_int() as u8;
+        g.screen.filter([r, gr, b], v, mode);
+        Value::Int(0)
+    }
+    n.register(0x4008, Native::result(|g, c| filter(g, c, 7)));
+    n.register(0x4009, Native::result(|g, c| filter(g, c, 8)));
+    n.register(
+        0x400C,
+        Native::result(|g, _| {
+            g.screen.filter_off();
+            Value::Int(0)
+        }),
+    );
+    // Motion blur at v / 128 (0 off).
+    n.register(
+        0x400A,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int() as i16;
+            g.screen.blur(v);
+            Value::Int(0)
+        }),
+    );
+    // The accumulation trail: 4019 takes the current frame, 401a moves its alpha (alpha, frames), 401b/401c set
+    // its two bytes.
+    n.register(
+        0x4019,
+        Native::result(|g, c| {
+            c.stack.pop_int();
+            g.screen.accumulation_current = true;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x401A,
+        Native::result(|g, c| {
+            let frames = c.stack.pop_int() as i16;
+            let alpha = c.stack.pop_int() as i16;
+            g.screen.accumulation(alpha, frames);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x401B,
+        Native::result(|g, c| {
+            g.accumulation_bytes[0] = c.stack.pop_int() as u8;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x401C,
+        Native::result(|g, c| {
+            g.accumulation_bytes[1] = c.stack.pop_int() as u8;
+            Value::Int(0)
+        }),
+    );
+    // A screen copy entry (index, value): 0 clears switch bit 0, else sets bit `value` and the screen copy
+    // switch.
+    n.register(
+        0x4015,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let i = c.stack.pop_int();
+            if let Some(e) = usize::try_from(i).ok().and_then(|i| g.screen_copies.get_mut(i)) {
+                *e = v;
+            }
+            if v == 0 {
+                g.screen_copy_bits &= !1;
+            } else {
+                g.screen_copy_bits |= 1 << (v as u32 & 31);
+                g.engine.screen_copy = true;
+            }
+            Value::Int(0)
+        }),
+    );
     // A choice window in one call (window, message, ?, ?, x, y, alignment): placed, opened, and waited on; the
     // result is the choice.
     for id in [0x013B, 0x0267] {
@@ -3881,9 +4128,211 @@ fn camera_table<'a>(g: &FieldState, c: &'a NativeCall, var: u32) -> Option<&'a [
     c.memory.script.get(areas[area - 2] as usize + (var & 0xFF_FFFF) as usize..)
 }
 
+/// Natives that set values for engine parts: save bytes, event and sound switches, the character ID effect
+/// tables, the cloth wind, character values and flag bits, the fog read-back.
+fn register_engine_values(n: &mut Natives<FieldState>) {
+    // Save image bytes 0x12 (00bb) and 0x11 (00bc); the value comes back.
+    fn save_byte(c: &mut NativeCall, at: usize) -> Value {
+        let v = c.stack.pop_int();
+        if let Some(b) = c.memory.global[0].get_mut(at) {
+            *b = v as u8;
+        }
+        Value::Int(v)
+    }
+    n.register(0x00BB, Native::result(|_, c| save_byte(c, 0x12)));
+    n.register(0x00BC, Native::result(|_, c| save_byte(c, 0x11)));
+    // The event flags byte's bit 5: set (non-zero) or clear; the old bit comes back.
+    n.register(
+        0x00F2,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let old = (g.engine.event_flags >> 5) & 1;
+            g.engine.event_flags = (g.engine.event_flags & !0x20) | (u8::from(v != 0) << 5);
+            Value::Int(i32::from(old))
+        }),
+    );
+    // Sound switch n on; returns 1.
+    n.register(
+        0x0151,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            g.engine.sound_switches |= 1 << (v as u32 & 31);
+            Value::Int(1)
+        }),
+    );
+    // Event bit n on; on scene 0x5e in room 0x186 (the save image's u16 at 0xbec), 9 also sets a switch and 10
+    // clears it.
+    n.register(
+        0x017A,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let room = c.memory.global[0].get(0xBEC..0xBEE).map(|b| u16::from_le_bytes([b[0], b[1]]));
+            if g.scene == Some(0x5E) && room == Some(0x186) {
+                if v == 10 {
+                    g.engine.event_switch_9 = false;
+                } else if v == 9 {
+                    g.engine.event_switch_9 = true;
+                }
+            }
+            g.engine.event_bits |= 1 << (v as u32 & 31);
+            Value::Int(v)
+        }),
+    );
+    // The event's 2D shapes drawn (non-zero) or not; returns the value.
+    n.register(
+        0x023F,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            g.engine.shapes_on = v;
+            Value::Int(v)
+        }),
+    );
+    // The screen copy switch (bit 0); the old one comes back.
+    n.register(
+        0x4014,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let old = g.engine.screen_copy;
+            g.engine.screen_copy = v & 1 != 0;
+            Value::Int(i32::from(old))
+        }),
+    );
+    // Character ID effect variable i = v (4017); the current set's effect byte i = v (403b).
+    n.register(
+        0x4017,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let i = c.stack.pop_int().max(0) as usize;
+            if g.engine.id_vars.len() <= i {
+                g.engine.id_vars.resize(i + 1, 0);
+            }
+            g.engine.id_vars[i] = v;
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x403B,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let i = c.stack.pop_int();
+            if let Some(b) = usize::try_from(g.engine.id_set as i32 * 4 + i)
+                .ok()
+                .and_then(|k| g.engine.id_effects.get_mut(k))
+            {
+                *b = v as u8;
+            }
+            Value::Int(0)
+        }),
+    );
+    // The cloth wind (x, y, z).
+    n.register(
+        0x4036,
+        Native::result(|g, c| {
+            let z = c.stack.pop_float();
+            let y = c.stack.pop_float();
+            let x = c.stack.pop_float();
+            g.engine.cloth_wind = [x, y, z];
+            Value::Int(0)
+        }),
+    );
+    // Character values, for a worker with a character: 5017 the +0x182 byte, 505f the +0x726 short, 5085 the shadow
+    // value; 5029 swaps the +0x183 byte and 502a flag bit 11, 5069 flag bit 20 (the old value comes back).
+    fn chr(g: &mut FieldState, w: usize) -> Option<&mut Actor> {
+        g.actors.get_mut(w).filter(|a| a.model.is_some())
+    }
+    n.register(
+        0x5017,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            if let Some(a) = chr(g, c.worker) {
+                a.chr_mode_182 = v as i8;
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x505F,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            if let Some(a) = chr(g, c.worker) {
+                a.chr_motion_726 = v as i16;
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5085,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            if let Some(a) = chr(g, c.worker) {
+                a.chr_shadow_17c = v;
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5029,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let Some(a) = chr(g, c.worker) else { return Value::Int(0) };
+            let old = a.chr_byte_183;
+            a.chr_byte_183 = v as i8;
+            Value::Int(i32::from(old))
+        }),
+    );
+    fn swap_bit(g: &mut FieldState, w: usize, bit: u32, v: i32) -> Value {
+        let Some(a) = chr(g, w) else { return Value::Int(0) };
+        let old = (a.chr_flags >> bit) & 1;
+        a.chr_flags = (a.chr_flags & !(1 << bit)) | (((v as u32) & 1) << bit);
+        Value::Int(old as i32)
+    }
+    n.register(
+        0x502A,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            swap_bit(g, c.worker, 11, v)
+        }),
+    );
+    n.register(
+        0x5069,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            swap_bit(g, c.worker, 20, v)
+        }),
+    );
+    // Flag bit 0 of another worker's character (worker, value); the old bit comes back.
+    n.register(
+        0x5057,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            let w = c.stack.pop_int();
+            let w = if w < 0 { c.worker } else { w as usize };
+            swap_bit(g, w, 0, v)
+        }),
+    );
+    // Every character whose flag bit 0 is clear gets bit 3.
+    n.register(
+        0x5087,
+        Native::result(|g, _| {
+            for a in g.actors.iter_mut().filter(|a| a.model.is_some() && a.chr_flags & 1 == 0) {
+                a.chr_flags |= 8;
+            }
+            Value::Int(0)
+        }),
+    );
+    // The fog limit as last set (0–255).
+    n.register(0x803D, Native::result(|g, _| Value::Float(g.fog.limit_raw)));
+    // A wait that ends at once; returns 1.
+    n.register(
+        0x0105,
+        Native { init: Some(|_, _| {}), wait: Some(|_, _| 5), result: Some(|_, _| Value::Int(1)) },
+    );
+}
+
 /// Natives of the field slice: actors, movement, turning, messages, camera, worker queries.
 /// Register every field native Aerugo implements.
 pub fn register(n: &mut Natives<FieldState>) {
+    register_engine_values(n);
     register_treasure(n);
     register_queries(n);
     register_menus(n);
@@ -3899,18 +4348,29 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(if i < 0 { c.worker as i32 } else { i })
         }),
     );
-    // Actors.
-    n.register(
-        0x0001,
-        Native::result(|g, c| {
-            let id = c.stack.pop_int();
-            let a = g.actor(c.worker);
-            a.model = Some(id as u16);
-            a.display_object = None;
-            g.bind_motions(c.worker, id as u16);
-            Value::Int(0)
-        }),
-    );
+    // Actors: bind a character model (0134 is the same native).
+    fn bind_model(g: &mut FieldState, c: &mut NativeCall) -> Value {
+        let id = c.stack.pop_int();
+        let a = g.actor(c.worker);
+        a.model = Some(id as u16);
+        a.display_object = None;
+        a.bind_kind = 1;
+        a.bind_id = id as u16;
+        g.bind_motions(c.worker, id as u16);
+        Value::Int(0)
+    }
+    n.register(0x0001, Native::result(bind_model));
+    n.register(0x0134, Native::result(bind_model));
+    // Bind the worker to a thing of kind 3 (0003) or 4 (0004), by number.
+    fn bind(g: &mut FieldState, c: &mut NativeCall, kind: u8) -> Value {
+        let v = c.stack.pop_int();
+        let a = g.actor(c.worker);
+        a.bind_kind = kind;
+        a.bind_id = v as u16;
+        Value::Int(0)
+    }
+    n.register(0x0003, Native::result(|g, c| bind(g, c, 3)));
+    n.register(0x0004, Native::result(|g, c| bind(g, c, 4)));
     // The entrance the party arrived by (the save image's byte 0xC) or a given one (below 0: that one too):
     // position, height, depth, heading, entry.
     fn entrance(g: &FieldState, c: &NativeCall, index: Option<i32>) -> aerugo_formats::script::Entrance {
@@ -4937,6 +5397,41 @@ pub fn register(n: &mut Natives<FieldState>) {
             let roll = radians(c.stack.pop_float());
             g.camera.set_roll(roll);
             Value::Int(0)
+        }),
+    );
+    // The camera natives on the camera system (they replace the ones above).
+    cam_natives::register(n);
+    chr_cache::register(n);
+    // 00f3(mode): the guide map's placement (when there is one); returns the mode.
+    n.register(
+        0x00F3,
+        Native::result(|g, c| {
+            let mode = c.stack.pop_int();
+            if let Some(m) = g.guide_map.as_mut() {
+                m.set_mode(mode);
+            }
+            Value::Int(mode)
+        }),
+    );
+    // 1000(slot, x, y, value): a point table entry (x or y negative: the entry cleared); returns 1.
+    n.register(
+        0x1000,
+        Native::result(|g, c| {
+            let value = c.stack.pop_int();
+            let y = c.stack.pop_int();
+            let x = c.stack.pop_int();
+            let slot = c.stack.pop_int().clamp(0, 31) as usize;
+            let e = &mut g.point_table[slot];
+            if x < 0 || y < 0 {
+                e[0] = 0;
+                e[1] = 0;
+                return Value::Int(1);
+            }
+            e[0] = ((x / 8) as u8 & 0x3F) | 0x80;
+            e[1] = (y / 4) as u8 & 0x7F;
+            e[2..4].copy_from_slice(&(c.worker as u16).to_le_bytes());
+            e[4..8].copy_from_slice(&value.to_le_bytes());
+            Value::Int(1)
         }),
     );
 }

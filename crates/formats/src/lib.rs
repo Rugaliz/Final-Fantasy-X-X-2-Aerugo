@@ -16,6 +16,7 @@ pub mod shape;
 pub mod skeleton;
 pub mod text;
 pub mod texture;
+pub mod vfx_shader;
 
 pub use kernel::{KernelError, KernelTable};
 pub use phyre::{Cluster, ObjectId, PhyreError, Pointer};

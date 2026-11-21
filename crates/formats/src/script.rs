@@ -369,6 +369,11 @@ impl Script {
         &self.data
     }
 
+    /// A `u16` of the header (`None` past the data).
+    pub fn header_u16(&self, at: usize) -> Option<u16> {
+        u16_at(&self.data, at).ok()
+    }
+
     /// Offset of the code from the script start.
     pub fn code_start(&self) -> u32 {
         self.code as u32

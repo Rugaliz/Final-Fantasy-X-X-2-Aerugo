@@ -95,6 +95,9 @@ impl Coverage {
 pub struct Natives<G> {
     pub game: Game,
     table: HashMap<u16, Native<G>>,
+    /// Natives registered only to take their arguments and give a fixed or kept result: the engine part behind
+    /// them is not ported yet.
+    stubs: std::collections::HashSet<u16>,
     pub coverage: Coverage,
     /// Recorded native behaviour used for natives without an implementation.
     pub replay: Option<Replay>,
@@ -109,19 +112,44 @@ impl<G> std::fmt::Debug for Natives<G> {
 impl<G> Natives<G> {
     /// An empty registry with the state-free groups (math, debug, waits) registered.
     pub fn new(game: Game) -> Natives<G> {
-        let mut n = Natives { game, table: HashMap::new(), coverage: Coverage::default(), replay: None };
+        let mut n = Natives {
+            game,
+            table: HashMap::new(),
+            stubs: Default::default(),
+            coverage: Coverage::default(),
+            replay: None,
+        };
         register_common(&mut n);
         n
     }
 
     pub fn register(&mut self, id: u16, native: Native<G>) {
         self.table.insert(id, native);
+        self.stubs.remove(&id);
+    }
+
+    /// Register a stand-in: it keeps the stack and the results right, but the engine part behind the native is
+    /// not ported yet.
+    pub fn register_stub(&mut self, id: u16, native: Native<G>) {
+        self.table.insert(id, native);
+        self.stubs.insert(id);
+    }
+
+    /// Mark a registered native as a stand-in.
+    pub fn mark_stub(&mut self, id: u16) {
+        self.stubs.insert(id);
+    }
+
+    /// The native is registered only as a stand-in.
+    pub fn is_stub(&self, id: u16) -> bool {
+        self.stubs.contains(&id)
     }
 
     /// Drop a native (comparisons replay the original's results for natives whose timing is the player's, such
     /// as menus).
     pub fn remove(&mut self, id: u16) {
         self.table.remove(&id);
+        self.stubs.remove(&id);
     }
 
     pub fn implemented(&self, id: u16) -> bool {

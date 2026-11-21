@@ -24,7 +24,7 @@ use super::scene::SceneConstants;
 use super::{ProgramKey, Programs, Value, fill, render_state};
 
 /// What the post chain does this frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PostSettings {
     /// HDAO level: 0 off, 1–3 (6, 12 or 20 rings).
     pub hdao: u32,
@@ -36,6 +36,9 @@ pub struct PostSettings {
     /// (Brightness setting − 50) / 100.
     pub brightness: f32,
     pub anisotropy: f32,
+    /// The screen fades of this frame, in order: colour and alpha, and the blend flags (2 additive, 0x10
+    /// subtractive, else normal). The remaster draws them after the post-processing, before the 2D layer.
+    pub fades: Vec<([f32; 4], u32)>,
 }
 
 /// The manager's HDAO defaults (constructor): fade-out, then kernel scale, reject radius, accept radius,
@@ -797,6 +800,35 @@ impl PostChain {
             ops,
         );
         self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
+        // Screen fades (alpha 0 draws nothing): ScreenFadeColor and the technique for the blend.
+        for &(rgba, flags) in &s.fades {
+            if rgba[3] == 0.0 {
+                continue;
+            }
+            self.set("fade", "ScreenFadeColor", floats(&rgba));
+            let technique = match flags {
+                2 => "ScreenFadeAdditive",
+                0x10 => "ScreenFadeSubtract",
+                _ => "ScreenFade",
+            };
+            self.pass(
+                vfs,
+                renderer,
+                programs,
+                game,
+                "screenfade",
+                technique,
+                "fade",
+                &[],
+                m,
+                None,
+                full,
+                Shape::Quad,
+                scene,
+                an,
+                ops,
+            );
+        }
         ops.push(resolve(color, t.resolved));
         // To the screen.
         self.set("copy", "UvScaleBias", floats(&[1.0, 1.0, 0.0, 0.0]));

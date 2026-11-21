@@ -1221,6 +1221,12 @@ impl FieldView {
             smaa: 4,
             brightness,
             anisotropy: 4.0,
+            fades: st
+                .screen
+                .passes
+                .iter()
+                .map(|p| ([p.rgb[0], p.rgb[1], p.rgb[2], p.alpha], p.flags))
+                .collect(),
         };
         // The map's 2D layers sit where the map does (ten times their file size).
         let layers: Vec<(&str, Mat4)> = s
