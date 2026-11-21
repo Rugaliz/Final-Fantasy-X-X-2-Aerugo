@@ -63,6 +63,13 @@ pub struct Actor {
     pub motion_play: Option<(i32, i32, i32, u32, u8)>,
     /// Motion speed (0x100 normal).
     pub motion_speed: u16,
+    /// The character engine's motion slots (5025): 0 standing, 1 walking, 2 running, 16–19 in water; a value
+    /// under 0x1000 picks from the model's own list, others are motion ids.
+    pub motion_slots: [i32; 20],
+    /// Above this speed a moving character runs (5028; 18 by default).
+    pub run_threshold: f32,
+    /// The speed the character engine moves the body at this tick (the player's push or the running move's).
+    pub engine_speed: f32,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
     /// Move state per script level: a level's move waits while a higher level runs.
@@ -92,6 +99,27 @@ pub struct Actor {
     pub color: [Eased; 4],
 }
 
+/// The motion slots a character starts with (Ch_Allocate: 0, 1, 2 for standing, walking, running and the
+/// defaults 0, 1, 2, 3 for slots 16–19; the rest start at 0).
+const DEFAULT_MOTION_SLOTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
+/// The value a slot set to −1 takes (by slot).
+const MOTION_SLOT_DEFAULTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
+const DEFAULT_RUN_THRESHOLD: f32 = 18.0;
+
+/// A character's own motion lists from its `.chr` data (header entries 5, 6 and 7: on the ground, the second
+/// list, in water), motion ids indexed by a slot value under 0x1000.
+pub fn chr_motion_lists(d: &[u8]) -> Option<[Vec<u32>; 3]> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let list = |k: usize| -> Option<Vec<u32>> {
+        let (at, n) = (u32_at(0x10 + k * 8)? as usize, u32_at(0x14 + k * 8)? as usize);
+        if at == 0 {
+            return Some(Vec::new());
+        }
+        (0..n.min(0x400)).map(|i| u32_at(at + 4 * i)).collect()
+    };
+    Some([list(5)?, list(6)?, list(7)?])
+}
+
 impl Default for Actor {
     fn default() -> Actor {
         Actor {
@@ -115,6 +143,9 @@ impl Default for Actor {
             height_test: true,
             motion_play: None,
             motion_speed: 0x100,
+            motion_slots: DEFAULT_MOTION_SLOTS,
+            run_threshold: DEFAULT_RUN_THRESHOLD,
+            engine_speed: 0.0,
             level: 0,
             moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
@@ -170,7 +201,7 @@ struct MoveState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ActorMove {
     /// From `from` to `to` over `frames` ticks; `count` ticks done.
-    Timed { from: [f32; 3], to: [f32; 3], count: f32, frames: f32 },
+    Timed { from: [f32; 3], to: [f32; 3], count: f32, frames: f32, mode: u32 },
     /// Towards `to` at a speed, on the ground plane only or in space; `mode` is move.start's mode word (0x8000:
     /// steered, the heading turning toward the target at a limited rate; 0x4000: the turn ends with it).
     Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32, mode: u32 },
@@ -356,7 +387,7 @@ impl Actor {
             }
             // The share done is the count over the frames (before counting this tick); the move ends, at its
             // target, once the count passes the frames.
-            ActorMove::Timed { from, to, count, frames } => {
+            ActorMove::Timed { from, to, count, frames, .. } => {
                 let t =
                     if *count == 0.0 && *frames == 0.0 { 1.0 } else { (*count / *frames).clamp(0.0, 1.0) };
                 *count += 1.0;
@@ -769,6 +800,8 @@ pub struct FieldState {
     pub control: PlayerControl,
     /// Frame counts of each model's motions by motion number, as the host loads them.
     pub motion_frames: std::collections::HashMap<u16, std::collections::HashMap<u16, u32>>,
+    /// Each model's own motion lists (`.chr` data).
+    pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
     /// Collision radii of models by id (None: no character data).
     pub model_radii: std::collections::HashMap<u16, Option<f32>>,
     /// Movie files by number (the game's video list).
@@ -1112,6 +1145,7 @@ impl FieldState {
                 a.steer_walk_end(st, self.ground.as_ref());
             }
         }
+        let (mut player_speed, mut swimming_player) = (0.0, None);
         // The player covers last tick's push, then this tick's input makes the next one (only while the
         // player has control).
         if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
@@ -1136,6 +1170,7 @@ impl FieldState {
                 }
             }
             let push = self.control.tick(self.input.stick, self.input.walk, swimming);
+            player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
             if let Some(push) = push.filter(|_| self.user_control) {
                 // Forward is where the camera looks; right is a quarter turn clockwise from it seen from above.
                 let h = self.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
@@ -1144,6 +1179,66 @@ impl FieldState {
                 self.player_step =
                     Some([(right[0] * x + fwd[0] * y) * push.step, (right[1] * x + fwd[1] * y) * push.step]);
             }
+            swimming_player = swimming.then_some(p);
+        }
+        self.engine_motions(player_speed, swimming_player);
+    }
+
+    /// The character engine's own motions (chr_motion_update): a body bound to a character with no script
+    /// motion playing stands, walks or runs by the speed the engine moves it at (the running move's, or the
+    /// player's push), picking its standing, walking or running slot; a slot under 0x1000 picks from the model's
+    /// own list. (Bodies in water take other slots by the water level, which is not modelled: they keep their
+    /// motion.)
+    fn engine_motions(&mut self, player_speed: f32, swimming_player: Option<usize>) {
+        for w in 0..self.actors.len() {
+            let a = &self.actors[w];
+            let Some(model) = a.model else { continue };
+            let speed = match a.move_state().active {
+                Some(m) => {
+                    let (mode, set) = match m {
+                        ActorMove::Walk { mode, speed, .. } => (mode, speed),
+                        ActorMove::Timed { mode, .. } => (mode, a.move_state().speed),
+                    };
+                    // 870540: the move's set speed, along the ground for kinds 2 and 4 (by the pitch the move
+                    // goes along), none for kinds 7 and 9 (placed directly).
+                    match mode & 0x7F {
+                        0 | 7 | 9 => 0.0,
+                        2 | 4 => {
+                            let pitch = match m {
+                                ActorMove::Walk { ground_only: true, .. } => 0.0,
+                                _ => a.move_pitch,
+                            };
+                            set * pitch.cos()
+                        }
+                        _ => set,
+                    }
+                }
+                None if Some(w) == self.player => player_speed,
+                None => 0.0,
+            };
+            self.actors[w].engine_speed = speed;
+            if Some(w) == swimming_player || self.motion_playing(&self.actors[w]) {
+                continue;
+            }
+            let a = &self.actors[w];
+            let slot = if speed == 0.0 {
+                0
+            } else if speed <= a.run_threshold {
+                1
+            } else {
+                2
+            };
+            let value = a.motion_slots[slot];
+            let id = if value & 0xFFFF < 0x1000 {
+                let lists = self.model_motion_lists.get(&model).and_then(|l| l.as_ref());
+                match lists.and_then(|l| l[0].get(value as usize)).copied() {
+                    Some(id) if id != 0 => id as i32,
+                    _ => continue,
+                }
+            } else {
+                value
+            };
+            self.actors[w].motion = Some(id);
         }
     }
 }
@@ -1694,8 +1789,10 @@ impl Event {
                 .map(|p| motion_frames(vfs, &p, m, Some(&self.path)))
                 .unwrap_or_default();
             self.state.motion_frames.insert(m, frames);
-            let radius = chr_path(self.game, m).and_then(|p| vfs.read(&p).ok()).and_then(|d| chr_radius(&d));
+            let chr = chr_path(self.game, m).and_then(|p| vfs.read(&p).ok());
+            let radius = chr.as_deref().and_then(chr_radius);
             self.state.model_radii.insert(m, radius);
+            self.state.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
         }
         for a in &mut self.state.actors {
             a.model_radius = a.model.and_then(|m| self.state.model_radii.get(&m).copied().flatten());
@@ -1908,8 +2005,8 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         )*};
     }
     zero!(
-        0x500B, 0x5013, 0x5014, 0x5017, 0x5020, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A,
-        0x403B, 0x6003, 0x6021, 0x5001, 0x5010
+        0x500B, 0x5013, 0x5014, 0x5017, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B,
+        0x6003, 0x6021, 0x5001, 0x5010
     );
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
@@ -3433,15 +3530,42 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
+    // A character's motion slot (5025(slot, motion); −1: the slot's default).
     n.register(
         0x5025,
         Native::result(|g, c| {
-            let _b = c.stack.pop_int();
-            let m = c.stack.pop_int();
-            g.actor(c.worker).motion = Some(m);
+            let motion = c.stack.pop_int();
+            let slot = c.stack.pop_int();
+            if let Ok(slot) = usize::try_from(slot)
+                && slot < MOTION_SLOT_DEFAULTS.len()
+            {
+                g.actor(c.worker).motion_slots[slot] =
+                    if motion == -1 { MOTION_SLOT_DEFAULTS[slot] } else { motion };
+            }
             Value::Int(0)
         }),
     );
+    // The speed above which a moving character runs (5028; 0 or less: 18); the result is the old one.
+    n.register(
+        0x5028,
+        Native::result(|g, c| {
+            let v = c.stack.pop_float();
+            let a = g.actor(c.worker);
+            let old = a.run_threshold;
+            a.run_threshold = if v <= 0.0 { DEFAULT_RUN_THRESHOLD } else { v };
+            Value::Float(old)
+        }),
+    );
+    // Stopping the motion (chr_motion_stop): the character engine picks its own again.
+    for id in [0x5005u16, 0x5020] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                g.actor(c.worker).motion_play = None;
+                Value::Int(0)
+            }),
+        );
+    }
     // The party character a worker plays (actors only); character 0 is taken as the player until the
     // native that names the player is known.
     n.register(
@@ -3602,7 +3726,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                     radius: m.radius,
                     mode: mode as u32,
                 },
-                _ => ActorMove::Timed { from, to: m.target, count: 0.0, frames: m.frames },
+                _ => ActorMove::Timed { from, to: m.target, count: 0.0, frames: m.frames, mode: mode as u32 },
             });
             Value::Int(0)
         }),
@@ -4099,8 +4223,13 @@ mod tests {
     #[test]
     fn a_levels_move_waits_while_a_higher_level_runs() {
         let mut a = Actor::default();
-        a.moves[1].active =
-            Some(ActorMove::Timed { from: [0.0; 3], to: [10.0, 0.0, 0.0], count: 0.0, frames: 10.0 });
+        a.moves[1].active = Some(ActorMove::Timed {
+            from: [0.0; 3],
+            to: [10.0, 0.0, 0.0],
+            count: 0.0,
+            frames: 10.0,
+            mode: 3,
+        });
         a.level = 1;
         a.advance_move(None);
         a.advance_move(None);

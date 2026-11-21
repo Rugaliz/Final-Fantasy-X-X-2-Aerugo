@@ -37,6 +37,8 @@ impl Default for PlayerControl {
 pub struct Push {
     pub dir: [f32; 2],
     pub step: f32,
+    /// The speed itself (the character engine's, a twentieth of it a tick).
+    pub speed: f32,
 }
 
 impl PlayerControl {
@@ -68,7 +70,7 @@ impl PlayerControl {
         } * strength
             / 256.0;
         let len = (vx * vx + vy * vy).sqrt();
-        Some(Push { dir: [vx / len, vy / len], step: speed / 20.0 })
+        Some(Push { dir: [vx / len, vy / len], step: speed / 20.0, speed })
     }
 }
 
