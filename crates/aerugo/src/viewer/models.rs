@@ -225,7 +225,8 @@ impl ModelBrowser {
             let [r, g, b] = self.background;
             scene.background = [r, g, b];
             let actors = [actor];
-            let objects = crate::phyre::field::Objects { map: None, models: &[], actors: &actors };
+            let objects =
+                crate::phyre::field::Objects { map: None, map_poses: &[], models: &[], actors: &actors };
             let msaa = renderer.msaa();
             let culling = self.culling;
             if let Some(frame) =

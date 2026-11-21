@@ -15,6 +15,7 @@ use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
 
 pub mod collision;
+pub mod map_objects;
 
 use collision::Ground;
 
@@ -51,6 +52,8 @@ pub struct Actor {
     bumped: bool,
     /// Body hit turned off (500f): neither blocks nor bumps.
     pub no_body_hit: bool,
+    /// The map display object this worker is bound to (0197), which its 0198/0199 keyframe requests act for.
+    pub display_object: Option<u16>,
     /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
     /// height difference unless both test it.
     pub height_test: bool,
@@ -107,6 +110,7 @@ impl Default for Actor {
             started_late: false,
             bumped: false,
             no_body_hit: false,
+            display_object: None,
             height_test: true,
             motion_play: None,
             motion_speed: 0x100,
@@ -731,6 +735,9 @@ pub struct FieldState {
     pub ground: Option<Ground>,
     /// The map's fog from its PS2 map package (the scripts may change it).
     pub map_fog: Option<MapFog>,
+    /// The PS2 map's display objects and keyframe tracks, and the keyframe slots playing them.
+    pub map_objects: Option<std::sync::Arc<map_objects::MapObjects>>,
+    pub keyframes: map_objects::Keyframes,
     /// The field light characters are lit by (reset at every event start, set by native 4013).
     pub lights: FieldLights,
     /// What the fog natives set over the map's scene fog.
@@ -1510,6 +1517,12 @@ impl Event {
         if let Some(d) = vpa.and_then(|p| vfs.read(&p).ok()) {
             state.ground = Ground::from_walk_mesh(&d);
             state.map_fog = MapFog::from_map_package(&d);
+            // Map setup attaches the objects' and texture slots' own tracks.
+            state.map_objects = map_objects::MapObjects::from_map_package(&d).map(std::sync::Arc::new);
+            if let Some(m) = &state.map_objects {
+                state.keyframes = map_objects::Keyframes::new(m);
+                state.keyframes.setup(m, 0);
+            }
         }
         let mut natives = Natives::new(game);
         register(&mut natives);
@@ -1563,6 +1576,10 @@ impl Event {
         self.vm.frame(&mut self.natives.host(&mut self.state));
         self.state.player_start = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.state.update();
+        // The map's keyframes play once a frame after the scripts and characters, on a clock of two ticks a frame.
+        if let Some(m) = self.state.map_objects.clone() {
+            self.state.keyframes.update(&m, (self.tick * 2) as u32);
+        }
         self.walk_encounters(before);
         self.tick += 1;
     }
@@ -2069,8 +2086,43 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     fixed!(1; 0x801D, 0x801E, 0x801F);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
-    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x0197, 0x5087, 0x5016, 0x504E);
-    fixed!(1; 0x0196, 0x0198, 0x01C9);
+    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x5087, 0x5016, 0x504E);
+    fixed!(1; 0x0196, 0x01C9);
+    // Map display objects: 0197 binds the worker to one; 0198(object, track, once) and 0199(track, once; the bound
+    // object) attach a keyframe track, for bound workers only (result 1, else 0).
+    n.register(
+        0x0197,
+        Native::result(|g, c| {
+            let id = c.stack.pop_int();
+            g.actor(c.worker).display_object = Some(id as u16);
+            Value::Int(0)
+        }),
+    );
+    fn attach(g: &mut FieldState, c: &NativeCall<'_>, object: Option<i32>, track: i32, once: i32) -> Value {
+        let Some(own) = g.actors.get(c.worker).and_then(|a| a.display_object) else { return Value::Int(0) };
+        if let Some(m) = g.map_objects.clone() {
+            let object = object.unwrap_or(i32::from(own));
+            g.keyframes.attach_object(&m, object as usize, track as usize, once as u16, (c.frame * 2) as u32);
+        }
+        Value::Int(1)
+    }
+    n.register(
+        0x0198,
+        Native::result(|g, c| {
+            let once = c.stack.pop_int();
+            let track = c.stack.pop_int();
+            let object = c.stack.pop_int();
+            attach(g, c, Some(object), track, once)
+        }),
+    );
+    n.register(
+        0x0199,
+        Native::result(|g, c| {
+            let once = c.stack.pop_int();
+            let track = c.stack.pop_int();
+            attach(g, c, None, track, once)
+        }),
+    );
     // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
     // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
     fixed!(1; 0x01C6, 0x0253);
@@ -3129,7 +3181,9 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0001,
         Native::result(|g, c| {
             let id = c.stack.pop_int();
-            g.actor(c.worker).model = Some(id as u16);
+            let a = g.actor(c.worker);
+            a.model = Some(id as u16);
+            a.display_object = None;
             Value::Int(0)
         }),
     );

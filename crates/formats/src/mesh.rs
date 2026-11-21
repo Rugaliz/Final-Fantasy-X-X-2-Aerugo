@@ -196,6 +196,8 @@ pub struct Mesh {
     pub bounds_size: [f32; 3],
     /// The PS2 draw object kind (`m_DObjKind`): 1 marks a map's sky objects.
     pub kind: i32,
+    /// The PS2 display object it belongs to (`m_objID`): keyframes on that object move and turn it.
+    pub object: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -540,6 +542,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             .map(|(a, b)| ([a[0], a[1], a[2]], [b[0], b[1], b[2]]))
             .unwrap_or(([0.0; 3], [0.0; 3]));
         let kind = cluster.u32(inst, "m_DObjKind").unwrap_or(0) as i32;
+        let object = cluster.u32(inst, "m_objID").unwrap_or(0) as i32;
         meshes.push(Mesh {
             name: cluster.string(inst, "m_name").unwrap_or_default(),
             instance: inst,
@@ -550,6 +553,7 @@ pub fn read_model(cluster: &Cluster) -> Result<Model, MeshError> {
             bounds_min,
             bounds_size,
             kind,
+            object,
         });
     }
     Ok(Model { meshes })

@@ -45,6 +45,8 @@ pub struct ActorDraw<'a> {
 #[derive(Default)]
 pub struct Objects<'a> {
     pub map: Option<&'a str>,
+    /// What the map's keyframes set on its display objects (by `m_objID`).
+    pub map_poses: &'a [aerugo_sim::field::map_objects::ObjectPose],
     pub models: &'a [(&'a str, Mat4)],
     pub actors: &'a [ActorDraw<'a>],
 }
@@ -153,6 +155,10 @@ impl FieldRenderer {
             for mesh in &model.meshes {
                 let source = &model.model.meshes[mesh.source];
                 let world = Mat4::from_scale(Vec3::splat(10.0)) * Mat4::from_cols_array(&source.world);
+                let world = usize::try_from(source.object)
+                    .ok()
+                    .and_then(|o| objects.map_poses.get(o))
+                    .map_or(world, |p| posed_world(world, p));
                 let object = object_values(world, scene.view, scene.projection);
                 let values = |name: &str| scene.value(name).or_else(|| object(name));
                 for seg in &mesh.segments {
@@ -329,4 +335,31 @@ fn character_value(
         "LgtMatClr" => f(&[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         _ => None,
     }
+}
+
+/// A map part's world matrix as its display object's keyframes leave it. A rotation replaces the 3×3 part with ten
+/// times the three axis rotations in the object's order (X = Rx(−a0), Y = Ry(−a1), Z = Rz(a2); order 0 ZYX, 1 ZXY,
+/// 2 YXZ, 3 YZX, 4 XZY, 5 XYZ, each multiplied on the right); a position replaces the translation with
+/// (−x, −y, z). Whatever was not set stays.
+pub fn posed_world(world: Mat4, pose: &aerugo_sim::field::map_objects::ObjectPose) -> Mat4 {
+    let mut w = world;
+    if let Some((a, order)) = pose.rotation {
+        let (x, y, z) =
+            (Mat4::from_rotation_x(-a[0]), Mat4::from_rotation_y(-a[1]), Mat4::from_rotation_z(a[2]));
+        let r = match order {
+            0 => z * y * x,
+            1 => z * x * y,
+            2 => y * x * z,
+            3 => y * z * x,
+            4 => x * z * y,
+            5 => x * y * z,
+            _ => Mat4::IDENTITY,
+        };
+        let m = Mat4::from_scale(Vec3::splat(10.0)) * r;
+        w = Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, w.w_axis);
+    }
+    if let Some(p) = pose.position {
+        w.w_axis = glam::Vec4::new(-p[0], -p[1], p[2], 1.0);
+    }
+    w
 }
