@@ -191,12 +191,18 @@ pub fn segment_draws(
     for index in 0.. {
         let key = ProgramKey { cluster: cluster.clone(), pass: pass.to_owned(), shader, index };
         let Some(p) = programs.get(vfs, renderer, &key) else { break };
-        out.push(draw(&p, model, material, fseg, seg, values, anisotropy, viewport, missing));
+        let empty = programs.empty_texture(renderer);
+        out.push(draw(&p, model, material, fseg, seg, values, anisotropy, viewport, empty, missing));
         if !programs.has_pass(vfs, &cluster, pass, shader, index + 1) {
             break;
         }
     }
     out
+}
+
+/// The texture animation manager's parameters (AnimSampler, AnimSampler2 … AnimSampler6).
+fn animation_slot(name: &str) -> bool {
+    name.strip_prefix("AnimSampler").is_some_and(|n| matches!(n, "" | "2" | "3" | "4" | "5" | "6"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -209,6 +215,7 @@ fn draw(
     values: &Values<'_>,
     anisotropy: f32,
     viewport: [f32; 6],
+    empty: Option<aerugo_gfx::TextureHandle>,
     missing: &mut Vec<String>,
 ) -> GameDraw {
     let mut constants = Vec::new();
@@ -231,7 +238,12 @@ fn draw(
                         Some((t, None)) => {
                             missing.push(format!("texture {} ({} not loaded)", r.name, t.asset))
                         }
-                        None => missing.push(format!("texture {} in {}", r.name, model.path)),
+                        // An empty animation slot reads zeros (see `Programs::empty_texture`); other empty
+                        // parameters may be written at run time by code not traced yet, so their draws stay out.
+                        None => match empty.filter(|_| animation_slot(&r.name)) {
+                            Some(h) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
+                            None => missing.push(format!("texture {} in {}", r.name, model.path)),
+                        },
                     }
                 }
                 aerugo_formats::dxbc::ResourceKind::Sampler => {

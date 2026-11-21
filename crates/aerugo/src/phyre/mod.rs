@@ -64,6 +64,8 @@ pub struct Programs {
     shapes: HashMap<String, Vec<(String, Vec<usize>)>>,
     /// Problems met (logged once each).
     pub problems: Vec<String>,
+    /// What an empty animation slot samples (see [`Programs::empty_texture`]).
+    empty: Option<aerugo_gfx::TextureHandle>,
 }
 
 fn bindings(shader: &Shader, stage: Stage) -> Vec<(Stage, u32, BindingKind)> {
@@ -83,6 +85,31 @@ fn bindings(shader: &Shader, stage: Stage) -> Vec<(Stage, u32, BindingKind)> {
 }
 
 impl Programs {
+    /// The texture an empty animation slot samples: 8×8 RGBA, all zeros. The texture animation manager gives the
+    /// AnimSampler–AnimSampler6 parameters of animated materials the shadow manager's 8×8 dummy shadow map, which
+    /// is filled with zeros (colour 0, 0, 0, 0) before use; a parameter nothing sets binds a null view, which
+    /// reads zeros too.
+    pub fn empty_texture(&mut self, renderer: &mut Renderer) -> Option<aerugo_gfx::TextureHandle> {
+        if self.empty.is_none() {
+            let zeros = [0u8; 8 * 8 * 4];
+            let desc = aerugo_gfx::TextureDesc {
+                format: aerugo_gfx::TexFormat::Rgba8,
+                width: 8,
+                height: 8,
+                levels: 1,
+                layers: 1,
+                cube: false,
+                data: vec![&zeros],
+                name: "empty texture parameter",
+            };
+            match renderer.create_texture(&desc) {
+                Ok(h) => self.empty = Some(h),
+                Err(e) => log::warn!("empty texture: {e:#}"),
+            }
+        }
+        self.empty
+    }
+
     /// Each translated program's bytecode hashes (vertex, pixel).
     pub fn hashes(&self) -> HashMap<ProgramHandle, (u64, u64)> {
         self.map.values().flatten().map(|p| (p.handle, (p.vs_hash, p.ps_hash))).collect()
