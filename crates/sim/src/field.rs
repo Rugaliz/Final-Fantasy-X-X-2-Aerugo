@@ -173,12 +173,18 @@ impl Default for Actor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Movement {
-    from: [f32; 3],
-    to: [f32; 3],
-    frames: u32,
-    done: u32,
+/// Degrees as radians, with the original's steps (single-precision pi, the product and quotient in extended
+/// precision).
+fn radians(deg: f32) -> f32 {
+    (deg as f64 * 3.1415927410125732 / 180.0) as f32
+}
+
+/// A camera part following a script path: the path, the place along it and the step a tick.
+#[derive(Debug, Clone, PartialEq)]
+struct PathMove {
+    path: crate::follow_camera::Path,
+    t: f32,
+    step: f32,
 }
 
 /// Collision radius of a character whose model size is not known (the party leader's: 4).
@@ -566,19 +572,28 @@ pub struct CameraState {
     /// Distance from the eye to the screen plane in the original's 512 × 448 frame (sets the field of view);
     /// zero until a script sets it.
     pub screen_distance: f32,
-    destination: Option<[f32; 3]>,
-    move_frames: u32,
-    moving: Option<Movement>,
+    /// The eye's and the focus's fixed places (6002 / 6020) while nothing else places them.
+    eye_fixed: Option<[f32; 3]>,
+    focus_fixed: Option<[f32; 3]>,
+    /// Timed moves of the eye and the focus, the roll and the screen distance (whose targets follow).
+    eye_move: crate::camera_move::PartMove,
+    focus_move: crate::camera_move::PartMove,
+    roll_move: crate::camera_move::ValueMove,
+    distance_move: crate::camera_move::ValueMove,
+    roll_target: f32,
+    distance_target: f32,
     /// Ticks left of the move channels: 0–2 the eye's three values, 3 and 4 the roll and the screen distance, 5–7 the
     /// focus's three values. A move of n frames keeps its channels busy for n + 1 polls from the tick it is set.
     timers: [u32; 8],
     /// Eye channels (bits 0–4) the next eye move time applies to; all until a script picks, and only for one
     /// move.
     parts: Option<u8>,
-    /// Ticks left of the moves of the eye and the focus along a path.
-    path_timers: [u32; 2],
-    /// A timed move whose destination may still be set this tick.
-    pending: bool,
+    /// Points recorded for script paths (604b / 6049, up to 32 each): x, y, z and the roll.
+    focus_record: Vec<[f32; 4]>,
+    eye_record: Vec<[f32; 4]>,
+    /// Script paths the focus and the eye follow (6047 / 6046).
+    focus_path: Option<PathMove>,
+    eye_path: Option<PathMove>,
     /// The field camera following the player (when a script turns it on).
     pub follow: crate::follow_camera::FollowCamera,
 }
@@ -586,51 +601,268 @@ pub struct CameraState {
 impl CameraState {
     /// The eye's channels or its path move (what a camera wait waits for) are under way.
     pub fn is_moving(&self) -> bool {
-        self.timers[0..5].iter().any(|&t| t > 0) || self.path_timers[0] > 0
+        self.timers[0..5].iter().any(|&t| t > 0) || self.eye_path.is_some()
     }
 
     /// The focus's channels or its path move are under way.
     pub fn focus_moving(&self) -> bool {
-        self.timers[5..8].iter().any(|&t| t > 0) || self.path_timers[1] > 0
+        self.timers[5..8].iter().any(|&t| t > 0) || self.focus_path.is_some()
     }
 
-    /// Time the eye's channels (those the part mask leaves, all by default) over `frames` (0: stops them).
-    pub fn time_eye(&mut self, frames: u32) {
-        let parts = self.parts.take().unwrap_or(0x1F);
+    /// Time the eye's channels (`mask`: bits 0–2 its values, 3 the roll, 4 the screen distance) for a wait of
+    /// `frames` (0: stops them).
+    fn time_eye(&mut self, mask: u8, frames: u32) {
         for (bit, t) in self.timers[0..5].iter_mut().enumerate() {
-            if parts & (1 << bit) != 0 {
+            if mask & (1 << bit) != 0 {
                 *t = if frames == 0 { 0 } else { frames + 1 };
             }
         }
     }
 
-    /// Time the focus's channels over `frames`.
-    pub fn time_focus(&mut self, frames: u32) {
+    /// Time the focus's channels for a wait of `frames`.
+    fn time_focus(&mut self, frames: u32) {
         self.timers[5..8].fill(if frames == 0 { 0 } else { frames + 1 });
     }
 
-    fn update(&mut self) {
-        if std::mem::take(&mut self.pending) && self.destination.is_some() {
-            self.start_move();
+    /// The eye channels the next eye move applies to (6043 picks them for one move; all by default).
+    fn take_mask(&mut self) -> u8 {
+        self.parts.take().unwrap_or(0x1F)
+    }
+
+    /// The eye is placed by heading, pitch and distance around the focus.
+    fn eye_by_polar(&self) -> bool {
+        self.eye_path.is_none() && self.follow.polar.is_some()
+    }
+
+    /// Time a move of the eye (`eye`) or the focus over `frames` frames (mode 1: linear), by angles around the
+    /// other part or along x, y and z; its start is where the part is now.
+    fn time_linear(&mut self, eye: bool, by_angles: bool, frames: i16) {
+        if eye {
+            let mask = self.take_mask();
+            self.time_eye(mask, frames.max(0) as u32);
+            self.eye_move.set(by_angles, mask, 1, frames);
+            if mask & 8 != 0 {
+                self.roll_move.channel.set(1, frames);
+            }
+            if mask & 0x10 != 0 {
+                self.distance_move.channel.set(1, frames);
+            }
+            self.move_from_here(true, mask);
+        } else {
+            self.time_focus(frames.max(0) as u32);
+            self.focus_move.set(by_angles, 7, 1, frames);
+            self.move_from_here(false, 7);
         }
-        for t in self.timers.iter_mut().chain(&mut self.path_timers) {
-            *t = t.saturating_sub(1);
+    }
+
+    /// Time a speeding up / steady / slowing down move (frames for each, and the lead frames).
+    fn time_profile(&mut self, eye: bool, by_angles: bool, profile: [i16; 4]) {
+        let total = profile[0].wrapping_add(profile[1]).wrapping_add(profile[2]).max(0) as u32;
+        if eye {
+            let mask = self.take_mask();
+            self.time_eye(mask, total);
+            self.eye_move.set_profile(by_angles, mask, profile);
+            let [a, s, d, lead] = profile;
+            if mask & 8 != 0 {
+                self.roll_move.channel.set_profile(a, s, d, lead);
+            }
+            if mask & 0x10 != 0 {
+                self.distance_move.channel.set_profile(a, s, d, lead);
+            }
+            self.move_from_here(true, mask);
+        } else {
+            self.time_focus(total);
+            self.focus_move.set_profile(by_angles, 7, profile);
+            self.move_from_here(false, 7);
         }
-        if let Some(m) = &mut self.moving {
-            m.done += 1;
-            let t = (m.done as f32 / m.frames.max(1) as f32).min(1.0);
-            self.position = Some(std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t));
-            if m.done >= m.frames {
-                self.moving = None;
+    }
+
+    /// Take the start of the part's timed moves from where it is now (`mask`: the channels timed).
+    fn move_from_here(&mut self, eye: bool, mask: u8) {
+        let by_polar = eye && self.eye_by_polar();
+        let (at, anchor) = if eye { (self.position, self.focus) } else { (self.focus, self.position) };
+        let at = at.unwrap_or_default();
+        let anchor = anchor.unwrap_or(at);
+        let part = if eye { &mut self.eye_move } else { &mut self.focus_move };
+        part.start(mask, at, anchor, by_polar);
+        if eye {
+            if mask & 8 != 0 {
+                self.roll_move.from = self.roll_move.value;
+            }
+            if mask & 0x10 != 0 {
+                self.distance_move.from = self.distance_move.value;
             }
         }
     }
 
-    /// Start moving to the destination over the set number of frames.
-    fn start_move(&mut self) {
-        if let (Some(to), Some(from)) = (self.destination, self.position.or(self.destination)) {
-            self.moving = Some(Movement { from, to, frames: self.move_frames.max(1), done: 0 });
+    /// Stop the eye's (`eye`) or the focus's moves and keep it where it is (6016 / 6034).
+    fn stop_moves(&mut self, eye: bool) {
+        if eye {
+            self.eye_move.stop();
+            self.roll_move.channel.frames = 0;
+            self.distance_move.channel.frames = 0;
+            self.timers[0..5].fill(0);
+            if let Some(at) = self.position {
+                self.place_eye(at);
+            }
+            self.set_roll(self.roll_move.value);
+            self.set_screen_distance(self.distance_move.value);
+        } else {
+            self.focus_move.stop();
+            self.timers[5..8].fill(0);
+            if let Some(at) = self.focus {
+                self.place_focus(at);
+            }
         }
+    }
+
+    /// Fix the eye at a point (6002).
+    fn place_eye(&mut self, at: [f32; 3]) {
+        self.follow.clear_eye();
+        self.eye_path = None;
+        self.parts = None;
+        self.eye_fixed = Some(at);
+        self.position = Some(at);
+    }
+
+    /// Fix the focus at a point (6020).
+    fn place_focus(&mut self, at: [f32; 3]) {
+        self.follow.stop();
+        self.focus_path = None;
+        self.focus_fixed = Some(at);
+        self.focus = Some(at);
+    }
+
+    /// Place the eye at a heading, pitch and distance (radians) around the focus (6004 / 6005).
+    fn place_eye_polar(&mut self, polar: [f32; 3]) {
+        self.follow.clear_eye();
+        self.eye_path = None;
+        self.eye_fixed = None;
+        self.parts = None;
+        self.follow.polar = Some(polar);
+        self.eye_move.polar = polar;
+        if let Some(focus) = self.focus {
+            self.position = Some(crate::camera_move::polar_point(focus, polar));
+        }
+    }
+
+    /// Set the roll (radians); it takes effect at once unless its move runs.
+    fn set_roll(&mut self, roll: f32) {
+        self.roll_target = roll;
+        self.roll_move.value = roll;
+        if !self.roll_move.channel.active() {
+            self.roll = roll;
+        }
+    }
+
+    fn set_screen_distance(&mut self, d: f32) {
+        self.distance_target = d;
+        self.distance_move.value = d;
+        if !self.distance_move.channel.active() {
+            self.screen_distance = d;
+        }
+    }
+
+    fn update(&mut self) {
+        for t in &mut self.timers {
+            *t = t.saturating_sub(1);
+        }
+    }
+
+    /// One tick of the script camera after the follow camera's (`follow`: its focus and eye while it follows):
+    /// paths step, then each part's timed moves take it from where they started towards its target (the eye
+    /// around the focus's target), and the roll and the screen distance move.
+    fn process(&mut self, follow: Option<([f32; 3], Option<[f32; 3]>)>) {
+        let focus_t = match follow {
+            Some((f, _)) => Some(f),
+            None => self.path_tick(false).or(self.focus_fixed).or(self.focus),
+        };
+        let follow_eye = follow.and_then(|f| f.1);
+        let mut polar = None;
+        let eye_t = match self.path_tick(true) {
+            Some(p) => Some(p),
+            None => match (self.follow.polar, focus_t) {
+                (Some(p), Some(f)) if self.eye_path.is_none() => {
+                    polar = Some(p);
+                    Some(crate::camera_move::polar_point(f, p))
+                }
+                _ => self.eye_fixed.or(self.position),
+            },
+        };
+        match follow {
+            Some((f, _)) => self.focus = Some(f),
+            None => {
+                if let Some(t) = focus_t {
+                    self.focus = Some(self.focus_move.apply(t, eye_t.unwrap_or(t), None));
+                }
+            }
+        }
+        if let Some(e) = follow_eye {
+            self.position = Some(e);
+        } else if let Some(t) = eye_t {
+            self.position = Some(self.eye_move.apply(t, focus_t.unwrap_or(t), polar));
+        }
+        self.roll = self.roll_move.apply(self.roll_target, true);
+        self.screen_distance = self.distance_move.apply(self.distance_target, false);
+    }
+
+    /// Record the focus's or the eye's place and the roll as the next point of a script path (at most 32).
+    fn record(&mut self, eye: bool) {
+        let at = if eye { self.position } else { self.focus };
+        let roll = crate::camera_move::angle_near(0.0, self.roll_move.value);
+        let list = if eye { &mut self.eye_record } else { &mut self.focus_record };
+        if let Some([x, y, z]) = at.filter(|_| list.len() < 32) {
+            list.push([x, y, z, roll]);
+        }
+    }
+
+    /// Follow a path from `start` by `step` a tick (6046 the eye, 6047 the focus): the first point is taken at
+    /// once.
+    fn start_path(&mut self, eye: bool, path: crate::follow_camera::Path, start: f32, step: f32) {
+        let m = Some(PathMove { path, t: start, step });
+        if eye {
+            self.follow.clear_eye();
+            self.eye_fixed = None;
+            self.parts = None;
+            self.eye_path = m;
+        } else {
+            self.follow.stop();
+            self.focus_fixed = None;
+            self.focus_path = m;
+        }
+        if let Some(at) = self.path_tick(eye) {
+            if eye {
+                self.position = Some(at);
+            } else {
+                self.focus = Some(at);
+            }
+        }
+    }
+
+    /// One tick along a script path: the point at the place (clamped to 0..1), with its roll set; the place
+    /// moves on by the step, and the path ends (the part fixed at its point) once the place was clamped or the
+    /// step is zero.
+    fn path_tick(&mut self, eye: bool) -> Option<[f32; 3]> {
+        let slot = if eye { &mut self.eye_path } else { &mut self.focus_path };
+        let m = slot.as_mut()?;
+        let clamped = !(0.0..=1.0).contains(&m.t);
+        m.t = m.t.clamp(0.0, 1.0);
+        let at = m.path.eval(m.t);
+        m.t += m.step;
+        let end = clamped || m.step == 0.0;
+        if end {
+            *slot = None;
+        }
+        let [x, y, z, roll] = at?;
+        self.set_roll(roll);
+        if end {
+            if eye {
+                self.eye_fixed = Some([x, y, z]);
+            } else {
+                self.focus_fixed = Some([x, y, z]);
+            }
+        }
+        Some([x, y, z])
     }
 }
 
@@ -1061,14 +1293,8 @@ impl FieldState {
         }
         self.camera.update();
         let actors = &self.actors;
-        if let Some((focus, eye)) = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos)) {
-            self.camera.focus = Some(focus);
-            if eye.is_some() {
-                self.camera.position = eye;
-            }
-        } else if let Some(eye) = self.camera.focus.and_then(|f| self.camera.follow.polar_eye(f)) {
-            self.camera.position = Some(eye);
-        }
+        let follow = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos));
+        self.camera.process(follow);
         for w in &mut self.windows {
             w.closing = w.closing.saturating_sub(1);
             w.choice_live = w.choice_live.saturating_sub(1);
@@ -3470,53 +3696,54 @@ fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
     Value::Int(1)
 }
 
-/// A move time with speeding up, steady and slowing down frame counts (then a fourth value): the channels
-/// run for the three together. `eye`: the eye's channels (else the focus's).
-fn camera_move_time(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> Value {
-    let _d = c.stack.pop_int();
-    let frames = (0..3).map(|_| c.stack.pop_int() as i16).fold(0i16, |a, b| a.wrapping_add(b));
-    let frames = frames.max(0) as u32;
-    let cam = &mut g.camera;
-    if eye {
-        let parts = cam.parts.unwrap_or(0x1F);
-        cam.time_eye(frames);
-        if parts & 7 != 0 {
-            cam.move_frames = frames.max(1);
-            cam.moving = None;
-            cam.pending = true;
-        }
-    } else {
-        cam.time_focus(frames);
-    }
+/// Speeding up, steady and slowing down frame counts, then the lead frames (see `Channel`): a move of the eye
+/// (`eye`) or the focus, by angles around the other part (`by_angles`) or along x, y and z.
+fn camera_move_time(g: &mut FieldState, c: &mut NativeCall, eye: bool, by_angles: bool) -> Value {
+    let lead = c.stack.pop_int() as i16;
+    let decel = c.stack.pop_int() as i16;
+    let steady = c.stack.pop_int() as i16;
+    let accel = c.stack.pop_int() as i16;
+    g.camera.time_profile(eye, by_angles, [accel, steady, decel, lead]);
     Value::Int(0)
 }
 
-/// A linear move time in frames for the eye or the focus (the same channels as above).
-fn camera_move_frames(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> u32 {
-    let frames = (c.stack.pop_int() as i16).max(0) as u32;
-    if eye {
-        g.camera.time_eye(frames)
-    } else {
-        g.camera.time_focus(frames)
-    }
+/// A linear move over a number of frames.
+fn camera_move_frames(g: &mut FieldState, c: &mut NativeCall, eye: bool, by_angles: bool) -> i16 {
+    let frames = c.stack.pop_int() as i16;
+    g.camera.time_linear(eye, by_angles, frames);
     frames
 }
 
-fn path_move(g: &mut FieldState, c: &mut NativeCall, which: usize) -> Value {
-    let _mode = c.stack.pop_int();
+/// 6046 (eye) / 6047 (focus): (path, start, step, mode). Path 0 / 1 is the points recorded for the focus / the
+/// eye (at least three, else nothing happens), any other value a script table; mode & 3 == 3 a cubic spline,
+/// else a quadratic one. (Mode bit 2, which adds the path's direction to the point, is not ported.)
+fn path_move(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> Value {
+    let mode = c.stack.pop_int();
     let step = c.stack.pop_float();
     let start = c.stack.pop_float();
-    let _path = c.stack.pop_int();
-    let mut ticks = 0u32;
-    if step > 0.0 {
-        let mut t = start;
-        while t < 1.0 && ticks < 100_000 {
-            t += step;
-            ticks += 1;
+    let path = c.stack.pop_int();
+    let cubic = mode & 3 == 3;
+    let path = match path {
+        0 | 1 => {
+            let rec = if path == 0 { &g.camera.focus_record } else { &g.camera.eye_record };
+            (rec.len() >= 3).then(|| crate::follow_camera::Path::from_points(rec, cubic))
         }
+        var => camera_table(g, c, var as u32).and_then(|t| crate::follow_camera::Path::read(t, cubic)),
+    };
+    if let Some(p) = path {
+        g.camera.start_path(eye, p, start, step);
     }
-    g.camera.path_timers[which] = ticks;
     Value::Int(0)
+}
+
+/// A script table a camera native names by variable (data areas 2–4 of the calling worker).
+fn camera_table<'a>(g: &FieldState, c: &'a NativeCall, var: u32) -> Option<&'a [u8]> {
+    let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+    let area = ((var >> 25) & 7) as usize;
+    if !(2..=4).contains(&area) {
+        return None;
+    }
+    c.memory.script.get(areas[area - 2] as usize + (var & 0xFF_FFFF) as usize..)
 }
 
 /// Natives of the field slice: actors, movement, turning, messages, camera, worker queries.
@@ -4270,16 +4497,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x6002,
         Native::result(|g, c| {
             let to = pop3(c);
-            let cam = &mut g.camera;
-            cam.follow.clear_eye();
-            // While the eye's channels are timed, it travels there over the frames left; else it is placed.
-            cam.moving = match (cam.position, cam.timers[0]) {
-                (Some(from), left) if left > 1 => Some(Movement { from, to, frames: left - 1, done: 0 }),
-                _ => {
-                    cam.position = Some(to);
-                    None
-                }
-            };
+            g.camera.place_eye(to);
             Value::Int(0)
         }),
     );
@@ -4290,8 +4508,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x6004,
         Native::result(|g, c| {
             let [yaw, pitch, dist] = pop3(c);
-            g.camera.follow.clear_eye();
-            g.camera.follow.polar = Some([yaw.to_radians(), pitch.to_radians(), dist]);
+            g.camera.place_eye_polar([radians(yaw), radians(pitch), dist]);
             Value::Int(0)
         }),
     );
@@ -4305,8 +4522,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                 Some(crate::follow_camera::to_polar(focus, eye))
             });
             if let Some([y, p, d]) = now {
-                cam.follow.clear_eye();
-                cam.follow.polar = Some([y + yaw.to_radians(), p + pitch.to_radians(), d + dist]);
+                cam.place_eye_polar([y + radians(yaw), p + radians(pitch), d + dist]);
             }
             Value::Int(0)
         }),
@@ -4314,9 +4530,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6010,
         Native::result(|g, c| {
-            let frames = camera_move_frames(g, c, true).max(1);
-            g.camera.move_frames = frames;
-            g.camera.start_move();
+            let frames = camera_move_frames(g, c, true, false).max(1) as u32;
             // The following camera's eye moves there from where it is over the frames.
             if let Some(from) = g.camera.position {
                 g.camera.follow.eye_move = Some((from, frames, 0));
@@ -4327,7 +4541,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x602E,
         Native::result(|g, c| {
-            let frames = camera_move_frames(g, c, false).max(1);
+            let frames = camera_move_frames(g, c, false, false).max(1) as u32;
             if let Some(from) = g.camera.focus {
                 g.camera.follow.focus_move = Some((from, frames, 0));
             }
@@ -4336,31 +4550,57 @@ pub fn register(n: &mut Natives<FieldState>) {
     );
     // Speeding up, steady and slowing down frame counts, then a fourth value: 0x6014 the eye, 0x6032 the focus;
     // 0x6015 / 0x6033 the same moving by angles and distance around the other.
-    for id in [0x6014u16, 0x6015] {
-        n.register(id, Native::result(|g, c| camera_move_time(g, c, true)));
-    }
-    for id in [0x6032u16, 0x6033] {
-        n.register(id, Native::result(|g, c| camera_move_time(g, c, false)));
-    }
+    n.register(0x6014, Native::result(|g, c| camera_move_time(g, c, true, false)));
+    n.register(0x6015, Native::result(|g, c| camera_move_time(g, c, true, true)));
+    n.register(0x6032, Native::result(|g, c| camera_move_time(g, c, false, false)));
+    n.register(0x6033, Native::result(|g, c| camera_move_time(g, c, false, true)));
     // Linear move times: 0x6011 the eye around the focus, 0x602F the focus around the eye.
     n.register(
         0x6011,
         Native::result(|g, c| {
-            camera_move_frames(g, c, true);
+            camera_move_frames(g, c, true, true);
             Value::Int(0)
         }),
     );
     n.register(
         0x602F,
         Native::result(|g, c| {
-            camera_move_frames(g, c, false);
+            camera_move_frames(g, c, false, true);
             Value::Int(0)
         }),
     );
-    // Eye and focus along a path: (path, start, step per tick, mode); the position on the path goes from the
-    // start to 1 by the step each tick.
-    n.register(0x6046, Native::result(|g, c| path_move(g, c, 0)));
-    n.register(0x6047, Native::result(|g, c| path_move(g, c, 1)));
+    // Eye and focus along a path: (path, start, step per tick, mode).
+    n.register(0x6046, Native::result(|g, c| path_move(g, c, true)));
+    n.register(0x6047, Native::result(|g, c| path_move(g, c, false)));
+    // Points for those paths: 604a / 6048 clear the focus's / the eye's, 604b / 6049 add where it is now.
+    n.register(
+        0x604A,
+        Native::result(|g, _| {
+            g.camera.focus_record.clear();
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6048,
+        Native::result(|g, _| {
+            g.camera.eye_record.clear();
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x604B,
+        Native::result(|g, _| {
+            g.camera.record(false);
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x6049,
+        Native::result(|g, _| {
+            g.camera.record(true);
+            Value::Int(0)
+        }),
+    );
     register_triggers(n);
     register_control(n);
     register_workers(n);
@@ -4405,15 +4645,14 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6016,
         Native::result(|g, _| {
-            g.camera.moving = None;
-            g.camera.timers[0..5].fill(0);
+            g.camera.stop_moves(true);
             Value::Int(0)
         }),
     );
     n.register(
         0x6034,
         Native::result(|g, _| {
-            g.camera.timers[5..8].fill(0);
+            g.camera.stop_moves(false);
             Value::Int(0)
         }),
     );
@@ -4424,7 +4663,8 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x603B,
         Native::result(|g, c| {
-            g.camera.screen_distance = c.stack.pop_float();
+            let d = c.stack.pop_float();
+            g.camera.set_screen_distance(d);
             Value::Int(0)
         }),
     );
@@ -4521,21 +4761,13 @@ pub fn register(n: &mut Natives<FieldState>) {
     );
     // Rails: the focus held near a path (605A: table, share kept, 3 for the cubic path) and the eye on a path at
     // the focus's place along it (605B: table, 3 for cubic).
-    fn table<'a>(g: &FieldState, c: &'a NativeCall, var: u32) -> Option<&'a [u8]> {
-        let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
-        let area = ((var >> 25) & 7) as usize;
-        if !(2..=4).contains(&area) {
-            return None;
-        }
-        c.memory.script.get(areas[area - 2] as usize + (var & 0xFF_FFFF) as usize..)
-    }
     n.register(
         0x605A,
         Native::result(|g, c| {
             let mode = c.stack.pop_int();
             let k = c.stack.pop_float();
             let var = c.stack.pop_int() as u32;
-            let rail = table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3));
+            let rail = camera_table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3));
             if let Some(r) = rail {
                 g.camera.follow.rail = Some((r, k));
             }
@@ -4547,7 +4779,9 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let mode = c.stack.pop_int();
             let var = c.stack.pop_int() as u32;
-            if let Some(r) = table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3)) {
+            if let Some(r) =
+                camera_table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3))
+            {
                 g.camera.follow.clear_eye();
                 g.camera.follow.eye_rail = Some(r);
             }
@@ -4557,15 +4791,16 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x6020,
         Native::result(|g, c| {
-            g.camera.follow.stop();
-            g.camera.focus = Some(pop3(c));
+            let at = pop3(c);
+            g.camera.place_focus(at);
             Value::Int(0)
         }),
     );
     n.register(
         0x603A,
         Native::result(|g, c| {
-            g.camera.roll = c.stack.pop_float();
+            let roll = radians(c.stack.pop_float());
+            g.camera.set_roll(roll);
             Value::Int(0)
         }),
     );
@@ -4573,6 +4808,43 @@ pub fn register(n: &mut Natives<FieldState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorded_points_make_a_path_the_camera_follows_to_its_end() {
+        use super::CameraState;
+        let mut cam = CameraState::default();
+        for x in [0.0, 0.0, 10.0, 10.0] {
+            cam.place_focus([x, 1.0, 2.0]);
+            cam.place_eye_polar([0.0, 0.0, 5.0]);
+            cam.record(false);
+            cam.record(true);
+        }
+        assert_eq!(cam.focus_record.len(), 4);
+        // The eye is recorded around the focus at its angles.
+        assert!((cam.eye_record[3][0] - 15.0).abs() < 1e-5);
+        let focus = crate::follow_camera::Path::from_points(&cam.focus_record, true);
+        let eye = crate::follow_camera::Path::from_points(&cam.eye_record, true);
+        cam.start_path(false, focus, 0.0, 0.25);
+        cam.start_path(true, eye, 0.0, 0.25);
+        assert_eq!(cam.follow.polar, None);
+        assert!(cam.focus_moving() && cam.is_moving());
+        assert!((cam.focus.unwrap()[0] - 5.0 / 3.0).abs() < 1e-5);
+        // Places 0.25, 0.5, 0.75, 1.0 (still moving), then 1.25 clamps: the move ends at the last point.
+        let mut ticks = 0;
+        while cam.is_moving() {
+            cam.update();
+            cam.process(None);
+            ticks += 1;
+        }
+        assert_eq!(ticks, 5);
+        assert!(!cam.focus_moving());
+        assert!((cam.focus.unwrap()[0] - 50.0 / 6.0).abs() < 1e-4);
+        assert!((cam.position.unwrap()[0] - 50.0 / 6.0 - 5.0).abs() < 1e-4);
+        // A step of zero places the camera and ends at once.
+        let p = crate::follow_camera::Path::from_points(&cam.focus_record, false);
+        cam.start_path(false, p, 0.5, 0.0);
+        assert!(!cam.focus_moving());
+    }
+
     #[test]
     fn a_walk_steps_a_twentieth_of_its_speed_and_ends_with_half_the_rest() {
         let (mut pos, to) = ([0.0, 0.0, 0.0], [10.0, 5.0, 0.0]);

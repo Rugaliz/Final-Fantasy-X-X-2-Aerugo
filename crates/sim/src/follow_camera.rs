@@ -131,11 +131,39 @@ impl EyePath {
     }
 }
 
-/// A path of points the camera runs along: a quadratic B-spline, or a cubic one.
+/// The segment of `segs` that `t` (0..1) falls in and the place within it, with the original's arithmetic (its
+/// x87 intermediates kept as f64): a segment is 1 / segs long, the place is moved into 0..1 by whole segments, and
+/// the end of the last segment is its place 1.
+fn segment(t: f32, segs: usize) -> (usize, f32) {
+    let n = segs as f32;
+    let len = 1.0 / n;
+    let mut seg = (t as f64 / len as f64) as i64;
+    let mut u = ((t as f64 - (seg as f32) as f64 * len as f64) * n as f64) as f32;
+    while u < 0.0 {
+        u += 1.0;
+        seg -= 1;
+    }
+    while u > 1.0 {
+        u -= 1.0;
+        seg += 1;
+    }
+    if seg < 0 {
+        (seg, u) = (0, 0.0);
+    }
+    if seg >= segs as i64 {
+        (seg, u) = (segs as i64 - 1, 1.0);
+    }
+    (seg as usize, u)
+}
+
+/// A path of points the camera runs along: a quadratic B-spline, or a cubic one. Each point's fourth value is a
+/// roll (radians), which a camera following the path takes on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Path {
     pub points: Vec<[f32; 3]>,
     pub cubic: bool,
+    /// The points' rolls (empty: none).
+    pub rolls: Vec<f32>,
 }
 
 impl Path {
@@ -146,39 +174,81 @@ impl Path {
         let points = (0..n.min(256))
             .map(|i| Some([f(0x10 + i * 16)?, f(0x14 + i * 16)?, f(0x18 + i * 16)?]))
             .collect::<Option<Vec<_>>>()?;
-        (!points.is_empty()).then_some(Path { points, cubic })
+        let rolls = (0..points.len()).map(|i| f(0x1C + i * 16).unwrap_or(0.0)).collect();
+        (!points.is_empty()).then_some(Path { points, cubic, rolls })
+    }
+
+    /// A path through recorded points (x, y, z, roll).
+    pub fn from_points(points: &[[f32; 4]], cubic: bool) -> Path {
+        Path {
+            points: points.iter().map(|p| [p[0], p[1], p[2]]).collect(),
+            cubic,
+            rolls: points.iter().map(|p| p[3]).collect(),
+        }
+    }
+
+    /// The point and its roll at `t` as the original's spline evaluation gives them, or None where it leaves its
+    /// output as it was (fewer than two points, or two points with `t` at either end). Two points give
+    /// (1 - t)·a + t + b: the original adds `t` instead of scaling the second point by it.
+    pub fn eval(&self, t: f32) -> Option<[f32; 4]> {
+        let n = self.points.len();
+        let t = t.clamp(0.0, 1.0);
+        let p = |i: usize| {
+            let q = self.points[i];
+            [q[0], q[1], q[2], self.rolls.get(i).copied().unwrap_or(0.0)]
+        };
+        match n {
+            0 | 1 => None,
+            2 => {
+                if t == 0.0 || t == 1.0 {
+                    return None;
+                }
+                let (a, b, v) = (p(0), p(1), (1.0 - t) as f64);
+                Some(std::array::from_fn(|k| (v * a[k] as f64 + t as f64 + b[k] as f64) as f32))
+            }
+            _ => {
+                let (seg, w) = self.weights(t);
+                let mut out = [0.0f32; 4];
+                for (i, w) in w.iter().enumerate() {
+                    let q = p(seg + i);
+                    for k in 0..4 {
+                        out[k] += q[k] * w;
+                    }
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// For three points or more: the first point of the segment `t` falls in and the weights of the points from
+    /// there (quadratic B-spline over n - 2 segments, or cubic over n - 3).
+    fn weights(&self, t: f32) -> (usize, Vec<f32>) {
+        let n = self.points.len();
+        let cubic = self.cubic && n > 3;
+        let (seg, u) = segment(t, if cubic { n - 3 } else { n - 2 });
+        let v = 1.0 - u;
+        let w = if cubic {
+            let u2 = u * u;
+            let h = u2 * (u / 2.0);
+            vec![v * v * v / 6.0, (h - u2) + 0.6666667, u2 / 2.0 - h + u / 2.0 + 0.16666667, h / 3.0]
+        } else {
+            vec![v * v * 0.5, u * v + 0.5, u * u * 0.5]
+        };
+        (seg, w)
     }
 
     /// The point at `t` (0..1 along the whole path).
     pub fn at(&self, t: f32) -> [f32; 3] {
         let p = &self.points;
-        let n = p.len();
         let t = t.clamp(0.0, 1.0);
-        if n == 1 {
-            return p[0];
+        match p.len() {
+            1 => p[0],
+            2 => std::array::from_fn(|k| (1.0 - t) * p[0][k] + t * p[1][k]),
+            _ => {
+                let (seg, w) = self.weights(t);
+                std::array::from_fn(|k| w.iter().enumerate().map(|(i, w)| w * p[seg + i][k]).sum())
+            }
         }
-        if n == 2 {
-            return std::array::from_fn(|k| (1.0 - t) * p[0][k] + t * p[1][k]);
-        }
-        let (order, segs) = if self.cubic && n > 3 { (4, n - 3) } else { (3, n - 2) };
-        let x = t * segs as f32;
-        let (seg, u) =
-            if x as usize >= segs { (segs - 1, 1.0) } else { (x as usize, x - (x as usize) as f32) };
-        let w: Vec<f32> = if order == 4 {
-            let v = 1.0 - u;
-            let u2 = u * u;
-            let u3 = u2 * u;
-            vec![
-                v * v * v / 6.0,
-                u3 / 2.0 - u2 + 2.0 / 3.0,
-                u2 / 2.0 - u3 / 2.0 + u / 2.0 + 1.0 / 6.0,
-                u3 / 6.0,
-            ]
-        } else {
-            let v = 1.0 - u;
-            vec![v * v * 0.5, u * v + 0.5, u * u * 0.5]
-        };
-        std::array::from_fn(|k| w.iter().enumerate().map(|(i, w)| w * p[seg + i][k]).sum())
     }
 
     /// The nearest point of the path to `q`, and where along the path it is: a coarse search over ten steps per
@@ -209,22 +279,7 @@ impl Path {
     }
 }
 
-/// The point at a heading, pitch and distance (radians, radians, units) from `from`.
-pub fn polar_point(from: [f32; 3], [yaw, pitch, dist]: [f32; 3]) -> [f32; 3] {
-    [
-        from[0] + dist * pitch.cos() * yaw.cos(),
-        from[1] + dist * pitch.sin(),
-        from[2] + dist * pitch.cos() * yaw.sin(),
-    ]
-}
-
-/// The heading, pitch and distance of `to` from `from` (the inverse of [`polar_point`]).
-pub fn to_polar(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
-    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let pitch = if dist > 0.0 { (d[1] / dist).clamp(-1.0, 1.0).asin() } else { 0.0 };
-    [d[2].atan2(d[0]), pitch, dist]
-}
+pub use crate::camera_move::{polar_point, to_polar};
 
 /// A move in progress blends from its start to the new place, a share of count / frames a tick.
 fn blend(m: &mut Option<([f32; 3], u32, u32)>, to: [f32; 3]) -> [f32; 3] {
@@ -331,12 +386,6 @@ impl FollowCamera {
         Some((focus, eye))
     }
 
-    /// The polar eye around a focus the scripts placed (while not following), moving there when a move is timed.
-    pub fn polar_eye(&mut self, focus: [f32; 3]) -> Option<[f32; 3]> {
-        let to = polar_point(focus, self.polar?);
-        Some(blend(&mut self.eye_move, to))
-    }
-
     /// Drop every way the eye was placed (before a script sets a new one).
     pub fn clear_eye(&mut self) {
         self.orbit = None;
@@ -357,8 +406,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_spline_blends_rolls_like_points_and_two_points_keep_the_original_sum() {
+        let pts = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0]];
+        let p = Path::from_points(&pts, true);
+        let start = p.eval(0.0).unwrap();
+        assert!((start[0] - 5.0 / 3.0).abs() < 1e-6 && (start[3] - 1.0 / 6.0).abs() < 1e-6);
+        let mid = p.eval(0.5).unwrap();
+        assert_eq!([mid[0], mid[1], mid[2]], p.at(0.5));
+        assert!((mid[3] - mid[0] / 10.0).abs() < 1e-6);
+        assert_eq!(p.eval(1.0).map(|v| v[0]), Some(p.at(1.0)[0]));
+        // Two points: (1 - t)·a + t + b between the ends, nothing at them.
+        let two = Path::from_points(&[[2.0, 0.0, 0.0, 0.0], [4.0, 1.0, 0.0, 0.5]], false);
+        assert_eq!(two.eval(0.0), None);
+        assert_eq!(two.eval(1.0), None);
+        assert_eq!(two.eval(0.25), Some([0.75 * 2.0 + 0.25 + 4.0, 0.25 + 1.0, 0.25, 0.25 + 0.5]));
+        assert_eq!(Path::from_points(&[[1.0, 2.0, 3.0, 0.0]], false).eval(0.5), None);
+    }
+
+    #[test]
+    fn segments_split_the_path_evenly_and_end_at_one() {
+        assert_eq!(segment(0.0, 3), (0, 0.0));
+        // A third is not exact in floats: t = 1 lands just short of the last segment's end.
+        assert_eq!(segment(1.0, 3), (2, 0.99999994));
+        assert_eq!(segment(1.0, 2), (1, 1.0));
+        let (seg, u) = segment(0.5, 2);
+        assert_eq!(seg, 1);
+        assert!(u.abs() < 1e-6);
+        let (seg, u) = segment(0.6, 4);
+        assert_eq!(seg, 2);
+        assert!((u - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
     fn paths_pass_near_their_points_and_find_the_nearest() {
-        let p = Path { points: vec![[0.0; 3], [0.0; 3], [10.0, 0.0, 0.0], [10.0, 0.0, 0.0]], cubic: false };
+        let p = Path {
+            points: vec![[0.0; 3], [0.0; 3], [10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            cubic: false,
+            rolls: vec![],
+        };
         assert_eq!(p.at(0.0), [0.0; 3]);
         assert_eq!(p.at(1.0), [10.0, 0.0, 0.0]);
         let (on, t) = p.nearest([5.0, 0.0, 3.0]);
