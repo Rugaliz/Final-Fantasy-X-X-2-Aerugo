@@ -1764,13 +1764,28 @@ fn reveal_parts(tokens: &[text::Token]) -> Vec<RevealPart> {
     parts
 }
 
-/// The map the event most likely uses: area from the first four letters, map from the first six
-/// (`bjyt0000` → `bjyt/bjyt00`).
-pub fn map_paths(vfs: &Vfs, game: Game, event: &str) -> (Option<String>, Option<String>) {
-    if event.len() < 6 || !event.is_ascii() {
-        return (None, None);
-    }
-    let (area, id) = (&event[..4], &event[..6]);
+/// An event's map number: the script header's word at +4 is the offset (from the script base, header word +4
+/// of the file) of a table whose first i16 is the map the event loads.
+pub fn event_map_number(script: &[u8]) -> Option<u16> {
+    let u32_at =
+        |o: usize| script.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let base = u32_at(4)?;
+    let table = u32_at(base + 4)?;
+    let m = script.get(base + table..base + table + 2).map(|b| i16::from_le_bytes([b[0], b[1]]))?;
+    u16::try_from(m).ok()
+}
+
+/// The HD map of FFX map number `m`: the engine reads files 2m (textures) and 2m + 1 (the map package) of set
+/// 0x13, whose folder (`map/<area>/<id>/`) names the map.
+pub fn map_paths_by_number(vfs: &Vfs, table: &FileTable, m: u16) -> (Option<String>, Option<String>) {
+    let Some(pkg) = table.path(0x13, usize::from(m) * 2 + 1) else { return (None, None) };
+    let Some(rest) = pkg.split("/map/").nth(1) else { return (None, None) };
+    let mut parts = rest.split('/');
+    let (Some(area), Some(id)) = (parts.next(), parts.next()) else { return (None, None) };
+    map_folder_paths(vfs, Game::Ffx, area, id)
+}
+
+fn map_folder_paths(vfs: &Vfs, game: Game, area: &str, id: &str) -> (Option<String>, Option<String>) {
     let root = match game {
         Game::Ffx => "ffx_data",
         Game::Ffx2 => "ffx-2_data",
@@ -1779,6 +1794,15 @@ pub fn map_paths(vfs: &Vfs, game: Game, event: &str) -> (Option<String>, Option<
     let layers = format!("{root}/gamedata/ps3data/map/{area}/{id}/2d/mdl/d3d11/{id}.dae.phyre");
     let exists = |p: String| vfs.size(&p).is_some().then_some(p);
     (exists(model), exists(layers))
+}
+
+/// FFX-2's maps by the event name (its file table is not read yet): area from the first four letters, map from
+/// the first six (`bjyt0000` → `bjyt/bjyt00`).
+pub fn map_paths(vfs: &Vfs, game: Game, event: &str) -> (Option<String>, Option<String>) {
+    if event.len() < 6 || !event.is_ascii() {
+        return (None, None);
+    }
+    map_folder_paths(vfs, game, &event[..4], &event[..6])
 }
 
 impl Event {
@@ -1814,7 +1838,12 @@ impl Event {
         {
             state.messages = decode_event_text(&bytes, &cs);
         }
-        let (map_model, map_layers) = map_paths(vfs, game, &name);
+        // FFX events load the map their header names; FFX-2 still goes by the event name.
+        let by_number = (game == Game::Ffx)
+            .then(|| FileTable::load(vfs).zip(event_map_number(&data)))
+            .flatten()
+            .map(|(table, m)| map_paths_by_number(vfs, &table, m));
+        let (map_model, map_layers) = by_number.unwrap_or_else(|| map_paths(vfs, game, &name));
         state.texture_animations =
             map_model.as_deref().and_then(|m| texture_animation::TextureAnimations::load(vfs, m));
         if game == Game::Ffx {
@@ -4845,6 +4874,38 @@ mod tests {
 
     /// The engine's file table names event scripts by number, and the character lists say whose resident motion
     /// files it reads.
+    #[test]
+    fn map_number_from_header() {
+        // Script base 0x10; its +4 points 0x20 further on, where the map number sits.
+        let mut d = vec![0u8; 0x40];
+        d[4..8].copy_from_slice(&0x10u32.to_le_bytes());
+        d[0x14..0x18].copy_from_slice(&0x20u32.to_le_bytes());
+        d[0x30..0x32].copy_from_slice(&16i16.to_le_bytes());
+        assert_eq!(event_map_number(&d), Some(16));
+        assert_eq!(event_map_number(&d[..0x20]), None);
+    }
+
+    /// Events load the map their header names: the attract demo and the opening share znkd06.
+    #[test]
+    fn events_find_their_maps() {
+        let Some(inst) = aerugo_vfs::install_from_env() else { return };
+        let mut vfs = Vfs::new();
+        if vfs.mount_install(&inst).is_err() {
+            return;
+        }
+        let table = FileTable::load(&vfs).expect("file table");
+        for (event, map) in [
+            ("lo/loopdemo/loopdemo", "znkd06"),
+            ("zn/znkd0600/znkd0600", "znkd06"),
+            ("bj/bjyt0400/bjyt0400", "bjyt04"),
+        ] {
+            let data = vfs.read(&format!("ffx_ps2/ffx/master/jppc/event/obj/{event}.ebp")).unwrap();
+            let m = event_map_number(&data).expect("map number");
+            let (model, _) = map_paths_by_number(&vfs, &table, m);
+            assert!(model.is_some_and(|p| p.ends_with(&format!("/{map}.dae.phyre"))), "{event}");
+        }
+    }
+
     #[test]
     fn file_table_and_character_lists() {
         let Some(inst) = aerugo_vfs::install_from_env() else {
