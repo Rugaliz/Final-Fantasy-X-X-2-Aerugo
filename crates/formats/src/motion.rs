@@ -61,6 +61,18 @@ pub struct Motion {
     pub rate: u16,
     /// `joints × 9` channels.
     pub channels: Vec<Channel>,
+    /// What happens at given frames (sounds, face patterns, …).
+    pub events: Vec<MotionEvent>,
+}
+
+/// A motion event: it fires once the motion's frame reaches `start` (unless the frame was already at `end` or
+/// later). Kinds: 1 sound, 2 the character's callback, 3 face pattern (`id`: kind << 8 | value), 5 effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionEvent {
+    pub kind: u8,
+    pub start: i16,
+    pub end: i16,
+    pub id: u16,
 }
 
 /// A joint's pose at one frame.
@@ -114,6 +126,7 @@ impl Motion {
         let frames = u16_at(d, at)?;
         let joints = u16_at(d, at + 2)?;
         let rate = u16_at(d, at + 4)?;
+        let event_count = i16_at(d, at + 6)?.max(0) as usize;
         let bits_at = at + u32_at(d, at + 8)? as usize;
         let mut values = at + u32_at(d, at + 12)? as usize;
         if joints == 0 || joints > 1024 || frames > 30_000 {
@@ -144,7 +157,23 @@ impl Motion {
                 }
             });
         }
-        Ok(Motion { frames, joints, rate, channels })
+        // Events: {kind, extra words, start, end, id} and the extra words.
+        let mut events = Vec::with_capacity(event_count.min(256));
+        if event_count > 0 {
+            let mut e = at + u32_at(d, at + 0x10)? as usize;
+            for _ in 0..event_count.min(256) {
+                let kind = *d.get(e).ok_or(MotionError::Truncated("event"))?;
+                let words = *d.get(e + 1).ok_or(MotionError::Truncated("event"))? as i8;
+                events.push(MotionEvent {
+                    kind,
+                    start: i16_at(d, e + 2)?,
+                    end: i16_at(d, e + 4)?,
+                    id: u16_at(d, e + 6)?,
+                });
+                e = e.wrapping_add_signed(isize::from(words) * 4 + 8);
+            }
+        }
+        Ok(Motion { frames, joints, rate, channels, events })
     }
 
     /// Pose of a joint at an integer frame.
@@ -248,16 +277,22 @@ pub struct MotionGroup {
     pub chr_id: u16,
     /// (motion number, sequence offset) pairs.
     pub entries: Vec<(u16, u32)>,
+    /// Each entry's jump table (offset in `data`: i16 offsets from the entry's sequence).
+    pub entry_jumps: Vec<u32>,
+    /// Each motion record's frame table (offset in `data`: i16 frame numbers the sequences pick by index).
+    pub record_frames: Vec<u32>,
+    /// The motion file's bytes (sequences and tables are read from it by offset).
+    pub data: std::sync::Arc<[u8]>,
     pub motions: Vec<Motion>,
     /// For each entry, the motion record its sequence plays first (sequence code 1 and a 16-bit record index;
-    /// codes 2, 3 and 6 skip ahead).
+    /// code 2 takes one byte, codes 3 and 6 three).
     pub entry_motion: Vec<Option<usize>>,
 }
 
 impl MotionGroup {
     /// The first group of a motion file.
     pub fn parse(d: &[u8]) -> Result<MotionGroup> {
-        MotionGroup::parse_at(d, u32_at(d, 0xC)? as usize)
+        MotionGroup::parse_at(&std::sync::Arc::from(d), u32_at(d, 0xC)? as usize)
     }
 
     /// Every group of a motion file: the count is at +4 and the descriptors follow one another (0x14 bytes each)
@@ -265,10 +300,12 @@ impl MotionGroup {
     pub fn parse_all(d: &[u8]) -> Result<Vec<MotionGroup>> {
         let first = u32_at(d, 0xC)? as usize;
         let count = (u32_at(d, 4)? as usize).clamp(1, 256);
-        (0..count).map(|g| MotionGroup::parse_at(d, first + g * 0x14)).collect()
+        let data: std::sync::Arc<[u8]> = std::sync::Arc::from(d);
+        (0..count).map(|g| MotionGroup::parse_at(&data, first + g * 0x14)).collect()
     }
 
-    fn parse_at(d: &[u8], desc: usize) -> Result<MotionGroup> {
+    fn parse_at(data: &std::sync::Arc<[u8]>, desc: usize) -> Result<MotionGroup> {
+        let d: &[u8] = data;
         if desc + 0x14 > d.len() {
             return Err(MotionError::Truncated("group descriptor"));
         }
@@ -278,14 +315,18 @@ impl MotionGroup {
         let entries_at = u32_at(d, desc + 0xC)? as usize;
         let records_at = u32_at(d, desc + 0x10)? as usize;
         let mut entries = Vec::with_capacity(entry_count.min(4096));
+        let mut entry_jumps = Vec::with_capacity(entry_count.min(4096));
         for i in 0..entry_count.min(4096) {
             let e = entries_at + i * 16;
             entries.push((u16_at(d, e)?, u32_at(d, e + 0xC)?));
+            entry_jumps.push(u32_at(d, e + 8)?);
         }
         let mut motions = Vec::with_capacity(motion_count.min(4096));
+        let mut record_frames = Vec::with_capacity(motion_count.min(4096));
         for i in 0..motion_count.min(4096) {
             let header = u32_at(d, records_at + i * 16 + 0xC)? as usize;
             motions.push(Motion::parse(d, header)?);
+            record_frames.push(u32_at(d, records_at + i * 16 + 8)?);
         }
         let entry_motion = entries
             .iter()
@@ -294,15 +335,23 @@ impl MotionGroup {
                 for _ in 0..16 {
                     match *d.get(at)? {
                         1 => return Some(i16_at(d, at + 1).ok()?.max(0) as usize),
-                        2 => at += 5,
-                        3 | 6 => at += 4,
+                        2 => at += 1,
+                        3 | 6 => at += 3,
                         _ => return None,
                     }
                 }
                 None
             })
             .collect();
-        Ok(MotionGroup { chr_id, entries, motions, entry_motion })
+        Ok(MotionGroup {
+            chr_id,
+            entries,
+            entry_jumps,
+            record_frames,
+            data: data.clone(),
+            motions,
+            entry_motion,
+        })
     }
 }
 

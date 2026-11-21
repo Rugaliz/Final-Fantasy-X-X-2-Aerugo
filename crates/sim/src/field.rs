@@ -17,6 +17,7 @@ use aerugo_vfs::{Language, Vfs};
 pub mod collision;
 pub mod face;
 pub mod map_objects;
+pub mod motion_engine;
 pub mod texture_animation;
 
 use collision::Ground;
@@ -59,11 +60,8 @@ pub struct Actor {
     /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
     /// height difference unless both test it.
     pub height_test: bool,
-    /// The motion playing: motion id, first frame, last frame (−1: its end), ticks played, loops left (0xFF:
-    /// for ever).
-    pub motion_play: Option<(i32, i32, i32, u32, u8)>,
-    /// Motion speed (0x100 normal).
-    pub motion_speed: u16,
+    /// The character's motion player (made when a model is bound).
+    pub player: Option<motion_engine::Player>,
     /// The character engine's motion slots (5025): 0 standing, 1 walking, 2 running, 16–19 in water; a value
     /// under 0x1000 picks from the model's own list, others are motion ids.
     pub motion_slots: [i32; 20],
@@ -105,13 +103,13 @@ pub struct Actor {
     pub color: [Eased; 4],
 }
 
-/// The motion slots a character starts with (Ch_Allocate: 0, 1, 2 for standing, walking, running and the
+/// The motion slots a character starts with (a new character: 0, 1, 2 for standing, walking, running and the
 /// defaults 0, 1, 2, 3 for slots 16–19; the rest start at 0).
 const DEFAULT_MOTION_SLOTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
 /// The value a slot set to −1 takes (by slot).
 const MOTION_SLOT_DEFAULTS: [i32; 20] = [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
 const DEFAULT_RUN_THRESHOLD: f32 = 18.0;
-/// The water level an event starts with (Sg_EventjumpInit).
+/// The water level an event starts with.
 const WATER_LEVEL_AT_START: f32 = 1_000_000.0;
 
 /// A character's own motion lists from its `.chr` data (header entries 5, 6 and 7: on the ground, the second
@@ -149,8 +147,7 @@ impl Default for Actor {
             no_body_hit: false,
             display_object: None,
             height_test: true,
-            motion_play: None,
-            motion_speed: 0x100,
+            player: None,
             motion_slots: DEFAULT_MOTION_SLOTS,
             run_threshold: DEFAULT_RUN_THRESHOLD,
             engine_speed: 0.0,
@@ -813,7 +810,6 @@ pub struct FieldState {
     pub talk: Option<Talk>,
     pub control: PlayerControl,
     /// Frame counts of each model's motions by motion number, as the host loads them.
-    pub motion_frames: std::collections::HashMap<u16, std::collections::HashMap<u16, u32>>,
     /// The water level (4001; far below everything at an event's start): a swimming character deeper than one
     /// below it takes its diving slot.
     pub water_level: f32,
@@ -821,6 +817,18 @@ pub struct FieldState {
     pub model_faces: std::collections::HashMap<u16, ModelFace>,
     /// The C runtime's random numbers (the face animation's blink waits and holds).
     pub crt_rand: face::CrtRand,
+    /// The game files, for what scripts load as they run (motion files).
+    pub vfs: Option<Vfs>,
+    /// The game and the event script's path.
+    pub game: Option<Game>,
+    pub event_path: String,
+    /// The character engine's motion groups (carried from event to event by the host).
+    pub motion_groups: motion_engine::Groups,
+    /// Each model's PS2 joint count and joint relations to other characters' motions (`.chr` data).
+    pub model_joints: std::collections::HashMap<u16, usize>,
+    pub model_relations: std::collections::HashMap<u16, Vec<std::sync::Arc<motion_engine::Relation>>>,
+    /// The alternative motion clock (native 4022).
+    pub alt_clock: bool,
     /// Each model's own motion lists (`.chr` data).
     pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
     /// Each model's motion translation scale (`.chr` data).
@@ -1016,33 +1024,9 @@ impl FieldState {
         &mut self.actors[w]
     }
 
-    /// Whether an actor's motion still plays (a looping one always does; one with an unknown length does not).
-    fn motion_playing(&self, a: &Actor) -> bool {
-        let Some((motion, start, end, done, loops)) = a.motion_play else { return false };
-        if loops != 0 {
-            return true;
-        }
-        let frames = if end >= 0 {
-            (end - start).max(0) as u32
-        } else {
-            let len = a
-                .model
-                .and_then(|m| self.motion_frames.get(&m))
-                .and_then(|f| f.get(&(motion as u32 as u16)))
-                .copied()
-                .unwrap_or(0);
-            len.saturating_sub(start.max(0) as u32)
-        };
-        let ticks = frames * 0x100 / u32::from(a.motion_speed.max(1));
-        done < ticks
-    }
-
     /// Advance movements and turns by one tick, then player control.
     fn update(&mut self) {
         for a in &mut self.actors {
-            if let Some(p) = &mut a.motion_play {
-                p.3 += 1;
-            }
             a.shade.tick();
             for c in &mut a.color {
                 c.tick();
@@ -1192,7 +1176,7 @@ impl FieldState {
                     a.yaw = dz.atan2(dx);
                 }
             }
-            // The water speed while the character engine is in water (mode 2, as Sg_ControlPlayer reads it).
+            // The water speed while the character engine is in water (mode 2, as the player control reads it).
             let in_water = self.actors[p].chr_mode == 2;
             let push = self.control.tick(self.input.stick, self.input.walk, in_water);
             player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
@@ -1206,7 +1190,155 @@ impl FieldState {
             }
         }
         self.engine_motions(player_speed);
+        // The motion players (after the engine's picks), then the face players, then the motions' events.
+        let alt = self.alt_clock.then_some(0x100);
+        for a in &mut self.actors {
+            if let Some(p) = &mut a.player {
+                p.frame(alt);
+            }
+        }
         self.faces();
+        self.motion_events();
+        // AERUGO_MOTION_TRACE: each character's motion player state, in the oracle's log form, every tick.
+        if std::env::var_os("AERUGO_MOTION_TRACE").is_some() {
+            let mut out = Vec::new();
+            for a in &self.actors {
+                if let (Some(m), Some(p)) = (a.model, &a.player) {
+                    out.push(format!("c{m:x} {}", p.trace()));
+                }
+            }
+            if !out.is_empty() {
+                eprintln!("MT {}", out.join(" | "));
+            }
+        }
+    }
+
+    /// The events the motions reached this frame: face patterns (kind 3: the id's high byte is the request kind,
+    /// 4 sets the pattern to the low byte).
+    fn motion_events(&mut self) {
+        let mut events = Vec::new();
+        for w in 0..self.actors.len() {
+            events.clear();
+            let Some(p) = &mut self.actors[w].player else { continue };
+            p.events(&mut events);
+            for e in &events {
+                if e.kind == 3 && e.id >> 8 == 4 {
+                    self.set_face_pattern(w, i32::from(e.id & 0xFF));
+                }
+            }
+        }
+    }
+
+    /// Set a character's face pattern (the value's low byte) and the pattern's flags (next byte).
+    fn set_face_pattern(&mut self, w: usize, value: i32) {
+        let sprites = self
+            .actors
+            .get(w)
+            .and_then(|a| a.model)
+            .and_then(|m| self.model_faces.get(&m))
+            .and_then(|f| f.1.clone());
+        let actor = self.actor(w);
+        if let Some((_, f)) = &mut actor.face {
+            let mut reports = Vec::new();
+            f.set_pattern((value & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, &mut reports);
+            if let Some(s) = sprites {
+                face::apply_reports(&mut actor.face_layers, &s, &reports);
+            }
+        }
+    }
+
+    /// A model's character data (`.chr`), read once: collision radius, motion lists and translation scale, face
+    /// data and sprites, PS2 joint count.
+    fn model_data(&mut self, m: u16) {
+        if self.model_radii.contains_key(&m) {
+            return;
+        }
+        let (Some(vfs), Some(game)) = (self.vfs.clone(), self.game) else { return };
+        let chr = chr_path(game, m).and_then(|p| vfs.read(&p).ok());
+        self.model_radii.insert(m, chr.as_deref().and_then(chr_radius));
+        self.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
+        self.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
+        self.model_joints.insert(m, chr.as_deref().and_then(chr_joints).unwrap_or(0));
+        self.model_relations.insert(
+            m,
+            chr.as_deref()
+                .map(motion_engine::chr_relations)
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect(),
+        );
+        let face = chr.as_deref().and_then(face::FaceData::from_chr).map(std::sync::Arc::new);
+        let sprites =
+            model_path(game, m).and_then(|p| face::CharFace::load(&vfs, &p)).map(std::sync::Arc::new);
+        self.model_faces.insert(m, (face, sprites));
+    }
+
+    /// Read a motion file into the engine's groups (unless it is in): a character's resident file (kind 0), the
+    /// event's (kind 1), the shared party file (kind 2). A file not read before waits for the read, and the shared
+    /// party file read at a game's start lands during that wait — before a resident file, after an event's.
+    pub fn read_motion_file(&mut self, key: motion_engine::FileKey) {
+        if self.motion_groups.has(key) {
+            return;
+        }
+        let (Some(vfs), Some(game)) = (self.vfs.clone(), self.game) else { return };
+        let root = match game {
+            Game::Ffx => "ffx_ps2/ffx/master/jppc",
+            Game::Ffx2 => "ffx_ps2/ffx2/master/jppc",
+        };
+        let path = match key.0 {
+            0 => ps2_chr_dir(game, key.2).map(|d| format!("{d}/mot/resident{}.mgrp", key.1)),
+            1 => self.event_path.rsplit_once('/').map(|(dir, file)| {
+                let name = file.trim_end_matches(".ebp");
+                format!("{dir}/{name}{:02}.mgrp", key.1)
+            }),
+            _ => Some(format!("{root}/battle/mot/regmot.mgrp")),
+        };
+        // A resident file of a character the engine does not list, or an empty one, is not read at all.
+        let data = path.and_then(|p| vfs.read(&p).ok());
+        if key.0 == 0 && (!chr_listed(&vfs, game, key.2) || data.as_ref().is_none_or(|d| d.len() <= 16)) {
+            return;
+        }
+        let groups =
+            data.and_then(|d| aerugo_formats::motion::MotionGroup::parse_all(&d).ok()).unwrap_or_default();
+        let waited = !self.motion_groups.cached(key);
+        if waited && key.0 == 0 {
+            self.party_motions_land();
+        }
+        self.motion_groups.add(key, groups);
+        if waited && key.0 == 1 {
+            self.party_motions_land();
+        }
+    }
+
+    /// The shared party motion file, if a game start asked for it.
+    fn party_motions_land(&mut self) {
+        if std::mem::take(&mut self.motion_groups.party_pending) {
+            self.motion_groups.party_pending = false;
+            let key = (2, 0, 0);
+            if !self.motion_groups.has(key) {
+                self.read_motion_file(key);
+            }
+        }
+    }
+
+    /// Bind a model's motions to a worker: its character data, its resident motion file 0 and a new player.
+    fn bind_motions(&mut self, w: usize, model: u16) {
+        self.model_data(model);
+        self.read_motion_file((0, 0, model));
+        let joints = self.model_joints.get(&model).copied().unwrap_or(0);
+        self.actor(w).player = Some(motion_engine::Player::new(joints));
+    }
+
+    /// Set a worker's motion (scripts and the character engine).
+    fn set_motion(&mut self, w: usize, id: i32) -> Option<motion_engine::SetMotion> {
+        let model = self.actors.get(w)?.model?;
+        let groups = &self.motion_groups;
+        let relations = self.model_relations.get(&model).map_or(&[][..], Vec::as_slice);
+        let a = self.actors.get_mut(w)?;
+        let r = a.player.as_mut()?.set_motion(groups, model, relations, id);
+        a.motion = Some(id);
+        Some(r)
     }
 
     /// The face animation players (after the character engine's motions): a character gets one when its model has face
@@ -1229,7 +1361,7 @@ impl FieldState {
         }
     }
 
-    /// The character engine's own motions (chr_motion_update): a body bound to a character with no script
+    /// The character engine's own motions: a body bound to a character with no script
     /// motion playing stands, walks or runs by the speed the engine moves it at (the running move's, or the
     /// player's push), picking its standing, walking or running slot; a slot under 0x1000 picks from the model's
     /// own list.
@@ -1243,7 +1375,7 @@ impl FieldState {
                         ActorMove::Walk { mode, speed, .. } => (mode, speed),
                         ActorMove::Timed { mode, .. } => (mode, a.move_state().speed),
                     };
-                    // 870540: the move's set speed, along the ground for kinds 2 and 4 (by the pitch the move
+                    // The move's set speed, along the ground for kinds 2 and 4 (by the pitch the move
                     // goes along), none for kinds 7 and 9 (placed directly).
                     match mode & 0x7F {
                         0 | 7 | 9 => 0.0,
@@ -1261,11 +1393,11 @@ impl FieldState {
                 None => 0.0,
             };
             self.actors[w].engine_speed = speed;
-            if self.motion_playing(&self.actors[w]) {
+            if self.actors[w].player.as_ref().is_none_or(|p| p.playing) {
                 continue;
             }
             let a = &self.actors[w];
-            // On the ground: standing, walking or running; in water (Ch_CalcMain): still, or diving below one under
+            // On the ground: standing, walking or running; in water: still, or diving below one under
             // the water level, else swimming at the surface.
             let (group, slot) = match a.chr_mode {
                 0 if speed == 0.0 => (0, 0),
@@ -1278,7 +1410,7 @@ impl FieldState {
             };
             let value = a.motion_slots[slot];
             let id = if value & 0xFFFF < 0x1000 {
-                // 837d00: the model's list for the group, else the first of its ground list.
+                // The model's list for the group, else the first of its ground list.
                 let lists = self.model_motion_lists.get(&model).and_then(|l| l.as_ref());
                 let pick =
                     |g: usize, i: usize| lists.and_then(|l| l[g].get(i)).copied().filter(|&id| id != 0);
@@ -1289,7 +1421,11 @@ impl FieldState {
             } else {
                 value
             };
-            self.actors[w].motion = Some(id);
+            // The engine's own motions do not count as playing.
+            self.set_motion(w, id);
+            if let Some(p) = &mut self.actors[w].player {
+                p.playing = false;
+            }
         }
     }
 }
@@ -1363,9 +1499,84 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
         .collect()
 }
 
+/// A character id's PS2 folder (`chr/<kind>/<letter><number>`): kinds 0 pc, 1 mon, 2 npc, 3 sum, 4 wep, 5 obj,
+/// 6 skl (motion skeletons other characters' motions play through).
+pub fn ps2_chr_dir(game: Game, id: u16) -> Option<String> {
+    let (dir, prefix) = match id >> 12 {
+        0 => ("pc", 'c'),
+        1 => ("mon", 'm'),
+        2 => ("npc", 'n'),
+        3 => ("sum", 's'),
+        4 => ("wep", 'w'),
+        5 => ("obj", 'f'),
+        6 => ("skl", 'k'),
+        _ => return None,
+    };
+    let root = match game {
+        Game::Ffx => "ffx_ps2/ffx/master/jppc",
+        Game::Ffx2 => "ffx_ps2/ffx2/master/jppc",
+    };
+    Some(format!("{root}/chr/{dir}/{prefix}{:03}", id & 0xFFF))
+}
+
+/// The engine's numbered files (`proj/battle/jp/cddata`): `cdrom.fid` gives each set's first number (i16, −1
+/// none), `cdrom.fnd` each number's name (u32 count, u32 offsets, `host0:/ffx/master/jppc/…` paths).
+#[derive(Debug, Clone)]
+pub struct FileTable {
+    sets: Vec<i16>,
+    names: Vec<u8>,
+}
+
+impl FileTable {
+    /// FFX's file table.
+    pub fn load(vfs: &Vfs) -> Option<FileTable> {
+        let dir = "ffx_ps2/ffx/proj/battle/jp/cddata";
+        let fid = vfs.read(&format!("{dir}/cdrom.fid")).ok()?;
+        let names = vfs.read(&format!("{dir}/cdrom.fnd")).ok()?;
+        let sets = fid.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        Some(FileTable { sets, names })
+    }
+
+    /// The archive path of file `index` of `set` (`host0:/ffx/…` → `ffx_ps2/ffx/…`).
+    pub fn path(&self, set: usize, index: usize) -> Option<String> {
+        let base = usize::try_from(*self.sets.get(set)?).ok()?;
+        let n = base + index;
+        let u32_at =
+            |o: usize| self.names.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if n >= u32_at(0)? as usize {
+            return None;
+        }
+        let (a, b) = (u32_at(4 + 4 * n)? as usize, u32_at(8 + 4 * n)? as usize);
+        let name = self.names.get(a..b.max(a))?;
+        let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+        let name = std::str::from_utf8(name).ok()?.strip_prefix("host0:/")?;
+        (!name.is_empty()).then(|| format!("ffx_ps2/{}", name.to_ascii_lowercase()))
+    }
+
+    /// The script of FFX event number `n` (what map changes and the save image name): set 0xC holds 18 files per
+    /// event, the script first.
+    pub fn event_script(&self, n: usize) -> Option<String> {
+        self.path(0xC, n * 18).filter(|p| p.ends_with(".ebp"))
+    }
+}
+
+/// Whether the engine can read a character's resident motion files: its number is in its type's list
+/// (`chr/<kind>/<kind>.tbl`: i16 count, i16 numbers).
+pub fn chr_listed(vfs: &Vfs, game: Game, chr: u16) -> bool {
+    let Some(dir) = ps2_chr_dir(game, chr) else { return false };
+    let Some((kind_dir, _)) = dir.rsplit_once('/') else { return false };
+    let kind = kind_dir.rsplit('/').next().unwrap_or("");
+    let Ok(d) = vfs.read(&format!("{kind_dir}/{kind}.tbl")) else { return false };
+    let n = d.get(0..2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]])).max(0) as usize;
+    let number = (chr & 0xFFF) as i16;
+    (0..n).any(|i| d.get(2 + 2 * i..4 + 2 * i).is_some_and(|b| i16::from_le_bytes([b[0], b[1]]) == number))
+}
+
 /// The PS2 character data of a model id (`.chr`: its header carries the collision radius among other sizes).
 pub fn chr_path(game: Game, id: u16) -> Option<String> {
-    chr_path_of_model(&model_path(game, id)?)
+    let dir = ps2_chr_dir(game, id)?;
+    let name = dir.rsplit('/').next()?.to_owned();
+    Some(format!("{dir}/mdl/{name}.chr"))
 }
 
 /// The PS2 character data of an HD character model (`…/ps3data/chr/<kind>/<id>/mdl/d3d11/<id>.dae.phyre`).
@@ -1400,69 +1611,10 @@ pub fn chr_radius(d: &[u8]) -> Option<f32> {
     u32_at(info + 4).map(f32::from_bits).filter(|r| r.is_finite() && *r > 0.0)
 }
 
-/// Frame counts of a model's motions by motion number (each group entry's first motion record).
-pub fn motion_frames(
-    vfs: &Vfs,
-    model_path: &str,
-    model: u16,
-    event_path: Option<&str>,
-) -> std::collections::HashMap<u16, u32> {
-    let mut out = std::collections::HashMap::new();
-    for group in motion_groups(vfs, model_path, model, event_path) {
-        for (&(number, _), record) in group.entries.iter().zip(&group.entry_motion) {
-            if let Some(m) = record.and_then(|r| group.motions.get(r)) {
-                out.entry(number).or_insert(u32::from(m.frames));
-            }
-        }
-    }
-    out
-}
-
-/// The motion groups a character's motions come from: its own (`chr/…/mot/`, in file order) and then those of
-/// the event's folder that belong to it (an event's motion files hold one group per character it animates).
-pub fn motion_groups(
-    vfs: &Vfs,
-    model_path: &str,
-    model: u16,
-    event_path: Option<&str>,
-) -> Vec<aerugo_formats::motion::MotionGroup> {
-    use aerugo_formats::motion::{MotionGroup, motion_dir};
-    let files = |dir: &str| {
-        let mut paths: Vec<String> = vfs
-            .archives()
-            .flat_map(|(_, a)| {
-                a.entries()
-                    .iter()
-                    .filter(|e| {
-                        e.path.starts_with(dir)
-                            && !e.path[dir.len()..].contains('/')
-                            && e.path.ends_with(".mgrp")
-                            && e.size > 16
-                    })
-                    .map(|e| e.path.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
-    };
-    let mut out = Vec::new();
-    if let Some(dir) = motion_dir(model_path) {
-        for path in files(&dir) {
-            if let Some(groups) = vfs.read(&path).ok().and_then(|b| MotionGroup::parse_all(&b).ok()) {
-                out.extend(groups);
-            }
-        }
-    }
-    if let Some((dir, _)) = event_path.and_then(|p| p.rsplit_once('/')) {
-        for path in files(&format!("{dir}/")) {
-            if let Some(groups) = vfs.read(&path).ok().and_then(|b| MotionGroup::parse_all(&b).ok()) {
-                out.extend(groups.into_iter().filter(|g| g.chr_id == model));
-            }
-        }
-    }
-    out
+/// A character's PS2 model joint count from its `.chr` data (the model block at the offset at 0x10, count at +10).
+pub fn chr_joints(d: &[u8]) -> Option<usize> {
+    let model = d.get(0x10..0x14).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))? as usize;
+    d.get(model + 10..model + 12).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
 }
 
 /// A map's fog as its PS2 map package states it (the scene chunk of the map object data): colour, the limit
@@ -1645,6 +1797,9 @@ impl Event {
             entrances: script.entrances(),
             data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
             kinds: script.workers.iter().map(|w| w.kind).collect(),
+            vfs: Some(vfs.clone()),
+            game: Some(game),
+            event_path: path.to_owned(),
             ..FieldState::default()
         };
         if let Some(tp) = event_text_path(game, path, lang)
@@ -1842,27 +1997,14 @@ impl Event {
         }
     }
 
-    /// Load the frame counts of the motions of models that appeared since the last call (hosts call it before each
-    /// tick).
+    /// Read the character data of models that appeared since the last call (hosts call it before each tick).
     pub fn load_motion_frames(&mut self, vfs: &Vfs) {
+        if self.state.vfs.is_none() {
+            self.state.vfs = Some(vfs.clone());
+        }
         let models: Vec<u16> = self.state.actors.iter().filter_map(|a| a.model).collect();
         for m in models {
-            if self.state.motion_frames.contains_key(&m) {
-                continue;
-            }
-            let frames = model_path(self.game, m)
-                .map(|p| motion_frames(vfs, &p, m, Some(&self.path)))
-                .unwrap_or_default();
-            self.state.motion_frames.insert(m, frames);
-            let chr = chr_path(self.game, m).and_then(|p| vfs.read(&p).ok());
-            let radius = chr.as_deref().and_then(chr_radius);
-            self.state.model_radii.insert(m, radius);
-            self.state.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
-            self.state.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
-            let face = chr.as_deref().and_then(face::FaceData::from_chr).map(std::sync::Arc::new);
-            let sprites =
-                model_path(self.game, m).and_then(|p| face::CharFace::load(vfs, &p)).map(std::sync::Arc::new);
-            self.state.model_faces.insert(m, (face, sprites));
+            self.state.model_data(m);
         }
         for a in &mut self.state.actors {
             a.model_radius = a.model.and_then(|m| self.state.model_radii.get(&m).copied().flatten());
@@ -2074,10 +2216,7 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    zero!(
-        0x500B, 0x5014, 0x5017, 0x5034, 0x5057, 0x505C, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003,
-        0x6021, 0x5001, 0x5010
-    );
+    zero!(0x500B, 0x5014, 0x5017, 0x5057, 0x400A, 0x4017, 0x4019, 0x401A, 0x403B, 0x6003, 0x6021);
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
         0x4013,
@@ -3370,6 +3509,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let a = g.actor(c.worker);
             a.model = Some(id as u16);
             a.display_object = None;
+            g.bind_motions(c.worker, id as u16);
             Value::Int(0)
         }),
     );
@@ -3460,19 +3600,24 @@ pub fn register(n: &mut Natives<FieldState>) {
             }),
         );
     }
-    // A motion over a frame range (motion, two values not used here, first frame, last frame or −1), and the
-    // waits for it.
+    // A motion over a frame range (motion, a value not used here, plays, first frame, last frame or −1).
     n.register(
         0x501A,
         Native::result(|g, c| {
             let end = c.stack.pop_int();
             let start = c.stack.pop_int();
-            let _b = c.stack.pop_int();
-            let _a = c.stack.pop_int();
+            let loops = c.stack.pop_int();
+            let _ = c.stack.pop_int();
             let motion = c.stack.pop_int();
-            let a = g.actor(c.worker);
-            a.motion = Some(motion);
-            a.motion_play = Some((motion, start, end, 0, 0));
+            let w = c.worker;
+            if let Some(model) = g.actors.get(w).and_then(|a| a.model) {
+                let groups = &g.motion_groups;
+                let relations = g.model_relations.get(&model).map_or(&[][..], Vec::as_slice);
+                if let Some(p) = g.actors[w].player.as_mut() {
+                    p.play_range(groups, model, relations, motion, loops as i16, start, end, false, false);
+                }
+                g.actors[w].motion = Some(motion);
+            }
             Value::Int(0)
         }),
     );
@@ -3534,8 +3679,8 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x5022,
         Native::result(|g, c| {
             let n = c.stack.pop_int();
-            if let Some(p) = &mut g.actor(c.worker).motion_play {
-                p.4 = n as u8;
+            if let Some(p) = &mut g.actor(c.worker).player {
+                p.plays = n as i8;
             }
             Value::Int(0)
         }),
@@ -3544,23 +3689,22 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x5021,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.actor(c.worker).motion_speed = v as u16;
+            if let Some(p) = &mut g.actor(c.worker).player {
+                p.speed = v as i16;
+            }
             Value::Int(0)
         }),
     );
-    // The waits for a motion (0x5003, 0x501E): until a motion played once has run its frames (a looping one, or
-    // one of unknown length, does not hold the script up). The original also waits out the rest of a motion the
-    // character engine was already playing (after 0x5022(0)), which needs the engine's own motion state: the
-    // comparisons keep these waits with the recordings.
+    // The waits for a motion (0x5003, 0x501E): while the character's motion plays.
     for id in [0x5003u16, 0x501E] {
         n.register(
             id,
             Native {
                 init: None,
                 wait: Some(|g, c| {
-                    let a = g.actor(c.worker).clone();
-                    let once = a.motion_play.is_some_and(|p| p.4 == 0);
-                    if once && g.motion_playing(&a) { 0 } else { WAIT_DONE }
+                    let playing =
+                        g.actors.get(c.worker).and_then(|a| a.player.as_ref()).is_some_and(|p| p.playing);
+                    if playing { 0 } else { WAIT_DONE }
                 }),
                 result: None,
             },
@@ -3570,8 +3714,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x5000,
         Native::result(|g, c| {
             let m = c.stack.pop_int();
-            g.actor(c.worker).motion_play = Some((m, 0, -1, 0, 0xFF));
-            g.actor(c.worker).motion = Some(m);
+            g.set_motion(c.worker, m);
             Value::Int(0)
         }),
     );
@@ -3585,8 +3728,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             id,
             Native::result(|g, c| {
                 let m = c.stack.pop_int();
-                g.actor(c.worker).motion_play = Some((m, 0, -1, 0, 0xFF));
-                g.actor(c.worker).motion = Some(m);
+                g.set_motion(c.worker, m);
                 Value::Int(0)
             }),
         );
@@ -3596,7 +3738,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let m = c.stack.pop_int();
             let w = target(c);
-            g.actor(w).motion = Some(m);
+            g.set_motion(w, m);
             Value::Int(0)
         }),
     );
@@ -3664,16 +3806,102 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Stopping the motion (chr_motion_stop): the character engine picks its own again.
+    // Stopping the motion: the character engine picks its own again.
     for id in [0x5005u16, 0x5020] {
         n.register(
             id,
             Native::result(|g, c| {
-                g.actor(c.worker).motion_play = None;
+                if let Some(p) = &mut g.actor(c.worker).player {
+                    p.stop();
+                }
                 Value::Int(0)
             }),
         );
     }
+    // Blending: the frames the next motion start blends over (5034; 0: none), and the length the next motion
+    // set takes (505c; −1: the default 4, 0: none).
+    n.register(
+        0x5034,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            if let Some(p) = &mut g.actor(c.worker).player {
+                p.blend = v as i16;
+                p.unblend();
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x505C,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            if let Some(p) = &mut g.actor(c.worker).player {
+                p.next_blend = match v {
+                    -1 => 0,
+                    0 => 1,
+                    v => v as i16,
+                };
+            }
+            Value::Int(0)
+        }),
+    );
+    // Motion files: the event's (5001(n)), a character's resident file (5010(character, n)); dropping a resident
+    // file of the worker's character (5011(n)) or of any (503b(character, n)), an event's (503c(n)).
+    n.register(
+        0x5001,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            g.read_motion_file((1, n as u16, 0));
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5010,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            let chr = c.stack.pop_int();
+            g.read_motion_file((0, n as u16, chr as u16));
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x5011,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            if let Some(m) = g.actors.get(c.worker).filter(|a| a.player.is_some()).and_then(|a| a.model) {
+                g.motion_groups.remove((0, n as u16, m));
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x503B,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            let chr = c.stack.pop_int();
+            if g.actors.get(c.worker).is_some_and(|a| a.player.is_some()) {
+                g.motion_groups.remove((0, n as u16, chr as u16));
+            }
+            Value::Int(0)
+        }),
+    );
+    n.register(
+        0x503C,
+        Native::result(|g, c| {
+            let n = c.stack.pop_int();
+            g.motion_groups.remove((1, n as u16, 0));
+            Value::Int(0)
+        }),
+    );
+    // The alternative motion clock.
+    n.register(
+        0x4022,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            g.alt_clock = v != 0;
+            Value::Int(0)
+        }),
+    );
     // The party character a worker plays (actors only); character 0 is taken as the player until the
     // native that names the player is known.
     n.register(
@@ -4605,5 +4833,29 @@ mod tests {
         assert_eq!(chr_radius(&d), Some(3.5));
         d[4] = 9;
         assert_eq!(chr_radius(&d), Some(1.0));
+    }
+
+    /// The engine's file table names event scripts by number, and the character lists say whose resident motion
+    /// files it reads.
+    #[test]
+    fn file_table_and_character_lists() {
+        let Some(inst) = aerugo_vfs::install_from_env() else {
+            eprintln!("skipped: set AERUGO_GAME_DIR");
+            return;
+        };
+        let mut vfs = Vfs::new();
+        vfs.mount_install(&inst).unwrap();
+        let t = FileTable::load(&vfs).unwrap();
+        assert_eq!(
+            t.event_script(50).as_deref(),
+            Some("ffx_ps2/ffx/master/jppc/event/obj/bj/bjyt0300/bjyt0300.ebp")
+        );
+        assert_eq!(
+            t.event_script(64).as_deref(),
+            Some("ffx_ps2/ffx/master/jppc/event/obj/cd/cdsp0700/cdsp0700.ebp")
+        );
+        assert!(vfs.read(&t.event_script(371).unwrap()).is_ok());
+        assert!(chr_listed(&vfs, Game::Ffx, 0x0001));
+        assert!(chr_listed(&vfs, Game::Ffx, 0x6004));
     }
 }

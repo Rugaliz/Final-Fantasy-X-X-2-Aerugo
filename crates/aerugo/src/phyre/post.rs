@@ -309,7 +309,7 @@ impl PostChain {
         })));
     }
 
-    /// The manager's copy (692c40): ColorBuffer and UvScaleBias set, the target cleared, CopyBuffer drawn.
+    /// The manager's copy: ColorBuffer and UvScaleBias set, the target cleared, CopyBuffer drawn.
     #[allow(clippy::too_many_arguments)]
     fn copy(
         &mut self,
@@ -378,7 +378,7 @@ impl PostChain {
         };
         ops.push(resolve(color, t.resolved));
         ops.push(resolve(normal_ms, t.normal));
-        // HDAO (renderHDAO 695ba0), after the depth resolve (698110: only with 2, 4 or 8 samples).
+        // HDAO, after the depth resolve (only with 2, 4 or 8 samples).
         if s.hdao > 0 && matches!(msaa, 2 | 4 | 8) {
             let depth_name = format!("DepthBuffer{msaa}");
             let depth_pass = format!("ResolveDepthBuffer{msaa}");
@@ -499,7 +499,7 @@ impl PostChain {
             self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
             ops.push(resolve(color, t.resolved));
         }
-        // Glow (render 694f10: prepareGlowMap 694c60, then the loops a1de20).
+        // Glow (the glow map, then the blur loops).
         if let Some([upper, lower, gain, spread]) = s.glow {
             self.set("glowmap", "UvScaleBias", floats(&[1.0, 1.0, 0.0, 0.0]));
             self.set("glowmap", "FullGlowThreshold", floats(&[upper]));
@@ -600,7 +600,7 @@ impl PostChain {
             }
             ops.push(resolve(color, t.resolved));
         }
-        // Unsharp mask (renderUSM 697670): the picture copied down to a quarter, blurred both ways, applied.
+        // Unsharp mask: the picture copied down to a quarter, blurred both ways, applied.
         if s.unsharp {
             let (q1, q2) = ((w / 2, h / 2), (w / 4, h / 4));
             self.copy(
@@ -777,7 +777,7 @@ impl PostChain {
             self.copy(vfs, renderer, programs, game, tex(t.b), m, full, scene, an, ops);
             ops.push(resolve(color, t.resolved));
         }
-        // Brightness (renderBright 695440).
+        // Brightness.
         self.set("bright", "g_brightPara", floats(&[s.brightness]));
         self.pass(
             vfs,

@@ -11,7 +11,7 @@ use std::time::Instant;
 use aerugo_audio::AudioOutput;
 use aerugo_debug_ui::egui;
 use aerugo_formats::Game;
-use aerugo_formats::motion::{Motion, ps2_joint};
+use aerugo_formats::motion::ps2_joint;
 use aerugo_formats::phyre::Cluster;
 use aerugo_gfx::Renderer;
 use aerugo_script::Wait;
@@ -51,14 +51,6 @@ struct Session {
     map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
     /// Character models by model id (None when missing).
     actors: HashMap<u16, Option<ModelInfo>>,
-    /// PS2 motions of each character model: its own groups, then the event's groups for it.
-    motions: HashMap<u16, Vec<Motion>>,
-    /// Per model: motion number (the low 16 bits of the ids scripts ask for) to its index in `motions`.
-    motion_numbers: HashMap<u16, HashMap<u16, usize>>,
-    /// Per model: how many of `motions` are its own (the rest come from the event's motion files).
-    motion_own: HashMap<u16, usize>,
-    /// Per worker: motion index, time in frames, translation scale.
-    anim: HashMap<usize, (usize, f32, f32)>,
     notes: Vec<String>,
     /// Drawing with the remaster's own shaders (the game screen).
     phyre: crate::phyre::field::FieldRenderer,
@@ -201,6 +193,17 @@ fn ffx_event_path(n: i32) -> Option<String> {
     Some(format!("ffx_ps2/ffx/master/jppc/event/obj/{e}/{name}.ebp"))
 }
 
+/// A joint of the character engine's pose: rotations in turns, translations in 1/4096 file units (the engine
+/// multiplies them by the model's scale and 4096), scales.
+fn engine_joint(v: [f32; 9]) -> aerugo_formats::motion::JointPose {
+    let tau = std::f32::consts::TAU;
+    aerugo_formats::motion::JointPose {
+        rotation: [v[0] * tau, v[1] * tau, v[2] * tau],
+        translation: [v[3] * 4096.0, v[4] * 4096.0, v[5] * 4096.0],
+        scale: [v[6], v[7], v[8]],
+    }
+}
+
 /// The title's two choices (pictures in the original).
 const TITLE_CHOICES: [&str; 2] = ["New Game", "Load Game"];
 
@@ -299,6 +302,10 @@ impl FieldView {
     }
 
     fn open(&mut self, vfs: &Vfs, renderer: &mut Renderer, audio: Option<&AudioOutput>, path: &str) {
+        // The character engine's motion files carry over: an event change drops all but the shared party file.
+        // A game that starts (from the title) or loads reads the party file with its first motion file.
+        let previous =
+            self.session.as_ref().map(|s| (s.event.state.motion_groups.clone(), s.event.path.clone()));
         self.close(renderer, audio);
         self.error = None;
         let game = game_of(path);
@@ -340,6 +347,14 @@ impl FieldView {
             let (lo, hi) = map_view_bounds(m);
             self.orbit = OrbitCamera::framing(lo, hi);
         }
+        let from_title = previous.as_ref().is_some_and(|(_, p)| p == FFX_TITLE_EVENT);
+        if let Some((mut groups, _)) = previous {
+            groups.remove_all_but_party();
+            event.state.motion_groups = groups;
+        }
+        if self.pending_restore.is_some() || from_title {
+            event.state.motion_groups.party_pending = true;
+        }
         let mut restore_position = None;
         if let Some(save) = self.pending_restore.take() {
             event.restore(&save);
@@ -362,10 +377,6 @@ impl FieldView {
             map,
             layers,
             actors: HashMap::new(),
-            motions: HashMap::new(),
-            motion_numbers: HashMap::new(),
-            motion_own: HashMap::new(),
-            anim: HashMap::new(),
             notes,
             phyre: Default::default(),
         });
@@ -739,8 +750,12 @@ impl FieldView {
 
     /// Events whose header names map `n` (variants for other platforms and test events left out).
     fn jump_candidates(&mut self, vfs: &Vfs, game: Game, n: i16) -> Vec<String> {
+        // FFX's event numbers name scripts through the engine's file table.
         if game == Game::Ffx
-            && let Some(path) = ffx_event_path(i32::from(n))
+            && let Some(path) = usize::try_from(n)
+                .ok()
+                .and_then(|n| aerugo_sim::field::FileTable::load(vfs)?.event_script(n))
+                .or_else(|| ffx_event_path(i32::from(n)))
         {
             return vec![path];
         }
@@ -968,53 +983,7 @@ impl FieldView {
                 let path = a.model_path(s.event.game);
                 let m = path.as_ref().and_then(|p| read_model_info(vfs, p).ok());
                 s.actors.insert(id, m);
-                let own = path.as_ref().map_or(0, |p| {
-                    aerugo_sim::field::motion_groups(vfs, p, id, None).iter().map(|g| g.motions.len()).sum()
-                });
-                s.motion_own.insert(id, own);
-                let groups = path
-                    .map(|p| aerugo_sim::field::motion_groups(vfs, &p, id, Some(&s.event.path)))
-                    .unwrap_or_default();
-                let (mut list, mut numbers) = (Vec::new(), HashMap::new());
-                for g in groups {
-                    let base = list.len();
-                    for (&(number, _), record) in g.entries.iter().zip(&g.entry_motion) {
-                        if let Some(r) = record.filter(|&r| r < g.motions.len()) {
-                            numbers.entry(number).or_insert(base + r);
-                        }
-                    }
-                    list.extend(g.motions);
-                }
-                s.motions.insert(id, list);
-                s.motion_numbers.insert(id, numbers);
             }
-        }
-        // Advance each body's motion: the one the script asked for when it exists, else the first (idle).
-        let dt = if self.paused { 0.0 } else { ui.input(|i| i.stable_dt).min(0.1) };
-        for (w, a) in s.event.state.actors.iter().enumerate() {
-            let (Some(id), Some(Some(_))) = (a.model, a.model.and_then(|id| s.actors.get(&id))) else {
-                continue;
-            };
-            let Some(motions) = s.motions.get(&id).filter(|m| !m.is_empty()) else { continue };
-            // The motion by its number (event motions included), else the old index guess, else the first.
-            let numbers = s.motion_numbers.get(&id);
-            let want = a
-                .motion
-                .and_then(|m| numbers.and_then(|n| n.get(&((m & 0xFFFF) as u16)).copied()))
-                .or_else(|| {
-                    a.motion.and_then(|m| usize::try_from(m & 0xFFF).ok()).filter(|&m| m < motions.len())
-                })
-                .unwrap_or(0);
-            let entry = s.anim.entry(w).or_insert((usize::MAX, 0.0, 1.0));
-            if entry.0 != want {
-                // The translation scale from the character's `.chr` data (without one, the block's default).
-                let scale = s.event.state.model_motion_scales.get(&id).copied().flatten().unwrap_or(0.001);
-                *entry = (want, 0.0, scale);
-            }
-            let motion = &motions[want];
-            let rate = f32::from(motion.rate.max(1)) / f32::from(0x1E00u16);
-            let last = (motion.frames.max(1) as f32 - 1.0).max(1.0);
-            entry.1 = (entry.1 + dt * 30.0 * rate) % last;
         }
         let size = ui.available_size();
         let ppp = ui.ctx().pixels_per_point();
@@ -1131,20 +1100,18 @@ impl FieldView {
         for (w, a) in st.actors.iter().enumerate().filter(|(_, a)| a.visible && a.color[3].value > 0.0) {
             let (Some(id), Some(path)) = (a.model, a.model_path(s.event.game)) else { continue };
             let (pos, yaw) = view.actors.get(w).copied().unwrap_or((a.pos, a.yaw));
-            let pose = s
-                .motions
-                .get(&id)
-                .zip(s.anim.get(&w))
-                .and_then(|(ms, &(i, t, sc))| ms.get(i).map(|m| (m, t, sc)));
-            let event_motion =
-                s.anim.get(&w).is_some_and(|&(i, _, _)| s.motion_own.get(&id).is_some_and(|&own| i >= own));
+            // The character engine's pose (each PS2 joint the motions set) and the model's translation scale.
+            let scale = st.model_motion_scales.get(&id).copied().flatten().unwrap_or(0.001);
+            let pose = a.player.as_ref().map(|p| (p.pose(), scale));
+            let event_motion = a.player.as_ref().and_then(|p| p.motion_file).is_some_and(|k| k.0 == 1);
             let place = character_place(pos, yaw);
             // The walk-mesh shade is taken where the character is drawn: for an event motion that is where its
             // root (joint 1) has carried it, not the actor's own position.
             let shade = pose
+                .as_ref()
                 .filter(|_| event_motion && a.shade_from_ground)
-                .and_then(|(m, t, sc)| {
-                    let root = Vec3::from(m.joint_at(1, t).translation) * sc;
+                .and_then(|(joints, sc)| {
+                    let root = Vec3::from(engine_joint(joints.get(1).copied().flatten()?).translation) * *sc;
                     st.ground.as_ref().and_then(|g| g.shade_at(place.transform_point3(root).to_array()))
                 })
                 .unwrap_or(a.shade.value);
@@ -1165,13 +1132,12 @@ impl FieldView {
         let poses: Vec<_> = paths
             .iter()
             .map(|(_, _, pose, ..)| {
-                let pose = *pose;
                 move |_: usize, sk: &aerugo_formats::skeleton::Skeleton| {
                     let mut local = sk.default_pose.clone();
-                    if let Some((motion, time, scale)) = pose {
+                    if let Some((joints, scale)) = pose {
                         for (i, name) in sk.names.iter().enumerate() {
-                            if let Some(j) = ps2_joint(name).filter(|&j| j < motion.joints as usize) {
-                                local[i] = motion.joint_at(j, time).matrix(scale);
+                            if let Some(v) = ps2_joint(name).and_then(|j| joints.get(j).copied().flatten()) {
+                                local[i] = engine_joint(v).matrix(*scale);
                             }
                         }
                     }

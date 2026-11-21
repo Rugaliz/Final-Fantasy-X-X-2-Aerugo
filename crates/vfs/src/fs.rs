@@ -20,7 +20,7 @@ pub enum VfsError {
     NotFound(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Source {
     Loose(PathBuf),
     Archive { id: Option<ArchiveId>, archive: Arc<VbfArchive> },
@@ -33,8 +33,8 @@ pub enum Origin {
     Archive(Option<ArchiveId>),
 }
 
-/// Ordered set of file sources. Earlier sources win.
-#[derive(Debug, Default)]
+/// Ordered set of file sources. Earlier sources win. Cloning shares the mounted archives.
+#[derive(Debug, Default, Clone)]
 pub struct Vfs {
     sources: Vec<Source>,
 }
