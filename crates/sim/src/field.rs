@@ -15,6 +15,7 @@ use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
 
 pub mod collision;
+pub mod face;
 pub mod map_objects;
 pub mod texture_animation;
 
@@ -72,6 +73,9 @@ pub struct Actor {
     pub engine_speed: f32,
     /// The character engine's mode (5013): 0 on the ground, 2 in water.
     pub chr_mode: u8,
+    /// The character's face animation player (for the model it was made for) and the remaster's face layer stack.
+    pub face: Option<(u16, face::Face)>,
+    pub face_layers: Vec<face::FaceLayer>,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
     /// Move state per script level: a level's move waits while a higher level runs.
@@ -151,6 +155,8 @@ impl Default for Actor {
             run_threshold: DEFAULT_RUN_THRESHOLD,
             engine_speed: 0.0,
             chr_mode: 0,
+            face: None,
+            face_layers: Vec::new(),
             level: 0,
             moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
@@ -756,6 +762,9 @@ impl Rng {
     }
 }
 
+/// A model's face animation data (`.chr`) and its face sprites (the remaster's).
+pub type ModelFace = (Option<std::sync::Arc<face::FaceData>>, Option<std::sync::Arc<face::CharFace>>);
+
 /// Everything natives act on.
 #[derive(Debug, Clone, Default)]
 pub struct FieldState {
@@ -808,8 +817,14 @@ pub struct FieldState {
     /// The water level (4001; far below everything at an event's start): a swimming character deeper than one
     /// below it takes its diving slot.
     pub water_level: f32,
+    /// Each model's face animation data (`.chr`) and the remaster's face sprites.
+    pub model_faces: std::collections::HashMap<u16, ModelFace>,
+    /// The C runtime's random numbers (the face animation's blink waits and holds).
+    pub crt_rand: face::CrtRand,
     /// Each model's own motion lists (`.chr` data).
     pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
+    /// Each model's motion translation scale (`.chr` data).
+    pub model_motion_scales: std::collections::HashMap<u16, Option<f32>>,
     /// Collision radii of models by id (None: no character data).
     pub model_radii: std::collections::HashMap<u16, Option<f32>>,
     /// Movie files by number (the game's video list).
@@ -1191,6 +1206,27 @@ impl FieldState {
             }
         }
         self.engine_motions(player_speed);
+        self.faces();
+    }
+
+    /// The face animation players (after the character engine's motions): a character gets one when its model has face
+    /// data; each frame it plays and reports to the face layer stack.
+    fn faces(&mut self) {
+        let mut reports = Vec::new();
+        for a in &mut self.actors {
+            let Some(model) = a.model else { continue };
+            let Some((data, sprites)) = self.model_faces.get(&model) else { continue };
+            if a.face.as_ref().map(|f| f.0) != Some(model) {
+                a.face = data.clone().map(|d| (model, face::Face::new(d)));
+                a.face_layers.clear();
+            }
+            let Some((_, f)) = &mut a.face else { continue };
+            reports.clear();
+            f.tick(&mut self.crt_rand, &mut reports);
+            if let Some(s) = sprites {
+                face::apply_reports(&mut a.face_layers, s, &reports);
+            }
+        }
     }
 
     /// The character engine's own motions (chr_motion_update): a body bound to a character with no script
@@ -1329,15 +1365,28 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
 
 /// The PS2 character data of a model id (`.chr`: its header carries the collision radius among other sizes).
 pub fn chr_path(game: Game, id: u16) -> Option<String> {
-    let p = model_path(game, id)?;
-    let (_, rest) = p.split_once("/chr/")?;
+    chr_path_of_model(&model_path(game, id)?)
+}
+
+/// The PS2 character data of an HD character model (`…/ps3data/chr/<kind>/<id>/mdl/d3d11/<id>.dae.phyre`).
+pub fn chr_path_of_model(model_path: &str) -> Option<String> {
+    let (_, rest) = model_path.split_once("/chr/")?;
     let (dir, _) = rest.split_once("/mdl/")?;
     let name = dir.rsplit('/').next()?;
-    let root = match game {
-        Game::Ffx => "ffx_ps2/ffx/master/jppc",
-        Game::Ffx2 => "ffx_ps2/ffx2/master/jppc",
+    let root = if model_path.starts_with("ffx-2_data/") {
+        "ffx_ps2/ffx2/master/jppc"
+    } else {
+        "ffx_ps2/ffx/master/jppc"
     };
     Some(format!("{root}/chr/{dir}/mdl/{name}.chr"))
+}
+
+/// A character's motion translation scale: its character record's size × 0.001, where the size is the `.chr` info
+/// block's (offset at 0x58) float at +0x20 from data version 10 on, and 1 for older data.
+pub fn chr_motion_scale(d: &[u8]) -> Option<f32> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let block = if u32_at(4)? < 10 { 1.0 } else { f32::from_bits(u32_at(u32_at(0x58)? as usize + 0x20)?) };
+    Some(block * 0.001)
 }
 
 /// A character's collision radius from its `.chr` data: header version (u32 at 4) 10 or later has an info block
@@ -1809,6 +1858,11 @@ impl Event {
             let radius = chr.as_deref().and_then(chr_radius);
             self.state.model_radii.insert(m, radius);
             self.state.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
+            self.state.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
+            let face = chr.as_deref().and_then(face::FaceData::from_chr).map(std::sync::Arc::new);
+            let sprites =
+                model_path(self.game, m).and_then(|p| face::CharFace::load(vfs, &p)).map(std::sync::Arc::new);
+            self.state.model_faces.insert(m, (face, sprites));
         }
         for a in &mut self.state.actors {
             a.model_radius = a.model.and_then(|m| self.state.model_radii.get(&m).copied().flatten());
@@ -3572,6 +3626,28 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(old)
         }),
     );
+    // A character's texture animation (5078(kind, value)): kind 4 sets the face pattern (value's low byte) and its
+    // flags (next byte).
+    n.register(
+        0x5078,
+        Native::result(|g, c| {
+            let value = c.stack.pop_int();
+            let kind = c.stack.pop_int();
+            if kind == 4 {
+                let a = g.actors.get(c.worker).and_then(|a| a.model);
+                let sprites = a.and_then(|m| g.model_faces.get(&m)).and_then(|f| f.1.clone());
+                let actor = g.actor(c.worker);
+                if let Some((_, f)) = &mut actor.face {
+                    let mut reports = Vec::new();
+                    f.set_pattern((value & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, &mut reports);
+                    if let Some(s) = sprites {
+                        face::apply_reports(&mut actor.face_layers, &s, &reports);
+                    }
+                }
+            }
+            Value::Int(0)
+        }),
+    );
     // The character engine's mode (5013: 0 on the ground, 2 in water) and the water level (4001).
     n.register(
         0x5013,
@@ -4506,6 +4582,18 @@ mod tests {
         let st = a.steer_walk_begin(0.0, 0.0).expect("a steered walk");
         a.steer_walk_end(st, None);
         assert!((a.pos[0] - a.yaw.cos()).abs() < 1e-4 && (a.pos[2] - a.yaw.sin()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn chr_motion_scale_from_the_info_block() {
+        let mut d = vec![0u8; 0x100];
+        d[4] = 11;
+        d[0x58] = 0x80;
+        d[0xA0..0xA4].copy_from_slice(&10.0f32.to_le_bytes());
+        // The original multiplies by 0.001f widened to a double, which rounds as an f32 product does.
+        assert_eq!(chr_motion_scale(&d), Some(10.0f32 * 0.001));
+        d[4] = 9;
+        assert_eq!(chr_motion_scale(&d), Some(0.001));
     }
 
     #[test]

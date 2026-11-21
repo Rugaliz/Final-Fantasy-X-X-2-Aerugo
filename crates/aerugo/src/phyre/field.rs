@@ -18,8 +18,10 @@ use glam::{Mat4, Vec3};
 
 use super::Programs;
 use super::Value;
-use super::model::{GameModel, main_pass, object_values, segment_draws};
+use super::model::{GameModel, Overrides, main_pass, object_values, segment_draws};
 use super::scene::{SceneConstants, to_hd};
+use aerugo_formats::mesh::SamplerState;
+use aerugo_sim::field::face::{self, CharFace, FaceLayer};
 
 /// The remaster's World for a character standing at `pos` (game space) facing `yaw`.
 pub fn character_world(pos: [f32; 3], yaw: f32) -> Mat4 {
@@ -38,6 +40,43 @@ pub struct ActorDraw<'a> {
     pub material: [f32; 4],
     /// CharacterShadeColor.
     pub shade: [f32; 3],
+    /// The character's face sprites and its face layer stack.
+    pub face: Option<&'a CharFace>,
+    pub face_layers: &'a [FaceLayer],
+}
+
+/// The face materials' texture parameters, layer by layer.
+const ANIM_SAMPLERS: [&str; 6] =
+    ["AnimSampler", "AnimSampler2", "AnimSampler3", "AnimSampler4", "AnimSampler5", "AnimSampler6"];
+
+/// The texture animation manager's second sampler (constructor defaults with minFilter 5, magFilter 1 and wrap 2
+/// on all three axes, which Direct3D 11 makes clamp; the border colour is not read when clamping).
+const ANIMATION_SAMPLER: SamplerState = SamplerState {
+    min_filter: 5,
+    mag_filter: 1,
+    wrap: [2, 2, 2],
+    lod_bias: 0.0,
+    max_anisotropy: 1.0,
+    border: [0; 4],
+    flags: 0,
+};
+
+/// A face material's `layer1` … `layer6`: 1 for the layers the stack fills, else 0.
+fn layer_value(name: &str, filled: usize) -> Option<Value> {
+    let k: usize = name.strip_prefix("layer")?.parse().ok()?;
+    (1..=6).contains(&k).then(|| Value::Floats(vec![if k <= filled { 1.0 } else { 0.0 }]))
+}
+
+/// A texture the engine shows at run time (a texture animation's frame), loaded on first use.
+fn runtime_texture(
+    cache: &mut HashMap<String, Option<aerugo_gfx::TextureHandle>>,
+    vfs: &Vfs,
+    renderer: &mut Renderer,
+    path: &str,
+) -> Option<aerugo_gfx::TextureHandle> {
+    *cache.entry(path.to_owned()).or_insert_with(|| {
+        crate::assets::load_texture(vfs, renderer, path).map_err(|e| log::warn!("{path}: {e}")).ok()
+    })
 }
 
 /// What a frame draws: the map (drawn ten times its file size), plain models with their own placement (in the
@@ -71,8 +110,25 @@ pub struct FieldRenderer {
     targets: Option<((u32, u32, u32), [TargetHandle; 4])>,
     /// Values the shaders read that nothing supplied (logged once each).
     reported: std::collections::HashSet<String>,
-    /// Texture animation swap textures by archive path, as they are first shown.
+    /// Texture animation frames (map swap textures, character face sprites) by archive path, as they are first
+    /// shown.
     swaps: HashMap<String, Option<aerugo_gfx::TextureHandle>>,
+    /// Whether an effect (by asset id) sets the `CHR_TEXTURE_ANIMATION_UV` switch.
+    uv_effects: HashMap<String, bool>,
+}
+
+/// Whether a material's effect variant sets the switch `CHR_TEXTURE_ANIMATION_UV` (to anything but ""), as
+/// the remaster's texture animation manager checks it; cached by effect.
+fn uv_animation(
+    cache: &mut HashMap<String, bool>,
+    vfs: &Vfs,
+    game: aerugo_formats::Game,
+    effect: &str,
+) -> bool {
+    *cache.entry(effect.to_owned()).or_insert_with(|| {
+        crate::assets::load_effect(vfs, game, effect)
+            .is_some_and(|e| e.switches.iter().any(|(n, v)| n == "CHR_TEXTURE_ANIMATION_UV" && !v.is_empty()))
+    })
 }
 
 impl FieldRenderer {
@@ -177,13 +233,11 @@ impl FieldRenderer {
                     let swap = (!id.is_empty() && !id.contains("Mat_CTA"))
                         .then(|| objects.texture_animations.and_then(|t| t.texture(id)))
                         .flatten()
-                        .and_then(|p| {
-                            *self.swaps.entry(p.to_owned()).or_insert_with(|| {
-                                crate::assets::load_texture(vfs, renderer, p)
-                                    .map_err(|e| log::warn!("{p}: {e}"))
-                                    .ok()
-                            })
-                        });
+                        .and_then(|p| runtime_texture(&mut self.swaps, vfs, renderer, p));
+                    let overrides = Overrides {
+                        textures: swap.map(|h| ("TextureSampler", Some(h))).into_iter().collect(),
+                        ..Overrides::default()
+                    };
                     let draws = segment_draws(
                         vfs,
                         renderer,
@@ -196,7 +250,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
-                        swap,
+                        &overrides,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
@@ -218,6 +272,7 @@ impl FieldRenderer {
                     let fseg = &source.segments[seg.source];
                     let Some(material) = source.materials.get(fseg.material as usize) else { continue };
                     let Some((pass, transparent)) = main_pass(vfs, model.game, material) else { continue };
+                    let overrides = Overrides::default();
                     let draws = segment_draws(
                         vfs,
                         renderer,
@@ -230,7 +285,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
-                        None,
+                        &overrides,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
@@ -256,10 +311,31 @@ impl FieldRenderer {
                         mesh.skeleton.as_ref().zip(joints.as_ref()).map(|(sk, j)| {
                             sk.palette(j, fseg).iter().map(|m| world * Mat4::from_cols_array(m)).collect()
                         });
+                    // A face material (`m_texAnimID` "Mat_CTA…") shows the newest six entries of the face layer
+                    // stack, oldest first (only the newest when its effect sets CHR_TEXTURE_ANIMATION_UV):
+                    // AnimSampler k takes entry k's texture and layer k = 1; the slots past them show the empty
+                    // texture with layer k = 0. Its AnimSamplerState is the manager's clamping sampler.
+                    let shown = material.tex_anim_id.contains("Mat_CTA").then(|| {
+                        let uv = uv_animation(&mut self.uv_effects, vfs, model.game, &material.effect);
+                        face::shown_layers(a.face_layers, uv)
+                    });
+                    let mut overrides = Overrides::default();
+                    if let Some(shown) = shown {
+                        for (k, slot) in ANIM_SAMPLERS.into_iter().enumerate() {
+                            let path =
+                                shown.get(k).zip(a.face).and_then(|(l, f)| f.texture(l.sprite, l.frame));
+                            let texture =
+                                path.and_then(|p| runtime_texture(&mut self.swaps, vfs, renderer, p));
+                            overrides.textures.push((slot, texture));
+                        }
+                        overrides.samplers.push(("AnimSamplerState", ANIMATION_SAMPLER));
+                    }
+                    let filled = shown.map(<[FaceLayer]>::len);
                     let values = |name: &str| {
                         scene
                             .value(name)
                             .or_else(|| object(name))
+                            .or_else(|| filled.and_then(|n| layer_value(name, n)))
                             .or_else(|| character_value(name, a, light, &bones))
                     };
                     let draws = segment_draws(
@@ -274,7 +350,7 @@ impl FieldRenderer {
                         &values,
                         anisotropy,
                         viewport,
-                        None,
+                        &overrides,
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));

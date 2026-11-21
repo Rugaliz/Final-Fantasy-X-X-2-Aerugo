@@ -225,7 +225,8 @@ pub fn motion_dir(model_path: &str) -> Option<String> {
 }
 
 /// Least-squares factor from motion translations (first frame) to an HD skeleton's default-pose
-/// translations, over the joints both share. About 0.01 for every character checked.
+/// translations, over the joints both share. About 0.01 for every character checked. A check on the decoder
+/// only: the game's scale is the character's `.chr` value (`aerugo_sim::field::chr_motion_scale`).
 pub fn fit_translation_scale(names: &[String], default_pose: &[[f32; 16]], motion: &Motion) -> f32 {
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (i, name) in names.iter().enumerate() {

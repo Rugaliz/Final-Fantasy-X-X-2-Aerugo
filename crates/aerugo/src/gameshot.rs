@@ -108,7 +108,7 @@ fn game_shot() {
                 &values,
                 4.0,
                 viewport,
-                None,
+                &crate::phyre::model::Overrides::default(),
                 &mut missing,
             );
             let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));

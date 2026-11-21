@@ -165,6 +165,14 @@ fn material_value(m: &Material, name: &str) -> Option<Value> {
     m.value(name).map(|v| Value::Floats(v.to_vec()))
 }
 
+/// Material parameters the engine writes at run time (the texture animation managers): texture parameters by
+/// name (`None`: the engine's empty texture) and sampler parameters by name.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub textures: Vec<(&'static str, Option<TextureHandle>)>,
+    pub samplers: Vec<(&'static str, SamplerState)>,
+}
+
 /// The draws of one segment in one scene pass of its material's effect (`shader` picks the light count).
 #[allow(clippy::too_many_arguments)]
 pub fn segment_draws(
@@ -179,7 +187,7 @@ pub fn segment_draws(
     values: &Values<'_>,
     anisotropy: f32,
     viewport: [f32; 6],
-    swap: Option<aerugo_gfx::TextureHandle>,
+    overrides: &Overrides,
     missing: &mut Vec<String>,
 ) -> Vec<GameDraw> {
     let source = &model.model.meshes[mesh.source];
@@ -193,7 +201,9 @@ pub fn segment_draws(
         let key = ProgramKey { cluster: cluster.clone(), pass: pass.to_owned(), shader, index };
         let Some(p) = programs.get(vfs, renderer, &key) else { break };
         let empty = programs.empty_texture(renderer);
-        out.push(draw(&p, model, material, fseg, seg, values, anisotropy, viewport, empty, swap, missing));
+        out.push(draw(
+            &p, model, material, fseg, seg, values, anisotropy, viewport, empty, overrides, missing,
+        ));
         if !programs.has_pass(vfs, &cluster, pass, shader, index + 1) {
             break;
         }
@@ -217,7 +227,7 @@ fn draw(
     anisotropy: f32,
     viewport: [f32; 6],
     empty: Option<aerugo_gfx::TextureHandle>,
-    swap: Option<aerugo_gfx::TextureHandle>,
+    overrides: &Overrides,
     missing: &mut Vec<String>,
 ) -> GameDraw {
     let mut constants = Vec::new();
@@ -234,9 +244,11 @@ fn draw(
         for r in &shader.resources {
             match r.kind {
                 aerugo_formats::dxbc::ResourceKind::Texture => {
-                    // The texture animation's current swap texture takes the material's `TextureSampler`.
-                    if let (true, Some(h)) = (r.name == "TextureSampler", swap) {
-                        images.push((stage, r.bind_point, ImageRef::Texture(h)));
+                    if let Some((_, h)) = overrides.textures.iter().find(|(n, _)| *n == r.name) {
+                        match h.or(empty) {
+                            Some(h) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
+                            None => missing.push(format!("texture {} (run-time)", r.name)),
+                        }
                         continue;
                     }
                     let binding = material.textures.iter().find(|t| t.parameter == r.name);
@@ -254,8 +266,13 @@ fn draw(
                     }
                 }
                 aerugo_formats::dxbc::ResourceKind::Sampler => {
-                    let state =
-                        material.samplers.iter().find(|(n, _)| *n == r.name).map(|(_, s)| *s).or_else(|| {
+                    let state = overrides
+                        .samplers
+                        .iter()
+                        .find(|(n, _)| *n == r.name)
+                        .map(|(_, s)| *s)
+                        .or_else(|| material.samplers.iter().find(|(n, _)| *n == r.name).map(|(_, s)| *s))
+                        .or_else(|| {
                             material
                                 .textures
                                 .iter()

@@ -34,13 +34,26 @@ pub struct TextureAnimations {
     pub materials: Vec<String>,
 }
 
-/// The files of an asset header in load order and the index it names `textureAnimation`.
-fn asset_header(text: &str) -> (Vec<String>, Option<usize>) {
+/// The files of an asset header's Direct3D 11 (32-bit) section in load order, and the index it names `name`.
+pub(crate) fn asset_header(text: &str, name: &str) -> (Vec<String>, Option<usize>) {
     let mut index = None;
     let mut files = Vec::new();
+    let mut inside = false;
+    let constant = format!("const Phyre::PUInt32 {name} =");
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("const Phyre::PUInt32 textureAnimation =") {
+        if line.starts_with("#ifdef PHYRE_RENDERING_PLATFORM_D3D11") {
+            inside = true;
+            continue;
+        }
+        if line.starts_with("#endif //! PHYRE_RENDERING_PLATFORM_D3D11") {
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(constant.as_str()) {
             index = rest.trim().trim_end_matches(';').trim().parse().ok();
         }
         let line = line.trim_start_matches(',');
@@ -60,7 +73,7 @@ impl TextureAnimations {
         let dir = map_model.rsplit_once("/mdl/")?.0;
         let name = dir.rsplit('/').next()?;
         let header = vfs.read(&format!("{dir}/{name}.ahwin32")).ok()?;
-        let (files, index) = asset_header(&String::from_utf8_lossy(&header));
+        let (files, index) = asset_header(&String::from_utf8_lossy(&header), "textureAnimation");
         let index = index?;
         let cluster = Cluster::parse(vfs.read(files.get(index)?).ok()?).ok()?;
         let animations = cluster
@@ -146,9 +159,13 @@ mod tests {
 
     #[test]
     fn reads_an_asset_header() {
-        let text = "const Phyre::PUInt32  = 0;\nconst Phyre::PUInt32 textureAnimation = 1;\n\
-                    const Phyre::PChar *g_fileNames[] = {\n\"/FFX_Data/A/t_000.dds.phyre\"\n,\"/FFX_Data/A/x.ags.phyre\"\n};";
-        let (files, index) = asset_header(text);
+        let text = "#ifdef PHYRE_RENDERING_PLATFORM_GL // 32 Bit\n\"/FFX_Data/GL/t.dds.phyre\"\n\
+                    #endif //! PHYRE_RENDERING_PLATFORM_GL 32 Bit\n\
+                    #ifdef PHYRE_RENDERING_PLATFORM_D3D11 // 32 Bit\n\
+                    const Phyre::PUInt32  = 0;\nconst Phyre::PUInt32 textureAnimation = 1;\n\
+                    const Phyre::PChar *g_fileNames[] = {\n\"/FFX_Data/A/t_000.dds.phyre\"\n,\"/FFX_Data/A/x.ags.phyre\"\n};\n\
+                    #endif //! PHYRE_RENDERING_PLATFORM_D3D11 32 Bit";
+        let (files, index) = asset_header(text, "textureAnimation");
         assert_eq!(files, ["ffx_data/a/t_000.dds.phyre", "ffx_data/a/x.ags.phyre"]);
         assert_eq!(index, Some(1));
     }

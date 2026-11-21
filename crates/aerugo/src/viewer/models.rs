@@ -138,6 +138,11 @@ impl ModelBrowser {
         self.selected = None;
         self.test_rotation = [0.0; 3];
         self.motions = load_motions(vfs, &path);
+        // The motion translation scale from the model's `.chr` data (without one, the block's default).
+        self.translation_scale = aerugo_sim::field::chr_path_of_model(&path)
+            .and_then(|p| vfs.read(&p).ok())
+            .and_then(|d| aerugo_sim::field::chr_motion_scale(&d))
+            .unwrap_or(0.001);
         self.motion = None;
         self.time = 0.0;
         let result = read_model_info(vfs, &path);
@@ -213,6 +218,8 @@ impl ModelBrowser {
                 pose: &pose,
                 material: [1.0; 4],
                 shade: [1.0; 3],
+                face: None,
+                face_layers: &[],
             };
             let cl = crate::assets::character_light(&aerugo_sim::field::FieldLights::default(), None, "");
             let light = crate::phyre::field::Lighting {
@@ -364,12 +371,6 @@ impl ModelBrowser {
     fn select_motion(&mut self, index: usize) {
         self.motion = Some(index);
         self.time = 0.0;
-        if let (Some((_, Ok(m))), Some((_, motion))) = (&self.loaded, self.motions.get(index))
-            && let Some(sk) = m.skeletons.iter().flatten().max_by_key(|s| s.len())
-        {
-            self.translation_scale =
-                aerugo_formats::motion::fit_translation_scale(&sk.names, &sk.default_pose, motion);
-        }
     }
 
     fn motion_ui(&mut self, ui: &mut egui::Ui) {

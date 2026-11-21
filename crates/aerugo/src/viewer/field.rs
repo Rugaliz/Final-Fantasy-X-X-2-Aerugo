@@ -11,7 +11,7 @@ use std::time::Instant;
 use aerugo_audio::AudioOutput;
 use aerugo_debug_ui::egui;
 use aerugo_formats::Game;
-use aerugo_formats::motion::{Motion, fit_translation_scale, ps2_joint};
+use aerugo_formats::motion::{Motion, ps2_joint};
 use aerugo_formats::phyre::Cluster;
 use aerugo_gfx::Renderer;
 use aerugo_script::Wait;
@@ -992,7 +992,7 @@ impl FieldView {
         // Advance each body's motion: the one the script asked for when it exists, else the first (idle).
         let dt = if self.paused { 0.0 } else { ui.input(|i| i.stable_dt).min(0.1) };
         for (w, a) in s.event.state.actors.iter().enumerate() {
-            let (Some(id), Some(Some(model))) = (a.model, a.model.and_then(|id| s.actors.get(&id))) else {
+            let (Some(id), Some(Some(_))) = (a.model, a.model.and_then(|id| s.actors.get(&id))) else {
                 continue;
             };
             let Some(motions) = s.motions.get(&id).filter(|m| !m.is_empty()) else { continue };
@@ -1007,14 +1007,8 @@ impl FieldView {
                 .unwrap_or(0);
             let entry = s.anim.entry(w).or_insert((usize::MAX, 0.0, 1.0));
             if entry.0 != want {
-                // The translation scale from the character's first (own) motion: an event motion's root
-                // carries it to its place, which a fit on that motion would take for body size.
-                let scale = model
-                    .skeletons
-                    .iter()
-                    .flatten()
-                    .max_by_key(|sk| sk.len())
-                    .map_or(1.0, |sk| fit_translation_scale(&sk.names, &sk.default_pose, &motions[0]));
+                // The translation scale from the character's `.chr` data (without one, the block's default).
+                let scale = s.event.state.model_motion_scales.get(&id).copied().flatten().unwrap_or(0.001);
                 *entry = (want, 0.0, scale);
             }
             let motion = &motions[want];
@@ -1165,6 +1159,7 @@ impl FieldView {
                 rgb,
                 k,
                 a.color[3].value.min(1.0),
+                (st.model_faces.get(&id).and_then(|f| f.1.as_deref()), a.face_layers.as_slice()),
             ));
         }
         let poses: Vec<_> = paths
@@ -1187,12 +1182,14 @@ impl FieldView {
         let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
             .iter()
             .zip(&poses)
-            .map(|((path, world, _, rgb, k, alpha), pose)| crate::phyre::field::ActorDraw {
+            .map(|((path, world, _, rgb, k, alpha, (face, layers)), pose)| crate::phyre::field::ActorDraw {
                 path,
                 world: *world,
                 pose,
                 material: [rgb[0] * k, rgb[1] * k, rgb[2] * k, *alpha],
                 shade: *rgb,
+                face: *face,
+                face_layers: layers,
             })
             .collect();
         let msaa = renderer.msaa();
