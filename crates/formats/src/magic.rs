@@ -13,7 +13,7 @@
 //! part's sub-part definitions and their program references from the part record. The readers keep them as
 //! offsets into the section bytes and never panic on bad input.
 
-/// A DLL's initialised data section.
+/// A DLL's data section, zero filled up to its size in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DllData {
     pub base: u32,
@@ -50,9 +50,13 @@ impl DllData {
             if !name.starts_with(b".data\0") {
                 continue;
             }
-            let (va, raw_size, raw) =
-                (u32_at(file, s + 0xc)?, u32_at(file, s + 0x10)?, u32_at(file, s + 0x14)?);
-            let bytes = file.get(raw as usize..(raw as usize).checked_add(raw_size as usize)?)?.to_vec();
+            let (vsize, va) = (u32_at(file, s + 8)?, u32_at(file, s + 0xc)?);
+            let (raw_size, raw) = (u32_at(file, s + 0x10)?, u32_at(file, s + 0x14)?);
+            let mut bytes = file.get(raw as usize..(raw as usize).checked_add(raw_size as usize)?)?.to_vec();
+            // (The part past the file's bytes reads as zero, as the loader leaves it.)
+            if vsize as usize > bytes.len() && vsize <= 0x1000_0000 {
+                bytes.resize(vsize as usize, 0);
+            }
             return Some(DllData { base, va: base.wrapping_add(va), bytes });
         }
         None

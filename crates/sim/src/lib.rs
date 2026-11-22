@@ -14,6 +14,7 @@ pub mod follow_camera;
 pub mod items;
 pub mod msgwin;
 pub mod new_game;
+pub mod ppp;
 pub mod save;
 pub mod snapshot;
 pub mod stats;
