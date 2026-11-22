@@ -242,6 +242,145 @@ rand_fn!(srand_hcv, Draw::Sym, RKind::ShortVec, true);
 rand_fn!(srand_up_hcv, Draw::Up, RKind::ShortVec, true);
 rand_fn!(srand_down_hcv, Draw::Down, RKind::ShortVec, true);
 
+// The matrix programs: the object's matrix (+0x10, 16 floats, the translation at +0x40) built from the
+// reference's works (A the translation, B three angles in 1/0x10000 turns, C the scale).
+
+type Mat = crate::chr::elements::Mat;
+
+/// The engine's turn matrices about X / Y / Z for an angle (the sine table at angle >> 4).
+fn turn(axis: u8, angle: u32) -> Mat {
+    let t = crate::traced_tables::sine();
+    let s = t[(angle >> 4 & 0xfff) as usize];
+    let c = t[(angle.wrapping_add(0x4000) >> 4 & 0xfff) as usize];
+    let mut m = [0.0; 16];
+    m[15] = 1.0;
+    match axis {
+        b'x' => {
+            m[0] = 1.0;
+            m[5] = c;
+            m[6] = s;
+            m[9] = -s;
+            m[10] = c;
+        }
+        b'y' => {
+            m[0] = c;
+            m[2] = -s;
+            m[5] = 1.0;
+            m[8] = s;
+            m[10] = c;
+        }
+        _ => {
+            m[0] = c;
+            m[1] = s;
+            m[4] = -s;
+            m[5] = c;
+            m[10] = 1.0;
+        }
+    }
+    m
+}
+
+fn get_mat(r: &Run, at: u32) -> Mat {
+    let mut m = [0.0; 16];
+    for (i, v) in m.iter_mut().enumerate() {
+        *v = r.m.f32(at + 4 * i as u32);
+    }
+    m
+}
+
+fn put_mat(r: &mut Run, at: u32, m: &Mat) {
+    for (i, v) in m.iter().enumerate() {
+        r.m.set_f32(at + 4 * i as u32, *v);
+    }
+}
+
+/// The three works of a matrix reference.
+fn works3(r: &Run, rf: u32) -> (u32, u32, u32) {
+    let pair = r.m.u32(rf + 0xc);
+    (r.m.u32(pair), r.m.u32(pair + 4), r.m.u32(pair + 8))
+}
+
+/// The turn matrix for angles (x, y, z) with the turns multiplied in `order` (the first two, then the third).
+fn turns(order: [u8; 3], ang: [u32; 3]) -> Mat {
+    let a = |ax: u8| ang[usize::from(ax - b'x')];
+    let first = crate::chr::elements::mul(&turn(order[0], a(order[0])), &turn(order[1], a(order[1])));
+    crate::chr::elements::mul(&first, &turn(order[2], a(order[2])))
+}
+
+fn matrix(r: &mut Run, order: [u8; 3], o: u32, rf: u32) {
+    let (wa, wb, wc) = works3(r, rf);
+    let (wa, wb, wc) = (at(o, wa), at(o, wb), at(o, wc));
+    let ang = [r.m.u32(wb), r.m.u32(wb + 4), r.m.u32(wb + 8)];
+    let mut m = turns(order, ang);
+    let sc = [r.m.f32(wc), r.m.f32(wc + 4), r.m.f32(wc + 8)];
+    for (row, k) in sc.iter().enumerate() {
+        for c in 0..3 {
+            m[row * 4 + c] *= k;
+        }
+    }
+    for i in 0..3 {
+        m[12 + i] = r.m.f32(wa + 4 * i as u32);
+    }
+    put_mat(r, o + 0x10, &m);
+}
+
+macro_rules! mat_fn {
+    ($name:ident, $order:expr) => {
+        fn $name(r: &mut Run, o: u32, _key: u32, rf: u32) {
+            matrix(r, $order, o, rf)
+        }
+    };
+}
+// (Multiplication orders, from the names: XYZ = Z · Y · X, and so on.)
+mat_fn!(matrix_xyz, *b"zyx");
+mat_fn!(matrix_xzy, *b"yzx");
+mat_fn!(matrix_yxz, *b"zxy");
+mat_fn!(matrix_yzx, *b"xzy");
+mat_fn!(matrix_zxy, *b"yxz");
+mat_fn!(matrix_zyx, *b"xyz");
+
+/// pppMatrixLoc: the unit matrix with the translation A.
+fn matrix_loc(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let wa = at(o, wa);
+    let mut m = crate::chr::elements::IDENTITY;
+    for i in 0..3 {
+        m[12 + i] = r.m.f32(wa + 4 * i as u32);
+    }
+    put_mat(r, o + 0x10, &m);
+}
+
+/// pppMatrixScl: the unit matrix with the scale B on its diagonal and the translation A.
+fn matrix_scl(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    let (wa, wb) = works(r, rf);
+    let (wa, wb) = (at(o, wa), at(o, wb));
+    let mut m = crate::chr::elements::IDENTITY;
+    m[0] = r.m.f32(wb);
+    m[5] = r.m.f32(wb + 4);
+    m[10] = r.m.f32(wb + 8);
+    for i in 0..3 {
+        m[12 + i] = r.m.f32(wa + 4 * i as u32);
+    }
+    put_mat(r, o + 0x10, &m);
+}
+
+/// pppParMatrix: with a target in the key, the object's translation through its parent's matrix (object
+/// +4): each row's three products summed and stored, then the translation added.
+fn par_matrix(r: &mut Run, o: u32, key: u32, _rf: u32) {
+    if r.m.u32(key + 4) == 0xffff_ffff {
+        return;
+    }
+    let parent = r.m.u32(o + 4);
+    let p = [r.m.f32(o + 0x40), r.m.f32(o + 0x44), r.m.f32(o + 0x48)].map(f64::from);
+    let pm = get_mat(r, parent + 0x10);
+    for i in 0..4 {
+        let d = |k: usize| f64::from(pm[k]);
+        let t = (p[2] * d(8 + i) + p[1] * d(4 + i) + p[0] * d(i)) as f32;
+        let v = (d(12 + i) + f64::from(t)) as f32;
+        r.m.set_f32(o + 0x40 + 4 * i as u32, v);
+    }
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -312,6 +451,7 @@ pub fn by_name(name: &'static str) -> Option<Program> {
         restart: Some(init),
         ..Program::default()
     };
+    let upd = |update: Upd| Program { name, update: Some(update), ..Program::default() };
     Some(match name {
         "pppAccele" | "pppMove" | "pppSclAccele" | "pppSclMove" => p(rate_f, init_b_one),
         "pppAngAccele" | "pppAngMove" => p(rate_i, init_b_zero),
@@ -319,6 +459,15 @@ pub fn by_name(name: &'static str) -> Option<Program> {
         "pppPoint" | "pppScale" => p(value_f, init_a_one),
         "pppAngle" => p(value_i, init_a_zero),
         "pppColor" => p(value_s, init_a_short),
+        "pppMatrixXYZ" => upd(matrix_xyz),
+        "pppMatrixXZY" => upd(matrix_xzy),
+        "pppMatrixYXZ" => upd(matrix_yxz),
+        "pppMatrixYZX" => upd(matrix_yzx),
+        "pppMatrixZXY" => upd(matrix_zxy),
+        "pppMatrixZYX" => upd(matrix_zyx),
+        "pppMatrixLoc" => upd(matrix_loc),
+        "pppMatrixScl" => upd(matrix_scl),
+        "pppParMatrix" => upd(par_matrix),
         _ if random_update(name).is_some() => {
             Program { name, update: random_update(name), ..Program::default() }
         }
