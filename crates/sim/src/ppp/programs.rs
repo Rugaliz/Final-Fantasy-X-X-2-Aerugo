@@ -797,6 +797,238 @@ fn point_r_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
     r.m.set_u8(cd, n);
 }
 
+// The born family: children at vertices of a mesh, walked in order or at random, through a callback per
+// program (the shared walk "pppKeBornRnd2").
+
+/// The callback: (run, spawner, key, vertex address) → whether to go on.
+type BornFn = fn(&mut Run, u32, u32, u32) -> bool;
+
+/// The walk: `count` vertices of mesh `mesh` from the cursor (u16 at `cursor`) or at random, each through `cb`;
+/// the cursor is kept when all were made (true), not when a callback stops it.
+#[allow(clippy::too_many_arguments)]
+fn born_walk(
+    r: &mut Run,
+    o: u32,
+    key: u32,
+    cb: BornFn,
+    cursor: u32,
+    mesh_n: i16,
+    random: bool,
+    count: u8,
+) -> bool {
+    let e = r.env.lists[2].wrapping_add((mesh_n as i32 as u32).wrapping_mul(8));
+    let verts = match r.m.u32(o + 0x90) {
+        0 if r.m.u16(e) as i16 == -0x6fe8 => 0,
+        0 => {
+            let rec = (r.m.u16(e) as i16 as i32 as u32).wrapping_mul(0x20);
+            r.m.u32(r.env.lists[0].wrapping_add(rec) + 0x14)
+        }
+        v => v,
+    };
+    let n = i32::from(r.m.u16(e + 2) as i16);
+    let pick = |r: &mut Run| if n == 0 { 0 } else { r.vu_int().wrapping_rem(n) as u32 };
+    let mut idx = if random { pick(r) } else { u32::from(r.m.u16(cursor)) };
+    let list = r.m.u32(e + 4);
+    for _ in 0..count {
+        let v = verts.wrapping_add(u32::from(r.m.u16(list.wrapping_add(idx.wrapping_mul(2)))) * 6);
+        if !cb(r, o, key, v) {
+            return false;
+        }
+        idx = if random {
+            pick(r)
+        } else if n <= idx as i32 + 1 {
+            0
+        } else {
+            idx + 1
+        };
+    }
+    r.m.set_u16(cursor, idx as u16);
+    true
+}
+
+/// The vertex as a point (x, y, z, 1).
+fn vertex4(r: &Run, v: u32) -> [f32; 4] {
+    let p = vertex_at(r, v, 0);
+    [p[0], p[1], p[2], 1.0]
+}
+
+fn set3(r: &mut Run, at_: u32, v: &[f32]) {
+    for (i, x) in v.iter().take(3).enumerate() {
+        r.m.set_f32(at_ + 4 * i as u32, *x);
+    }
+}
+
+/// The born children of 758840 / 758fc0 (slot key +0x10): at the vertex through the spawner's matrix (work
+/// key +0x14), moving away from the spawner (key +8 · the unit direction, work key +0x1c). Not for magic 0x2a9.
+fn born_away(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
+    use crate::chr::elements::{apply4, normalize};
+    if r.magic == 0x2a9 {
+        return true;
+    }
+    let c = child(r, o, r.m.u32(key + 0x10));
+    if c == 0 {
+        return false;
+    }
+    let p = apply4(&get_mat(r, o + 0x10), vertex4(r, v));
+    set3(r, at(c, r.m.u32(key + 0x14)), &p);
+    let t = vec4(r, o + 0x40);
+    let d = normalize([p[0] - t[0], p[1] - t[1], p[2] - t[2], p[3] - t[3]]);
+    let k = r.m.f32(key + 8);
+    let d = [k * d[0], d[1] * k, d[2] * k];
+    set3(r, at(c, r.m.u32(key + 0x1c)), &d);
+    true
+}
+
+/// 7589f0 (slot key +0xc): at the vertex through the matrix (work key +0x10), the unit direction away from the
+/// spawner (work key +0x18).
+fn born_dir(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
+    use crate::chr::elements::{apply4, normalize};
+    let c = child(r, o, r.m.u32(key + 0xc));
+    if c == 0 {
+        return false;
+    }
+    let p = apply4(&get_mat(r, o + 0x10), vertex4(r, v));
+    set3(r, at(c, r.m.u32(key + 0x10)), &p);
+    let t = vec4(r, o + 0x40);
+    let d = normalize([p[0] - t[0], p[1] - t[1], p[2] - t[2], p[3] - t[3]]);
+    set3(r, at(c, r.m.u32(key + 0x18)), &d);
+    true
+}
+
+/// The engine's two-argument arc tangent (7590e0): of (a, b), None at the origin.
+fn atan_ab(a: f32, b: f32) -> Option<f32> {
+    let prod = a * b;
+    // (The engine's 3.141592654 and 1.570796327, as floats.)
+    let pi = f64::from(f32::from_bits(0x40490fdb));
+    let half = f64::from(f32::from_bits(0x3fc90fdb));
+    if prod > 0.0 {
+        let base = if a <= 0.0 { -pi } else { 0.0 };
+        let t = (f64::from(b) / f64::from(a)).atan() as f32;
+        return Some(t + base as f32);
+    }
+    if prod < 0.0 {
+        let base = if b <= 0.0 { -half } else { half };
+        let t = (f64::from(a) / f64::from(b)).atan() as f32;
+        return Some((base - f64::from(t)) as f32);
+    }
+    if a == 0.0 {
+        if b == 0.0 {
+            return None;
+        }
+        return Some(if b <= 0.0 { -half } else { half } as f32);
+    }
+    Some(if a <= 0.0 { pi } else { 0.0 } as f32)
+}
+
+/// The angle as the engine's turn units (· 32768 / 3.141592654, truncated).
+fn turn_units(a: f32) -> u32 {
+    // (The engine's 3.141592654 as a double.)
+    ftol(f64::from(a) * 32768.0 / f64::from_bits(0x400921fb54524550)) as u32
+}
+
+/// 7592a0 (slot key +0xc): at the vertex's own coordinates (work key +0x10), facing it (work key +0x18: the
+/// angles about X and Y, 0 about Z... as the engine orders them: +0 from the horizontal length and −z, +8
+/// from (−y, x), +4 zero).
+fn born_face(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
+    let c = child(r, o, r.m.u32(key + 0xc));
+    if c == 0 {
+        return false;
+    }
+    let p = vertex4(r, v);
+    set3(r, at(c, r.m.u32(key + 0x10)), &p);
+    let w = at(c, r.m.u32(key + 0x18));
+    if let Some(a) = atan_ab(-p[1], p[0]) {
+        r.m.set_u32(w + 8, turn_units(a));
+    }
+    let len = ((f64::from((f64::from(p[0]) * f64::from(p[0]) + f64::from(p[1]) * f64::from(p[1])) as f32))
+        .sqrt()) as f32;
+    if let Some(a) = atan_ab(len, -p[2]) {
+        r.m.set_u32(w, turn_units(a));
+    }
+    r.m.set_u32(w + 4, 0);
+    true
+}
+
+/// pppKeBornRnd5 / pppKeBornRnd6: every key interval frames (countdown byte at A +2) a walk; the countdown
+/// runs down only after a walk that made all its children.
+fn born_timed(r: &mut Run, o: u32, key: u32, rf: u32, six: bool) {
+    let (wait, s1, s2, mesh_at, rnd_at, cnt_at, cb): (u32, u32, u32, u32, u32, u32, BornFn) =
+        if six { (7, 0xc, 0x14, 4, 8, 6, born_face) } else { (0xd, 0x10, 0x18, 4, 0xe, 0xc, born_away) };
+    if r.paused || r.m.u8(key + wait) == 0 {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    let cd = a + 2;
+    let go = if r.m.u8(cd) != 0 {
+        true
+    } else {
+        let w = r.m.u8(key + wait);
+        r.m.set_u8(cd, w);
+        r.m.u32(key + s1) != 0xffff_ffff
+            && r.m.u32(key + s2) != 0xffff_ffff
+            && born_walk(
+                r,
+                o,
+                key,
+                cb,
+                a,
+                r.m.u16(key + mesh_at) as i16,
+                r.m.u8(key + rnd_at) != 0,
+                r.m.u8(key + cnt_at),
+            )
+    };
+    if go {
+        let n = r.m.u8(cd).wrapping_sub(1);
+        r.m.set_u8(cd, n);
+    }
+}
+
+fn born5(r: &mut Run, o: u32, k: u32, rf: u32) {
+    born_timed(r, o, k, rf, false)
+}
+fn born6(r: &mut Run, o: u32, k: u32, rf: u32) {
+    born_timed(r, o, k, rf, true)
+}
+
+/// pppKeBornRnd2 / pppKeBornRnd3: a walk on frames where the integer draw's second byte has none of the key's
+/// mask bits (mask 0xff: never).
+fn born_chance(r: &mut Run, o: u32, key: u32, rf: u32, three: bool) {
+    let (mask_at, s1, s2, rnd_at, cnt_at, cb): (u32, u32, u32, u32, u32, BornFn) =
+        if three { (7, 0xc, 0x14, 8, 6, born_dir) } else { (0xd, 0x10, 0x18, 0xe, 0xc, born_away) };
+    let mask = r.m.u8(key + mask_at);
+    if r.paused || mask == 0xff {
+        return;
+    }
+    if (r.vu_int() >> 8) as u8 & mask != 0 {
+        return;
+    }
+    if r.m.u32(key + s1) == 0xffff_ffff || r.m.u32(key + s2) == 0xffff_ffff {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let (mesh_n, random, count) = (r.m.u16(key + 4) as i16, r.m.u8(key + rnd_at) != 0, r.m.u8(key + cnt_at));
+    born_walk(r, o, key, cb, at(o, wa), mesh_n, random, count);
+}
+
+fn born2(r: &mut Run, o: u32, k: u32, rf: u32) {
+    born_chance(r, o, k, rf, false)
+}
+fn born3(r: &mut Run, o: u32, k: u32, rf: u32) {
+    born_chance(r, o, k, rf, true)
+}
+
+fn born_init_timed(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_u16(at(o, wa), 0);
+    r.m.set_u8(at(o, wa) + 2, 0);
+}
+
+fn born_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_u16(at(o, wa), 0);
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -908,6 +1140,14 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             ..Program::default()
         },
         "pppVertexAttend" => upd(vertex_attend),
+        "pppKeBornRnd5" => {
+            Program { name, update: Some(born5), init: Some(born_init_timed), ..Program::default() }
+        }
+        "pppKeBornRnd6" => {
+            Program { name, update: Some(born6), init: Some(born_init_timed), ..Program::default() }
+        }
+        "pppKeBornRnd2" => Program { name, update: Some(born2), init: Some(born_init), ..Program::default() },
+        "pppKeBornRnd3" => Program { name, update: Some(born3), init: Some(born_init), ..Program::default() },
         "pppPointRAp" => {
             Program { name, update: Some(point_r_ap), init: Some(point_ap_init), ..Program::default() }
         }

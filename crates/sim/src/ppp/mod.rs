@@ -311,6 +311,8 @@ pub struct Run<'a> {
     /// and the engine's link value set): a parent ending before its new child lives a frame longer. The host
     /// sets it.
     pub vertex_lc_extend: bool,
+    /// The engine's current magic number (some programs leave effect 0x2a9 alone).
+    pub magic: u32,
 }
 
 impl Run<'_> {
@@ -328,6 +330,12 @@ impl Run<'_> {
             1.0
         };
         v + -1.0
+    }
+
+    /// The vector-unit integer draw (two draws; the second's value · 32768, truncated).
+    pub fn vu_int(&mut self) -> i32 {
+        self.vu_draw();
+        (f64::from(self.vu_draw()) * 32768.0).trunc() as i32
     }
 
     /// The program a bound reference (or list entry) at `at` points to (table entries are 0x28 bytes).
