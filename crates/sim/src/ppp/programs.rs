@@ -381,6 +381,109 @@ fn par_matrix(r: &mut Run, o: u32, key: u32, _rf: u32) {
     }
 }
 
+fn vec4(r: &Run, at: u32) -> [f32; 4] {
+    [r.m.f32(at), r.m.f32(at + 4), r.m.f32(at + 8), r.m.f32(at + 12)]
+}
+
+fn put_vec4(r: &mut Run, at: u32, v: [f32; 4]) {
+    for (i, x) in v.into_iter().enumerate() {
+        r.m.set_f32(at + 4 * i as u32, x);
+    }
+}
+
+/// The rows of `m` scaled by `k` (x, y, z), their fourth elements kept.
+fn scale_rows(m: &mut Mat, k: [f32; 3]) {
+    for (row, s) in k.iter().enumerate() {
+        for c in 0..3 {
+            m[row * 4 + c] *= s;
+        }
+    }
+}
+
+/// pppKeParMatR: the parent's (object +4) turn without its scale, then the object's translation through the
+/// parent's whole matrix.
+fn ke_par_mat_r(r: &mut Run, o: u32, _key: u32, _rf: u32) {
+    use crate::chr::elements::{apply4, mul, normalize};
+    let parent = r.m.u32(o + 4);
+    let pm = get_mat(r, parent + 0x10);
+    let row = |k: usize| normalize([pm[k * 4], pm[k * 4 + 1], pm[k * 4 + 2], pm[k * 4 + 3]]);
+    let mut n = [0.0; 16];
+    for k in 0..3 {
+        n[k * 4..k * 4 + 4].copy_from_slice(&row(k));
+    }
+    let v = apply4(&pm, vec4(r, o + 0x40));
+    let m = mul(&n, &get_mat(r, o + 0x10));
+    put_mat(r, o + 0x10, &m);
+    put_vec4(r, o + 0x40, v);
+}
+
+/// pppKeOfsMatXYZ: the XYZ turn of B scaled by C, about the offset A +0x10 + A +0x20: the translation is A plus
+/// the offset less the turned offset.
+fn ke_ofs_mat_xyz(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    use crate::chr::elements::apply4;
+    let (wa, wb, wc) = works3(r, rf);
+    let (wa, wb, wc) = (at(o, wa), at(o, wb), at(o, wc));
+    let mut m = turns(*b"zyx", [r.m.u32(wb), r.m.u32(wb + 4), r.m.u32(wb + 8)]);
+    scale_rows(&mut m, [r.m.f32(wc), r.m.f32(wc + 4), r.m.f32(wc + 8)]);
+    m[12] = 0.0;
+    m[13] = 0.0;
+    m[14] = 0.0;
+    m[15] = 1.0;
+    let (p, q) = (vec4(r, wa + 0x10), vec4(r, wa + 0x20));
+    let off = [p[0] + q[0], p[1] + q[1], p[2] + q[2], p[3] + q[3]];
+    let t = apply4(&m, off);
+    for i in 0..3 {
+        let v = ((f64::from(r.m.f32(wa + 4 * i as u32)) + f64::from(off[i])) - f64::from(t[i])) as f32;
+        m[12 + i] = v;
+    }
+    m[15] = 1.0;
+    put_mat(r, o + 0x10, &m);
+}
+
+/// pppKeMatSN: the XYZ turn of the change of the angles B since the last frame (kept at A +0x80) into the
+/// matrix at A +0x40, its first two translation words then zero.
+fn ke_mat_sn(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    let (wa, wb) = works(r, rf);
+    let (wa, wb) = (at(o, wa), at(o, wb));
+    let prev = [r.m.u32(wa + 0x80), r.m.u32(wa + 0x84), r.m.u32(wa + 0x88)];
+    let now = [r.m.u32(wb), r.m.u32(wb + 4), r.m.u32(wb + 8)];
+    for (i, v) in now.iter().enumerate() {
+        r.m.set_u32(wa + 0x80 + 4 * i as u32, *v);
+    }
+    let d = [prev[0].wrapping_sub(now[0]), prev[1].wrapping_sub(now[1]), prev[2].wrapping_sub(now[2])];
+    let m = turns(*b"zyx", d);
+    put_mat(r, wa + 0x40, &m);
+    r.m.set_u32(wa + 0x70, 0);
+    r.m.set_u32(wa + 0x74, 0);
+}
+
+fn ke_mat_sn_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa) + 0x80, &[0; 3]);
+}
+
+/// pppKeMatPht: the XYZ-ordered (X · Y · Z) turn of B scaled by C with the translation A, kept in work D; the
+/// object's matrix is C on the diagonal with D's translation.
+fn ke_mat_pht(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    let pair = r.m.u32(rf + 0xc);
+    let (wa, wb, wc, wd) = (r.m.u32(pair), r.m.u32(pair + 4), r.m.u32(pair + 8), r.m.u32(pair + 12));
+    let (wa, wb, wc, wd) = (at(o, wa), at(o, wb), at(o, wc), at(o, wd));
+    let mut m = turns(*b"xyz", [r.m.u32(wb), r.m.u32(wb + 4), r.m.u32(wb + 8)]);
+    let k = [r.m.f32(wc), r.m.f32(wc + 4), r.m.f32(wc + 8)];
+    scale_rows(&mut m, k);
+    for i in 0..3 {
+        m[12 + i] = r.m.f32(wa + 4 * i as u32);
+    }
+    put_mat(r, wd, &m);
+    let mut om = crate::chr::elements::IDENTITY;
+    om[0] = k[0];
+    om[5] = k[1];
+    om[10] = k[2];
+    put_mat(r, o + 0x10, &om);
+    let t = vec4(r, wd + 0x30);
+    put_vec4(r, o + 0x40, t);
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -468,6 +571,12 @@ pub fn by_name(name: &'static str) -> Option<Program> {
         "pppMatrixLoc" => upd(matrix_loc),
         "pppMatrixScl" => upd(matrix_scl),
         "pppParMatrix" => upd(par_matrix),
+        "pppKeParMatR" => upd(ke_par_mat_r),
+        "pppKeOfsMatXYZ" => upd(ke_ofs_mat_xyz),
+        "pppKeMatSN" => {
+            Program { name, update: Some(ke_mat_sn), init: Some(ke_mat_sn_init), ..Program::default() }
+        }
+        "pppKeMatPht" => upd(ke_mat_pht),
         _ if random_update(name).is_some() => {
             Program { name, update: random_update(name), ..Program::default() }
         }
