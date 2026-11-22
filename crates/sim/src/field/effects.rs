@@ -2,9 +2,11 @@
 //! state goes 0 idle → 1 loading (00db) → 3 loaded (its tick, the frame after) → 4 running (00dc) → 5
 //! signalled (by the effect program) → 6 freed → 0.
 //!
-//! Not ported yet: the effect programs themselves (the magic file loader and the effect runtime the programs
-//! drive, shared with battle magic). Until they are, a started effect is taken as signalled at once, so the
-//! events go on; nothing is drawn.
+//! The program's signal is ported: an event effect's run (after the scripts, each unpaused frame) signals on its
+//! first run, as nothing in the field holds the effect system busy (only battle effect commands set that).
+//!
+//! Not ported yet: the rest of the effect programs (their particle runtime, the end that frees the effect, the
+//! draw). Nothing is drawn.
 
 use aerugo_script::natives::{Native, Natives};
 use aerugo_script::vm::Value;
@@ -67,8 +69,12 @@ pub fn frame_start(g: &mut FieldState) {
     }
 }
 
-/// After the scripts: the loader's process (a freed effect goes).
+/// After the scripts: the running effect's program (its first run signals: state 4 → 5), then the loader's
+/// process (a freed effect goes).
 pub fn frame_after_scripts(g: &mut FieldState) {
+    if g.effects.state == 4 {
+        g.effects.state = 5;
+    }
     if g.effects.state == 6 {
         g.effects.state = 0;
     }
@@ -99,8 +105,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             result: None,
         },
     );
-    // 00dc: start the loaded effect (state 3 → 4) and wait until it signals (state 5). (The program is not
-    // ported: see the module notes.)
+    // 00dc: start the loaded effect (state 3 → 4) and wait until it signals (state 5).
     n.register(
         0x00DC,
         Native {
@@ -110,8 +115,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                     g.effects.state = 4;
                     0
                 }
-                4 | 5 => {
-                    g.effects.state = 5;
+                5 => {
                     g.effects.hold = 0;
                     5
                 }
