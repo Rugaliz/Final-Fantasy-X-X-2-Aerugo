@@ -1029,6 +1029,162 @@ fn born_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u16(at(o, wa), 0);
 }
 
+/// A vector's length (x² + y² + z², the double square root, as a float).
+fn length(v: [f32; 4]) -> f32 {
+    let d = |x: f32| f64::from(x) * f64::from(x);
+    ((d(v[0]) + d(v[1]) + d(v[2])).sqrt()) as f32
+}
+
+fn sub4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]]
+}
+
+/// The address a key's target names: work `w` of the first object of slot `slot` of the running part, or (−1)
+/// the scratch vector.
+fn key_target(r: &Run, slot: u32, w: u32) -> u32 {
+    if slot == 0xffff_ffff {
+        return super::SCRATCH_VECTOR;
+    }
+    let first = r.m.u32(r.slots.wrapping_add(slot.wrapping_mul(0x10)) + 4);
+    first.wrapping_add(w).wrapping_add(0xa0)
+}
+
+/// pppKeGrvTgt: on the key's time, B = (radius key +4, strength key +8, the address of A): a gravity target.
+fn ke_grv_tgt(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.m.u32(o + 0xc) != r.m.u32(key) {
+        return;
+    }
+    let (wa, wb) = works(r, rf);
+    let b = at(o, wb);
+    let (k1, k2) = (r.m.u32(key + 4), r.m.u32(key + 8));
+    r.m.set_u32(b, k1);
+    r.m.set_u32(b + 4, k2);
+    r.m.set_u32(b + 8, at(o, wa));
+}
+
+fn ke_grv_tgt_init(r: &mut Run, o: u32, rf: u32) {
+    let (_, wb) = works(r, rf);
+    r.m.set_u32(at(o, wb) + 8, 0);
+}
+
+/// pppKeGrvEff: on the key's time C = the gravity target the key names (slot key +4, work key +8); from then on
+/// (not on the first frame) the velocity B is pulled toward the target's position within its radius:
+/// (1 − distance / radius) · strength along the unit direction.
+fn ke_grv_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
+    use crate::chr::elements::normalize;
+    let (wa, wb, wc) = works3(r, rf);
+    let c = at(o, wc);
+    if r.m.u32(o + 0xc) == r.m.u32(key) {
+        let t = key_target(r, r.m.u32(key + 4), r.m.u32(key + 8));
+        r.m.set_u32(c, t);
+        if r.m.u32(o + 0xc) == 0 {
+            return;
+        }
+    }
+    let t = r.m.u32(c);
+    if r.paused || t == super::SCRATCH_VECTOR {
+        return;
+    }
+    let pos = vec4(r, r.m.u32(t + 8));
+    let d = sub4(pos, vec4(r, at(o, wa)));
+    let dist = length(d);
+    let dn = normalize(d);
+    let rad = r.m.f32(t);
+    if dist < rad {
+        let k = ((1.0 - f64::from(dist) / f64::from(rad)) * f64::from(r.m.f32(t + 4))) as f32;
+        let b = at(o, wb);
+        for (i, x) in dn.iter().take(3).enumerate() {
+            let v = r.m.f32(b + 4 * i as u32) + x * k;
+            r.m.set_f32(b + 4 * i as u32, v);
+        }
+    }
+}
+
+/// pppKeHmgEff: on the key's time C = (the turn rate key +4, the target the key names: slot +8, work +0xc);
+/// from then on the velocity B turns toward the target: its direction blended with the target's by the
+/// rate (nudged on a random axis when they are opposite), at B's speed.
+fn ke_hmg_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
+    use crate::chr::elements::normalize;
+    let (wa, wb, wc) = works3(r, rf);
+    let c = at(o, wc);
+    if r.m.u32(o + 0xc) == r.m.u32(key) {
+        let k1 = r.m.u32(key + 4);
+        r.m.set_u32(c, k1);
+        let t = key_target(r, r.m.u32(key + 8), r.m.u32(key + 0xc));
+        r.m.set_u32(c + 4, t);
+        if r.m.u32(o + 0xc) == 0 {
+            return;
+        }
+    }
+    let t = r.m.u32(c + 4);
+    if r.paused || t == super::SCRATCH_VECTOR {
+        return;
+    }
+    let b = at(o, wb);
+    let mut d = normalize(sub4(vec4(r, t), vec4(r, at(o, wa))));
+    let v = vec4(r, b);
+    let speed = length(v);
+    let vn = normalize(v);
+    let sum = [vn[0] + d[0], vn[1] + d[1], vn[2] + d[2], vn[3] + d[3]];
+    if sum.iter().all(|x| x.to_bits() == 0) {
+        let k = r.vu_int().wrapping_rem(3) as usize;
+        d[k] += 0.05;
+    }
+    let rate = f64::from(r.m.f32(c));
+    let inv = 1.0 - rate;
+    let mix = |a: f32, b_: f32| (f64::from(a) * rate + inv * f64::from(b_)) as f32;
+    let m = [
+        mix(d[0], vn[0]),
+        mix(d[1], vn[1]),
+        mix(d[2], vn[2]),
+        (inv * f64::from(vn[3]) + f64::from(d[3]) * rate) as f32,
+    ];
+    let m = normalize(m);
+    set3(r, b, &[m[0] * speed, m[1] * speed, m[2] * speed]);
+}
+
+/// pppKeMvYpEff: A's angles from the velocity B (when it is not zero): about Z from (−vy, vx), about X from the
+/// horizontal length and −vz.
+fn ke_mv_yp_eff(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    if r.paused {
+        return;
+    }
+    let (wa, wb) = works(r, rf);
+    let (a, b) = (at(o, wa), at(o, wb));
+    let v = vec4(r, b);
+    if v[1] == 0.0 && v[0] == 0.0 && v[2] == 0.0 {
+        return;
+    }
+    if let Some(t) = atan_ab(-v[1], v[0]) {
+        r.m.set_u32(a + 8, turn_units(t));
+    }
+    let len = ((f64::from((f64::from(v[0]) * f64::from(v[0]) + f64::from(v[1]) * f64::from(v[1])) as f32))
+        .sqrt()) as f32;
+    if let Some(t) = atan_ab(len, -v[2]) {
+        r.m.set_u32(a, turn_units(t));
+    }
+}
+
+/// pppKeDrct: on the key's time A = the key's three integers (+0x10).
+fn ke_drct(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.m.u32(o + 0xc) != r.m.u32(key) {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    for i in 0..3 {
+        let v = r.m.u32(key + 0x10 + 4 * i);
+        r.m.set_u32(a + 4 * i, v);
+    }
+}
+
+fn ke_drct_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_f32(at(o, wa) + 0xc, 1.0);
+}
+
+fn nothing(_: &mut Run, _: u32, _: u32) {}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1140,6 +1296,19 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             ..Program::default()
         },
         "pppVertexAttend" => upd(vertex_attend),
+        "pppKeGrvTgt" => {
+            Program { name, update: Some(ke_grv_tgt), init: Some(ke_grv_tgt_init), ..Program::default() }
+        }
+        "pppKeGrvEff" => {
+            Program { name, update: Some(ke_grv_eff), init: Some(nothing), ..Program::default() }
+        }
+        "pppKeHmgEff" => {
+            Program { name, update: Some(ke_hmg_eff), init: Some(nothing), ..Program::default() }
+        }
+        "pppKeMvYpEff" => upd(ke_mv_yp_eff),
+        "pppKeDrct" => {
+            Program { name, update: Some(ke_drct), init: Some(ke_drct_init), ..Program::default() }
+        }
         "pppKeBornRnd5" => {
             Program { name, update: Some(born5), init: Some(born_init_timed), ..Program::default() }
         }
