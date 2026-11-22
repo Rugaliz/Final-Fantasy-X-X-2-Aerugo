@@ -531,7 +531,7 @@ fn point_ap_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u8(at(o, wb) + 1, 0);
 }
 
-/// 757770: a child in slot key +0xc at a mesh vertex (three i16) through the spawner's matrix, into the child's
+/// A child in slot key +0xc at a mesh vertex (three i16) through the spawner's matrix, into the child's
 /// work at key +0x10.
 fn vertex_child(r: &mut Run, o: u32, key: u32, vtx: u32) {
     use crate::chr::elements::apply4;
@@ -626,7 +626,7 @@ fn vertex_at(r: &Run, verts: u32, idx: u32) -> [f32; 3] {
     [0, 2, 4].map(|k| f32::from(r.m.u16(verts + idx * 6 + k) as i16))
 }
 
-/// pppVertexApLc: pppVertexAp with the children at the vertex's own coordinates (757ed0).
+/// pppVertexApLc: pppVertexAp with the children at the vertex's own coordinates.
 fn vertex_ap_lc(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
     let wa = at(o, wa);
@@ -858,7 +858,7 @@ fn set3(r: &mut Run, at_: u32, v: &[f32]) {
     }
 }
 
-/// The born children of 758840 / 758fc0 (slot key +0x10): at the vertex through the spawner's matrix (work
+/// The born children of the away and away-in-place walks (slot key +0x10): at the vertex through the spawner's matrix (work
 /// key +0x14), moving away from the spawner (key +8 · the unit direction, work key +0x1c). Not for magic 0x2a9.
 fn born_away(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
     use crate::chr::elements::{apply4, normalize};
@@ -879,7 +879,7 @@ fn born_away(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
     true
 }
 
-/// 7589f0 (slot key +0xc): at the vertex through the matrix (work key +0x10), the unit direction away from the
+/// At the vertex through the matrix (work key +0x10), the unit direction away from the
 /// spawner (work key +0x18).
 fn born_dir(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
     use crate::chr::elements::{apply4, normalize};
@@ -895,7 +895,7 @@ fn born_dir(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
     true
 }
 
-/// The engine's two-argument arc tangent (7590e0): of (a, b), None at the origin.
+/// The engine's two-argument arc tangent: of (a, b), None at the origin.
 fn atan_ab(a: f32, b: f32) -> Option<f32> {
     let prod = a * b;
     // (The engine's 3.141592654 and 1.570796327, as floats.)
@@ -926,7 +926,7 @@ fn turn_units(a: f32) -> u32 {
     ftol(f64::from(a) * 32768.0 / f64::from_bits(0x400921fb54524550)) as u32
 }
 
-/// 7592a0 (slot key +0xc): at the vertex's own coordinates (work key +0x10), facing it (work key +0x18: the
+/// At the vertex's own coordinates (work key +0x10), facing it (work key +0x18: the
 /// angles about X and Y, 0 about Z... as the engine orders them: +0 from the horizontal length and −z, +8
 /// from (−y, x), +4 zero).
 fn born_face(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
@@ -1279,7 +1279,7 @@ fn ke_acm_cic(r: &mut Run, _o: u32, key: u32, _rf: u32) {
 
 fn nothing_part(_: &mut Run, _: &mut super::Part) {}
 
-/// 75c660: the average of a model's polygon centres (the model: u16 +0x10 polygon count, +4 its groups, +8 its
+/// The average of a model's polygon centres (the model: u16 +0x10 polygon count, +4 its groups, +8 its
 /// vertices, offsets from the model): groups of {type byte +1, i16 count +2, polygons from +0x10}: type 0
 /// triangles of 0x14 bytes, 2 triangles of 0x20 (vertex numbers at +0xc), 4 quads of 0x18, 6 quads of 0x28
 /// (at +0x10); w = 1.
@@ -1405,6 +1405,484 @@ fn ke_d_mat_fr(r: &mut Run, o: u32, _key: u32, rf: u32) {
     put_mat(r, at(o, wb), &m);
 }
 
+// The model draws: the object's colour (four i16 at a work plus the engine's scratch offset, which they then
+// clear) times the part's (each product >> 19, one byte), nothing when the alpha byte is 0; the model of image
+// record key +4 (0xffff: none) of the group's +0x14 list; the draw flags from the key and the model's flag
+// byte; then a render request with the object's draw matrix and buffers.
+
+/// The packed colour of the i16 colour at `at`.
+fn packed_colour(r: &mut Run, at_: u32) -> [u8; 4] {
+    let base = at_.wrapping_add(r.env.scratch_offset);
+    r.env.scratch_offset = 0;
+    std::array::from_fn(|i| {
+        let c = i32::from(r.m.u16(base + 2 * i as u32) as i16);
+        let p = i32::from(r.part_colour[i] as i16);
+        (c.wrapping_mul(p) >> 19 & 0x1fff) as u8
+    })
+}
+
+/// The image record of model number `n`.
+fn image_record(r: &Run, n: u32) -> u32 {
+    r.env.lists[0].wrapping_add(n.wrapping_mul(0x20))
+}
+
+/// The texture page of the model's first packet.
+fn first_page(r: &Run, model: u32) -> u32 {
+    r.m.u32(model.wrapping_add(r.m.u32(model + 4)) + 8) & 0x3fff
+}
+
+/// The render state a blend kind gives a new entry.
+fn blend_state(blend: u8) -> u32 {
+    match blend {
+        0x41 => 0x100,
+        0x42 => 0x10,
+        0x46 => 0x20,
+        0x48 => 2,
+        0x88 => 0x200,
+        _ => 0,
+    }
+}
+
+/// The draw flags from the semi / extra bits and the model's flag byte (bit 0: textured, bit 1).
+fn model_flags(semi: bool, extra: bool, model_byte: u8) -> u32 {
+    let mut f = if semi {
+        4
+    } else if extra {
+        0x80
+    } else {
+        0
+    };
+    if model_byte & 1 == 0 {
+        f |= 8;
+    }
+    if model_byte & 2 == 0 {
+        f |= 0x10;
+    }
+    f
+}
+
+struct ModelArgs {
+    model_no: u32,
+    flags: u32,
+    blend: u8,
+    texture_word: u16,
+    offsets: (u32, u32),
+    colour: [u8; 4],
+    work: u32,
+    create: u32,
+    finish: bool,
+    fade: Option<(u32, u32, f32)>,
+}
+
+fn emit_model(r: &mut Run, o: u32, a: ModelArgs) {
+    let record = image_record(r, a.model_no);
+    let model = r.m.u32(record + 0x1c);
+    let draw = super::ModelDraw {
+        object: o,
+        record,
+        model,
+        flags: a.flags,
+        blend: a.blend,
+        texture_word: a.texture_word,
+        offsets: a.offsets,
+        colour: a.colour,
+        matrix: get_mat(r, o + 0x50),
+        work: a.work,
+        work_matrix: (a.work != 0).then(|| get_mat(r, a.work)),
+        vertices: r.m.u32(o + 0x90),
+        second: r.m.u32(o + 0x94),
+        part_word: r.part_word,
+        create: a.create,
+        semi: a.flags & 4 != 0,
+        finish: a.finish,
+        fade: a.fade,
+    };
+    r.render.push(super::RenderCall::Model(Box::new(draw)));
+}
+
+/// pppDrawMdl3: key +4 the model, +8 its switches (4: semi-transparent with the plain blend; 2: semi-transparent,
+/// the plain blend when the model is untextured; 1: flag 0x80), +9 / +0xb flags 0x200 / 0x100, +0xa facing the
+/// camera, +0xc the third work as the entry's matrix; the blend is the model's (+0x16) otherwise. Remaster
+/// adjustments for some magic files while their own effect runs: 0x296 is drawn solid, 0x241 semi-transparent
+/// on pages 0x36c0 / 0x3700; the render state of a new entry follows the blend, the work, the texture flag and
+/// (0x17a, 0x110, 0x111, 0x231, and the map effects of five events) its own exceptions.
+fn draw_mdl3(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let (wa, _, wc) = works3(r, rf);
+    let colour = packed_colour(r, at(o, wa));
+    if colour[3] == 0 {
+        return;
+    }
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    let mb = r.m.u8(model);
+    let sw = r.m.u8(key + 8);
+    let mut blend = r.m.u8(model + 0x16);
+    let mut f = model_flags(sw & 6 != 0, sw & 1 != 0, mb);
+    if sw & 4 != 0 {
+        f = 0xc | (f & 0x10);
+        blend = 0x44;
+    } else if sw & 2 != 0 && mb & 1 == 0 {
+        blend = 0x44;
+    }
+    if r.m.u8(key + 9) != 0 {
+        f |= 0x200;
+    }
+    if r.m.u8(key + 0xb) != 0 {
+        f |= 0x100;
+    }
+    if r.m.u8(key + 0xa) != 0 {
+        f |= 0x2000;
+    }
+    let work = if r.m.u8(key + 0xc) != 0 { at(o, wc) } else { 0 };
+    let own = r.scene.own_magic;
+    let loaded = r.magic != u32::MAX;
+    if loaded && r.magic == 0x296 && own {
+        f &= !4;
+    }
+    if loaded && r.magic == 0x241 && own && matches!(first_page(r, model), 0x36c0 | 0x3700) {
+        f |= 4;
+    }
+    let mut c = blend_state(blend);
+    if sw & 4 != 0 || f & 0x2000 == 0 {
+        c |= u32::from(work != 0);
+    }
+    if f & 8 != 0 {
+        c |= 0x40;
+    }
+    if r.magic == 0x17a && own && first_page(r, model) == 0x37e0 {
+        c |= 0x40;
+    }
+    let map_index = r.scene.map_part;
+    if (r.magic == 0x110 || r.magic == 0x111) && own {
+        if f & 0x10 != 0 {
+            c |= 0x8000;
+        }
+        let (top, low) = if r.magic == 0x110 { (0x1e, 0x1a) } else { (0x1f, 0x1c) };
+        if n == top {
+            c = 0x1000_0000;
+        } else if n == low {
+            c = 0x8000_0000;
+        }
+    } else if loaded && r.magic == 0x231 && own {
+        c |= 0x800;
+    } else {
+        match r.scene.event {
+            0x17c if map_index == Some(0x19) => c = c & !1 | 0x800,
+            0x3e if matches!(r.scene.map_part_id, 0x2c..=0x2f) => c = c & !1 | 0x800,
+            0xc6 if map_index == Some(5) => c &= !1,
+            0xc2 | 0xff if map_index == Some(0) => c &= !1,
+            _ => {}
+        }
+    }
+    let args = ModelArgs {
+        model_no: n,
+        flags: f,
+        blend,
+        texture_word: 0,
+        offsets: (0, 0),
+        colour,
+        work,
+        create: c,
+        finish: false,
+        fade: None,
+    };
+    emit_model(r, o, args);
+}
+
+/// pppDrawMdlSemi3: key +4 the model, +8 the blend (0: the render state 2), +0xa its switches (2:
+/// semi-transparent; 1: flag 0x80), +0xb / +0xd flags 0x200 / 0x100, +0xc facing the camera, +0xe the third
+/// work as the entry's matrix; an extra pass after each update.
+fn draw_mdl_semi3(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let (wa, _, wc) = works3(r, rf);
+    let colour = packed_colour(r, at(o, wa));
+    if colour[3] == 0 {
+        return;
+    }
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    let sw = r.m.u8(key + 0xa);
+    let mut f = model_flags(sw & 2 != 0, sw & 1 != 0, r.m.u8(model));
+    if r.m.u8(key + 0xb) != 0 {
+        f |= 0x200;
+    }
+    if r.m.u8(key + 0xd) != 0 {
+        f |= 0x100;
+    }
+    if r.m.u8(key + 0xc) != 0 {
+        f |= 0x2000;
+    }
+    let work = if r.m.u8(key + 0xe) != 0 { at(o, wc) } else { 0 };
+    let blend = r.m.u8(key + 8);
+    let mut c = if blend == 0 { 2 } else { blend_state(blend) };
+    if f & 0x2000 == 0 {
+        c |= u32::from(work != 0);
+    }
+    if f & 8 != 0 {
+        c |= 0x40;
+    }
+    let args = ModelArgs {
+        model_no: n,
+        flags: f,
+        blend,
+        texture_word: 0,
+        offsets: (0, 0),
+        colour,
+        work,
+        create: c,
+        finish: true,
+        fade: None,
+    };
+    emit_model(r, o, args);
+}
+
+/// Three floats ramping: v1 += v2, v0 += v1; on the key's time each += the key's three floats at `k`.
+fn ramp3(r: &mut Run, o: u32, key: u32, v: u32, k: u32, accel: Option<f32>) {
+    if r.paused {
+        return;
+    }
+    let v1 = accel.unwrap_or_else(|| r.m.f32(v + 8)) + r.m.f32(v + 4);
+    r.m.set_f32(v + 4, v1);
+    let v0 = r.m.f32(v) + v1;
+    r.m.set_f32(v, v0);
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        r.m.set_f32(v, v0 + r.m.f32(k));
+        r.m.set_f32(v + 4, v1 + r.m.f32(k + 4));
+        if accel.is_none() {
+            r.m.set_f32(v + 8, r.m.f32(k + 8) + r.m.f32(v + 8));
+        }
+    }
+}
+
+/// pppKeMdlTfd3: the third work ramps (key +8); then (model key +4) the fading draw: the fade from the key's
+/// words +0x14 / +0x18 and the ramp's value, texture word key byte +0x1c · 4, switches the bytes +0x1d..+0x21
+/// together (2 semi-transparent, 1 flag 0x80, 4 / 8 flags 0x200 / 0x100, 0x10 facing the camera, 0x20 the
+/// fourth work as the entry's matrix), colour from the first work.
+fn ke_mdl_tfd3(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let pair = r.m.u32(rf + 0xc);
+    let (wa, wc, wd) = (r.m.u32(pair), r.m.u32(pair + 8), r.m.u32(pair + 0xc));
+    let c = at(o, wc);
+    ramp3(r, o, key, c, key + 8, None);
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let fade = (r.m.u32(key + 0x14), r.m.u32(key + 0x18), r.m.f32(c));
+    let sw = (0x1d..=0x21).fold(0u8, |acc, b| acc | r.m.u8(key + b));
+    let word = u16::from(r.m.u8(key + 0x1c)) << 2;
+    draw_mdl(r, o, n, at(o, wa), word, (0, 0), sw, at(o, wd), fade);
+}
+
+/// pppDrawMdl (the model draw other programs call): switches `sw` as pppKeMdlTfd3 gives them; the blend is the
+/// model's; a new entry's render state also gets 0x80.
+#[allow(clippy::too_many_arguments)]
+fn draw_mdl(
+    r: &mut Run,
+    o: u32,
+    n: u32,
+    colour_at: u32,
+    word: u16,
+    offsets: (u32, u32),
+    sw: u8,
+    work_at: u32,
+    fade: (u32, u32, f32),
+) {
+    let colour = packed_colour(r, colour_at);
+    if colour[3] == 0 {
+        return;
+    }
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    let mut f = model_flags(sw & 2 != 0, sw & 1 != 0, r.m.u8(model));
+    if sw & 4 != 0 {
+        f |= 0x200;
+    }
+    if sw & 8 != 0 {
+        f |= 0x100;
+    }
+    if sw & 0x10 != 0 {
+        f |= 0x2000;
+    }
+    let work = if sw & 0x20 != 0 { work_at } else { 0 };
+    let blend = r.m.u8(model + 0x16);
+    let mut c = blend_state(blend);
+    if f & 0x2000 == 0 {
+        c |= u32::from(work != 0);
+    }
+    if f & 8 != 0 {
+        c |= 0x40;
+    }
+    let args = ModelArgs {
+        model_no: n,
+        flags: f,
+        blend,
+        texture_word: word,
+        offsets: (offsets.0 << 16, offsets.1 << 16),
+        colour,
+        work,
+        create: c | 0x80,
+        finish: false,
+        fade: Some(fade),
+    };
+    emit_model(r, o, args);
+}
+
+/// pppKeMdlDtt (not on event 0x13e): the first work ramps (key +8; for key modes (+0x14) 4 and up its third
+/// float is a pointer, and the ramp has no acceleration while that is set); then (model key +4) a distortion
+/// draw when the part's alpha times the second work's is not 0.
+fn ke_mdl_dtt(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.scene.event == 0x13e {
+        return;
+    }
+    let (wa, wb, wc) = works3(r, rf);
+    let a = at(o, wa);
+    let mode = r.m.u8(key + 0x14);
+    let pointer = if mode >= 4 { r.m.u32(a + 8) } else { 0 };
+    let accel = (mode >= 4 && pointer != 0).then_some(0.0);
+    let accel = accel.or_else(|| (mode >= 4).then(|| r.m.f32(a + 8)));
+    ramp3(r, o, key, a, key + 8, accel);
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let b = at(o, wb);
+    let ch = |r: &Run, i: u32| {
+        i32::from(r.part_colour[i as usize]).wrapping_mul(i32::from(r.m.u16(b + 2 * i) as i16))
+    };
+    if ch(r, 3) == 0 {
+        return;
+    }
+    let colour = std::array::from_fn(|i| (f64::from(ch(r, i as u32)) * 1.4901161193847656e-8) as f32);
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    let work = at(o, wc);
+    let draw = super::DistortDraw {
+        object: o,
+        model,
+        colour,
+        scale: r.part_scale[0] * r.m.f32(a),
+        mode,
+        kind: r.m.u8(key + 0x15),
+        work,
+        work_matrix: get_mat(r, work),
+        vertices: r.m.u32(o + 0x90),
+        pointer: (mode >= 4 && pointer != 0).then(|| (pointer, r.m.u32(pointer))),
+    };
+    r.render.push(super::RenderCall::Distort(Box::new(draw)));
+}
+
+fn ke_mdl_dtt_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 3]);
+}
+
+fn ke_mdl_tfd3_init(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    set(r, at(o, wc), &[0; 3]);
+}
+
+/// pppKeZCrct: into the first work, the object's matrix with its rows scaled by the key's (+0x20) and its
+/// position, by the key's mode (+0x30): 0 the position offset by the key's (+0x10), then through the camera;
+/// 1 through the camera, then offset; 2 through the frame matrix, the position replaced by the part's scale
+/// plus the scale times the key's offset (w the part's), then through the world matrix; others unchanged.
+fn ke_z_crct(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let src = get_mat(r, o + 0x10);
+    let mut m = src;
+    for row in 0..3 {
+        let s = r.m.f32(key + 0x20 + 4 * row as u32);
+        for c in 0..3 {
+            m[row * 4 + c] = s * src[row * 4 + c];
+        }
+    }
+    let pos = vec4(r, o + 0x40);
+    m[12..16].copy_from_slice(&pos);
+    let off = vec4(r, key + 0x10);
+    let el = crate::chr::elements::mul;
+    match r.m.u8(key + 0x30) {
+        0 => {
+            for i in 0..4 {
+                m[12 + i] += off[i];
+            }
+            m = el(&r.camera, &m);
+        }
+        1 => {
+            m = el(&r.camera, &m);
+            for i in 0..4 {
+                m[12 + i] += off[i];
+            }
+        }
+        2 => {
+            m = el(&r.frame, &m);
+            let s = r.part_scale;
+            for i in 0..3 {
+                m[12 + i] = s[i] + s[i] * off[i];
+            }
+            m[15] = s[3];
+            m = el(&r.world, &m);
+        }
+        _ => {}
+    }
+    put_mat(r, at(o, wa), &m);
+}
+
+/// pppVtMime: the first work ramps (key +0xc); then, with two meshes (key +4 / +8, records of the group's +0x14
+/// list: +0 the vertex count, +0x14 the vertices, three i16 each), each vertex blended (first + (second − first)
+/// · the ramp's value, truncated) into a buffer of the pool (made once, at the work's +0xc) that becomes the
+/// object's vertex buffer.
+fn vt_mime(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    ramp3(r, o, key, a, key + 0xc, None);
+    let (n1, n2) = (r.m.u32(key + 4), r.m.u32(key + 8));
+    if n1 == 0xffff && n2 == 0xffff {
+        return;
+    }
+    let (r1, r2) = (image_record(r, n1), image_record(r, n2));
+    let (v1, v2) = (r.m.u32(r1 + 0x14), r.m.u32(r2 + 0x14));
+    let t = r.m.f32(a);
+    let count = r.m.u32(r1);
+    if r.m.u32(a + 0xc) == 0 {
+        let p = r.env.alloc(r.m, count.wrapping_mul(8));
+        r.m.set_u32(a + 0xc, p);
+        if p == 0 {
+            return;
+        }
+    }
+    let buf = r.m.u32(a + 0xc);
+    for i in 0..count.wrapping_mul(3) {
+        let x = i32::from(r.m.u16(v1 + 2 * i) as i16);
+        let y = i32::from(r.m.u16(v2 + 2 * i) as i16);
+        let d = (y - x) as f32;
+        let v = (f64::from(d) * f64::from(t) + f64::from(x)).trunc() as i32;
+        r.m.set_u16(buf + 2 * i, v as u16);
+    }
+    r.m.set_u32(o + 0x90, buf);
+}
+
+fn vt_mime_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 4]);
+}
+
+fn vt_mime_restart(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 3]);
+}
+
+fn vt_mime_free(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    let p = r.m.u32(a + 0xc);
+    if p != 0 {
+        r.env.free(r.m, p);
+        r.m.set_u32(a + 0xc, 0);
+    }
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1519,6 +1997,31 @@ pub fn by_name(name: &'static str) -> Option<Program> {
         "pppDrawMatrix" => Program { name, second: Some(draw_matrix), ..Program::default() },
         "pppDrawMatrixFront" => Program { name, second: Some(draw_matrix_front), ..Program::default() },
         "pppKeDMatFr" => Program { name, second: Some(ke_d_mat_fr), ..Program::default() },
+        "pppDrawMdl3" => Program { name, second: Some(draw_mdl3), ..Program::default() },
+        "pppDrawMdlSemi3" => Program { name, second: Some(draw_mdl_semi3), ..Program::default() },
+        "pppKeZCrct" => Program { name, second: Some(ke_z_crct), ..Program::default() },
+        "pppKeMdlDtt" => Program {
+            name,
+            second: Some(ke_mdl_dtt),
+            init: Some(ke_mdl_dtt_init),
+            restart: Some(ke_mdl_dtt_init),
+            ..Program::default()
+        },
+        "pppKeMdlTfd3" => Program {
+            name,
+            second: Some(ke_mdl_tfd3),
+            init: Some(ke_mdl_tfd3_init),
+            restart: Some(ke_mdl_tfd3_init),
+            ..Program::default()
+        },
+        "pppVtMime" => Program {
+            name,
+            second: Some(vt_mime),
+            init: Some(vt_mime_init),
+            restart: Some(vt_mime_restart),
+            free: Some(vt_mime_free),
+            ..Program::default()
+        },
         "pppKeOfsPt" => p(ke_ofs_pt, ke_ofs_pt_init),
         "pppKeLnsLpSft" => p(ke_lns_lp_sft, zero_a2),
         "pppNeiLightEikyo" => p(nei_light_eikyo, zero_a6),

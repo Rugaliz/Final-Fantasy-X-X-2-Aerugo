@@ -2624,7 +2624,7 @@ impl SgControl {
     }
 }
 
-/// (degrees · 3.141592) / 180, as 82d950 / 82d990 compute it.
+/// (degrees · 3.141592) / 180, as the engine computes it.
 fn degree_rad(d: f32) -> f32 {
     ((f64::from(d) * f64::from(crate::chr::BODY_PI)) / 180.0) as f32
 }

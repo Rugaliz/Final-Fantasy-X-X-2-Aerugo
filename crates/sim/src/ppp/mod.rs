@@ -100,7 +100,7 @@ impl Space {
     }
 }
 
-/// A block pool (pppInitEnv / the pool's alloc and free): four words {cursor, first block, end marker, used}.
+/// A block pool (the environment set-up and the pool's alloc and free): four words {cursor, first block, end marker, used}.
 /// Blocks are {next, prev, in use, _} headers of 0x10 bytes before their space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pool {
@@ -200,7 +200,7 @@ pub struct Env {
 }
 
 impl Env {
-    /// The instance set-up (7169d0): the group's lists, the pool over the work buffer.
+    /// The instance set-up: the group's lists, the pool over the work buffer.
     pub fn new(m: &mut Space, group: u32, group_lists: [u32; 3], work: u32, size: u32) -> Env {
         let _ = group;
         Env {
@@ -212,7 +212,7 @@ impl Env {
         }
     }
 
-    /// pppMemAlloc: the first pool, then the second; 0 (and the failure flag) when neither holds it.
+    /// The engine's allocation: the first pool, then the second; 0 (and the failure flag) when neither holds it.
     pub fn alloc(&mut self, m: &mut Space, n: u32) -> u32 {
         let p = self.pool.alloc(m, n);
         self.alloc_failed = false;
@@ -301,15 +301,21 @@ pub struct Run<'a> {
     pub paused: bool,
     pub vu: &'a mut VuRand,
     pub crt: &'a mut crate::field::face::CrtRand,
-    /// The running part's object list head and its sub-part slots (what programs that spawn objects use), and
-    /// its scale (placement +0x60).
+    /// The running part's object list head and its sub-part slots (what programs that spawn objects use), its
+    /// scale (placement +0x60, four floats), its colour (four u16, 0x1000 = 1) and its draw word (+0x78).
     pub objects: u32,
     pub slots: u32,
-    pub part_scale: [f32; 3],
+    pub part_scale: [f32; 4],
+    pub part_colour: [u16; 4],
+    pub part_word: u32,
     /// The engine's two effect matrices the driver sets each frame: the view (for draw matrices) and the camera
     /// (for front-facing positions).
     pub view: crate::chr::elements::Mat,
     pub camera: crate::chr::elements::Mat,
+    /// The engine's two further effect matrices the driver sets (the third mode of pppKeZCrct goes through the
+    /// first, then the second).
+    pub frame: crate::chr::elements::Mat,
+    pub world: crate::chr::elements::Mat,
     /// The remaster's slower vertex spawning in one scene (map 0xe6c, event 0xcc6, magic 0x207 loaded, one of
     /// workers 5–7 running): pppVertexAp's interval × 1.8. The host sets it.
     pub vertex_ap_slow: bool,
@@ -317,17 +323,96 @@ pub struct Run<'a> {
     /// and the engine's link value set): a parent ending before its new child lives a frame longer. The host
     /// sets it.
     pub vertex_lc_extend: bool,
-    /// The engine's current magic number (some programs leave effect 0x2a9 alone).
+    /// The engine's current magic number (some programs leave effect 0x2a9 alone; the remaster's draw
+    /// adjustments test it). `u32::MAX` when no magic file is loaded.
     pub magic: u32,
+    /// The engine state the remaster's draw adjustments test (the host sets it).
+    pub scene: Scene,
     /// What the programs ask of the renderer this step, in order (the host's renderer acts on them).
     pub render: Vec<RenderCall>,
 }
 
+/// The engine state the remaster's draw adjustments test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Scene {
+    /// The current event.
+    pub event: u32,
+    /// The running effect is the loaded magic file's own (set while the engine runs that file's update and
+    /// draw).
+    pub own_magic: bool,
+    /// The index of the map effect part being run (none for every other effect), and the id of the last map
+    /// effect part run (kept after).
+    pub map_part: Option<u32>,
+    pub map_part_id: u32,
+}
+
+/// A model draw: one object's model with its parameters, for the remaster's effect renderer, which keeps one
+/// render entry per object (made on its first draw with `create`, updated on every later one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDraw {
+    /// The object (its entry's key, with the effect).
+    pub object: u32,
+    /// The image record (0x20 bytes of the group's +0x14 list) and its model (the record's +0x1c).
+    pub record: u32,
+    pub model: u32,
+    /// The draw flags: 4 semi-transparent, 8 the model has no texture flag, 0x10 nor its second flag, 0x80,
+    /// 0x100, 0x200 (key switches), 0x2000 facing the camera.
+    pub flags: u32,
+    /// The blend kind (0x41, 0x42, 0x44, 0x46, 0x48, 0x88) and the texture word (pppDrawMdl's key byte · 4).
+    pub blend: u8,
+    pub texture_word: u16,
+    /// The two offsets pppDrawMdl passes (each · 0x10000); 0 for the others.
+    pub offsets: (u32, u32),
+    /// The object's colour times the part's, one byte each (r, g, b, a; the alpha is never 0 here).
+    pub colour: [u8; 4],
+    /// The object's draw matrix (+0x50).
+    pub matrix: crate::chr::elements::Mat,
+    /// The address of the matrix work the key names (0: none) and its 16 floats.
+    pub work: u32,
+    pub work_matrix: Option<crate::chr::elements::Mat>,
+    /// The object's vertex and second buffers (+0x90 / +0x94; 0: the model's own).
+    pub vertices: u32,
+    pub second: u32,
+    /// The part's draw word (+0x78).
+    pub part_word: u32,
+    /// The render state a new entry is made with.
+    pub create: u32,
+    /// The update: semi-transparent (flag 4) or solid; `finish` the extra pass pppDrawMdlSemi3 asks for.
+    pub semi: bool,
+    pub finish: bool,
+    /// pppDrawMdl's fade parameters (the key's two words and the work's value).
+    pub fade: Option<(u32, u32, f32)>,
+}
+
+/// A frame-buffer distortion draw of a model (pppKeMdlDtt).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistortDraw {
+    pub object: u32,
+    pub model: u32,
+    /// The colour (the part's u16 times the work's i16, · 2⁻²⁶).
+    pub colour: [f32; 4],
+    /// The part's scale times the work's value.
+    pub scale: f32,
+    /// The key's mode byte (+0x14) and its second byte (+0x15).
+    pub mode: u8,
+    pub kind: u8,
+    /// The work matrix (16 floats at the third work) and its address.
+    pub work: u32,
+    pub work_matrix: crate::chr::elements::Mat,
+    /// The object's vertex buffer (+0x90; 0: the model's own).
+    pub vertices: u32,
+    /// For modes 4 and up, the word the work's +8 points to (and that pointer), which the draw may change and
+    /// which is put back after it.
+    pub pointer: Option<(u32, u32)>,
+}
+
 /// A program's request to the renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RenderCall {
     /// The scene's accumulation setting (pppKeAcmCic: (0, 1)).
     Accumulation(u32, u32),
+    Model(Box<ModelDraw>),
+    Distort(Box<DistortDraw>),
 }
 
 impl Run<'_> {
@@ -360,7 +445,7 @@ impl Run<'_> {
     }
 }
 
-/// A running part (the part state _pppStartPart fills).
+/// A running part (the part state the part start fills).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Part {
     /// 0, or 0xfffff000 when its sub-part slots could not be allocated.
@@ -382,14 +467,22 @@ pub struct Part {
     /// The part's placement as the effect's driver sets it (+0x40 position, +0x50, +0x60 scale; four floats
     /// each).
     pub place: [f32; 12],
+    /// The part's colour (four u16, 0x1000 each at the start) and its draw word (0 at the start).
+    pub colour: [u16; 4],
+    pub word: u32,
 }
 
 impl Part {
-    /// _pppStartPart(part, step, record): the record's length, flags and lists; one slot per definition.
+    /// The part start (part, step, record): the record's length, flags and lists; one slot per definition.
     pub fn start(r: &mut Run, step: i32, record: u32) -> Part {
         let m = &mut *r.m;
-        let mut p =
-            Part { length: m.u32(record), until_empty: m.u8(record + 4) != 0, step, ..Part::default() };
+        let mut p = Part {
+            length: m.u32(record),
+            until_empty: m.u8(record + 4) != 0,
+            step,
+            colour: [0x1000; 4],
+            ..Part::default()
+        };
         let (l1, l2) = (record.wrapping_add(m.u32(record + 8)), record.wrapping_add(m.u32(record + 0xc)));
         p.programs = (m.u32(l1), l1 + 4);
         p.subs = (m.u32(l2), l2 + 4);
@@ -420,7 +513,9 @@ impl Part {
     pub fn update(&mut self, r: &mut Run, flags: u8) -> bool {
         r.objects = self.objects;
         r.slots = self.slots;
-        r.part_scale = [self.place[8], self.place[9], self.place[10]];
+        r.part_scale = [self.place[8], self.place[9], self.place[10], self.place[11]];
+        r.part_colour = self.colour;
+        r.part_word = self.word;
         let done = self.step(r, flags);
         self.objects = r.objects;
         done
@@ -461,7 +556,7 @@ impl Part {
         }
     }
 
-    /// 712b80: each slot whose start time has come gets one object (and its start time is spent).
+    /// Each slot whose start time has come gets one object (and its start time is spent).
     fn spawn(&mut self, r: &mut Run) {
         for i in 0..self.subs.0 {
             let s = self.slots + i * 0x10;
@@ -475,7 +570,7 @@ impl Part {
     }
 }
 
-/// pppCreatePObject: a pool block for the slot's definition, linked into the slot's list and into the running
+/// The object creation: a pool block for the slot's definition, linked into the slot's list and into the running
 /// part's list by priority (def u16 +0x24), then each program slot set and each program's +0x1c run; 0 when
 /// the pools are full.
 pub fn create(r: &mut Run, slot: u32) -> u32 {
@@ -534,7 +629,7 @@ pub fn create(r: &mut Run, slot: u32) -> u32 {
     o
 }
 
-/// 712d90 / 712d20: each program slot of the object set to its reference's track, then the init (or restart)
+/// Each program slot of the object set to its reference's track, then the init (or restart)
 /// entry of its program.
 fn init_slots(r: &mut Run, o: u32, pick: fn(&Program) -> Option<SetupFn>) {
     {
@@ -553,7 +648,7 @@ fn init_slots(r: &mut Run, o: u32, pick: fn(&Program) -> Option<SetupFn>) {
     }
 }
 
-/// _pppAllFreePObject: each program's +0x24, the slot's count down (its list moves on when this was its head),
+/// The object free: each program's +0x24, the slot's count down (its list moves on when this was its head),
 /// the block back to its pool. (The caller unlinks it from the part's list.)
 pub fn free_object(r: &mut Run, o: u32) {
     let slot = r.m.u32(o + 8);
@@ -577,7 +672,7 @@ pub fn free_object(r: &mut Run, o: u32) {
 }
 
 impl Part {
-    /// pppRunPartStd: each slot's objects through its definition's programs (keys advanced on their time),
+    /// The part run: each slot's objects through its definition's programs (keys advanced on their time),
     /// their ages stepped; then objects past their definition's times restart or go.
     fn run(&mut self, r: &mut Run) {
         for i in 0..self.subs.0 {
@@ -668,7 +763,7 @@ impl Part {
         }
     }
 
-    /// 711f20: every object freed, the slots back to the pool.
+    /// Every object freed, the slots back to the pool.
     pub fn free(&mut self, r: &mut Run) {
         r.objects = self.objects;
         let mut o = r.objects;
