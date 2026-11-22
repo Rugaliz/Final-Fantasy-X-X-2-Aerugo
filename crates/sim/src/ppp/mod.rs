@@ -301,6 +301,12 @@ pub struct Run<'a> {
     pub paused: bool,
     pub vu: &'a mut VuRand,
     pub crt: &'a mut crate::field::face::CrtRand,
+    /// The running part's object list head and its sub-part slots (what programs that spawn objects use).
+    pub objects: u32,
+    pub slots: u32,
+    /// The remaster's slower vertex spawning in one scene (map 0xe6c, event 0xcc6, magic 0x207 loaded, one of
+    /// workers 5–7 running): pppVertexAp's interval × 1.8. The host sets it.
+    pub vertex_ap_slow: bool,
 }
 
 impl Run<'_> {
@@ -382,6 +388,14 @@ impl Part {
 
     /// One step (the update with `flags`): spawns, the programs over every object, the time; true when done.
     pub fn update(&mut self, r: &mut Run, flags: u8) -> bool {
+        r.objects = self.objects;
+        r.slots = self.slots;
+        let done = self.step(r, flags);
+        self.objects = r.objects;
+        done
+    }
+
+    fn step(&mut self, r: &mut Run, flags: u8) -> bool {
         if flags & 0x10 != 0 {
             self.each_program(r, |pg| pg.pre);
         }
@@ -399,7 +413,7 @@ impl Part {
             return self.length as i32 <= self.time;
         }
         if self.drained {
-            return self.objects == 0;
+            return r.objects == 0;
         }
         if self.time > 0x6fff_ffff {
             self.prev = 0x7000_0000 - self.step;
@@ -422,16 +436,19 @@ impl Part {
             let s = self.slots + i * 0x10;
             if self.slots != 0 && (r.m.u32(s + 8) as i32) <= self.time {
                 r.m.set_u32(s + 8, 0x7fff_ffff);
-                if self.create(r, s) == 0 {
+                if create(r, s) == 0 {
                     return;
                 }
             }
         }
     }
+}
 
-    /// pppCreatePObject: a pool block for the slot's definition, linked into the slot's list and into the
-    /// part's list by priority (def u16 +0x24), then each program slot set and each program's +0x1c run.
-    fn create(&mut self, r: &mut Run, slot: u32) -> u32 {
+/// pppCreatePObject: a pool block for the slot's definition, linked into the slot's list and into the running
+/// part's list by priority (def u16 +0x24), then each program slot set and each program's +0x1c run; 0 when
+/// the pools are full.
+pub fn create(r: &mut Run, slot: u32) -> u32 {
+    let o = {
         let m = &mut *r.m;
         let def = m.u32(slot);
         let n = m.u32(def + 0x20).wrapping_add((m.u16(def + 0x26) as i16 as i32 as u32).wrapping_mul(4));
@@ -444,7 +461,7 @@ impl Part {
         m.set_u32(o + 0x94, 0);
         m.set_u32(o + 8, slot);
         let first = m.u32(slot + 4);
-        if self.objects != 0 && first != 0 {
+        if r.objects != 0 && first != 0 {
             // After the slot's newest object.
             m.set_u32(o, m.u32(first));
             m.set_u32(first, o);
@@ -452,7 +469,7 @@ impl Part {
             // Into the part list before the first object of a priority at least this one's.
             let pri = m.u16(def + 0x24) as i16;
             let mut link: Option<u32> = None;
-            let mut cur = self.objects;
+            let mut cur = r.objects;
             let mut placed = false;
             while cur != 0 {
                 let cdef = m.u32(m.u32(cur + 8));
@@ -460,7 +477,7 @@ impl Part {
                     m.set_u32(slot + 4, o);
                     match link {
                         Some(l) => m.set_u32(l, o),
-                        None => self.objects = o,
+                        None => r.objects = o,
                     }
                     m.set_u32(o, cur);
                     placed = true;
@@ -473,20 +490,23 @@ impl Part {
                 m.set_u32(slot + 4, o);
                 match link {
                     Some(l) => m.set_u32(l, o),
-                    None => self.objects = o,
+                    None => r.objects = o,
                 }
                 m.set_u32(o, 0);
             }
         }
         let c = m.u16(slot + 0xc);
         m.set_u16(slot + 0xc, c.wrapping_add(1));
-        self.init_slots(r, o, |pg| pg.init);
         o
-    }
+    };
+    init_slots(r, o, |pg| pg.init);
+    o
+}
 
-    /// 712d90 / 712d20: each program slot of the object set to its reference's track, then the init (or
-    /// restart) entry of its program.
-    fn init_slots(&mut self, r: &mut Run, o: u32, pick: fn(&Program) -> Option<SetupFn>) {
+/// 712d90 / 712d20: each program slot of the object set to its reference's track, then the init (or restart)
+/// entry of its program.
+fn init_slots(r: &mut Run, o: u32, pick: fn(&Program) -> Option<SetupFn>) {
+    {
         let def = r.m.u32(r.m.u32(o + 8));
         let mut at = o.wrapping_add(r.m.u32(def + 0x20));
         let count = r.m.u16(def + 0x26) as i16;
@@ -500,7 +520,32 @@ impl Part {
             }
         }
     }
+}
 
+/// _pppAllFreePObject: each program's +0x24, the slot's count down (its list moves on when this was its head),
+/// the block back to its pool. (The caller unlinks it from the part's list.)
+pub fn free_object(r: &mut Run, o: u32) {
+    let slot = r.m.u32(o + 8);
+    let def = r.m.u32(slot);
+    let refs = r.m.u16(def + 0x26) as i16;
+    for k in 0..refs.max(0) as u32 {
+        let rf = def + 0x28 + k * 0x10;
+        if let Some(f) = r.program(rf).and_then(|p| p.free) {
+            f(r, o, rf);
+        }
+    }
+    let c = r.m.u16(slot + 0xc).wrapping_sub(1);
+    r.m.set_u16(slot + 0xc, c);
+    if c == 0 {
+        r.m.set_u32(slot + 4, 0);
+    } else if r.m.u32(slot + 4) == o {
+        let n = r.m.u32(o);
+        r.m.set_u32(slot + 4, n);
+    }
+    r.env.free(r.m, o);
+}
+
+impl Part {
     /// pppRunPartStd: each slot's objects through its definition's programs (keys advanced on their time),
     /// their ages stepped; then objects past their definition's times restart or go.
     fn run(&mut self, r: &mut Run) {
@@ -557,14 +602,14 @@ impl Part {
         }
         let mut ends: u32 = 0;
         let mut link: Option<u32> = None;
-        let mut o = self.objects;
+        let mut o = r.objects;
         while o != 0 {
             let def = r.m.u32(r.m.u32(o + 8));
             let next = r.m.u32(o);
             let age = r.m.u32(o + 0xc);
             if !self.drained && (r.m.u32(def + 0x1c) as i32) <= age as i32 {
                 r.m.set_u32(o + 0xc, r.m.u32(def + 0x18));
-                self.init_slots(r, o, |pg| pg.restart);
+                init_slots(r, o, |pg| pg.restart);
                 link = Some(o);
             } else {
                 let end = r.m.u32(def + 0x14);
@@ -574,55 +619,34 @@ impl Part {
                 } else {
                     match link {
                         Some(l) => r.m.set_u32(l, next),
-                        None => self.objects = next,
+                        None => r.objects = next,
                     }
-                    self.free_object(r, o);
+                    free_object(r, o);
                 }
             }
             o = next;
         }
         if self.drained && ends == 0x7000_0000 {
-            let mut o = self.objects;
+            let mut o = r.objects;
             while o != 0 {
                 let next = r.m.u32(o);
-                self.free_object(r, o);
+                free_object(r, o);
                 o = next;
             }
-            self.objects = 0;
+            r.objects = 0;
         }
-    }
-
-    /// _pppAllFreePObject: each program's +0x24, the slot's count down (its list moves on when this was its
-    /// head), the block back to its pool.
-    fn free_object(&mut self, r: &mut Run, o: u32) {
-        let slot = r.m.u32(o + 8);
-        let def = r.m.u32(slot);
-        let refs = r.m.u16(def + 0x26) as i16;
-        for k in 0..refs.max(0) as u32 {
-            let rf = def + 0x28 + k * 0x10;
-            if let Some(f) = r.program(rf).and_then(|p| p.free) {
-                f(r, o, rf);
-            }
-        }
-        let c = r.m.u16(slot + 0xc).wrapping_sub(1);
-        r.m.set_u16(slot + 0xc, c);
-        if c == 0 {
-            r.m.set_u32(slot + 4, 0);
-        } else if r.m.u32(slot + 4) == o {
-            let n = r.m.u32(o);
-            r.m.set_u32(slot + 4, n);
-        }
-        r.env.free(r.m, o);
     }
 
     /// 711f20: every object freed, the slots back to the pool.
     pub fn free(&mut self, r: &mut Run) {
-        let mut o = self.objects;
+        r.objects = self.objects;
+        let mut o = r.objects;
         while o != 0 {
             let next = r.m.u32(o);
-            self.free_object(r, o);
+            free_object(r, o);
             o = next;
         }
+        r.objects = 0;
         self.objects = 0;
         if self.slots != 0 {
             r.env.free(r.m, self.slots);

@@ -484,6 +484,132 @@ fn ke_mat_pht(r: &mut Run, o: u32, _key: u32, rf: u32) {
     put_vec4(r, o + 0x40, t);
 }
 
+// Spawners: objects made in another sub-part slot of the running part (the key names it), parented to the
+// spawning object (child +4).
+
+/// A child in slot `index` of the running part, parented to `o` (0 when the pools are full).
+fn child(r: &mut Run, o: u32, index: u32) -> u32 {
+    let slot = r.slots.wrapping_add(index.wrapping_mul(0x10));
+    let c = super::create(r, slot);
+    if c != 0 {
+        r.m.set_u32(c + 4, o);
+    }
+    c
+}
+
+/// pppPointAp: every key +0xc frames (countdown byte at B +1), a child in slot key +4 at A's position (into the
+/// child's work at key +8); no child for −1.
+fn point_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, wb) = works(r, rf);
+    if r.paused {
+        return;
+    }
+    let (wa, cd) = (at(o, wa), at(o, wb) + 1);
+    if r.m.u8(cd) == 0 {
+        let slot = r.m.u32(key + 4);
+        if slot == 0xffff_ffff {
+            return;
+        }
+        let c = child(r, o, slot);
+        if c == 0 {
+            return;
+        }
+        let w = at(c, r.m.u32(key + 8));
+        for i in 0..3 {
+            let v = r.m.u32(wa + 4 * i);
+            r.m.set_u32(w + 4 * i, v);
+        }
+        let n = r.m.u8(key + 0xc);
+        r.m.set_u8(cd, n);
+    }
+    let n = r.m.u8(cd).wrapping_sub(1);
+    r.m.set_u8(cd, n);
+}
+
+fn point_ap_init(r: &mut Run, o: u32, rf: u32) {
+    let (_, wb) = works(r, rf);
+    r.m.set_u8(at(o, wb) + 1, 0);
+}
+
+/// 757770: a child in slot key +0xc at a mesh vertex (three i16) through the spawner's matrix, into the child's
+/// work at key +0x10.
+fn vertex_child(r: &mut Run, o: u32, key: u32, vtx: u32) {
+    use crate::chr::elements::apply4;
+    let slot = r.m.u32(key + 0xc);
+    if slot == 0xffff_ffff {
+        return;
+    }
+    let c = child(r, o, slot);
+    if c == 0 {
+        return;
+    }
+    let v = [0, 2, 4].map(|k| f32::from(r.m.u16(vtx + k) as i16));
+    let p = apply4(&get_mat(r, o + 0x10), [v[0], v[1], v[2], 1.0]);
+    let w = at(c, r.m.u32(key + 0x10));
+    for (i, x) in p.iter().take(3).enumerate() {
+        r.m.set_f32(w + 4 * i as u32, *x);
+    }
+}
+
+/// pppVertexAp: every key +7 frames (countdown u16 at A +2), key +6 children at vertices of mesh key +4 (the
+/// group's mesh list: its packet record's vertices, or the object's own at +0x90, and its index list): in
+/// order from the cursor at A (mode key +8 = 0), or at random (mode 1).
+fn vertex_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let wa = at(o, wa);
+    let mesh = r.m.u16(key + 4) as i16;
+    if r.paused || mesh < 0 {
+        return;
+    }
+    if r.m.u16(wa + 2) == 0 {
+        let meshes = r.env.lists[2] + u32::from(mesh as u16) * 8;
+        let verts = match r.m.u32(o + 0x90) {
+            0 => {
+                let rec = (r.m.u16(meshes) as i16 as i32 as u32).wrapping_mul(0x20);
+                r.m.u32(r.env.lists[0].wrapping_add(rec) + 0x14)
+            }
+            v => v,
+        };
+        let count = r.m.u16(meshes + 2) as i16;
+        let list = r.m.u32(meshes + 4);
+        let n = r.m.u8(key + 6);
+        match r.m.u8(key + 8) {
+            0 => {
+                for _ in 0..n {
+                    if i32::from(count) <= i32::from(r.m.u16(wa)) {
+                        r.m.set_u16(wa, 0);
+                    }
+                    let cur = r.m.u16(wa);
+                    let idx = u32::from(r.m.u16(list + u32::from(cur) * 2));
+                    r.m.set_u16(wa, cur.wrapping_add(1));
+                    vertex_child(r, o, key, verts + idx * 6);
+                }
+            }
+            1 => {
+                for _ in 0..n {
+                    let d = r.vu_draw();
+                    let k = ftol(f64::from(count) * f64::from(d)) as u32;
+                    let idx = u32::from(r.m.u16(list.wrapping_add(k.wrapping_mul(2))));
+                    vertex_child(r, o, key, verts + idx * 6);
+                }
+            }
+            _ => {}
+        }
+        let mut wait = u16::from(r.m.u8(key + 7));
+        if r.vertex_ap_slow {
+            wait = (f64::from(wait) * f64::from(1.8f32)).round_ties_even() as u16;
+        }
+        r.m.set_u16(wa + 2, wait);
+    }
+    let v = r.m.u16(wa + 2).wrapping_sub(1);
+    r.m.set_u16(wa + 2, v);
+}
+
+fn vertex_ap_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_u32(at(o, wa), 0);
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -577,6 +703,12 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             Program { name, update: Some(ke_mat_sn), init: Some(ke_mat_sn_init), ..Program::default() }
         }
         "pppKeMatPht" => upd(ke_mat_pht),
+        "pppPointAp" => {
+            Program { name, update: Some(point_ap), init: Some(point_ap_init), ..Program::default() }
+        }
+        "pppVertexAp" => {
+            Program { name, update: Some(vertex_ap), init: Some(vertex_ap_init), ..Program::default() }
+        }
         _ if random_update(name).is_some() => {
             Program { name, update: random_update(name), ..Program::default() }
         }
