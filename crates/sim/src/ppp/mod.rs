@@ -195,13 +195,21 @@ pub struct Env {
     pub lists: [u32; 3],
     /// The objects the pools could not hold.
     pub alloc_failed: bool,
+    /// The engine's scratch offset (the draw stage sets it for a moment; the i16 inits add it, then clear it).
+    pub scratch_offset: u32,
 }
 
 impl Env {
     /// The instance set-up (7169d0): the group's lists, the pool over the work buffer.
     pub fn new(m: &mut Space, group: u32, group_lists: [u32; 3], work: u32, size: u32) -> Env {
         let _ = group;
-        Env { pool: Pool::init(m, work, size), pool2: None, lists: group_lists, alloc_failed: false }
+        Env {
+            pool: Pool::init(m, work, size),
+            pool2: None,
+            lists: group_lists,
+            alloc_failed: false,
+            scratch_offset: 0,
+        }
     }
 
     /// pppMemAlloc: the first pool, then the second; 0 (and the failure flag) when neither holds it.
@@ -263,8 +271,27 @@ impl std::fmt::Debug for Program {
     }
 }
 
+/// The engine's vector-unit random generator: its seed word (shared by every effect and the engine's other
+/// random users; 1.0's bits at boot) and its switch (on from the engine's start-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VuRand {
+    pub seed: u32,
+    pub on: bool,
+}
+
+impl Default for VuRand {
+    fn default() -> VuRand {
+        VuRand { seed: 0x3f80_0000, on: true }
+    }
+}
+
+/// The address the programs' shared target vector has in an effect's space (the engine's scratch vector, for
+/// keys that name no work offset). Aerugo's own place, outside every effect's data.
+pub const SCRATCH_VECTOR: u32 = 0xf000_0000;
+
 /// What the programs run against: the address space, the environment, the effect's program table (its
-/// address in the effect's data, and its entries) and the engine's pause switch.
+/// address in the effect's data, and its entries), the engine's pause switch and its random generators (the
+/// vector-unit one, and the C runtime's, which each vector draw re-seeds).
 #[derive(Debug)]
 pub struct Run<'a> {
     pub m: &'a mut Space,
@@ -272,9 +299,27 @@ pub struct Run<'a> {
     pub table_va: u32,
     pub table: &'a [Program],
     pub paused: bool,
+    pub vu: &'a mut VuRand,
+    pub crt: &'a mut crate::field::face::CrtRand,
 }
 
 impl Run<'_> {
+    /// One vector-unit draw in [0, 1): the seed flipped (its low 23 bits) and handed to the C runtime's
+    /// srand, then stepped as a float in [1, 2) when the generator is on (1.0 when off), less 1.
+    pub fn vu_draw(&mut self) -> f32 {
+        let s = self.vu.seed ^ 0x7f_ffff;
+        self.vu.seed = s;
+        *self.crt = crate::field::face::CrtRand(s & 0x7f_ffff);
+        let v = if self.vu.on {
+            let n = ((s >> 18 ^ s) >> 4 & 1) | ((s & 0x3f_ffff) | 0x1fc0_0000) << 1;
+            self.vu.seed = n;
+            f32::from_bits(n)
+        } else {
+            1.0
+        };
+        v + -1.0
+    }
+
     /// The program a bound reference (or list entry) at `at` points to (table entries are 0x28 bytes).
     pub fn program(&mut self, at: u32) -> Option<Program> {
         let p = self.m.u32(at).checked_sub(self.table_va)?;
