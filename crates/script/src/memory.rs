@@ -68,6 +68,28 @@ impl Memory {
         }
     }
 
+    /// `n` bytes at a place (none when they run past its block).
+    pub fn bytes_mut(&mut self, p: Place, n: usize) -> Option<&mut [u8]> {
+        self.bytes(p, n)
+    }
+
+    /// The bytes at a place up to (not including) the first NUL, at most `max`.
+    pub fn c_string(&mut self, p: Place, max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for k in 0..max {
+            let q = match p {
+                Place::Global(b, o) => Place::Global(b, o + k),
+                Place::Script(o) => Place::Script(o + k),
+                Place::Registers(w, o) => Place::Registers(w, o + k),
+            };
+            match self.bytes(q, 1).map(|b| b[0]) {
+                Some(0) | None => break,
+                Some(b) => out.push(b),
+            }
+        }
+        out
+    }
+
     fn bytes(&mut self, p: Place, n: usize) -> Option<&mut [u8]> {
         match p {
             Place::Global(b, off) => self.global[b].get_mut(off..off + n),

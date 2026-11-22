@@ -20,6 +20,8 @@ pub const SWIM_SPEED: f32 = 20.0;
 pub struct PlayerControl {
     /// Ramped pushes towards right, left, forward, back (0..256).
     pushes: [i32; 4],
+    /// This tick's push vector (right − left, forward − back), also below the dead strength.
+    pub vector: [f32; 2],
     pub walk_speed: f32,
     pub run_speed: f32,
     pub swim_speed: f32,
@@ -27,7 +29,13 @@ pub struct PlayerControl {
 
 impl Default for PlayerControl {
     fn default() -> PlayerControl {
-        PlayerControl { pushes: [0; 4], walk_speed: WALK_SPEED, run_speed: RUN_SPEED, swim_speed: SWIM_SPEED }
+        PlayerControl {
+            pushes: [0; 4],
+            vector: [0.0; 2],
+            walk_speed: WALK_SPEED,
+            run_speed: RUN_SPEED,
+            swim_speed: SWIM_SPEED,
+        }
     }
 }
 
@@ -42,6 +50,11 @@ pub struct Push {
 }
 
 impl PlayerControl {
+    /// Some push is not zero.
+    pub fn pushing(&self) -> bool {
+        self.pushes.iter().any(|&p| p != 0)
+    }
+
     /// One tick: `stick` is −1..1 per axis (x right, y forward; keys give ±1), `walk` slows to the walking speed,
     /// `swim` uses the speed in water instead.
     pub fn tick(&mut self, stick: [f32; 2], walk: bool, swim: bool) -> Option<Push> {
@@ -56,6 +69,7 @@ impl PlayerControl {
             *p = if t == 0 { (*p - RAMP).max(0) } else { (*p + RAMP).min(t) };
         }
         let [r, l, f, b] = self.pushes.map(|p| p as f32);
+        self.vector = [r - l, f - b];
         let (vx, vy) = (r - l, f - b);
         let strength = (vx * vx + vy * vy).sqrt().min(256.0);
         if strength < DEAD_STRENGTH {

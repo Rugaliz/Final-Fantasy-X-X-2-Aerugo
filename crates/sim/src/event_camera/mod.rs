@@ -28,6 +28,7 @@ pub mod rail;
 pub mod screen;
 pub mod set;
 pub mod spline;
+pub mod view;
 
 pub use process::CamEnv;
 

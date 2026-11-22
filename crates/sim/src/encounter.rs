@@ -15,7 +15,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub danger: u8,
+    /// (formation, weight now): the weight is the pair's high nibble.
     pub formations: Vec<(u8, u8)>,
+    /// Each formation's starting weight (the pair's low nibble).
+    pub seeds: Vec<u8>,
 }
 
 impl Group {
@@ -58,7 +61,8 @@ impl EncounterTable {
                 let formations = (0..n)
                     .map(|k| Some((*d.get(g + 5 + k * 2)?, d.get(g + 6 + k * 2)? & 0xF)))
                     .collect::<Option<Vec<_>>>()?;
-                list.push(Group { danger, formations });
+                let seeds = formations.iter().map(|f| f.1).collect();
+                list.push(Group { danger, formations, seeds });
                 g += 5 + n * 2;
             }
             areas.push(Area { id, name, groups: list });
@@ -72,6 +76,15 @@ impl EncounterTable {
             return None;
         }
         self.areas.iter().position(|a| i32::from(a.id) == id)
+    }
+
+    /// Encounter reset (mode 0): every formation of the area takes its starting weight again.
+    pub fn reset_weights(&mut self, area: usize) {
+        for g in &mut self.areas[area].groups {
+            for (f, &s) in g.formations.iter_mut().zip(&g.seeds) {
+                f.1 = s;
+            }
+        }
     }
 
     /// A battle label (area id << 16 | formation) as area index, group and formation index.
@@ -190,7 +203,7 @@ mod tests {
             areas: vec![Area {
                 id: 0x32,
                 name: "cdsp00".into(),
-                groups: vec![Group { danger: 60, formations: vec![(0, 1), (1, 3)] }],
+                groups: vec![Group { danger: 60, formations: vec![(0, 1), (1, 3)], seeds: vec![1, 3] }],
             }],
         }
     }

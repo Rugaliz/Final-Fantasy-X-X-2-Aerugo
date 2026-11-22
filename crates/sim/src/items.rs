@@ -47,6 +47,9 @@ pub struct ItemTables {
     pub equipment_names: KernelTable,
     /// Battle-end texts, which include the "Obtained ..." lines.
     pub messages: KernelTable,
+    /// The save screens' texts (`save_txt`: 01d9 takes a name from it) and the commands (`command`: names).
+    pub save_text: KernelTable,
+    pub commands: KernelTable,
     /// Shops: item shops (item ids), weapon shops (indexes into the shop equipment), the shop equipment, item
     /// prices and the value of each auto-ability.
     pub item_shops: KernelTable,
@@ -72,6 +75,8 @@ impl ItemTables {
             key_items: table("important")?,
             equipment_names: table("w_name")?,
             messages: table("btlend_txt")?,
+            save_text: table("save_txt")?,
+            commands: table("command")?,
             item_shops: table("item_shop")?,
             weapon_shops: table("arms_shop")?,
             shop_equipment: table("shop_arms")?,
@@ -79,6 +84,12 @@ impl ItemTables {
             ability_prices: table("arms_rate")?,
             charset,
         }))
+    }
+
+    /// The bytes of a text field of a record (up to its NUL; field 0 or 4 by the text variant).
+    pub fn text_bytes(table: &KernelTable, id: u16, field: usize) -> Option<&[u8]> {
+        let r = table.record(u32::from(id & 0xFFF))?;
+        table.text(&r, field)
     }
 
     /// A text field of a record, decoded; `None` for an empty one ("-" marks a missing variant).

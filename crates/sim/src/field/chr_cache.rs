@@ -44,6 +44,21 @@ impl ChrCache {
         self.entries.push(Entry { ty, id, reading: false, held: false, use_kind: 5, purge_pending: false });
     }
 
+    /// Every entry not held is dropped (its data and the remaster's tasks let go); one still being
+    /// read is marked instead.
+    pub fn unload(&mut self) {
+        self.entries.retain_mut(|e| {
+            if e.held {
+                return true;
+            }
+            if e.reading {
+                e.purge_pending = true;
+                return true;
+            }
+            false
+        });
+    }
+
     /// Drop the read entries that are not held and not of use 5 or 7; one still being read is marked instead.
     pub fn purge(&mut self) {
         self.entries.retain_mut(|e| {
@@ -85,6 +100,14 @@ impl FieldState {
 /// 504e read a character's data, 504f wait for it; 5061 read a character's resident motion file, 5063 wait for
 /// it; 4020 purge the cache.
 pub fn register(n: &mut Natives<FieldState>) {
+    // 401f: the unheld character data let go; returns 0.
+    n.register(
+        0x401F,
+        Native::result(|g, _| {
+            g.chr_cache.unload();
+            Value::Int(0)
+        }),
+    );
     n.register(
         0x504E,
         Native::result(|g, c| {

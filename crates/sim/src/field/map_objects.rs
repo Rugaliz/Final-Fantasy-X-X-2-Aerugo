@@ -197,6 +197,8 @@ pub struct Keyframes {
     pub texture_frames: Vec<Option<u32>>,
     /// The slots whose frame the keyframes set on the last update (passed on to the remaster's animations).
     pub texture_frames_set: Vec<bool>,
+    /// Slots a native set since the last update (their flag bit 0, pushed with the next update's).
+    pub texture_frames_pending: Vec<bool>,
 }
 
 const SLOTS: usize = 64;
@@ -209,6 +211,7 @@ impl Keyframes {
             poses: vec![ObjectPose::default(); objects.objects.len()],
             texture_frames: vec![None; objects.texture_slots.len()],
             texture_frames_set: vec![false; objects.texture_slots.len()],
+            texture_frames_pending: vec![false; objects.texture_slots.len()],
         }
     }
 
@@ -238,6 +241,35 @@ impl Keyframes {
                 continue;
             }
             if usize::from(s.target) == target && s.kind == kind {
+                *s = Slot { start: 0, now: 0, ..Slot::default() };
+                self.count = self.count.wrapping_sub(1);
+            }
+            seen += 1;
+            if self.count <= seen {
+                return;
+            }
+        }
+    }
+
+    /// Texture slot `slot`'s frame (when the slot and frame exist); flag bit 0, pushed with the next
+    /// update.
+    pub fn set_texture_frame(&mut self, objects: &MapObjects, slot: u32, frame: u32) {
+        let Some(s) = objects.texture_slots.get(slot as usize) else { return };
+        if (frame as usize) < s.frames.len() {
+            self.texture_frames[slot as usize] = Some(frame);
+            self.texture_frames_pending[slot as usize] = true;
+        }
+    }
+
+    /// Stop the slots on `target` (of `kind`, or any kind) (01c9). A stopped morph slot (kind 2)
+    /// also has the remaster clear its morph (not kept here).
+    pub fn stop(&mut self, target: u16, kind: Option<u16>) {
+        let mut seen = 0;
+        for s in self.slots.iter_mut() {
+            if !s.active {
+                continue;
+            }
+            if s.target == target && kind.is_none_or(|k| s.kind == k) {
                 *s = Slot { start: 0, now: 0, ..Slot::default() };
                 self.count = self.count.wrapping_sub(1);
             }
@@ -310,7 +342,9 @@ impl Keyframes {
     /// One frame: every active slot sets its target from the current key at the time it last advanced to, then
     /// advances to `clock`.
     pub fn update(&mut self, objects: &MapObjects, clock: u32) {
-        self.texture_frames_set.iter_mut().for_each(|s| *s = false);
+        for (set, pending) in self.texture_frames_set.iter_mut().zip(self.texture_frames_pending.iter_mut()) {
+            *set = std::mem::take(pending);
+        }
         // The original keeps the last share through slots without a current key.
         let mut t = 0.0f32;
         for i in 0..SLOTS {

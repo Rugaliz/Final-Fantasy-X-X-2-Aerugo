@@ -6,10 +6,10 @@ use std::sync::Arc;
 use aerugo_formats::Game;
 use aerugo_formats::script::Script;
 use aerugo_formats::text::{self, Charset};
-use aerugo_script::natives::{Native, World, heading, wrap_angle};
+use aerugo_script::natives::{Native, World, wrap_angle};
 
 use crate::control::PlayerControl;
-use crate::trigger::{self, PlayerStep, Talk, Talker, Trigger};
+use crate::trigger::{self, Talk, Trigger};
 use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
@@ -17,14 +17,68 @@ use aerugo_vfs::{Language, Vfs};
 pub mod cam_natives;
 pub mod chr_cache;
 pub mod collision;
+pub mod effects;
 pub mod face;
+pub mod fog;
+pub mod map_fx;
 pub mod map_objects;
 pub mod motion_engine;
+pub mod pad;
+pub mod pos_sound;
+pub mod pre_bg;
 pub mod rng_streams;
 pub mod screen_fx;
+pub mod shapes;
+pub mod sound;
+pub mod sys_natives;
+pub mod text_build;
+pub mod text_space;
 pub mod texture_animation;
+pub mod vibration;
+pub mod voice;
+pub mod worker_bridge;
+pub mod worker_natives;
 
 use collision::Ground;
+
+/// A character's texture records as the PS2 engine keeps them (0x40 each at the character's +0x6ec): the image
+/// base to load (+0x38) and the one loaded (+0x3a), −1 for none. The remaster draws its own textures; this is
+/// the state scripts set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChrTextures {
+    /// Image bases by record (set for all records: `None` as the key).
+    pub bases: Vec<(Option<i32>, i32)>,
+    /// The bases were loaded (5071) this many times.
+    pub loads: u32,
+    /// The texture animation's timer (per slot).
+    pub anim_timer: Option<u8>,
+}
+
+/// A body's matrices as the character engine's batch left them: the world matrix (+0x1d0), the element matrices
+/// (model space) and the option points (+0x524 + key · 0x10).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChrFrame {
+    pub world: crate::chr::elements::Mat,
+    pub elems: Vec<crate::chr::elements::Mat>,
+    pub points: [[f32; 4]; 0x16],
+}
+
+/// The body's X turn one step toward the target (by at most `speed`), wrapped.
+fn tilt_step(a: f32, target: f32, speed: f32) -> f32 {
+    let f = crate::chr::wrap(a - target);
+    if f == 0.0 {
+        return target;
+    }
+    let a = if f <= 0.0 {
+        let s = if -speed < f { -f } else { speed };
+        s + a
+    } else if speed <= f {
+        a - speed
+    } else {
+        a - f
+    };
+    crate::chr::wrap(a)
+}
 
 /// A worker's body in the world.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +134,9 @@ pub struct Actor {
     pub height_test: bool,
     /// The character's motion player (made when a model is bound).
     pub player: Option<motion_engine::Player>,
+    /// The character's texture records' image bases as scripts set them (505a / 5071) and its texture
+    /// animation timer (508d).
+    pub chr_textures: ChrTextures,
     /// The character engine's motion slots (5025): 0 standing, 1 walking, 2 running, 16–19 in water; a value
     /// under 0x1000 picks from the model's own list, others are motion ids.
     pub motion_slots: [i32; 20],
@@ -89,6 +146,10 @@ pub struct Actor {
     pub engine_speed: f32,
     /// The character engine's mode (5013): 0 on the ground, 2 in water.
     pub chr_mode: u8,
+    /// The body's rise this tick (the engine's vertical step, ×0.05).
+    pub chr_rise: f32,
+    /// The body's parts hidden by script (5054), by part number.
+    pub parts_hidden: Vec<bool>,
     /// The character's face animation player (for the model it was made for) and the remaster's face layer stack.
     pub face: Option<(u16, face::Face)>,
     pub face_layers: Vec<face::FaceLayer>,
@@ -132,7 +193,7 @@ const WATER_LEVEL_AT_START: f32 = 1_000_000.0;
 
 /// A character's own motion lists from its `.chr` data (header entries 5, 6 and 7: on the ground, the second
 /// list, in water), motion ids indexed by a slot value under 0x1000.
-pub fn chr_motion_lists(d: &[u8]) -> Option<[Vec<u32>; 3]> {
+pub fn chr_motion_lists(d: &[u8]) -> Option<[Vec<u32>; 4]> {
     let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let list = |k: usize| -> Option<Vec<u32>> {
         let (at, n) = (u32_at(0x10 + k * 8)? as usize, u32_at(0x14 + k * 8)? as usize);
@@ -141,7 +202,7 @@ pub fn chr_motion_lists(d: &[u8]) -> Option<[Vec<u32>; 3]> {
         }
         (0..n.min(0x400)).map(|i| u32_at(at + 4 * i)).collect()
     };
-    Some([list(5)?, list(6)?, list(7)?])
+    Some([list(5)?, list(6)?, list(7)?, list(8)?])
 }
 
 impl Default for Actor {
@@ -173,11 +234,14 @@ impl Default for Actor {
             chr_shadow_17c: 0.0,
             chr_flags: 0,
             height_test: true,
+            chr_textures: ChrTextures::default(),
             player: None,
             motion_slots: DEFAULT_MOTION_SLOTS,
             run_threshold: DEFAULT_RUN_THRESHOLD,
             engine_speed: 0.0,
             chr_mode: 0,
+            chr_rise: 0.0,
+            parts_hidden: Vec::new(),
             face: None,
             face_layers: Vec::new(),
             level: 0,
@@ -247,141 +311,18 @@ enum ActorMove {
     Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32, mode: u32 },
 }
 
-/// One tick of a walk from `pos` to `to`: steps of speed / 20, ending (true) once within speed / 10 with a last
-/// step of half the rest.
-fn walk_step(pos: [f32; 3], to: [f32; 3], speed: f32, ground_only: bool, radius: f32) -> ([f32; 3], bool) {
-    let arrived = (to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2) < radius * radius;
-    let to = if ground_only { [to[0], pos[1], to[2]] } else { to };
-    let d = [to[0] - pos[0], to[1] - pos[1], to[2] - pos[2]];
-    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let (step, done) = if len <= speed / 10.0 { (len / 2.0, true) } else { (speed / 20.0, arrived) };
-    if len <= 0.0 {
-        return (pos, done);
-    }
-    (std::array::from_fn(|k| pos[k] + d[k] / len * step), done)
-}
-/// The settings key of a per-level value of a worker.
+/// The settings key of a worker's level.
 fn level_key(worker: usize, level: u8) -> usize {
     worker | (usize::from(level) + 1) << 16
 }
 
+/// The frame time the character engine scales its steps by.
+const FRAME_TIME: f32 = 1.0 / 30.0;
+
 /// A turn block's rate before a script sets one (π/10 a tick).
 const DEFAULT_TURN_RATE: f32 = std::f32::consts::PI / 10.0;
 
-/// Turn `cur` toward `target` by at most `max` (exactly onto it when closer).
-fn turn_toward(cur: f32, target: f32, max: f32) -> f32 {
-    let d = wrap_angle(target - cur);
-    if d.abs() < max { target } else { wrap_angle(cur + max.copysign(d)) }
-}
-
-/// The share of an eased turn's rate at progress `t`: 0.4 at the ends, 1 halfway.
-fn turn_ease(t: f32) -> f32 {
-    ((1.0 - (t - 0.5) * 4.0 * (t - 0.5)) * 0.6 + 0.4).clamp(0.0, 1.0)
-}
-
-/// What a steered walk does this tick, once its heading is known: the step length, whether the move ends, and
-/// whether it keeps to the ground.
-#[derive(Debug, Clone, Copy)]
-struct SteerStep {
-    len: f32,
-    done: bool,
-    ground_only: bool,
-    mode: u32,
-}
-
 impl Actor {
-    /// A steered walk (move mode 0x8000), first half of the tick: the arrival tests on the position before the
-    /// step, then the heading (and pitch, in space) turned toward the target by at most the steering rates.
-    fn steer_walk_begin(&mut self, yaw_rate: f32, pitch_rate: f32) -> Option<SteerStep> {
-        let pos = self.pos;
-        let level = self.level;
-        let Some(ActorMove::Walk { to, speed, ground_only, radius, mode }) = self.move_at(level).active
-        else {
-            return None;
-        };
-        if mode & 0x8000 == 0 {
-            return None;
-        }
-        let arrived = (to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2) < radius * radius;
-        let aim = if ground_only { [to[0], pos[1], to[2]] } else { to };
-        let d = ((aim[0] - pos[0]).powi(2) + (aim[1] - pos[1]).powi(2) + (aim[2] - pos[2]).powi(2)).sqrt();
-        let near = d <= speed / 10.0;
-        if pos[0] != to[0] || pos[2] != to[2] {
-            self.move_heading =
-                turn_toward(self.move_heading, heading(pos[0], pos[2], to[0], to[2]), yaw_rate);
-            if !ground_only {
-                let ground = ((to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2)).sqrt();
-                self.move_pitch =
-                    turn_toward(self.move_pitch, heading(0.0, pos[1], ground, to[1]), pitch_rate);
-            }
-        }
-        Some(SteerStep {
-            len: if near { d / 2.0 } else { speed / 20.0 },
-            done: near || arrived,
-            ground_only,
-            mode,
-        })
-    }
-
-    /// Second half: the step along the heading (after the turn, which a linked turn sets it from).
-    fn steer_walk_end(&mut self, st: SteerStep, ground: Option<&Ground>) {
-        let (h, p) = (self.move_heading, if st.ground_only { 0.0 } else { self.move_pitch });
-        let mut next = [
-            self.pos[0] + st.len * p.cos() * h.cos(),
-            self.pos[1] + st.len * p.sin(),
-            self.pos[2] + st.len * p.cos() * h.sin(),
-        ];
-        if st.ground_only
-            && let Some(y) = ground.and_then(|g| g.floor(next))
-        {
-            next[1] = y;
-        }
-        // A hidden body walks in the character engine only (see advance_move).
-        if self.visible || self.model.is_none() {
-            self.pos = next;
-        }
-        if st.done {
-            let level = self.level;
-            self.move_at(level).active = None;
-            // A move linked to the turn (0x4000) ends it too.
-            if st.mode & 0x4000 != 0 {
-                self.turning = false;
-                self.turn_steps = None;
-            }
-        }
-    }
-
-    /// One tick of a steered turn (kinds 1 and 2 with mode 0x8000): the facing turns toward the current level's
-    /// move target, an eased turn (kind 2) at the rate times `turn_ease` of its progress. With 0x1000 the walk
-    /// goes along the facing.
-    fn steer_turn(&mut self, rate: f32) {
-        let kind = self.turn_mode & 0x1F;
-        let mut share = 1.0;
-        if kind == 2 {
-            self.turn_t = (self.turn_t + self.turn_inc).clamp(0.0, 1.0);
-            share = turn_ease(self.turn_t);
-        }
-        let level = self.level;
-        let to = self.move_at(level).target;
-        let pos = self.pos;
-        let want = heading(pos[0], pos[2], to[0], to[2]);
-        let ground = ((to[0] - pos[0]).powi(2) + (to[2] - pos[2]).powi(2)).sqrt();
-        self.yaw = turn_toward(self.yaw, want, rate * share);
-        self.pitch = turn_toward(self.pitch, heading(0.0, pos[1], ground, to[1]), rate * share);
-        if kind == 2 && self.turn_t >= 1.0 && self.yaw == want {
-            self.turn_mode = self.turn_mode & !0x1F | 1;
-        }
-        if self.turn_mode & 0x1000 != 0 {
-            self.move_heading = self.yaw;
-            self.move_pitch = self.pitch;
-        }
-    }
-
-    /// Whether the current level runs a steered walk.
-    fn steered_walk(&self) -> bool {
-        matches!(self.move_state().active, Some(ActorMove::Walk { mode, .. }) if mode & 0x8000 != 0)
-    }
-
     /// Radius for collisions between characters.
     pub fn collision_radius(&self) -> f32 {
         self.radius.or(self.model_radius).unwrap_or(DEFAULT_RADIUS)
@@ -403,45 +344,6 @@ impl Actor {
 
     fn move_at(&mut self, level: u8) -> &mut MoveState {
         &mut self.moves[usize::from(level).min(MOVE_LEVELS - 1)]
-    }
-
-    /// One tick of the running level's move.
-    fn advance_move(&mut self, ground: Option<&Ground>) {
-        let pos = self.pos;
-        let body_hidden = !self.visible && self.model.is_some();
-        let level = self.level;
-        let m = self.move_at(level);
-        let Some(mv) = &mut m.active else { return };
-        let (next, done) = match mv {
-            ActorMove::Walk { to, speed, ground_only, radius, .. } => {
-                let (mut next, done) = walk_step(pos, *to, *speed, *ground_only, *radius);
-                // A hidden body walks in the character engine only: the worker's position stays, so the walk
-                // never arrives (znkd1400 w6).
-                if body_hidden {
-                    next = pos;
-                }
-                if *ground_only && let Some(y) = ground.and_then(|g| g.floor(next)) {
-                    next[1] = y;
-                }
-                (next, done)
-            }
-            // The share done is the count over the frames (before counting this tick); the move ends, at its
-            // target, once the count passes the frames.
-            ActorMove::Timed { from, to, count, frames, .. } => {
-                let t =
-                    if *count == 0.0 && *frames == 0.0 { 1.0 } else { (*count / *frames).clamp(0.0, 1.0) };
-                *count += 1.0;
-                if *frames < *count {
-                    (*to, true)
-                } else {
-                    (std::array::from_fn(|k| from[k] + (to[k] - from[k]) * t), false)
-                }
-            }
-        };
-        if done {
-            m.active = None;
-        }
-        self.pos = next;
     }
 
     /// The model's archive path.
@@ -467,6 +369,33 @@ pub fn model_path(game: Game, id: u16) -> Option<String> {
     };
     let n = id & 0xFFF;
     Some(format!("{root}/gamedata/ps3data/chr/{dir}/{prefix}{n:03}/mdl/d3d11/{prefix}{n:03}.dae.phyre"))
+}
+
+/// Engine globals that outlive an event (the host carries them to the next one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Globals {
+    /// The wide-turn limit in degrees (179 at start; 01f0).
+    pub turn_limit_deg: f32,
+    /// A one-time flag 01c6 returns and clears (1 at start).
+    pub first_c6: u8,
+    /// A value a menu sets (−1 at start; 01fa reads it).
+    pub menu_value_fa: i32,
+}
+
+impl Default for Globals {
+    fn default() -> Self {
+        Globals { turn_limit_deg: 179.0, first_c6: 1, menu_value_fa: -1 }
+    }
+}
+
+/// A body attached to a worker's body (a weapon): its model, its character record, the mount point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub model: u16,
+    pub chr: crate::chr::Chr,
+    pub mount: i32,
+    /// Hidden (024b).
+    pub hidden: bool,
 }
 
 /// One of the eight message windows.
@@ -502,6 +431,93 @@ pub struct Window {
     pub choice_live: u8,
     /// The style a script set (0066); 0 is the system window (slower to close).
     pub style: Option<u8>,
+    /// The values the text's placeholders show (009e): per slot, a type byte and the value.
+    pub values: Vec<(u8, i32)>,
+    /// The window's colour word (00a2: four bytes) and its +0x28 word (0256 / 0257).
+    pub color: u32,
+    pub word28: u32,
+    /// The +0x16 word (a text's choices in its high byte; 0141).
+    pub word16: u16,
+    /// Bytes +0x22 / +0x23 and the word +0x24 (010f).
+    pub byte22: u8,
+    pub byte23: u8,
+    pub word24: u32,
+    /// The number entry a window opened with flag 0x40 takes (its input record).
+    pub number: Option<NumberEntry>,
+}
+
+/// A number entry window's input: digits picked by a cursor, each stepped up or down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NumberEntry {
+    /// +1: 2 once confirmed.
+    pub state: u8,
+    /// +2 the digit under the cursor (0: the leftmost), +3 the one it starts on, +4 / +5 the first and the
+    /// count.
+    pub cursor: i8,
+    pub start_cursor: i8,
+    pub first: i8,
+    pub digits: i8,
+    /// +0xc the number, +0x10 the one it starts with.
+    pub value: i32,
+    pub start: i32,
+}
+
+/// Powers of ten by digit place + 1 (its first entry is not one).
+const DIGIT_PLACES: [i32; 10] =
+    [0x003b_3b3b, 1, 10, 100, 1000, 10000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+impl NumberEntry {
+    /// The window opens on cursor `cursor` (and goes back to `start`) with `value`, for `digits` digits.
+    pub fn new(cursor: i32, start: i32, value: i32, digits: i8) -> Self {
+        let clamp = |v: i32| (v.clamp(0, 7) as i8).min(digits - 1);
+        NumberEntry {
+            state: 0,
+            cursor: clamp(cursor),
+            start_cursor: clamp(start),
+            first: 0,
+            digits,
+            value,
+            start: value,
+        }
+    }
+
+    /// One frame of input: `repeat` the pressed-with-repeat word, `pressed` the pressed word.
+    pub fn step(&mut self, repeat: u32, pressed: u32) {
+        if repeat & 0x2000 != 0 {
+            self.cursor = self.cursor.wrapping_add(1);
+        }
+        if repeat & 0x8000 != 0 {
+            self.cursor = self.cursor.wrapping_sub(1);
+        }
+        let place = |e: &Self| {
+            let k = (i32::from(e.digits) - i32::from(e.cursor)).clamp(0, 9) as usize;
+            let p = DIGIT_PLACES[k];
+            (p, if k == 0 { -1 } else { e.value / p % 10 })
+        };
+        if repeat & 0x1000 != 0 {
+            let (p, d) = place(self);
+            self.value = self.value.wrapping_add(if d == 9 { p.wrapping_mul(-9) } else { p });
+        }
+        if repeat & 0x4000 != 0 {
+            let (p, d) = place(self);
+            self.value = self.value.wrapping_add(if d == 0 { p.wrapping_mul(9) } else { -p });
+        }
+        let (n, c) = (self.digits, self.cursor);
+        self.cursor = if n - 1 < c {
+            self.first - n + c
+        } else if c < self.first {
+            c - self.first + n
+        } else {
+            c
+        };
+        if pressed & 0x40 != 0 {
+            self.cursor = self.start_cursor;
+            self.value = self.start;
+        }
+        if pressed & 0x20 != 0 {
+            self.state = 2;
+        }
+    }
 }
 
 /// Characters further apart than this vertically do not touch (cdsp0100: one falling past another 16 apart).
@@ -521,8 +537,8 @@ const SYSTEM_CLOSE_EXTRA: u8 = 5;
 const TEXT_SPEED: usize = 2;
 
 /// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
-const NAMES: usize = 0x634C;
-const NAME_SLOT: usize = 0x14;
+pub(crate) const NAMES: usize = 0x634C;
+pub(crate) const NAME_SLOT: usize = 0x14;
 
 /// Characters in a character's name as the save image spells it.
 fn name_chars(image: &[u8], chr: u8) -> usize {
@@ -541,6 +557,9 @@ pub struct Message {
     pub raw: String,
     /// How many of the last lines are choices.
     pub choices: u8,
+    /// The text table's word for it (the window's +0x16: the choices in the high byte, a number entry's digits in
+    /// the low nibble).
+    pub word: u16,
     /// What the text reveal goes through: everything but line breaks, after a first line that is only control
     /// codes (the speaker's name, shown at once).
     pub reveal: Vec<RevealPart>,
@@ -984,8 +1003,10 @@ pub struct FogOverride {
     pub curve: Option<f32>,
     /// Share of fog colour at most (0–1).
     pub limit: f32,
-    /// The limit as scripts set it (0–255), which 803d reads back.
+    /// The limit as scripts set it (0–255).
     pub limit_raw: f32,
+    /// The fog colour the natives hand the remaster (events 0xe0 / 0x140 only).
+    pub colour: Option<[f32; 3]>,
 }
 
 /// Values natives set for parts of the engine: event flag bits, sound switches, the character ID effect
@@ -994,14 +1015,14 @@ pub struct FogOverride {
 pub struct EngineValues {
     /// The event flags byte (bit 5: 00f2).
     pub event_flags: u8,
+    /// The event system's byte +3 (bit 2: a learned-command message holds the player's control, 0216).
+    pub event_flags3: u8,
     /// Sound switches (0151 sets bit n).
     pub sound_switches: u32,
     /// Event bits (017a sets bit n; an event effect load clears them).
     pub event_bits: u32,
     /// Set by 017a(9) and cleared by 017a(10) on scene 0x5e, room 0x186.
     pub event_switch_9: bool,
-    /// The event's 2D shapes are drawn (023f).
-    pub shapes_on: i32,
     /// The screen copy switch (4014).
     pub screen_copy: bool,
     /// Character ID effect variables (4017) and the current set's effect bytes (403b).
@@ -1051,11 +1072,13 @@ pub type ModelFace = (Option<std::sync::Arc<face::FaceData>>, Option<std::sync::
 
 /// The guide map's placement: its mode (0–3 a corner at 128, 4 the centre at 256), size and centre in the PS2
 /// frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GuideMap {
     pub mode: i32,
     pub size: i32,
     pub pos: (i32, i32),
+    /// The farthest camera distance (+0x6c; 8032).
+    pub max_camera_dist: Option<f32>,
 }
 
 impl GuideMap {
@@ -1105,6 +1128,8 @@ pub struct FieldState {
     pub camera: CameraState,
     /// The event camera system's memory.
     pub cam: crate::event_camera::CamMem,
+    /// The shown camera's view matrix as the original builds it (row-major, points as rows).
+    pub cam_view: Option<[f32; 16]>,
     /// Each worker's camera handle (the original's worker +0x3c), 0 until a camera native first needs one.
     pub cam_slots: Vec<u32>,
     /// The worker the script header names (+0x18; its camera handles are of the event camera's kind).
@@ -1117,6 +1142,33 @@ pub struct FieldState {
     pub magic: MagicState,
     /// The character data cache's entries.
     pub chr_cache: chr_cache::ChrCache,
+    /// Character reads (0203) running: the machine's 512-bit mask, OR'd (voice standbys wait for it).
+    pub chr_read_mask: u32,
+    /// The voice natives' and the sound driver's voice state.
+    pub voice: voice::VoiceState,
+    /// The event's 2D shapes.
+    pub shapes: shapes::Shapes,
+    /// The offset of the script's data shared by all workers.
+    pub shared_data: u32,
+    /// The worker records the engine steps (the original's layout).
+    pub workers: crate::workers::Workers,
+    /// Each worker's character record (the original's layout), once it binds a body.
+    pub chrs: Vec<Option<crate::chr::Chr>>,
+    /// The event effect running in the sandbox (00db–00de).
+    pub effects: effects::Effects,
+    /// Each body's matrices from the last batch.
+    pub chr_frames: Vec<Option<ChrFrame>>,
+    /// Each body's element values (+0xe4..) and the model they belong to.
+    pub chr_joints: Vec<Option<(u16, Vec<crate::chr::elements::Joint>)>>,
+    pub chr_globals: crate::chr::Globals,
+    /// The positional sound slots.
+    pub pos_sounds: pos_sound::PosSounds,
+    /// The engine globals that outlive the event.
+    pub globals: Globals,
+    /// Each worker's two attached bodies (0006): the model, its record, the mount point on the worker's body.
+    pub attachments: Vec<[Option<Attachment>; 2]>,
+    /// The music side of the sound driver and the commands for the remaster's sound layer.
+    pub sound: sound::SoundState,
     /// The guide map (the field's small map), when the field has one.
     pub guide_map: Option<GuideMap>,
     /// The event machine's 32-entry table that native 1000 fills (8 bytes each: x / 8 with bit 7, y / 4, the
@@ -1126,12 +1178,107 @@ pub struct FieldState {
     pub messages: Vec<Message>,
     /// Item, treasure and equipment tables (FFX).
     pub items: Option<Arc<crate::items::ItemTables>>,
+    /// The party stat recompute's tables and what it keeps outside the save image.
+    pub stat_tables: Option<Arc<crate::stats::StatTables>>,
+    pub stats: crate::stats::StatsState,
+    /// What a new game's save image is made from (023d).
+    pub new_game_tables: Option<Arc<crate::new_game::NewGameTables>>,
+    /// The battle results buffer 0217 resets (0x1b0 bytes).
+    pub battle_get: Vec<u8>,
+    /// The Al Bhed primer word of the save as it was loaded (save +0x3d10 when the save was read), for
+    /// the session to set; without it the save image's word now stands for it.
+    pub primers_loaded: Option<i32>,
+    /// A switch only the debug menu toggles (0265).
+    pub debug_cccacc: i32,
     pub input: Input,
     /// Worker the player controls.
     pub player: Option<usize>,
     pub ground: Option<Ground>,
     /// The map's fog from its PS2 map package (the scripts may change it).
     pub map_fog: Option<MapFog>,
+    /// The map's particle effects as natives switch them.
+    pub map_effects: map_fx::MapEffects,
+    pub map_effects_on: map_fx::EffectsOn,
+    /// A map display switch (805c) and a map effect value (8066).
+    pub map_switch_5eb8: u8,
+    pub map_effect_230fd34: i32,
+    /// The PS2 map's pre-rendered background layers.
+    pub pre_bg: pre_bg::PreBg,
+    /// The remaster's map id (the hash of the map path) and language type (jp 0, us 1, fr 2, es 3, de 4, it 5,
+    /// kr 9, ch 10) and its +0 (0 Japanese, 1 western, 3 Korean / Chinese).
+    pub map_id: u32,
+    pub language_type: Option<u32>,
+    pub language_region: u32,
+    /// The event's character set (for texts natives build at run time).
+    pub charset: Option<std::sync::Arc<Charset>>,
+    /// The texts natives hand out addresses of, and the last message asked for.
+    pub texts: text_space::TextSpace,
+    pub last_text: i32,
+    /// The PS2 map package (for its walk mesh pages) and the page switch the event step applies next frame
+    /// (kind: 1 with the guide map, 2 without; the two pages, −1 none).
+    pub map_package: Option<std::sync::Arc<[u8]>>,
+    pub page_switch: (u8, i8, i8),
+    /// Set by 8006 on map 0x159c at story 0x7e4 with page 2 (the remaster reads it).
+    pub page_flag_bf68: bool,
+    /// The map display switches (map load sets 0x11, 0x4000 with a background stream; 8001 bit 0x10)
+    /// and the remaster's render switch 8001 passes.
+    pub map_display: u32,
+    pub map_render_off: Option<bool>,
+    /// The screen distortion (01e2–01e6).
+    pub distortion: Distortion,
+    /// The pad vibration channels.
+    pub vibration: vibration::Vibration,
+    /// The PS2 fog block, the remaster's scene settings the fog natives read, and the background colour 8045
+    /// gives the remaster.
+    pub ps_fog: fog::PsFog,
+    pub hd_scene: Option<fog::HdScene>,
+    pub background: Option<[f32; 3]>,
+    /// Achievements the scripts unlocked (025b).
+    pub achievements: Vec<i32>,
+    /// The movie 01b0 asked the remaster to preload (number, mode & 0x80).
+    pub movie_preload: Option<(i32, i32)>,
+    /// The two values 0259 sets; 4043's pair; 4039's bytes
+    /// ; the character light table 4023 allocates (0x2c bytes each: +0xc and +0x1c
+    /// 1.0, +0x28 the byte 402a sets).
+    pub values_5b98: [f32; 2],
+    /// The player control's heading state.
+    pub sg: SgControl,
+    /// Remaster switches natives hand over: the shadow solution (025e → graphicSwitchShadowSolution) and the
+    /// loading screen request (025f(a, b)).
+    pub shadow_solution: Option<i32>,
+    pub loading_screen: Option<(i32, i32)>,
+    /// A map the scripts asked to load directly (c003: a map, c031: a battle map; the map number and
+    /// whether it is the battle map) for the host.
+    pub map_load_request: Option<(i32, bool)>,
+    /// Debug-build memory blocks (c054 allocates; their addresses are 0x7000_0000 + index << 20).
+    pub debug_heap: Vec<Vec<u8>>,
+    /// The shared battle motions (loaded, and the flag 70a2's wait clears first).
+    pub regmot_ready: bool,
+    pub regmot_flag: bool,
+    /// 70a2 read the file itself (holding its data).
+    pub regmot_data: bool,
+    /// The system block's eight variable slots (+0x1a4 + slot·8: the address, +4; 101c sets).
+    pub sys_slots: [(i32, u32); 8],
+    /// Pending key items (on, and the bits; 0234 grants them).
+    pub key_pending: (u32, u32),
+    /// The morph weight 01a4 gives each display object.
+    pub mime_params: Vec<Option<f32>>,
+    /// The pad's held word last frame and the buttons let go this frame (the pad history's +8, kept).
+    pub pad_prev_held: u32,
+    /// A menu value (01fb reads it; the menus set it).
+    pub value_a228: i32,
+    pub pad_released: u32,
+    /// The pad block's analog bytes and second word (0121 / 0122 / 0251).
+    pub pad: pad::PadBlock,
+    /// c007's pair and the debug switch bytes 707d / 707e set and read.
+    pub values_085c: [i32; 2],
+    pub debug_flags: Vec<u8>,
+    pub values_08c4: [i32; 2],
+    pub bytes_0771: [u8; 4],
+    pub lights_08cc: Vec<[u8; 0x2c]>,
+    /// A switch byte 00b2 sets and the three values 00b3/00b4 set.
+    pub byte_181e: u8,
+    pub values_194c: [i32; 3],
     /// The PS2 map's display objects and keyframe tracks, and the keyframe slots playing them.
     pub map_objects: Option<std::sync::Arc<map_objects::MapObjects>>,
     pub keyframes: map_objects::Keyframes,
@@ -1184,7 +1331,9 @@ pub struct FieldState {
     /// The alternative motion clock (native 4022).
     pub alt_clock: bool,
     /// Each model's own motion lists (`.chr` data).
-    pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 3]>>,
+    pub model_motion_lists: std::collections::HashMap<u16, Option<[Vec<u32>; 4]>>,
+    /// Each model's option positions.
+    pub model_optpos: std::collections::HashMap<u16, Option<std::sync::Arc<OptPos>>>,
     /// Each model's motion translation scale (`.chr` data).
     pub model_motion_scales: std::collections::HashMap<u16, Option<f32>>,
     /// Models' PS2 bones and parts (from their `.chr` data).
@@ -1241,60 +1390,26 @@ impl FieldState {
 }
 
 impl World for FieldState {
-    fn worker_ran(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
-        // The level the worker's turn ended on is the one whose move advances this tick. (The original advances
-        // moves and turns here, at the end of the worker's first pass: one started in a later pass of the same
-        // tick waits for the next.)
-        let a = self.actor(w);
-        a.level = level;
-        a.first_pass_done = true;
-        let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
-        // A player warped this tick did not walk: nothing is crossed.
-        let cur = self.actors[p].pos;
-        let prev = if self.player_placed { cur } else { self.player_prev };
-        let step = PlayerStep { prev, cur };
-        let Some(a) = self.actors.get_mut(w).filter(|a| a.trigger.active) else { return Vec::new() };
-        let mut out = Vec::new();
-        match kind {
-            1 if a.model.is_some() => trigger::test_character(&mut a.trigger, a.pos, step, &mut out),
-            2 => trigger::test_line_zone(&mut a.trigger, a.pos, step, &mut out),
-            3 | 6 => trigger::test_box(&mut a.trigger, a.pos, a.yaw, step, &mut out),
-            5 => trigger::test_line(&mut a.trigger, a.pos, step, &mut out),
-            _ => {}
-        }
-        let bits = a.flags;
-        // Kind 6 zones raise enter and leave, not "inside" every tick.
-        out.retain(|&t| bits & (1 << t) != 0 && !(kind == 6 && t == trigger::INSIDE));
-        if let Some(talk) = self.talk.as_mut().filter(|_| bits & 1 != 0 && w != p) {
-            let talker = Talker { pos: step.cur, yaw: self.actors[p].yaw, reach: self.talk_reach };
-            let a = &self.actors[w];
-            match kind {
-                1 if a.model.is_some() => trigger::talk_character(&a.trigger, w, a.pos, &talker, talk),
-                2 => trigger::talk_line_zone(&a.trigger, w, a.pos, &talker, talk),
-                3 => trigger::talk_box(&a.trigger, w, a.pos, a.yaw, &talker, talk),
-                _ => {}
-            }
-        }
-        out
+    fn worker_ran(&mut self, w: usize, _kind: u8, level: u8) -> Vec<u8> {
+        self.worker_engine_step(w, level)
     }
 
-    fn start_signals(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
-        let Some(p) = self.player.and_then(|p| self.actors.get(p)).map(|a| a.pos) else { return Vec::new() };
-        let prev = std::mem::replace(&mut self.player_prev, p);
-        let talk = self.talk.take();
-        let out = self.worker_ran(w, kind, level);
-        self.player_prev = prev;
-        self.talk = talk;
-        out
+    fn worker_will_run(&mut self, w: usize, _kind: u8, _level: u8) {
+        self.worker_pre_run(w);
+    }
+
+    fn level_started(&mut self, w: usize, level: u8) {
+        if let Some(wk) = self.workers.list.get_mut(w) {
+            wk.reset_level(i32::from(level));
+        }
     }
 
     fn after_workers(&mut self) -> Vec<(usize, u8)> {
         let mut out = Vec::new();
-        if let Some(talk) = self.talk.take()
-            && let Some((w, _)) = talk.best.filter(|_| self.user_control)
-        {
-            out.push((w, talk.signal));
+        if let Some(t) = self.talk_end().filter(|_| self.user_control) {
+            out.push(t);
         }
+        self.talk = None;
         out.extend(self.bumps().into_iter().map(|w| (w, trigger::BUMP)));
         out
     }
@@ -1401,6 +1516,7 @@ impl FieldState {
             }
         }
         self.screen.frame();
+        self.voice.tick();
         if let Some(m) = self.movie.as_mut().filter(|m| m.playing) {
             m.elapsed += 1;
             if let Some(f) = m.frames.filter(|&f| !m.looping && m.elapsed > f) {
@@ -1414,7 +1530,7 @@ impl FieldState {
         let follow = self.camera.follow.update(|w| actors.get(w).map(|a| a.pos));
         self.camera.process(follow);
         self.cam_publish();
-        // The map's frame push (90bf10): group 3 is always off, scene 0x8a keeps group 8 on.
+        // The map's frame push: group 3 is always off, scene 0x8a keeps group 8 on.
         if self.scene == Some(0x8A) {
             self.hidden_map_groups &= !0x100;
         }
@@ -1438,71 +1554,36 @@ impl FieldState {
             }
             w.shown = if w.instant { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
+        // The character engine's step of each body: the velocity this frame from the speed its worker's engine
+        // handed over, along the heading of travel (speed · 0.05 · 30 · the frame time), the rise added, and a
+        // walking body kept from sinking under the ground. The player moves by the pad instead unless a script
+        // move runs on it.
         for (i, a) in self.actors.iter_mut().enumerate() {
-            // Bodies not moving settle onto the nearest floor (cdsp0100: one placed under the floor comes up).
-            if Some(i) != self.player
-                && a.model.is_some()
-                && a.move_state().active.is_none()
-                && let Some(g) = self.ground.as_ref()
-                && let Some(h) = g
-                    .heights(a.pos[0], a.pos[2])
-                    .min_by(|x, y| (x - a.pos[1]).abs().total_cmp(&(y - a.pos[1]).abs()))
-            {
-                a.pos[1] = h;
-            }
-            a.first_pass_done = false;
-            if std::mem::take(&mut a.started_late) {
+            if a.model.is_none() {
                 continue;
             }
-            let setting_at = |id: u16, key: usize| {
-                self.settings.get(&(id, key)).and_then(|v| v.first()).map(|v| match v {
-                    Value::Float(f) => *f,
-                    Value::Int(x) => *x as f32,
-                })
+            let scripted = self.workers.list.get(i).is_some_and(|wk| {
+                let m = wk.move_of(i32::from(wk.level()));
+                wk.u16(m + crate::workers::mv::MODE) & 0x7f != 0
+            });
+            if Some(i) == self.player && !scripted {
+                continue;
+            }
+            let (vx, vz) = if a.engine_speed == 0.0 {
+                (0.0, 0.0)
+            } else {
+                let v = (f64::from(a.engine_speed) * 0.05 * 30.0 * f64::from(FRAME_TIME)) as f32;
+                let h = f64::from(a.move_heading);
+                ((h.cos() as f32) * v, (h.sin() as f32) * v)
             };
-            let setting = |id: u16| setting_at(id, i);
-            let lvl = a.level;
-            let level_setting = |id: u16| setting_at(id, level_key(i, lvl));
-            let turn_runs = a.turn_level == a.level;
-            let steering_turn = a.turning
-                && turn_runs
-                && a.turn_steps.is_none()
-                && matches!(a.turn_mode & 0x1F, 1 | 2)
-                && a.turn_mode & 0x8000 != 0
-                && a.steered_walk();
-            let steer = a.steer_walk_begin(
-                level_setting(0x002B).or(setting(0x006D)).unwrap_or(0.0),
-                setting(0x002C).or(setting(0x006E)).unwrap_or(0.0),
-            );
-            if steer.is_none() {
-                a.advance_move(self.ground.as_ref());
-            }
-            if steering_turn {
-                let rate = level_setting(if a.turn_mode & 0x200 != 0 { 0x00E3 } else { 0x002E });
-                a.steer_turn(rate.unwrap_or(DEFAULT_TURN_RATE));
-            } else if a.turning
-                && turn_runs
-                && let Some((step, left)) = &mut a.turn_steps
+            a.pos[0] += vx;
+            a.pos[1] += a.chr_rise;
+            a.pos[2] += vz;
+            if a.chr_mode == 0
+                && let Some(y) = self.ground.as_ref().and_then(|g| g.floor(a.pos))
+                && y < a.pos[1]
             {
-                a.yaw = wrap_angle(a.yaw + *step);
-                *left = left.saturating_sub(1);
-                if *left == 0 {
-                    a.yaw = a.turn_target;
-                    a.turning = false;
-                    a.turn_steps = None;
-                }
-            } else if a.turning && turn_runs {
-                let step = if a.turn_speed[0] > 0.0 { a.turn_speed[0] } else { 0.2 };
-                let d = wrap_angle(a.turn_target - a.yaw);
-                if d.abs() <= step {
-                    a.yaw = a.turn_target;
-                    a.turning = false;
-                } else {
-                    a.yaw = wrap_angle(a.yaw + step.copysign(d));
-                }
-            }
-            if let Some(st) = steer {
-                a.steer_walk_end(st, self.ground.as_ref());
+                a.pos[1] = y;
             }
         }
         let mut player_speed = 0.0;
@@ -1533,13 +1614,12 @@ impl FieldState {
             let in_water = self.actors[p].chr_mode == 2;
             let push = self.control.tick(self.input.stick, self.input.walk, in_water);
             player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
-            if let Some(push) = push.filter(|_| self.user_control) {
-                // Forward is where the camera looks; right is a quarter turn clockwise from it seen from above.
-                let h = self.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
-                let (fwd, right) = ([h.cos(), h.sin()], [h.sin(), -h.cos()]);
-                let [x, y] = push.dir;
-                self.player_step =
-                    Some([(right[0] * x + fwd[0] * y) * push.step, (right[1] * x + fwd[1] * y) * push.step]);
+            // The heading: the player control's camera heading kept while the stick holds its direction.
+            let cam = self.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
+            let vector = self.control.vector;
+            let heading = self.sg.frame(cam, self.user_control, self.control.pushing(), vector, self.map_id);
+            if let (Some(push), Some(h)) = (push.filter(|_| self.user_control), heading) {
+                self.player_step = Some([h.cos() * push.step, h.sin() * push.step]);
             }
         }
         self.engine_motions(player_speed);
@@ -1550,7 +1630,7 @@ impl FieldState {
                 p.frame(alt);
             }
         }
-        self.faces();
+        self.chr_elements();
         self.motion_events();
         // AERUGO_MOTION_TRACE: each character's motion player state, in the oracle's log form, every tick.
         if std::env::var_os("AERUGO_MOTION_TRACE").is_some() {
@@ -1564,6 +1644,160 @@ impl FieldState {
                 eprintln!("MT {}", out.join(" | "));
             }
         }
+    }
+
+    /// The batch step for every body: first the bodies standing on their own, then the hung ones (so these
+    /// take this frame's matrices of what they hang on); a body held (+0x180 set and +0x181 clear) is skipped.
+    /// Per body: the motion's values into the elements (only the channels it moved this frame; the element values
+    /// persist), the blink, the neck, and with +0x194 & 0x3000000 the element matrices, the tilt step, the world
+    /// matrix and the option points; then its face player. (Mode 1 of the neck looks at the camera's focus side,
+    /// taken as the sim camera's focus.)
+    fn chr_elements(&mut self) {
+        let n = self.actors.len();
+        self.chr_frames.resize(n, None);
+        self.chr_joints.resize(n, None);
+        for pass in 0..2 {
+            for w in 0..n {
+                let hung = self.chrs.get(w).and_then(Option::as_ref).map(|c| c.u32(crate::chr::PARENT) != 0);
+                match hung {
+                    Some(h) if h == (pass == 1) => {}
+                    Some(_) => continue,
+                    None => {
+                        if pass == 0 {
+                            self.chr_frames[w] = None;
+                            self.chr_joints[w] = None;
+                            self.face_tick(w);
+                        }
+                        continue;
+                    }
+                }
+                let held = self.chrs[w].as_ref().is_some_and(|c| c.u8(0x180) != 0 && c.u8(0x181) == 0);
+                if !held {
+                    self.chr_batch(w);
+                }
+                self.face_tick(w);
+            }
+        }
+    }
+
+    /// One body's part of the batch (see chr_elements).
+    fn chr_batch(&mut self, w: usize) {
+        use crate::chr::elements as el;
+        let Some(model) = self.actors[w].model else {
+            self.chr_frames[w] = None;
+            return;
+        };
+        let rig = self.model_rigs.get(&model).cloned().flatten();
+        let opt = self.model_optpos.get(&model).cloned().flatten();
+        let (b30, b38) = opt.as_ref().map_or((1.0, 1.0), |o| (o.block_30, o.block_38));
+        let mscale = self.model_motion_scales.get(&model).copied().flatten().unwrap_or(0.001);
+        // The element values: the model's own when the body (or its model) is new.
+        let fresh = !matches!(&self.chr_joints[w], Some((m, _)) if *m == model);
+        if fresh {
+            let joints = rig.as_ref().map_or_else(Vec::new, |r| {
+                r.bones
+                    .iter()
+                    .map(|b| el::Joint { rotation: b.rotation, translation: b.translation, scale: b.scale })
+                    .collect()
+            });
+            // At allocation (the model at rest).
+            let parents: Vec<Option<usize>> =
+                rig.as_ref().map_or_else(Vec::new, |r| r.bones.iter().map(|b| b.parent).collect());
+            let elem9 = opt.as_ref().and_then(|o| o.element(9)).map(|e| e.0).filter(|&e| e != 0);
+            if let Some(ch) = self.chrs[w].as_mut() {
+                el::neck_init(ch, &parents, &joints, elem9.and_then(|e| usize::try_from(e).ok()));
+            }
+            self.chr_joints[w] = Some((model, joints));
+        }
+        // The blink (its rand calls whether or not the model has an eyelid element).
+        let eye = opt.as_ref().and_then(|o| o.element(0xd)).map(|e| e.0).filter(|&e| e != 0);
+        let eye_block = opt.as_ref().map_or((0, 2, 1, [0.0; 3]), |o| o.eye_block(model));
+        let mut face_frame = None;
+        if let Some(ch) = self.chrs[w].as_mut()
+            && let Some((_, joints)) = self.chr_joints[w].as_mut()
+        {
+            // The element values for the channels the motion moved this frame (it runs before the batch).
+            if let Some(p) = &self.actors[w].player {
+                for (j, v) in p.pose_dirty().into_iter().enumerate() {
+                    if let (Some((v, d)), Some(joint)) = (v, joints.get_mut(j)) {
+                        el::apply_channels(joint, v, d, mscale);
+                    }
+                }
+            }
+            face_frame = el::blink(ch, &mut self.crt_rand, joints, eye, eye_block);
+        }
+        if let (Some(f), Some((_, face))) = (face_frame, self.actors[w].face.as_mut()) {
+            face.blink_frame(f);
+        }
+        // The neck, from the option points of the last batch.
+        let elem9 = opt.as_ref().and_then(|o| o.element(9)).map(|e| e.0).filter(|&e| e != 0);
+        let mut neck = None;
+        if let Some(e9) = elem9.and_then(|e| usize::try_from(e).ok()) {
+            let last = self.chr_frames[w].clone();
+            let pts = last.as_ref().map_or([[0.0; 4]; 0x16], |f| f.points);
+            let body = last.as_ref().map_or([0.0; 3], |f| [f.world[12], f.world[13], f.world[14]]);
+            let p = |k: usize| (pts[k][3] != 0.0).then(|| el::point(&pts, k, body));
+            let ch = self.chrs[w].as_ref();
+            let mode = ch.map_or(0, |c| c.i8(0x40d));
+            let target = match mode {
+                1 => self.camera.focus.map(|f| [f[0], f[1], f[2], 1.0]),
+                2 => ch.map(|c| c.u32(0x4c0)).filter(|&t| t != 0).and_then(|t| {
+                    let t = t as usize - 1;
+                    self.chrs.get(t).and_then(Option::as_ref)?;
+                    let f = self.chr_frames.get(t).cloned().flatten()?;
+                    Some(el::point(&f.points, 9, [f.world[12], f.world[13], f.world[14]]))
+                }),
+                3 => ch.map(|c| [c.f32(0x4c0), c.f32(0x4c4), c.f32(0x4c8), c.f32(0x4cc)]),
+                _ => None,
+            };
+            let inp = el::NeckInput {
+                p13: p(0x13),
+                p14: p(0x14),
+                p9: el::point(&pts, 9, body),
+                target,
+                side: opt.as_ref().map_or(0, |o| o.eye_block(model).0),
+            };
+            if let Some(ch) = self.chrs[w].as_mut() {
+                neck = el::neck(ch, &inp).map(|(m, wt)| (e9, m, wt));
+            }
+        }
+        let Some(ch) = self.chrs[w].as_ref() else { return };
+        if ch.u32(crate::chr::FLAGS) & 0x0300_0000 == 0 {
+            return;
+        }
+        let parents: Vec<Option<usize>> =
+            rig.as_ref().map_or_else(Vec::new, |r| r.bones.iter().map(|b| b.parent).collect());
+        let joints = self.chr_joints[w].as_ref().map_or(&[][..], |(_, j)| &j[..]);
+        let elems = el::element_matrices_with(&parents, joints, neck);
+        let (scale, facing) = ([ch.f32(0x5c), ch.f32(0x60), ch.f32(0x64)], ch.f32(crate::chr::FACING));
+        let (hung, elem, off, k1b4) = (
+            ch.u32(crate::chr::PARENT),
+            ch.i32(0x1a0),
+            [ch.f32(0x1a4), ch.f32(0x1a8), ch.f32(0x1ac), ch.f32(0x1b0)],
+            ch.f32(0x1b4),
+        );
+        let pos = ch.pos();
+        let mut tilt = None;
+        if ch.f32(0x160) != 0.0 {
+            let t = tilt_step(ch.f32(0x15c), ch.f32(0x160), ch.f32(0x164));
+            if let Some(ch) = self.chrs[w].as_mut() {
+                ch.set_f32(0x15c, t);
+            }
+            tilt = Some(t);
+        }
+        let dr = self.actors[w].draw_offset;
+        let place = [dr[0] + pos[0], dr[1] + pos[1], dr[2] + pos[2]];
+        let parent = (hung != 0).then(|| hung as usize - 1).and_then(|p| {
+            let f = self.chr_frames.get(p).cloned().flatten()?;
+            let pm = self.actors.get(p).and_then(|a| a.model)?;
+            let pb30 = self.model_optpos.get(&pm).cloned().flatten().map_or(1.0, |o| o.block_30);
+            let pe = usize::try_from(elem).ok().and_then(|e| f.elems.get(e)).copied().unwrap_or(el::IDENTITY);
+            Some(el::hung_world(&f.world, &pe, pb30, k1b4, off))
+        });
+        let world = parent.unwrap_or_else(|| el::body_world(b30, b38, scale, tilt, facing, place));
+        let entries = opt.as_ref().map_or(&[][..], |o| &o.entries[..]);
+        let points = el::option_points(&world, &elems, entries, b30, b38);
+        self.chr_frames[w] = Some(ChrFrame { world, elems, points });
     }
 
     /// The events the motions reached this frame: face patterns (kind 3: the id's high byte is the request kind,
@@ -1610,6 +1844,7 @@ impl FieldState {
         let chr = chr_path(game, m).and_then(|p| vfs.read(&p).ok());
         self.model_radii.insert(m, chr.as_deref().and_then(chr_radius));
         self.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
+        self.model_optpos.insert(m, chr.as_deref().and_then(chr_optpos).map(std::sync::Arc::new));
         self.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
         self.model_rigs.insert(m, chr.as_deref().and_then(chr_rig).map(std::sync::Arc::new));
         self.model_joints.insert(m, chr.as_deref().and_then(chr_joints).unwrap_or(0));
@@ -1685,6 +1920,19 @@ impl FieldState {
     }
 
     /// Set a worker's motion (scripts and the character engine).
+    /// The idle motion (chr, mode, key) for the models with the motion tables (block +0x6c; mode → list 5, 6, 7,
+    /// 8): the list's motion for the key, else (mode ≠ 0) the ground list's first; set by chr_set_motion.
+    pub(crate) fn mode_motion(&mut self, w: usize, mode: u8, key: usize) {
+        let Some(model) = self.actors.get(w).and_then(|a| a.model) else { return };
+        let lists = self.model_motion_lists.get(&model).and_then(|l| l.clone());
+        let Some(lists) = lists else { return };
+        let pick = |m: usize, k: usize| lists.get(m).and_then(|l| l.get(k)).copied().filter(|&id| id != 0);
+        let id = pick(usize::from(mode).min(3), key).or_else(|| if mode != 0 { pick(0, 0) } else { None });
+        if let Some(id) = id {
+            self.set_motion(w, id as i32);
+        }
+    }
+
     fn set_motion(&mut self, w: usize, id: i32) -> Option<motion_engine::SetMotion> {
         let model = self.actors.get(w)?.model?;
         let groups = &self.motion_groups;
@@ -1697,21 +1945,20 @@ impl FieldState {
 
     /// The face animation players (after the character engine's motions): a character gets one when its model has face
     /// data; each frame it plays and reports to the face layer stack.
-    fn faces(&mut self) {
+    /// One body's face player (at the end of its batch step).
+    fn face_tick(&mut self, w: usize) {
         let mut reports = Vec::new();
-        for a in &mut self.actors {
-            let Some(model) = a.model else { continue };
-            let Some((data, sprites)) = self.model_faces.get(&model) else { continue };
-            if a.face.as_ref().map(|f| f.0) != Some(model) {
-                a.face = data.clone().map(|d| (model, face::Face::new(d)));
-                a.face_layers.clear();
-            }
-            let Some((_, f)) = &mut a.face else { continue };
-            reports.clear();
-            f.tick(&mut self.crt_rand, &mut reports);
-            if let Some(s) = sprites {
-                face::apply_reports(&mut a.face_layers, s, &reports);
-            }
+        let a = &mut self.actors[w];
+        let Some(model) = a.model else { return };
+        let Some((data, sprites)) = self.model_faces.get(&model) else { return };
+        if a.face.as_ref().map(|f| f.0) != Some(model) {
+            a.face = data.clone().map(|d| (model, face::Face::new(d)));
+            a.face_layers.clear();
+        }
+        let Some((_, f)) = &mut a.face else { return };
+        f.tick(&mut self.crt_rand, &mut reports);
+        if let Some(s) = sprites {
+            face::apply_reports(&mut a.face_layers, s, &reports);
         }
     }
 
@@ -1723,29 +1970,12 @@ impl FieldState {
         for w in 0..self.actors.len() {
             let a = &self.actors[w];
             let Some(model) = a.model else { continue };
-            let speed = match a.move_state().active {
-                Some(m) => {
-                    let (mode, set) = match m {
-                        ActorMove::Walk { mode, speed, .. } => (mode, speed),
-                        ActorMove::Timed { mode, .. } => (mode, a.move_state().speed),
-                    };
-                    // The move's set speed, along the ground for kinds 2 and 4 (by the pitch the move
-                    // goes along), none for kinds 7 and 9 (placed directly).
-                    match mode & 0x7F {
-                        0 | 7 | 9 => 0.0,
-                        2 | 4 => {
-                            let pitch = match m {
-                                ActorMove::Walk { ground_only: true, .. } => 0.0,
-                                _ => a.move_pitch,
-                            };
-                            set * pitch.cos()
-                        }
-                        _ => set,
-                    }
-                }
-                None if Some(w) == self.player => player_speed,
-                None => 0.0,
-            };
+            // The speed the body moves at: what its worker's engine handed over, or the player's push.
+            let scripted = self.workers.list.get(w).is_some_and(|wk| {
+                let m = wk.move_of(i32::from(wk.level()));
+                wk.u16(m + crate::workers::mv::MODE) & 0x7f != 0
+            });
+            let speed = if Some(w) == self.player && !scripted { player_speed } else { a.engine_speed };
             self.actors[w].engine_speed = speed;
             if self.actors[w].player.as_ref().is_none_or(|p| p.playing) {
                 continue;
@@ -1823,6 +2053,22 @@ pub fn event_text_path(game: Game, ebp_path: &str, lang: Language) -> Option<Str
 
 /// Decode an event text table: 8-byte entries (u16 offset, u16 flags with the choice count in the high byte,
 /// twice), strings after the table.
+/// A message from its stored bytes (up to the NUL) and its choice count.
+pub fn message_from_bytes(bytes: Vec<u8>, word: u16, charset: &Charset) -> Message {
+    let tokens = text::decode(&bytes, charset);
+    let text = tokens
+        .iter()
+        .filter_map(|t| match *t {
+            text::Token::Char(c) => Some(c),
+            text::Token::LineBreak => Some('\n'),
+            _ => None,
+        })
+        .collect();
+    let reveal = reveal_parts(&tokens);
+    let instant = starts_instant(&tokens);
+    Message { text, raw: text::to_display(&tokens), choices: (word >> 8) as u8, word, reveal, instant, bytes }
+}
+
 pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
     let Some(first) = data.get(0..2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]]))) else {
         return Vec::new();
@@ -1832,25 +2078,7 @@ pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
             let word = |k: usize| data.get(k..k + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
             let off = usize::from(word(i * 8));
             let bytes = text::string_at(data, off).unwrap_or_default().to_vec();
-            let tokens = text::decode(&bytes, charset);
-            let text = tokens
-                .iter()
-                .filter_map(|t| match *t {
-                    text::Token::Char(c) => Some(c),
-                    text::Token::LineBreak => Some('\n'),
-                    _ => None,
-                })
-                .collect();
-            let reveal = reveal_parts(&tokens);
-            let instant = starts_instant(&tokens);
-            Message {
-                text,
-                raw: text::to_display(&tokens),
-                choices: (word(i * 8 + 2) >> 8) as u8,
-                reveal,
-                instant,
-                bytes,
-            }
+            message_from_bytes(bytes, word(i * 8 + 2), charset)
         })
         .collect()
 }
@@ -1957,6 +2185,83 @@ pub fn chr_path_of_model(model_path: &str) -> Option<String> {
 
 /// A character's motion translation scale: its character record's size × 0.001, where the size is the `.chr` info
 /// block's (offset at 0x58) float at +0x20 from data version 10 on, and 1 for older data.
+/// A character's option positions (`.chr` list 2 at 0x20: 16-byte entries: u16 key (low 14 bits; bits 14–15 the
+/// kind), i16 element, three floats) and the model block's +0x30 / +0x38 (info block +0xc / +0x20; 1.0 for data
+/// before version 10).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OptPos {
+    pub entries: Vec<(u16, i16, [f32; 3])>,
+    pub block_30: f32,
+    pub block_38: f32,
+    /// The block's +0x40 (neck side), +0x42 (the eyelid's axis), +0x43 (its sign) and +0x44..+0x4c (its turn at
+    /// rest), from the info block (+0x24, bytes +0x26 / +0x27, +0x28..+0x30); none before version 10.
+    pub eye: Option<(u8, u8, u8, [f32; 3])>,
+}
+
+impl OptPos {
+    /// The block's eye and neck values for model `id` (the block's defaults: side 0, axis 2, sign 1; model kind
+    /// 0x2000: side 1, sign 0).
+    pub fn eye_block(&self, id: u16) -> (u8, u8, u8, [f32; 3]) {
+        self.eye.unwrap_or(if id & 0xf000 == 0x2000 { (1, 2, 0, [0.0; 3]) } else { (0, 2, 1, [0.0; 3]) })
+    }
+}
+
+pub fn chr_optpos(d: &[u8]) -> Option<OptPos> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let f = |o: usize| u32_at(o).map(f32::from_bits);
+    let (at, n) = (u32_at(0x20)? as usize, u32_at(0x24)? as usize);
+    let entries = if at == 0 {
+        Vec::new()
+    } else {
+        (0..n.min(0x400))
+            .map_while(|i| {
+                let e = at + i * 16;
+                let key = d.get(e..e + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+                let elem = d.get(e + 2..e + 4).map(|b| i16::from_le_bytes([b[0], b[1]]))?;
+                Some((key, elem, [f(e + 4)?, f(e + 8)?, f(e + 12)?]))
+            })
+            .collect()
+    };
+    let (block_30, block_38, eye) = if u32_at(4)? < 10 {
+        (1.0, 1.0, None)
+    } else {
+        let info = u32_at(0x58)? as usize;
+        let b = |o: usize| d.get(info + o).copied();
+        // Block +0x30 = info +0xc, +0x38 = info +0x20.
+        let eye = (b(0x24)?, b(0x26)?, b(0x27)?, [f(info + 0x28)?, f(info + 0x2c)?, f(info + 0x30)?]);
+        (f(info + 0xc)?, f(info + 0x20)?, Some(eye))
+    };
+    Some(OptPos { entries, block_30, block_38, eye })
+}
+
+impl OptPos {
+    /// The element of the key and its offset (kind 0x4000: the floats × (10000 / b30 / b30)
+    /// · b38; kind 0: none), with the kind code it returns (0, 1, 2 for 0x8000, else 0).
+    pub fn element(&self, key: u32) -> Option<(i32, [f32; 4], u8)> {
+        let &(k, elem, v) =
+            self.entries.iter().find(|e| u32::from(e.0 as i16 as i32 as u32 as u16 & 0x3fff) == key)?;
+        let kind = k & 0xc000;
+        let mut off = [0.0, 0.0, 0.0, 1.0];
+        let code = match kind {
+            0 => 0,
+            0x4000 => {
+                let s = ((10000.0f64 / f64::from(self.block_30) / f64::from(self.block_30))
+                    * f64::from(self.block_38)) as f32;
+                off = [
+                    (f64::from(s) * f64::from(v[0])) as f32,
+                    (f64::from(v[1]) * f64::from(s)) as f32,
+                    (f64::from(s) * f64::from(v[2])) as f32,
+                    1.0,
+                ];
+                1
+            }
+            0x8000 => 2,
+            _ => 0,
+        };
+        Some((i32::from(elem), off, code))
+    }
+}
+
 pub fn chr_motion_scale(d: &[u8]) -> Option<f32> {
     let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let block = if u32_at(4)? < 10 { 1.0 } else { f32::from_bits(u32_at(u32_at(0x58)? as usize + 0x20)?) };
@@ -2002,7 +2307,7 @@ const ENGINE_TAU: f32 = 6.283184;
 #[allow(clippy::approx_constant)]
 const ENGINE_PI_F64: f64 = 3.141592;
 
-/// An angle brought within half a turn with the engine's constants (829800).
+/// An angle brought within half a turn with the engine's constants.
 fn ps2_wrap_angle(mut a: f32) -> f32 {
     while a > ENGINE_PI {
         a -= ENGINE_TAU;
@@ -2154,6 +2459,11 @@ pub struct Movie {
 fn open_movie(g: &mut FieldState, c: &mut NativeCall<'_>, playing: bool) {
     let flags = c.stack.pop_int();
     let number = c.stack.pop_int().max(0) as u32;
+    start_movie(g, number, flags, playing);
+}
+
+/// A movie by number with its flags.
+pub(crate) fn start_movie(g: &mut FieldState, number: u32, flags: i32, playing: bool) {
     let path = g.videos.get(&number).cloned();
     let looping = flags & 0x2000 != 0;
     // A movie missing from the list counts as already over.
@@ -2247,6 +2557,171 @@ pub fn map_paths(vfs: &Vfs, game: Game, event: &str) -> (Option<String>, Option<
     map_folder_paths(vfs, game, &event[..4], &event[..6])
 }
 
+/// The player control's heading state (the camera heading it goes by, an offset, the stick's angle
+/// atan2(right − left, up − down), the angle the heading was last taken at, a fixed heading switch and value).
+/// With the control mode at 3 (its value from the start): while the stick is
+/// pushed the camera heading is taken again only when the stick turns more than 0.349066 (and always on maps 0x19c,
+/// 0x220); let go, it is taken every frame. The body heads (fixed or camera) − (stick − offset).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SgControl {
+    pub camera: f32,
+    pub offset: f32,
+    pub stick: f32,
+    pub last: f32,
+    pub fixed_on: bool,
+    pub fixed: f32,
+}
+
+impl SgControl {
+    /// The heading fix: into ±3.141592.
+    pub fn dir_fix(a: f32) -> f32 {
+        crate::chr::wrap(a)
+    }
+
+    /// One frame (the player control's heading part): the heading the body takes, if pushed.
+    pub fn frame(
+        &mut self,
+        cam: f32,
+        control: bool,
+        pushing: bool,
+        vector: [f32; 2],
+        map_id: u32,
+    ) -> Option<f32> {
+        // Without control: the offset is cleared and nothing else changes.
+        if !control {
+            self.offset = 0.0;
+            return None;
+        }
+        let moving = vector[0] != 0.0 || vector[1] != 0.0;
+        if pushing {
+            self.stick = (f64::from(vector[0])).atan2(f64::from(vector[1])) as f32;
+        }
+        if !moving {
+            self.camera = cam;
+            self.last = -1000.0;
+            self.offset = 0.0;
+            return None;
+        }
+        let turn = (f64::from((f64::from(self.stick) - f64::from(self.last)) as f32)).abs();
+        if f64::from(SgControl::dir_fix(f32::from_bits(0x3eb2_b8c0))) < turn {
+            self.camera = cam;
+            self.last = self.stick;
+            self.offset = 0.0;
+        }
+        if matches!(map_id, 0x19c | 0x220) {
+            self.camera = cam;
+        }
+        let a = (f64::from(self.stick) - f64::from(self.offset)) as f32;
+        let base = if self.fixed_on { self.fixed } else { self.camera };
+        Some(-((f64::from(a) - f64::from(base)) as f32))
+    }
+
+    /// The camera heading now, the offset fix(degrees · π / 180) + the stick angle.
+    pub fn turn_to(&mut self, cam: f32, degrees: f32) {
+        self.camera = cam;
+        let fix = SgControl::dir_fix(degree_rad(degrees));
+        self.offset = (f64::from(fix) + f64::from(self.stick)) as f32;
+    }
+}
+
+/// (degrees · 3.141592) / 180, as 82d950 / 82d990 compute it.
+fn degree_rad(d: f32) -> f32 {
+    ((f64::from(d) * f64::from(crate::chr::BODY_PI)) / 180.0) as f32
+}
+
+/// The screen distortion: the PS2 block natives set (flags, +4, +0x18..+0x28, the colour bytes +0x2c, a value
+/// and a timer) and the remaster's Distortion switch (+0x7c on, +0x7e fresh, +0x78 its start value).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Distortion {
+    pub flags: u32,
+    pub value_e7c: f32,
+    /// +8..+0x14 (the reset clears them).
+    pub values_e80: [u32; 4],
+    pub point: [f32; 3],
+    pub value_e9c: f32,
+    pub count_ea0: i32,
+    pub rgb: [u8; 3],
+    pub value_ea8: u32,
+    pub value_ded28: u32,
+    pub on: bool,
+    pub fresh: bool,
+    pub start: f32,
+}
+
+impl Distortion {
+    /// The parameters' defaults (the flags stay).
+    pub fn reset(&mut self) {
+        self.value_e7c = 0.0;
+        self.values_e80 = [0; 4];
+        self.point = [f32::from_bits(0x3cf5_c28f), f32::from_bits(0x3ca3_d70a), f32::from_bits(0x3ba3_d70a)];
+        self.value_e9c = f32::from_bits(0x4280_0000);
+        self.count_ea0 = 0x60;
+        self.rgb = [0x80; 3];
+    }
+}
+
+impl FieldState {
+    /// The game's file table.
+    pub fn file_table(vfs: &Vfs) -> Option<FileTable> {
+        FileTable::load(vfs)
+    }
+
+    /// Kind 1 loads the first page's walk mesh (and sets the guide map model), kind 2 the second page's
+    ///; the kind is cleared.
+    pub fn apply_page_switch(&mut self) {
+        let (kind, a, b) = self.page_switch;
+        let page = match kind {
+            1 if a >= 0 => Some(a),
+            2 if b >= 0 => Some(b),
+            _ => None,
+        };
+        if let (Some(p), Some(d)) = (page, &self.map_package)
+            && let Some(g) = Ground::from_walk_mesh_page(d, p as usize)
+        {
+            self.ground = Some(g);
+        }
+        self.page_switch.0 = 0;
+    }
+}
+
+/// The remaster's map id: a hash of the map package path between `jppc` and `bin/` (`/map/bjyt/bjyt00/`).
+pub fn map_id(path: &str) -> u32 {
+    let (Some(i), Some(j)) = (path.find("jppc/"), path.find("bin/")) else { return 0 };
+    let Some(part) = path.get(i + 4..j) else { return 0 };
+    let (mut h, mut k) = (0i32, 0x7ab7i32);
+    for c in part.bytes() {
+        h = (i32::from(c as i8) + h * k) % 0x2717;
+        k = k * 0x6af5 % 0x2716;
+    }
+    if h < 0 { (h + 0x2717) as u32 } else { h as u32 }
+}
+
+/// The remaster's language type (its current language's +4), from the configured language as the remaster sets it
+/// (config index 1 us 1, 2 fr 2, 3 de 4, 4 it 5, 5 es 3, 6 kr 9, 7 ch 10; anything else, as simplified Chinese
+/// would be, all zero like Japanese).
+pub fn language_type(lang: Language) -> Option<u32> {
+    Some(match lang {
+        Language::Japanese | Language::ChineseSimplified => 0,
+        Language::English => 1,
+        Language::French => 2,
+        Language::Spanish => 3,
+        Language::German => 4,
+        Language::Italian => 5,
+        Language::Korean => 9,
+        Language::ChineseTraditional => 10,
+    })
+}
+
+/// The language type's +0: 0 Japanese (and the unlisted), 1 the western languages, 3 Korean and
+/// Chinese.
+pub fn language_region(lang: Language) -> u32 {
+    match lang {
+        Language::Japanese | Language::ChineseSimplified => 0,
+        Language::Korean | Language::ChineseTraditional => 3,
+        _ => 1,
+    }
+}
+
 impl Event {
     /// Load an event script (`.ebp`), its text in `lang`, and set up the machine.
     pub fn load(vfs: &Vfs, game: Game, path: &str, lang: Language) -> Result<Event, String> {
@@ -2267,6 +2742,7 @@ impl Event {
             actors,
             entrances: script.entrances(),
             data_areas: script.workers.iter().map(|w| w.data_areas).collect(),
+            shared_data: script.shared_data(),
             kinds: script.workers.iter().map(|w| w.kind).collect(),
             cam_slots: vec![0; script.workers.len()],
             camera_worker: script.header_u16(0x18).unwrap_or(0xFFFF),
@@ -2279,21 +2755,39 @@ impl Event {
             event_path: path.to_owned(),
             ..FieldState::default()
         };
+        let kinds = state.kinds.clone();
+        state.setup_workers(&kinds);
         if let Some(tp) = event_text_path(game, path, lang)
             && let Ok(bytes) = vfs.read(&tp)
             && let Ok(cs) = vfs.read(&text::charset_path(game, lang)).map(|b| Charset::parse(&b))
             && let Ok(cs) = cs
         {
             state.messages = decode_event_text(&bytes, &cs);
+            state.charset = Some(std::sync::Arc::new(cs.clone()));
+            state.texts.event = Some(bytes.clone().into());
         }
+        state.texts.macrodic =
+            vfs.read_localized("ffx_ps2/ffx/master/jppc/menu/macrodic.dcp", lang).ok().map(Into::into);
         // FFX events load the map their header names; FFX-2 still goes by the event name.
         let by_number = (game == Game::Ffx)
             .then(|| FileTable::load(vfs).zip(event_map_number(&data)))
             .flatten()
             .map(|(table, m)| map_paths_by_number(vfs, &table, m));
         let (map_model, map_layers) = by_number.unwrap_or_else(|| map_paths(vfs, game, &name));
+        // The remaster's scene settings (the map cluster's GlobalCamera), which the fog getters read.
+        state.hd_scene = map_model
+            .as_deref()
+            .and_then(|p| vfs.read(p).ok())
+            .and_then(|d| aerugo_formats::phyre::Cluster::parse(d).ok())
+            .and_then(|c| aerugo_formats::mesh::scene_settings(&c))
+            .map(|s| fog::HdScene::from_settings(&s));
         if game == Game::Ffx {
             state.scene = FileTable::load(vfs).and_then(|t| t.event_number(path));
+            // The vibration data (set 0x18, file 8).
+            state.vibration.data = FileTable::load(vfs)
+                .and_then(|t| t.path(0x18, 8))
+                .and_then(|p| vfs.read(&p).ok())
+                .map(Into::into);
         }
         state.screen.mode_0x102 = state.scene == Some(0x102);
         // The map's group mask at load: every group but 3 (all of them only under a debug option).
@@ -2302,6 +2796,9 @@ impl Event {
             map_model.as_deref().and_then(|m| texture_animation::TextureAnimations::load(vfs, m));
         if game == Game::Ffx {
             state.items = crate::items::ItemTables::load(vfs, lang);
+            state.stat_tables = crate::stats::StatTables::load(vfs, lang);
+            state.new_game_tables = crate::new_game::NewGameTables::load(vfs, lang);
+            state.texts.commands = state.items.as_ref().map(|t| t.commands.data().into());
             state.encounters = vfs
                 .read("ffx_ps2/ffx/master/jppc/battle/kernel/btl.bin")
                 .ok()
@@ -2322,9 +2819,21 @@ impl Event {
             (game == Game::Ffx && name.len() >= 6 && name.is_ascii())
                 .then(|| format!("ffx_ps2/ffx/master/jppc/map/{}/{}/bin/mapout.vpa", &name[..4], &name[..6]))
         });
+        if let Some(p) = &vpa {
+            state.map_id = map_id(p);
+        }
+        state.language_type = language_type(lang);
+        state.language_region = language_region(lang);
+        state.page_switch = (0, -1, -1);
+        state.distortion.reset();
         if let Some(d) = vpa.and_then(|p| vfs.read(&p).ok()) {
             state.ground = Ground::from_walk_mesh(&d);
             state.map_fog = MapFog::from_map_package(&d);
+            state.ps_fog = fog::PsFog::from_map_package(&d).unwrap_or_default();
+            state.map_effects = map_fx::MapEffects::from_map_package(&d);
+            state.pre_bg = pre_bg::PreBg::from_map_package(&d, name.get(..6).unwrap_or(&name));
+            state.map_display = 0x11 | if state.pre_bg.main { 0x4000 } else { 0 };
+            state.map_package = Some(d.clone().into());
             // Map setup attaches the objects' and texture slots' own tracks.
             state.map_objects = map_objects::MapObjects::from_map_package(&d).map(std::sync::Arc::new);
             if let Some(m) = &state.map_objects {
@@ -2379,11 +2888,50 @@ impl Event {
             return;
         }
         self.state.player_placed = false;
+        // The effect loader's tick comes early in the game's frame, before the event step.
+        effects::frame_start(&mut self.state);
+        // The event step's page switch, before the shapes and the scripts; the pad words: the
+        // buttons let go since last frame.
+        self.state.apply_page_switch();
+        {
+            let held = held_word(&self.state);
+            self.state.pad_released = (self.state.pad_prev_held ^ held) & self.state.pad_prev_held;
+            self.state.pad_prev_held = held;
+            let stick = self.state.input.stick;
+            self.state.pad.refresh(held, stick);
+        }
         self.state.begin_talk();
+        self.state.talk_begin();
+        // The shapes step twice before the scripts run, then the vibration channels.
+        for _ in 0..2 {
+            self.state.shapes.step(&self.vm.memory);
+        }
+        self.state.vibration.frame();
+        // The positional sounds: the listeners, the fade level, every slot.
+        {
+            let st = &mut self.state;
+            let player = st.player.and_then(|p| st.workers.list.get(p)).map(crate::workers::Worker::position);
+            st.pos_sounds.listen(st.cam_view, player);
+            let scene = st.scene.unwrap_or(0);
+            let image = &self.vm.memory.global[0];
+            let story = image.get(0xbec..0xbee).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            st.pos_sounds.frame(&self.vm.memory, &st.workers, scene, story, &mut st.sound);
+        }
         let before = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
         self.vm.frame(&mut self.natives.host(&mut self.state));
+        // The event system counts the frames it runs once its setup is over.
+        if self.vm.phase == aerugo_script::vm::Phase::Running {
+            self.state.workers.sys.frames = self.state.workers.sys.frames.wrapping_add(1);
+        }
         self.state.player_start = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
+        // The background layers step after the scripts, before the characters.
+        {
+            let st = &mut self.state;
+            st.pre_bg.frame(&mut st.crt_rand, crate::traced_tables::sine(), st.map_id, st.language_type);
+        }
         self.state.update();
+        // The running effect's update (the main loop's effect step after the field's process).
+        effects::frame_after_scripts(&mut self.state);
         // The map's keyframes play once a frame after the scripts and characters, on a clock of two ticks a frame.
         if let Some(m) = self.state.map_objects.clone() {
             self.state.keyframes.update(&m, (self.tick * 2) as u32);
@@ -2597,7 +3145,7 @@ fn register_settings(n: &mut Natives<FieldState>) {
     for id in [0x0070, 0x0071] {
         n.mark_stub(id);
     }
-    // One int, returned (0074 worker setting, 00bb/00bc/00f3 field settings, 0116 actor flag).
+    // One int, returned (00bb/00bc/00f3 field settings, 0116 actor flag).
     macro_rules! int_back {
         ($($id:expr),*) => {$(
             n.register_stub($id, Native::result(|g, c| {
@@ -2607,7 +3155,30 @@ fn register_settings(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    int_back!(0x0074, 0x00F3);
+    int_back!(0x00F3);
+    // The move record value at +0xc (16 bits) of the worker's level blocks: 0074 sets all nine levels, 0072 the
+    // running level; each returns its value. (Read once the move records are ported whole.)
+    n.register(
+        0x0074,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            for lvl in 0..9 {
+                keep(g, 0x0074, level_key(c.worker, lvl), vec![Value::Int(i32::from(v as u16))]);
+            }
+            Value::Int(v)
+        }),
+    );
+    n.register(
+        0x0072,
+        Native::result(|g, c| {
+            let v = c.stack.pop_int();
+            keep(g, 0x0074, level_key(c.worker, c.level), vec![Value::Int(i32::from(v as u16))]);
+            Value::Int(v)
+        }),
+    );
+    for id in [0x0072, 0x0074] {
+        n.mark_stub(id);
+    }
     // One float kept, nothing useful returned (per-level move settings: 002e, 002f, 0030).
     macro_rules! float_set {
         ($($id:expr),*) => {$(
@@ -2747,42 +3318,6 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Fog near, far and limit (0–255) for the remaster's shaders. (The original skips them on three maps,
-    // ids 0xCA2, 0x1E38 and 0x699, not checked here.)
-    n.register(
-        0x8037,
-        Native::result(|g, c| {
-            let limit = c.stack.pop_float();
-            g.fog.far = Some(c.stack.pop_float());
-            g.fog.near = Some(c.stack.pop_float());
-            g.fog.limit = (limit / 255.0).clamp(0.0, 1.0);
-            g.fog.curve = Some(1.0);
-            Value::Int(1)
-        }),
-    );
-    n.register(
-        0x8038,
-        Native::result(|g, c| {
-            g.fog.near = Some(c.stack.pop_float());
-            Value::Int(1)
-        }),
-    );
-    n.register(
-        0x803A,
-        Native::result(|g, c| {
-            g.fog.far = Some(c.stack.pop_float());
-            Value::Int(1)
-        }),
-    );
-    n.register(
-        0x803C,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            g.fog.limit_raw = v;
-            g.fog.limit = (v / 255.0).clamp(0.0, 1.0);
-            Value::Int(1)
-        }),
-    );
     // A character's shade (float; the original eases to it over the given frames, not modelled).
     n.register(
         0x5088,
@@ -2877,16 +3412,6 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // Map layer animations (on/off by the second argument): return it.
-    macro_rules! second {
-        ($($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                let v = take(g, c, $id);
-                v.get(1).copied().unwrap_or(Value::Int(0))
-            }));
-        )*};
-    }
-    second!(0x8002, 0x800D);
     // Map group on (non-zero) or off; returns the group. Scene 0x188 keeps group 14 on.
     n.register(
         0x8000,
@@ -2932,13 +3457,12 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             }));
         )*};
     }
-    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060, 0x01E2, 0x01E3, 0x01E4, 0x01E5, 0x0119);
+    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
     fixed!(0; 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
-    fixed!(1; 0x801D, 0x801E, 0x801F);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
-    fixed!(0; 0x0002, 0x0005, 0x00D1, 0x504E);
+    fixed!(0; 0x00D1, 0x504E);
     // The model's drawing offset from its position (x, y, z), for a worker with a character.
     n.register(
         0x5016,
@@ -2952,7 +3476,6 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    fixed!(1; 0x0196, 0x01C9);
     // Map display objects: 0197 binds the worker to one; 0198(object, track, once) and 0199(track, once; the bound
     // object) attach a keyframe track, for bound workers only (result 1, else 0).
     n.register(
@@ -2963,7 +3486,31 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             a.display_object = Some(id as u16);
             a.bind_kind = 5;
             a.bind_id = id as u16;
+            g.sync_bind(c.worker);
             Value::Int(0)
+        }),
+    );
+    // 01a5(slot, frame): a texture slot's frame; returns 1.
+    n.register(
+        0x01A5,
+        Native::result(|g, c| {
+            let frame = c.stack.pop_int() as u32;
+            let slot = c.stack.pop_int() as u32;
+            if let Some(m) = g.map_objects.clone() {
+                g.keyframes.set_texture_frame(&m, slot, frame);
+            }
+            Value::Int(1)
+        }),
+    );
+    // 01c9(target, kind): stop the keyframe slots on the target of that kind (any kind when negative);
+    // returns 1.
+    n.register(
+        0x01C9,
+        Native::result(|g, c| {
+            let kind = c.stack.pop_int();
+            let target = c.stack.pop_int();
+            g.keyframes.stop(target as u16, u16::try_from(kind).ok().filter(|_| kind >= 0));
+            Value::Int(1)
         }),
     );
     fn attach(g: &mut FieldState, c: &NativeCall<'_>, object: Option<i32>, track: i32, once: i32) -> Value {
@@ -2996,7 +3543,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     );
     // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
     // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
-    fixed!(1; 0x01C6, 0x0253);
+    fixed!(1; 0x01C6);
     fixed!(3; 0x0243);
     fixed!(0; 0x400E);
     // Reading the save dictionary (01c5): done at once but the worker's turn ends there; nothing to report (0).
@@ -3030,7 +3577,6 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
         )*};
     }
     swap!(0x5009);
-    fixed!(1; 0x8010, 0x8030);
     // A message variable (window, slot, kind, value) for the window's text; returns the window.
     n.register(0x009E, Native::result(|g, c| Value::Int(int(&take(g, c, 0x009E), 0))));
     // Play a sound (returns the first argument).
@@ -3088,17 +3634,116 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // A body's position (worker, then three variable descriptors for x, y, z); nothing for a worker with none.
+    // 5035: the frames the calling worker's motion sequence has left; 0 without a character.
+    n.register(
+        0x5035,
+        Native::result(|g, c| {
+            let a = g.actor(c.worker);
+            if a.model.is_none() {
+                return Value::Int(0);
+            }
+            Value::Int(a.player.as_ref().map_or(-1, |p| p.sequence_length()))
+        }),
+    );
+    // 505a(record, base): texture record `record` (−1: all of them) takes image base `base` (
+    // its result, the base after the record, is discarded by every script).
+    n.register(
+        0x505A,
+        Native::result(|g, c| {
+            let base = c.stack.pop_int();
+            let record = c.stack.pop_int();
+            let a = g.actor(c.worker);
+            if a.model.is_none() {
+                return Value::Int(0);
+            }
+            let key = (record != -1).then_some(record);
+            if key.is_none() {
+                a.chr_textures.bases.clear();
+            }
+            a.chr_textures.bases.retain(|(k, _)| *k != key);
+            a.chr_textures.bases.push((key, base));
+            Value::Int(base)
+        }),
+    );
+    // 5071(_): the texture records load their image bases; returns 0.
+    n.register(
+        0x5071,
+        Native::result(|g, c| {
+            c.stack.pop_int();
+            let a = g.actor(c.worker);
+            if a.model.is_some() {
+                a.chr_textures.loads += 1;
+            }
+            Value::Int(0)
+        }),
+    );
+    // 508d(t): the character's texture animation timer; returns 0.
+    n.register(
+        0x508D,
+        Native::result(|g, c| {
+            let t = c.stack.pop_int();
+            let a = g.actor(c.worker);
+            if a.model.is_some() {
+                a.chr_textures.anim_timer = Some(t as u8);
+            }
+            Value::Int(0)
+        }),
+    );
+    // 5036(worker, part, x, y, z) / 5037(worker, x, y, z): option point `part` (0) of the worker's body (
+    // the point when set, else the first one, else the body's place) into three float variables; nothing for a
+    // worker without one.
+    fn body_point(g: &mut FieldState, c: &mut NativeCall<'_>, with_part: bool) {
+        let z = c.stack.pop_int();
+        let y = c.stack.pop_int();
+        let x = c.stack.pop_int();
+        let part = if with_part { c.stack.pop_int() } else { 0 };
+        let w = c.stack.pop_int().max(0) as usize;
+        if g.actors.get(w).is_some_and(|a| a.model.is_some())
+            && let Some(f) = g.chr_frames.get(w).cloned().flatten()
+        {
+            let body = [f.world[12], f.world[13], f.world[14]];
+            let p = crate::chr::elements::point(&f.points, part.max(0) as usize, body);
+            let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
+            for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
+                store_float_var(c, areas, desc, v);
+            }
+        }
+    }
+    n.register(
+        0x5036,
+        Native::result(|g, c| {
+            body_point(g, c, true);
+            Value::Int(0)
+        }),
+    );
     n.register(
         0x5037,
+        Native::result(|g, c| {
+            body_point(g, c, false);
+            Value::Int(0)
+        }),
+    );
+    // 5026(worker, element, x, y, z): the world position of an element of the worker's body (an element
+    // the motion relation lists, or any without one, takes its translation × 1000).
+    n.register(
+        0x5026,
         Native::result(|g, c| {
             let z = c.stack.pop_int();
             let y = c.stack.pop_int();
             let x = c.stack.pop_int();
+            let e = c.stack.pop_int();
             let w = c.stack.pop_int().max(0) as usize;
-            if let Some(a) = g.actors.get(w).filter(|a| a.model.is_some()).cloned() {
+            if g.actors.get(w).is_some_and(|a| a.model.is_some())
+                && let Some(f) = g.chr_frames.get(w).cloned().flatten()
+            {
+                let n = f.elems.len();
+                let listed = match g.actors[w].player.as_ref().and_then(|p| p.relation()) {
+                    Some(r) => r.map.iter().take(n).any(|&m| i32::from(m) == e),
+                    None => usize::try_from(e).is_ok_and(|e| e < n),
+                };
+                let p = crate::chr::elements::element_position(&f.world, &f.elems, e.max(0) as usize, listed);
                 let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
-                for (desc, v) in [(x, a.pos[0]), (y, a.pos[1]), (z, a.pos[2])] {
+                for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
                     store_float_var(c, areas, desc, v);
                 }
             }
@@ -3117,16 +3762,12 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Float((dx * dx + dz * dz).sqrt() as f32)
         }),
     );
-    fixed!(1; 0x019C, 0x01EB, 0x0103, 0x0104, 0x01CE, 0x01CF, 0x0205, 0x0209, 0x01D0, 0x022E);
+    fixed!(1; 0x019C, 0x0103, 0x0104, 0x01CE, 0x01CF, 0x0205, 0x0209);
     // Switches that return whether they were turned on: the only argument (013e), the second (01d4), the int of
     // (int, float) (c02f).
     n.register(0x013E, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0x013E), 0) != 0))));
-    n.register(0x01D4, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0x01D4), 1) != 0))));
-    n.register(0xC02F, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0xC02F), 0) != 0))));
-    // Returns its int argument (01e6: int, float, float).
-    n.register(0x01E6, Native::result(|g, c| Value::Int(int(&take(g, c, 0x01E6), 0))));
     // Results that only follow from the arguments: the engine parts behind them are not ported yet.
-    for id in [0x4034, 0x8009, 0x007F, 0x00CB, 0x00E7, 0x009E, 0x00FD, 0x013E, 0x01D4, 0xC02F, 0x01E6] {
+    for id in [0x4034, 0x007F, 0x00CB, 0x00E7, 0x009E, 0x00FD, 0x013E] {
         n.mark_stub(id);
     }
     // (0102/0105 load sound banks and wait for the loader: replayed until sound loading is ported.)
@@ -3193,6 +3834,10 @@ fn store_float_var(c: &mut NativeCall<'_>, areas: [u32; 3], desc: i32, v: f32) {
 }
 
 /// Open a window on its message: the text reveal starts over.
+pub(crate) fn open_window_pub(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
+    open_window(g, image, w, instant);
+}
+
 fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
     let text_instant = g.windows[w].message.and_then(|m| g.messages.get(m)).is_some_and(|m| m.instant);
     let (mut reveal, mut stops) = (0, Vec::new());
@@ -3214,6 +3859,17 @@ fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
     win.instant = instant || text_instant;
 }
 
+/// With mode flag 0x40 a window whose text has digits (+0x16 low nibble) takes a number entry: the cursor from
+/// +0x22, where cancel puts it back from +0x23, the number from +0x24.
+fn open_number(g: &mut FieldState, w: usize, mode: i32) {
+    let word = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.word);
+    let win = &mut g.windows[w];
+    win.word16 = word;
+    let digits = (word & 0xf) as i8;
+    win.number = (mode & 0x40 != 0 && digits != 0)
+        .then(|| NumberEntry::new(i32::from(win.byte22), i32::from(win.byte23), win.word24 as i32, digits));
+}
+
 /// A message made at run time (not from the event's text).
 fn runtime_message(text: &str) -> Message {
     let tokens: Vec<text::Token> =
@@ -3222,6 +3878,7 @@ fn runtime_message(text: &str) -> Message {
         text: text.to_owned(),
         raw: text.to_owned(),
         choices: 0,
+        word: 0,
         reveal: reveal_parts(&tokens),
         instant: true,
         bytes: Vec::new(),
@@ -3294,6 +3951,11 @@ fn register_menus(n: &mut Natives<FieldState>) {
         g.screen.fade(frames, fade_in, white);
         Value::Int(0)
     }
+    // 400d: wait until the black/white fade channel's frames run out.
+    n.register(
+        0x400D,
+        Native { init: None, wait: Some(|g, _| u32::from(g.screen.channels[4].count == 0)), result: None },
+    );
     n.register(0x4004, Native::result(|g, c| fade(g, c, true, false)));
     n.register(0x4005, Native::result(|g, c| fade(g, c, false, false)));
     n.register(0x4006, Native::result(|g, c| fade(g, c, true, true)));
@@ -3422,6 +4084,50 @@ fn register_menus(n: &mut Natives<FieldState>) {
             },
         );
     }
+    // 0139(window, message, number, cursor, cancel cursor, x, y, alignment): a number entry window placed (0065),
+    // given the message (+0x20 = 0, +0x18 flags = 0) and opened with mode 0x42, then the choice wait (007d); the
+    // result is the number entered.
+    n.register(
+        0x0139,
+        Native {
+            init: Some(|g, c| {
+                let align = c.stack.pop_int();
+                let y = c.stack.pop_int();
+                let x = c.stack.pop_int();
+                let start = c.stack.pop_int();
+                let cursor = c.stack.pop_int();
+                let value = c.stack.pop_int();
+                let msg = c.stack.pop_int();
+                let w = window(c);
+                g.last_text = msg;
+                let win = &mut g.windows[w];
+                win.x = x;
+                win.y = y;
+                win.align = align;
+                win.message = usize::try_from(msg).ok();
+                win.flags = 0;
+                win.byte22 = cursor as u8;
+                win.byte23 = start as u8;
+                win.word24 = value as u32;
+                open_window(g, &c.memory.global[0], w, true);
+                open_number(g, w, 0x42);
+                c.scratch[0] = w as i32;
+                c.scratch[1] = 0;
+                c.scratch[2] = 0;
+                c.scratch[3] = 0;
+            }),
+            wait: Some(choice_wait),
+            result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].number.map_or(0, |e| e.value))),
+        },
+    );
+    // 0110(window): the number its entry holds.
+    n.register(
+        0x0110,
+        Native::result(|g, c| {
+            let w = window(c);
+            Value::Int(g.windows[w].number.map_or(0, |e| e.value))
+        }),
+    );
     n.register(
         0x007D,
         Native {
@@ -3509,6 +4215,13 @@ fn pad_word(g: &FieldState) -> u32 {
             0x1000
         } else if i.stick[1] < 0.0 {
             0x4000
+        } else {
+            0
+        };
+        w |= if i.stick[0] > 0.0 {
+            0x2000
+        } else if i.stick[0] < 0.0 {
+            0x8000
         } else {
             0
         };
@@ -3652,6 +4365,16 @@ fn register_queries(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(held_word(g) & 0xFFFF & (1 << bit) != 0))
         }),
     );
+    // 0050(bit): a bit of the held word as the pad gives it (no key remap); 0047: the buttons let go this frame
+    // (the remapped released word).
+    n.register(
+        0x0050,
+        Native::result(|g, c| {
+            let bit = c.stack.pop_int() as u32 & 31;
+            Value::Int(i32::from(held_word(g) & 0xFFFF & (1 << bit) != 0))
+        }),
+    );
+    n.register(0x0047, Native::result(|g, _| Value::Int((g.pad_released & 0xFFFF) as i32)));
     n.register(
         0x0051,
         Native::result(|g, c| {
@@ -3711,14 +4434,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
     );
     // Target roll of a turn (wrapped; not modelled).
     n.register(0x002A, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
-    // A map part's animation set back (returns 1).
-    n.register(
-        0x8003,
-        Native::result(|_, c| {
-            c.stack.pop_int();
-            Value::Int(1)
-        }),
-    );
     // Sound effects (not played yet): the result is the sound.
     for id in [0x00DFu16, 0x00E0] {
         n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
@@ -3803,7 +4518,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
 
 /// The message wait: the init takes the window (and a flag), the wait reveals the text and closes the window on
 /// confirm (moving between choices with the stick), the result is the chosen choice.
-fn message_wait() -> Native<FieldState> {
+pub(crate) fn message_wait() -> Native<FieldState> {
     Native {
         init: Some(|_, c| {
             let _b = c.stack.pop_int();
@@ -3860,6 +4575,18 @@ fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
             if c.scratch[2] > 0 { win.choice.saturating_sub(1) } else { (win.choice + 1).min(n - 1) };
     }
     c.scratch[2] = 0;
+    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal && win.number.is_some() {
+        // A number entry: its input handler, until confirmed.
+        let pad = pad_word(g);
+        let win = &mut g.windows[w];
+        if let Some(e) = win.number.as_mut() {
+            e.step(pad, pad);
+            if e.state == 2 {
+                c.scratch[1] = 1;
+            }
+        }
+        return 0;
+    }
     if c.scratch[1] == 0 && win.open && win.shown >= win.reveal {
         if g.input.stick_pressed && g.input.stick[1] != 0.0 {
             c.scratch[2] = if g.input.stick[1] > 0.0 { 1 } else { -1 };
@@ -4178,15 +4905,6 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
             Value::Int(v)
         }),
     );
-    // The event's 2D shapes drawn (non-zero) or not; returns the value.
-    n.register(
-        0x023F,
-        Native::result(|g, c| {
-            let v = c.stack.pop_int();
-            g.engine.shapes_on = v;
-            Value::Int(v)
-        }),
-    );
     // The screen copy switch (bit 0); the old one comes back.
     n.register(
         0x4014,
@@ -4321,7 +5039,6 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
         }),
     );
     // The fog limit as last set (0–255).
-    n.register(0x803D, Native::result(|g, _| Value::Float(g.fog.limit_raw)));
     // A wait that ends at once; returns 1.
     n.register(
         0x0105,
@@ -4357,16 +5074,53 @@ pub fn register(n: &mut Natives<FieldState>) {
         a.bind_kind = 1;
         a.bind_id = id as u16;
         g.bind_motions(c.worker, id as u16);
+        // A new character record; the body faces the worker's heading of travel and stands where the worker is.
+        if g.chrs.len() <= c.worker {
+            g.chrs.resize(c.worker + 1, None);
+        }
+        let mut ch = crate::chr::Chr::allocate(id as u16, crate::chr::Block::default());
+        ch.set_i32(0x190, i32::from(g.workers.list.get(c.worker).map_or(0, crate::workers::Worker::id)));
+        // The body takes the worker's slot (+0xaf), and a slot below 16 names the worker.
+        if let Some(wk) = g.workers.list.get(c.worker) {
+            let slot = wk.u8(0xaf);
+            ch.set_u8(0x184, slot);
+            if slot < 16 {
+                g.workers.sys.body_slots[usize::from(slot)] = i32::from(wk.id());
+            }
+        }
+        g.chrs[c.worker] = Some(ch);
+        g.sync_bind(c.worker);
+        if let Some(wk) = g.workers.list.get(c.worker) {
+            let (pos, dir) = (wk.position(), wk.pf(crate::workers::p::DIR_YAW));
+            let a = g.actor(c.worker);
+            a.yaw = dir;
+            a.move_heading = dir;
+            worker_natives::place_worker(g, c.worker, pos, false);
+        }
         Value::Int(0)
     }
     n.register(0x0001, Native::result(bind_model));
     n.register(0x0134, Native::result(bind_model));
+    // 0203(model): the model's data read (resident motions, data; done at once here), then 0001 with it and the
+    // worker's reading bit cleared; returns 0001's result.
+    n.register(
+        0x0203,
+        Native {
+            init: Some(|_, c| c.scratch[0] = c.stack.pop_int()),
+            wait: Some(|_, _| 1),
+            result: Some(|g, c| {
+                c.stack.push(Value::Int(c.scratch[0]));
+                bind_model(g, c)
+            }),
+        },
+    );
     // Bind the worker to a thing of kind 3 (0003) or 4 (0004), by number.
     fn bind(g: &mut FieldState, c: &mut NativeCall, kind: u8) -> Value {
         let v = c.stack.pop_int();
         let a = g.actor(c.worker);
         a.bind_kind = kind;
         a.bind_id = v as u16;
+        g.sync_bind(c.worker);
         Value::Int(0)
     }
     n.register(0x0003, Native::result(|g, c| bind(g, c, 3)));
@@ -5002,15 +5756,18 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native { init: None, wait: Some(|g, c| if g.actor(c.worker).turning { 0 } else { 5 }), result: None },
     );
     // Map change: target and entrance; the session carries it out between ticks.
-    n.register(
-        0x0011,
-        Native::result(|g, c| {
-            let entrance = c.stack.pop_int();
-            let target = c.stack.pop_int();
-            g.jump = Some((target, entrance));
-            Value::Int(0)
-        }),
-    );
+    // (00ab is the same native: (target, entrance, 1).)
+    for id in [0x0011u16, 0x00AB] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let entrance = c.stack.pop_int();
+                let target = c.stack.pop_int();
+                g.jump = Some((target, entrance));
+                Value::Int(0)
+            }),
+        );
+    }
     // Messages: text, position, open, wait for the player, close.
     n.register(
         0x0064,
@@ -5053,6 +5810,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let mode = c.stack.pop_int();
             let w = window(c);
             open_window(g, &c.memory.global[0], w, mode & 2 != 0);
+            open_number(g, w, mode);
             Value::Int(w as i32)
         }),
     );
@@ -5402,6 +6160,24 @@ pub fn register(n: &mut Natives<FieldState>) {
     // The camera natives on the camera system (they replace the ones above).
     cam_natives::register(n);
     chr_cache::register(n);
+    voice::register(n);
+    sound::register(n);
+    shapes::register(n);
+    map_fx::register(n);
+    pre_bg::register(n);
+    vibration::register(n);
+    pad::register(n);
+    effects::register(n);
+    fog::register(n);
+    text_build::register(n);
+    worker_natives::register(n);
+    worker_natives::register_shapes(n);
+    worker_natives::register_turn_status(n);
+    sys_natives::register(n);
+    sys_natives::register_chr(n);
+    sys_natives::register_chr2(n);
+    pos_sound::register(n);
+    sys_natives::register_02(n);
     // 00f3(mode): the guide map's placement (when there is one); returns the mode.
     n.register(
         0x00F3,
@@ -5476,47 +6252,6 @@ mod tests {
     }
 
     #[test]
-    fn a_walk_steps_a_twentieth_of_its_speed_and_ends_with_half_the_rest() {
-        let (mut pos, to) = ([0.0, 0.0, 0.0], [10.0, 5.0, 0.0]);
-        let mut ticks = 0;
-        loop {
-            let (next, done) = walk_step(pos, to, 34.0, true, 0.0);
-            ticks += 1;
-            if done {
-                // Within 3.4 of the target: half the remaining distance, on the ground plane.
-                assert!((next[0] - (pos[0] + (10.0 - pos[0]) / 2.0)).abs() < 1e-5);
-                assert_eq!(next[1], 0.0);
-                break;
-            }
-            assert!((next[0] - pos[0] - 1.7).abs() < 1e-5);
-            pos = next;
-        }
-        assert_eq!(ticks, 5);
-    }
-
-    #[test]
-    fn a_levels_move_waits_while_a_higher_level_runs() {
-        let mut a = Actor::default();
-        a.moves[1].active = Some(ActorMove::Timed {
-            from: [0.0; 3],
-            to: [10.0, 0.0, 0.0],
-            count: 0.0,
-            frames: 10.0,
-            mode: 3,
-        });
-        a.level = 1;
-        a.advance_move(None);
-        a.advance_move(None);
-        assert_eq!(a.pos[0], 1.0);
-        a.level = 2;
-        a.advance_move(None);
-        assert_eq!(a.pos[0], 1.0);
-        a.level = 1;
-        a.advance_move(None);
-        assert_eq!(a.pos[0], 2.0);
-    }
-
-    #[test]
     fn walking_into_a_character_bumps_it_once_and_stops_at_contact() {
         let body = |x: f32| Actor { model: Some(0x2001), pos: [x, 0.0, 0.0], ..Actor::default() };
         let mut state =
@@ -5581,6 +6316,7 @@ mod tests {
                 text: "Hello there".into(),
                 raw: String::new(),
                 choices: 0,
+                word: 0,
                 reveal: vec![RevealPart::Chars(11)],
                 instant: false,
                 bytes: Vec::new(),
@@ -5717,38 +6453,6 @@ mod tests {
             chr_path(Game::Ffx, 0x2051).as_deref(),
             Some("ffx_ps2/ffx/master/jppc/chr/npc/n081/mdl/n081.chr")
         );
-    }
-
-    #[test]
-    fn eased_turns_and_turning_toward() {
-        // 0.4 of the rate at the ends of an eased turn, all of it halfway.
-        assert!((turn_ease(0.0) - 0.4).abs() < 1e-6);
-        assert!((turn_ease(0.5) - 1.0).abs() < 1e-6);
-        assert!((turn_ease(1.0) - 0.4).abs() < 1e-6);
-        // At most the step, exactly onto the target when closer, the short way round.
-        assert_eq!(turn_toward(0.0, 1.0, 0.25), 0.25);
-        assert_eq!(turn_toward(0.0, 0.1, 0.25), 0.1);
-        assert!((turn_toward(3.0, -3.0, 0.1) - 3.1).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_steered_turn_leads_the_walk() {
-        // cdsp0700 w2: facing 0, target at heading 2.4857; the turn's rate 0.1745 eased, its progress 0.1309 a
-        // tick: the first step is 0.1175, and the walk (0x1000) goes along the facing.
-        let mut a = Actor { model: Some(1), ..Actor::default() };
-        let to = [2.4857f32.cos() * 100.0, 0.0, 2.4857f32.sin() * 100.0];
-        a.move_at(0).target = to;
-        a.move_at(0).active =
-            Some(ActorMove::Walk { to, speed: 20.0, ground_only: true, radius: 0.0, mode: 0xC001 });
-        a.turning = true;
-        a.turn_mode = 0xD202;
-        a.turn_inc = 0.1309;
-        a.steer_turn(0.17453294);
-        assert!((a.yaw - 0.1175).abs() < 1e-3, "{}", a.yaw);
-        assert_eq!(a.move_heading, a.yaw);
-        let st = a.steer_walk_begin(0.0, 0.0).expect("a steered walk");
-        a.steer_walk_end(st, None);
-        assert!((a.pos[0] - a.yaw.cos()).abs() < 1e-4 && (a.pos[2] - a.yaw.sin()).abs() < 1e-4);
     }
 
     #[test]

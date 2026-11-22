@@ -255,6 +255,14 @@ impl<G: World> Host for Bound<'_, G> {
     fn start_signals(&mut self, w: usize, kind: u8, level: u8) -> Vec<u8> {
         self.game.start_signals(w, kind, level)
     }
+
+    fn worker_will_run(&mut self, w: usize, kind: u8, level: u8) {
+        self.game.worker_will_run(w, kind, level)
+    }
+
+    fn level_started(&mut self, w: usize, level: u8) {
+        self.game.level_started(w, level)
+    }
 }
 
 /// What the machine asks of the game state beyond natives.
@@ -277,6 +285,10 @@ pub trait World {
     fn start_signals(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
         Vec::new()
     }
+    /// Worker `w` is about to take its turn (main or setup pass).
+    fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
+    /// A request started on a worker's level, or the level started over.
+    fn level_started(&mut self, _w: usize, _level: u8) {}
 }
 
 impl World for () {}

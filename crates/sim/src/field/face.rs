@@ -206,6 +206,12 @@ impl Face {
         }
     }
 
+    /// Every group whose mode byte is 1 shows `frame` (the blink's eyelid).
+    pub fn blink_frame(&mut self, frame: i32) {
+        let data = self.data.clone();
+        Self::set_frame(&data, &mut self.groups, 1, frame);
+    }
+
     /// Native 5078 with kind 4: set a pattern's flags; a new pattern (or flags 2) restarts every group
     /// and reports frame 0 of each.
     pub fn set_pattern(&mut self, pattern: u8, flags: u8, reports: &mut Vec<Report>) {

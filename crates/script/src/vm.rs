@@ -236,6 +236,8 @@ pub struct NativeCall<'a> {
     pub frame: u64,
     /// Requests to the machine, applied when the call returns.
     pub effects: &'a mut Vec<Effect>,
+    /// Per worker, the levels it has requests at (bit n: a non-signal request at level n).
+    pub requests: &'a [u16],
 }
 
 impl std::fmt::Debug for NativeCall<'_> {
@@ -269,6 +271,10 @@ pub trait Host {
     fn start_signals(&mut self, _w: usize, _kind: u8, _level: u8) -> Vec<u8> {
         Vec::new()
     }
+    /// Worker `w` is about to take its turn in the frame's main or setup pass (it takes its body's place).
+    fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
+    /// A request started on level `level` of worker `w`, or the level started over.
+    fn level_started(&mut self, _w: usize, _level: u8) {}
 }
 
 /// Engine signal defaults per worker kind and signal type: the level, and the entry (255 / -1: none).
@@ -305,6 +311,10 @@ pub struct Vm {
     /// Faults with the worker and pc they happened at.
     pub faults: Vec<(usize, u32, Fault)>,
     effects: Vec<Effect>,
+    /// Levels a request started on or that started over (worker, level), not yet told to the host.
+    level_starts: Vec<(usize, u8)>,
+    /// The frame's main (or setup) pass is running, not an extra pass.
+    main_pass: bool,
 }
 
 /// When a request is refused: the plain request opcodes refuse a second request at the same level; variants
@@ -326,6 +336,9 @@ pub enum Effect {
     PassAgain(usize),
     /// Turn a worker on or off.
     Enable(usize, bool),
+    /// The requests above `level` that have not started are dropped (a
+    /// requester waiting for the start is answered first); running ones stay.
+    SkipQueued(usize, u8),
 }
 
 impl Vm {
@@ -377,6 +390,8 @@ impl Vm {
             trace: None,
             faults: Vec::new(),
             effects: Vec::new(),
+            level_starts: Vec::new(),
+            main_pass: false,
         };
         // Each runnable worker starts with its setup entry running and entry 1 (its main code) queued at level
         // 0; ending the setup entry starts entry 1.
@@ -427,11 +442,19 @@ impl Vm {
     pub fn frame(&mut self, host: &mut dyn Host) {
         match self.phase {
             Phase::Init => {
+                self.main_pass = true;
                 for w in 0..self.workers.len() {
                     if !self.workers[w].ended_entry {
                         self.run_worker(w, host);
+                        // The engine steps the worker after its setup turn too.
+                        if self.workers[w].active && self.workers[w].enabled {
+                            for t in host.worker_ran(w, self.workers[w].kind, self.workers[w].level) {
+                                self.engine_signal(w, t);
+                            }
+                        }
                     }
                 }
+                self.main_pass = false;
                 if self.workers.iter().all(|w| w.ended_entry || !w.active) {
                     for w in 0..self.workers.len() {
                         if self.workers[w].active && self.workers[w].enabled {
@@ -443,10 +466,12 @@ impl Vm {
                     for w in 0..self.workers.len() {
                         self.decode(w, None);
                     }
+                    self.tell_level_starts(host);
                     self.phase = Phase::Running;
                 }
             }
             Phase::Running => {
+                self.main_pass = true;
                 for w in 0..self.workers.len() {
                     self.run_worker(w, host);
                     if self.workers[w].active && self.workers[w].enabled {
@@ -455,6 +480,7 @@ impl Vm {
                         }
                     }
                 }
+                self.main_pass = false;
                 for (w, t) in host.after_workers() {
                     self.engine_signal(w, t);
                 }
@@ -463,6 +489,7 @@ impl Vm {
                     let m = &mut self.workers[w].pass_marks;
                     *m = ((*m >> 2) & 0x180 | *m & 0xF87F) & !0x1000;
                 }
+                self.tell_level_starts(host);
                 // Extra passes: marked workers run again in the same frame (a worker asked by one that is marked
                 // starts its new entry now rather than next frame).
                 for _ in 0..4 {
@@ -480,6 +507,7 @@ impl Vm {
                         self.workers[w].pass_marks = m;
                         if m & 0x180 != 0 {
                             self.decode(w, None);
+                            self.tell_level_starts(host);
                             let count = ((m >> 7) & 3).saturating_sub(1);
                             self.workers[w].pass_marks = m & !0x180 | count << 7;
                         }
@@ -597,6 +625,7 @@ impl Vm {
             } else {
                 let entries = &self.script.workers[w].entries;
                 let pc = entries.get(usize::from(head.entry)).copied().unwrap_or(0);
+                self.level_starts.push((w, head.level));
                 let worker = &mut self.workers[w];
                 worker.entry = head.entry;
                 worker.level = head.level;
@@ -649,12 +678,21 @@ impl Vm {
         self.decode(w, Some(()));
         if restart {
             let pc = self.script.workers[w].entries.get(1).copied().unwrap_or(0);
+            let level = self.workers[w].level;
+            self.level_starts.push((w, level));
             let worker = &mut self.workers[w];
             let li = worker.level_index(worker.level);
             worker.contexts[li].depth = 0;
             worker.contexts[li].pc = pc;
         }
         self.workers[w].ended_entry = true;
+    }
+
+    /// Tell the host the levels that started since it last heard.
+    fn tell_level_starts(&mut self, host: &mut dyn Host) {
+        for (w, level) in std::mem::take(&mut self.level_starts) {
+            host.level_started(w, level);
+        }
     }
 
     fn fault(&mut self, w: usize, f: Fault) {
@@ -668,6 +706,10 @@ impl Vm {
     pub fn run_worker(&mut self, w: usize, host: &mut dyn Host) {
         if !self.workers[w].active || !self.workers[w].enabled {
             return;
+        }
+        self.tell_level_starts(host);
+        if self.main_pass {
+            host.worker_will_run(w, self.workers[w].kind, self.workers[w].level);
         }
         // Speed: a rate below 1 skips frames.
         let worker = &mut self.workers[w];
@@ -753,6 +795,19 @@ impl Vm {
         let arg = insn.operand.unwrap_or(0);
         let next = pc + insn.len();
         let level = self.workers[w].level;
+        let requests: Vec<u16> = if matches!(insn.op, 0x35 | 0x58) {
+            self.workers
+                .iter()
+                .map(|wk| {
+                    wk.queue
+                        .iter()
+                        .filter(|r| r.mode != RequestMode::Signal)
+                        .fold(0u16, |m, r| m | 1 << r.level.min(15))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let worker = &mut self.workers[w];
         let s = &mut worker.stack;
         // Binary helpers: right operand on top.
@@ -970,6 +1025,7 @@ impl Vm {
                     memory: &mut self.memory,
                     frame: self.frame,
                     effects: &mut self.effects,
+                    requests: &requests,
                 };
                 if first {
                     host.native_init(arg, &mut call);
@@ -1002,6 +1058,17 @@ impl Vm {
                         Effect::Enable(t, on) => {
                             if let Some(t) = self.workers.get_mut(t) {
                                 t.enabled = on;
+                            }
+                        }
+                        Effect::SkipQueued(t, level) => {
+                            let Some(wk) = self.workers.get(t) else { continue };
+                            let dropped: Vec<Request> =
+                                wk.queue.iter().filter(|r| r.level > level && !r.running).copied().collect();
+                            self.workers[t].queue.retain(|r| !dropped.iter().any(|d| d.id == r.id));
+                            for r in dropped {
+                                if r.mode == RequestMode::WaitStart && r.from.is_some() {
+                                    self.signal(t, r.from, r.level, r.entry);
+                                }
                             }
                         }
                     }

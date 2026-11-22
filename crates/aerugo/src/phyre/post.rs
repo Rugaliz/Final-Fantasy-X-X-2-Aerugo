@@ -687,7 +687,7 @@ impl PostChain {
             self.copy(vfs, renderer, programs, game, tex(t.usm), m, full, scene, an, ops);
             ops.push(resolve(color, t.resolved));
         }
-        // SMAA (copyDepthBuffer 696af0 with the quality setting at +0x1231c).
+        // SMAA (the depth copy pass, with the quality setting).
         if s.smaa > 0 {
             if self.smaa_tables.is_none() {
                 let mut load = |p: &str| {

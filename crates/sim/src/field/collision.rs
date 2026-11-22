@@ -104,6 +104,11 @@ impl Ground {
     /// 0x10 bytes starting with three vertex indices, whose word at +0xC holds the three vertex shades, 5 bits each,
     /// from bit 17). Positions are vertices divided by the scale.
     pub fn from_walk_mesh(vpa: &[u8]) -> Option<Ground> {
+        Ground::from_walk_mesh_page(vpa, 0)
+    }
+
+    /// The walk mesh of page `page` (the package's section `page + 2`; 8006 switches pages).
+    pub fn from_walk_mesh_page(vpa: &[u8], page: usize) -> Option<Ground> {
         let u32_at =
             |d: &[u8], at: usize| d.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         let i16_at =
@@ -111,7 +116,7 @@ impl Ground {
         if !vpa.starts_with(b"MAP1") {
             return None;
         }
-        let d = vpa.get(u32_at(vpa, 0x18)? as usize..)?;
+        let d = vpa.get(u32_at(vpa, 0x18 + 4 * page).filter(|&o| o != 0)? as usize..)?;
         let scale = f32::from_bits(u32_at(d, 0xC)?) / 10.0;
         if scale <= 0.0 || !scale.is_finite() {
             return None;

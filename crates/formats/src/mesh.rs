@@ -470,6 +470,8 @@ pub struct SceneSettings {
     pub near: f32,
     pub far: f32,
     pub ambient: [f32; 3],
+    /// The ambient colour's fourth component.
+    pub ambient_w: f32,
     pub background: [f32; 3],
     pub fog_color: [f32; 3],
     pub fog_near: f32,
@@ -506,6 +508,7 @@ pub fn scene_settings(cluster: &Cluster) -> Option<SceneSettings> {
         near: f("m_nearPlane"),
         far: f("m_farPlane"),
         ambient: v3("m_ambientColor"),
+        ambient_w: v4("m_ambientColor")[3],
         background: v3("m_bgColor"),
         fog_color: v3("m_fogColor"),
         fog_near: f("m_fogNear"),

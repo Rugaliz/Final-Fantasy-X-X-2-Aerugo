@@ -343,6 +343,8 @@ impl FieldView {
         // A game that starts (from the title) or loads reads the party file with its first motion file.
         let previous =
             self.session.as_ref().map(|s| (s.event.state.motion_groups.clone(), s.event.path.clone()));
+        // The engine's globals outlive the event.
+        let globals = self.session.as_ref().map(|s| s.event.state.globals.clone());
         self.close(renderer, audio);
         self.error = None;
         let game = game_of(path);
@@ -388,6 +390,9 @@ impl FieldView {
         if let Some((mut groups, _)) = previous {
             groups.remove_all_but_party();
             event.state.motion_groups = groups;
+        }
+        if let Some(g) = globals {
+            event.state.globals = g;
         }
         if self.pending_restore.is_some() || from_title {
             event.state.motion_groups.party_pending = true;

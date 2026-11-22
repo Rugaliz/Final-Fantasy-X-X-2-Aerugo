@@ -5,6 +5,7 @@
 //! the original timing. This crate has no graphics, audio or window dependencies.
 
 pub mod camera_move;
+pub mod chr;
 pub mod control;
 pub mod encounter;
 pub mod event_camera;
@@ -12,12 +13,16 @@ pub mod field;
 pub mod follow_camera;
 pub mod items;
 pub mod msgwin;
+pub mod new_game;
 pub mod save;
 pub mod snapshot;
+pub mod stats;
 pub mod test_scene;
 pub mod tick;
+pub mod traced_tables;
 pub mod trigger;
 pub mod ui2d;
+pub mod workers;
 
 pub use snapshot::{Item, Snapshot, Transform, interpolate};
 pub use tick::{FixedTimestep, GAME_TICK_HZ, Steps};

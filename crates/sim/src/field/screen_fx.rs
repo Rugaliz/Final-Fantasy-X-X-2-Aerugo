@@ -35,7 +35,7 @@ pub struct ScreenFx {
     pub channels: [Channel; 5],
     /// The motion blur is on, at this strength (value / 128).
     pub motion_blur: Option<f32>,
-    /// The accumulation trail draws from the current frame (Sg_AccSetCurrent: 4019).
+    /// The accumulation trail draws from the current frame (4019).
     pub accumulation_current: bool,
     /// The accumulation alpha the trail last took (401a).
     pub accumulation_alpha: Option<i16>,

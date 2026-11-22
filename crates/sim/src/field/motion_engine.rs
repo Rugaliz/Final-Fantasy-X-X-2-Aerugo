@@ -220,6 +220,9 @@ pub struct Player {
     decoded: i32,
     rate: i32,
     blended: bool,
+    /// The channels the last frame moved (the motion step sets their dirty bytes: all of them while the blend runs, then
+    /// the ones with frame values); the element pass writes only those into the elements.
+    pub dirty: Vec<bool>,
     /// Model joints × 9 channels: rotation X/Y/Z, translation X/Y/Z, scale X/Y/Z.
     pub channels: Vec<ChannelState>,
     streams: Vec<usize>,
@@ -316,6 +319,7 @@ impl Player {
             decoded: 0,
             rate: 0,
             blended: false,
+            dirty: vec![false; joints * 9],
             channels: vec![ChannelState::default(); joints * 9],
             streams: Vec::new(),
             last_event: 0,
@@ -698,17 +702,22 @@ impl Player {
                     + f64::from(c.current)) as f32;
             }
         };
+        self.dirty.resize(self.channels.len(), false);
         if !self.blended {
             for (i, c) in self.channels.iter_mut().enumerate() {
                 c.rotation = i % 9 < 3;
                 towards(c);
             }
+            self.dirty.iter_mut().for_each(|d| *d = true);
             if n == 1 {
                 self.blended = true;
             }
         } else {
             for &i in &self.streams {
                 towards(&mut self.channels[i]);
+                if let Some(d) = self.dirty.get_mut(i) {
+                    *d = true;
+                }
             }
         }
     }
@@ -716,6 +725,7 @@ impl Player {
     /// One frame: the sequence, the pose at the clock, then the clock moves on. `alt_clock` is the frame-time
     /// scale (0x100 normal) when the alternative clock (native 4022) is on.
     pub fn frame(&mut self, alt_clock: Option<i32>) {
+        self.dirty.iter_mut().for_each(|d| *d = false);
         if self.pc.is_none() {
             return;
         }
@@ -778,6 +788,89 @@ impl Player {
             self.rate,
             j1.join(",")
         )
+    }
+
+    /// The frames the sequence has left from where it is: each play of a range adds its length times its
+    /// plays, each wait its frames; −1 without a sequence, for a range record that is not there or plays 0
+    /// times, or an unknown code.
+    pub fn sequence_length(&self) -> i32 {
+        let (data, mut at) = match (&self.pc, &self.entry) {
+            (Some(Pc::Range(at)), _) => (Arc::<[u8]>::from(&RANGE_SEQUENCE[..]), *at),
+            (Some(Pc::Data(at)), Some((g, _))) => (g.data.clone(), *at),
+            _ => return -1,
+        };
+        let mut total = 0i32;
+        // The original walks until the sequence ends (a sequence that jumps back for ever would hang it).
+        for _ in 0..0x10000 {
+            match data.get(at).copied().unwrap_or(0xFF) as i8 {
+                0 | 5 => return total,
+                1 => {
+                    let Some((group, _)) = &self.entry else { return -1 };
+                    let record = seq_value(&data, at + 1);
+                    let Some(&frames) = usize::try_from(record).ok().and_then(|r| group.record_frames.get(r))
+                    else {
+                        return -1;
+                    };
+                    let plays = i32::from(seq_value(&data, at + 3));
+                    if plays == 0 {
+                        return -1;
+                    }
+                    let frame = |k: i16| {
+                        i32::from(i16_at(&data, (frames as usize).wrapping_add(2 * k as isize as usize)))
+                    };
+                    let (to, from) = (frame(seq_value(&data, at + 7)), frame(seq_value(&data, at + 5)));
+                    total = total.wrapping_add((to - from).wrapping_mul(plays));
+                    at += 9;
+                }
+                2 => at += 1,
+                3 => {
+                    total = total.wrapping_add(i32::from(seq_value(&data, at + 1)));
+                    at += 3;
+                }
+                6 => at += 3,
+                4 => {
+                    let Some((group, entry)) = &self.entry else { return -1 };
+                    let i = seq_value(&data, at + 1);
+                    let table = group.entry_jumps[*entry] as usize;
+                    let base = i64::from(group.entries[*entry].1);
+                    at = (base + i64::from(i16_at(&group.data, table.wrapping_add(2 * i as isize as usize))))
+                        .max(0) as usize;
+                }
+                _ => {
+                    log::warn!("motion {:#x}: unknown sequence code at {at:#x}", self.motion);
+                    return -1;
+                }
+            }
+        }
+        total
+    }
+
+    /// The pose with each channel's dirty mark, for the model joints (through the relation, as pose()).
+    pub fn pose_dirty(&self) -> Vec<Option<([f32; 9], [bool; 9])>> {
+        let joints = self.channels.len() / 9;
+        let mut out = vec![None; joints];
+        for c in 0..self.touched.min(joints) {
+            let j = match &self.remap {
+                Some(r) => match r.map.get(c) {
+                    Some(&0xFFFF) => continue,
+                    Some(&j) => usize::from(j),
+                    None => break,
+                },
+                None => c,
+            };
+            if let Some(slot) = out.get_mut(j) {
+                let v: [f32; 9] = std::array::from_fn(|k| self.channels[c * 9 + k].current);
+                let d: [bool; 9] =
+                    std::array::from_fn(|k| self.dirty.get(c * 9 + k).copied().unwrap_or(false));
+                *slot = Some((v, d));
+            }
+        }
+        out
+    }
+
+    /// The joint relation the motion plays through (the character's +0x758), if any.
+    pub fn relation(&self) -> Option<&Relation> {
+        self.remap.as_deref()
     }
 
     /// Blend all channels again from the next frame (a script set the blend length).

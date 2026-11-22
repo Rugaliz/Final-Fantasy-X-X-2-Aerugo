@@ -73,6 +73,12 @@ impl FieldState {
         self.camera.focus = Some(self.cam.vec3(CamMem::side(r, 0) + 0x10));
         self.camera.roll = self.cam.f32(rec + 0xc90);
         self.camera.screen_distance = self.cam.f32(rec + 0xc9c);
+        self.cam_view = Some(crate::event_camera::view::view_matrix(
+            self.cam.vec4(CamMem::side(r, 1) + 0x10),
+            self.cam.vec4(CamMem::side(r, 0) + 0x10),
+            self.cam.vec4(rec),
+            self.cam.f32(rec + 0xc90),
+        ));
     }
 
     /// The frame's camera step (after the workers ran), then each screen slot's step.
