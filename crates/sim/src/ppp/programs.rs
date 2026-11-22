@@ -1365,6 +1365,46 @@ fn ke_ofs_pt_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u32(a + 0x2c, 0);
 }
 
+// The draw stage (each object's second entry, run in the update): the object's draw matrix at +0x50 (16 floats)
+// and its kind at +0x9c (0: through the view; 1: facing the camera).
+
+/// pppDrawMatrix: the view matrix times the object's.
+fn draw_matrix(r: &mut Run, o: u32, _key: u32, _rf: u32) {
+    r.m.set_u8(o + 0x9c, 0);
+    let m = crate::chr::elements::mul(&r.view, &get_mat(r, o + 0x10));
+    put_mat(r, o + 0x50, &m);
+}
+
+/// The facing matrix: the object's rows scaled by the part's scale, its position through the camera matrix.
+fn front(r: &mut Run, o: u32) -> Mat {
+    let src = get_mat(r, o + 0x10);
+    let mut m = [0.0; 16];
+    for k in 0..3 {
+        let s = r.part_scale[k];
+        for c in 0..4 {
+            m[k * 4 + c] = s * src[k * 4 + c];
+        }
+    }
+    let p = crate::chr::elements::apply4(&r.camera, vec4(r, o + 0x40));
+    m[12..16].copy_from_slice(&p);
+    m
+}
+
+/// pppDrawMatrixFront.
+fn draw_matrix_front(r: &mut Run, o: u32, _key: u32, _rf: u32) {
+    r.m.set_u8(o + 0x9c, 1);
+    let m = front(r, o);
+    put_mat(r, o + 0x50, &m);
+}
+
+/// pppKeDMatFr: the facing matrix (the kind byte left as it is), also copied into work B.
+fn ke_d_mat_fr(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    let m = front(r, o);
+    put_mat(r, o + 0x50, &m);
+    let (_, wb) = works(r, rf);
+    put_mat(r, at(o, wb), &m);
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1476,6 +1516,9 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             ..Program::default()
         },
         "pppVertexAttend" => upd(vertex_attend),
+        "pppDrawMatrix" => Program { name, second: Some(draw_matrix), ..Program::default() },
+        "pppDrawMatrixFront" => Program { name, second: Some(draw_matrix_front), ..Program::default() },
+        "pppKeDMatFr" => Program { name, second: Some(ke_d_mat_fr), ..Program::default() },
         "pppKeOfsPt" => p(ke_ofs_pt, ke_ofs_pt_init),
         "pppKeLnsLpSft" => p(ke_lns_lp_sft, zero_a2),
         "pppNeiLightEikyo" => p(nei_light_eikyo, zero_a6),

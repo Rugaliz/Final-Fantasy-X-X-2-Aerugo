@@ -301,9 +301,15 @@ pub struct Run<'a> {
     pub paused: bool,
     pub vu: &'a mut VuRand,
     pub crt: &'a mut crate::field::face::CrtRand,
-    /// The running part's object list head and its sub-part slots (what programs that spawn objects use).
+    /// The running part's object list head and its sub-part slots (what programs that spawn objects use), and
+    /// its scale (placement +0x60).
     pub objects: u32,
     pub slots: u32,
+    pub part_scale: [f32; 3],
+    /// The engine's two effect matrices the driver sets each frame: the view (for draw matrices) and the camera
+    /// (for front-facing positions).
+    pub view: crate::chr::elements::Mat,
+    pub camera: crate::chr::elements::Mat,
     /// The remaster's slower vertex spawning in one scene (map 0xe6c, event 0xcc6, magic 0x207 loaded, one of
     /// workers 5–7 running): pppVertexAp's interval × 1.8. The host sets it.
     pub vertex_ap_slow: bool,
@@ -355,7 +361,7 @@ impl Run<'_> {
 }
 
 /// A running part (the part state _pppStartPart fills).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Part {
     /// 0, or 0xfffff000 when its sub-part slots could not be allocated.
     pub status: u32,
@@ -373,6 +379,9 @@ pub struct Part {
     /// +0 definition, +4 object list, +8 start time, +0xc u16 count, +0xe index).
     pub objects: u32,
     pub slots: u32,
+    /// The part's placement as the effect's driver sets it (+0x40 position, +0x50, +0x60 scale; four floats
+    /// each).
+    pub place: [f32; 12],
 }
 
 impl Part {
@@ -411,6 +420,7 @@ impl Part {
     pub fn update(&mut self, r: &mut Run, flags: u8) -> bool {
         r.objects = self.objects;
         r.slots = self.slots;
+        r.part_scale = [self.place[8], self.place[9], self.place[10]];
         let done = self.step(r, flags);
         self.objects = r.objects;
         done
