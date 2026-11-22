@@ -307,6 +307,10 @@ pub struct Run<'a> {
     /// The remaster's slower vertex spawning in one scene (map 0xe6c, event 0xcc6, magic 0x207 loaded, one of
     /// workers 5–7 running): pppVertexAp's interval × 1.8. The host sets it.
     pub vertex_ap_slow: bool,
+    /// The remaster's lifetime link for local vertex spawns (map 0x18cd or event 0x10e, with no magic loaded
+    /// and the engine's link value set): a parent ending before its new child lives a frame longer. The host
+    /// sets it.
+    pub vertex_lc_extend: bool,
 }
 
 impl Run<'_> {
