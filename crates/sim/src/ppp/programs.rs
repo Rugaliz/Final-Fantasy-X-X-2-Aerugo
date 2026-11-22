@@ -1279,6 +1279,92 @@ fn ke_acm_cic(r: &mut Run, _o: u32, key: u32, _rf: u32) {
 
 fn nothing_part(_: &mut Run, _: &mut super::Part) {}
 
+/// 75c660: the average of a model's polygon centres (the model: u16 +0x10 polygon count, +4 its groups, +8 its
+/// vertices, offsets from the model): groups of {type byte +1, i16 count +2, polygons from +0x10}: type 0
+/// triangles of 0x14 bytes, 2 triangles of 0x20 (vertex numbers at +0xc), 4 quads of 0x18, 6 quads of 0x28
+/// (at +0x10); w = 1.
+fn model_centre(r: &Run, model: u32) -> [f32; 4] {
+    let total = r.m.u16(model + 0x10) as i16;
+    let mut g = model.wrapping_add(r.m.u32(model + 4));
+    let verts = model.wrapping_add(r.m.u32(model + 8));
+    let mut acc = [0.0f32; 4];
+    let mut left = i32::from(total);
+    while left > 0 {
+        let n = r.m.u16(g + 2) as i16;
+        let (stride, first, k) = match r.m.u8(g + 1) {
+            0 => (0x14, 0xc, 3),
+            2 => (0x20, 0xc, 3),
+            4 => (0x18, 0x10, 4),
+            6 => (0x28, 0x10, 4),
+            _ => (0, 0, 0),
+        };
+        let mut poly = g + 0x10;
+        if k != 0 {
+            for _ in 0..n.max(0) {
+                let mut c = [0.0f32; 3];
+                for j in 0..k {
+                    let vi = u32::from(r.m.u16(poly + first + 2 * j));
+                    let v = vertex_at(r, verts, vi);
+                    for (x, y) in c.iter_mut().zip(v) {
+                        *x += y;
+                    }
+                }
+                for (i, x) in c.iter().enumerate() {
+                    acc[i] += x / k as f32;
+                }
+                poly += stride;
+            }
+        }
+        left -= i32::from(n);
+        g = poly;
+        if k == 0 {
+            break;
+        }
+    }
+    if total > 0 {
+        let t = f32::from(total);
+        for x in acc.iter_mut().take(3) {
+            *x /= t;
+        }
+    }
+    acc[3] = 1.0;
+    acc
+}
+
+/// pppKeOfsPt: on the key's time A += the key's floats (+0x10) and A +0x20 = its integers (+0x20); at age 0 first
+/// A +0x10 = the centre of packet record key +0x2c's model (none for 0xffff).
+fn ke_ofs_pt(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.paused || r.m.u32(o + 0xc) != r.m.u32(key) {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    if r.m.u32(o + 0xc) == 0 {
+        let rec = r.m.u32(key + 0x2c);
+        if rec == 0xffff {
+            return;
+        }
+        let model = r.m.u32(r.env.lists[0].wrapping_add(rec.wrapping_mul(0x20)) + 0x1c);
+        let c = model_centre(r, model);
+        put_vec4(r, a + 0x10, c);
+    }
+    for i in 0..3 {
+        let v = r.m.f32(key + 0x10 + 4 * i) + r.m.f32(a + 4 * i);
+        r.m.set_f32(a + 4 * i, v);
+    }
+    for i in 0..3 {
+        let v = r.m.u32(key + 0x20 + 4 * i);
+        r.m.set_u32(a + 0x20 + 4 * i, v);
+    }
+}
+
+fn ke_ofs_pt_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    set(r, a, &[0; 3]);
+    r.m.set_u32(a + 0x2c, 0);
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1390,6 +1476,7 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             ..Program::default()
         },
         "pppVertexAttend" => upd(vertex_attend),
+        "pppKeOfsPt" => p(ke_ofs_pt, ke_ofs_pt_init),
         "pppKeLnsLpSft" => p(ke_lns_lp_sft, zero_a2),
         "pppNeiLightEikyo" => p(nei_light_eikyo, zero_a6),
         "pppNeiPointLight" => p(nei_point_light, zero_a3),
