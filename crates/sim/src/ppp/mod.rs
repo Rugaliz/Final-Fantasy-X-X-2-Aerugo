@@ -313,6 +313,15 @@ pub struct Run<'a> {
     pub vertex_lc_extend: bool,
     /// The engine's current magic number (some programs leave effect 0x2a9 alone).
     pub magic: u32,
+    /// What the programs ask of the renderer this step, in order (the host's renderer acts on them).
+    pub render: Vec<RenderCall>,
+}
+
+/// A program's request to the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderCall {
+    /// The scene's accumulation setting (pppKeAcmCic: (0, 1)).
+    Accumulation(u32, u32),
 }
 
 impl Run<'_> {

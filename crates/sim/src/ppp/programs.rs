@@ -1185,6 +1185,100 @@ fn ke_drct_init(r: &mut Run, o: u32, rf: u32) {
 
 fn nothing(_: &mut Run, _: u32, _: u32) {}
 
+/// pppKeLnsLpSft: A (two floats) += the key's (+4, +8) on its time (not used on the first frame); then B +0x9c
+/// += A.x and B +0xa8 += A.y.
+fn ke_lns_lp_sft(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.paused {
+        return;
+    }
+    let (wa, wb) = works(r, rf);
+    let (a, b) = (at(o, wa), at(o, wb));
+    if r.m.u32(o + 0xc) == r.m.u32(key) {
+        for i in 0..2 {
+            let v = r.m.f32(key + 4 + 4 * i) + r.m.f32(a + 4 * i);
+            r.m.set_f32(a + 4 * i, v);
+        }
+        if r.m.u32(o + 0xc) == 0 {
+            return;
+        }
+    }
+    let v = r.m.f32(b + 0x9c) + r.m.f32(a);
+    r.m.set_f32(b + 0x9c, v);
+    let v = r.m.f32(a + 4) + r.m.f32(b + 0xa8);
+    r.m.set_f32(b + 0xa8, v);
+}
+
+fn zero_a2(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 2]);
+}
+
+/// pppNeiLightEikyo: A (six floats) += the key's (+4) on its time; then two ramps: A1 += A0, A2 += A1;
+/// A4 += A3, A5 += A4.
+fn nei_light_eikyo(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    if r.paused {
+        return;
+    }
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        for i in 0..6 {
+            let v = r.m.f32(key + 4 + 4 * i) + r.m.f32(a + 4 * i);
+            r.m.set_f32(a + 4 * i, v);
+        }
+    }
+    let f = |r: &Run, i: u32| r.m.f32(a + 4 * i);
+    let v1 = f(r, 1) + f(r, 0);
+    r.m.set_f32(a + 4, v1);
+    let v2 = v1 + f(r, 2);
+    r.m.set_f32(a + 8, v2);
+    let v4 = f(r, 3) + f(r, 4);
+    r.m.set_f32(a + 16, v4);
+    let v5 = v4 + f(r, 5);
+    r.m.set_f32(a + 20, v5);
+}
+
+fn zero_a6(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 6]);
+}
+
+/// pppNeiPointLight: on the key's time A +0xc / +0x10 = the addresses of B and C, A (three floats) += the
+/// key's (+4); then the ramp A1 += A0, A2 += A1.
+fn nei_point_light(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, wb, wc) = works3(r, rf);
+    let a = at(o, wa);
+    if r.paused {
+        return;
+    }
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        r.m.set_u32(a + 0xc, at(o, wb));
+        r.m.set_u32(a + 0x10, at(o, wc));
+        for i in 0..3 {
+            let v = r.m.f32(key + 4 + 4 * i) + r.m.f32(a + 4 * i);
+            r.m.set_f32(a + 4 * i, v);
+        }
+    }
+    let v1 = r.m.f32(a) + r.m.f32(a + 4);
+    r.m.set_f32(a + 4, v1);
+    let v2 = v1 + r.m.f32(a + 8);
+    r.m.set_f32(a + 8, v2);
+}
+
+fn zero_a3(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    set(r, at(o, wa), &[0; 3]);
+}
+
+/// pppKeAcmCic / pppKeAcmCicEx: unless the key's byte +4 is 2, the scene's accumulation set to (0, 1).
+fn ke_acm_cic(r: &mut Run, _o: u32, key: u32, _rf: u32) {
+    if r.m.u8(key + 4) != 2 {
+        r.render.push(super::RenderCall::Accumulation(0, 1));
+    }
+}
+
+fn nothing_part(_: &mut Run, _: &mut super::Part) {}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1296,6 +1390,11 @@ pub fn by_name(name: &'static str) -> Option<Program> {
             ..Program::default()
         },
         "pppVertexAttend" => upd(vertex_attend),
+        "pppKeLnsLpSft" => p(ke_lns_lp_sft, zero_a2),
+        "pppNeiLightEikyo" => p(nei_light_eikyo, zero_a6),
+        "pppNeiPointLight" => p(nei_point_light, zero_a3),
+        "pppKeAcmCic" | "pppKeAcmCicEx" => upd(ke_acm_cic),
+        "pppKeAcmSolid" => Program { name, post: Some(nothing_part), ..Program::default() },
         "pppKeGrvTgt" => {
             Program { name, update: Some(ke_grv_tgt), init: Some(ke_grv_tgt_init), ..Program::default() }
         }
