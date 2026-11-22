@@ -8,6 +8,7 @@ pub mod fev;
 pub mod fsb;
 pub mod ftc;
 pub mod kernel;
+pub mod magic;
 pub mod mesh;
 pub mod motion;
 pub mod phyre;
