@@ -300,6 +300,20 @@ fn works3(r: &Run, rf: u32) -> (u32, u32, u32) {
     (r.m.u32(pair), r.m.u32(pair + 4), r.m.u32(pair + 8))
 }
 
+/// The engine's matrix set-ups by angle order (0 XYZ, 1 XZY, 2 YXZ, 3 YZX, 4 ZXY, 5 ZYX; others XYZ): the turn
+/// matrix of the three angles.
+pub(crate) fn set_matrix(order: u8, ang: [u32; 3]) -> Mat {
+    let o = match order {
+        1 => *b"yzx",
+        2 => *b"zxy",
+        3 => *b"xzy",
+        4 => *b"yxz",
+        5 => *b"xyz",
+        _ => *b"zyx",
+    };
+    turns(o, ang)
+}
+
 /// The turn matrix for angles (x, y, z) with the turns multiplied in `order` (the first two, then the third).
 fn turns(order: [u8; 3], ang: [u32; 3]) -> Mat {
     let a = |ax: u8| ang[usize::from(ax - b'x')];
@@ -1479,6 +1493,7 @@ fn emit_model(r: &mut Run, o: u32, a: ModelArgs) {
     let model = r.m.u32(record + 0x1c);
     let draw = super::ModelDraw {
         object: o,
+        ref_index: r.ref_index,
         record,
         model,
         flags: a.flags,
@@ -1761,6 +1776,7 @@ fn ke_mdl_dtt(r: &mut Run, o: u32, key: u32, rf: u32) {
     let work = at(o, wc);
     let draw = super::DistortDraw {
         object: o,
+        ref_index: r.ref_index,
         model,
         colour,
         scale: r.part_scale[0] * r.m.f32(a),
@@ -1883,6 +1899,1189 @@ fn vt_mime_free(r: &mut Run, o: u32, rf: u32) {
     }
 }
 
+// The loop family: values that add the key's on its time like the plain ones, but whose restart takes the
+// first key's values off again (so a looping object starts over from where it began). The first key is kept at
+// A +0x10 (set on the first update, cleared at the init).
+
+fn loop_add(r: &mut Run, o: u32, key: u32, rf: u32, float: bool) {
+    if r.paused {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    if r.m.u32(a + 0x10) == 0 {
+        set(r, a, &[0; 3]);
+        r.m.set_u32(a + 0x10, key);
+    }
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        for i in 0..3 {
+            if float {
+                let v = r.m.f32(key + 0x10 + 4 * i) + r.m.f32(a + 4 * i);
+                r.m.set_f32(a + 4 * i, v);
+            } else {
+                let v = r.m.u32(a + 4 * i).wrapping_add(r.m.u32(key + 0x10 + 4 * i));
+                r.m.set_u32(a + 4 * i, v);
+            }
+        }
+    }
+}
+
+fn loop_back(r: &mut Run, o: u32, rf: u32, float: bool) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    let first = r.m.u32(a + 0x10);
+    for i in 0..3 {
+        if float {
+            let v = r.m.f32(a + 4 * i) - r.m.f32(first + 0x10 + 4 * i);
+            r.m.set_f32(a + 4 * i, v);
+        } else {
+            let v = r.m.u32(a + 4 * i).wrapping_sub(r.m.u32(first + 0x10 + 4 * i));
+            r.m.set_u32(a + 4 * i, v);
+        }
+    }
+}
+
+/// pppAngleLoop: integers.
+fn angle_loop(r: &mut Run, o: u32, key: u32, rf: u32) {
+    loop_add(r, o, key, rf, false)
+}
+fn angle_loop_back(r: &mut Run, o: u32, rf: u32) {
+    loop_back(r, o, rf, false)
+}
+/// pppPointLoop / pppScaleLoop: floats.
+fn float_loop(r: &mut Run, o: u32, key: u32, rf: u32) {
+    loop_add(r, o, key, rf, true)
+}
+fn float_loop_back(r: &mut Run, o: u32, rf: u32) {
+    loop_back(r, o, rf, true)
+}
+fn loop_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_u32(at(o, wa) + 0x10, 0);
+}
+
+/// pppDrawMdlLoop: a model whose texture scrolls: the third work keeps the first key (+0), u and v (+4, +0x10;
+/// from the key's +8 / +0x14 at the start) with their speeds and accelerations (+8 / +0xc, +0x14 / +0x18,
+/// added from the key's +0xc / +0x10 / +0x18 / +0x1c on its time); each frame the speeds take their
+/// accelerations and u, v their speeds, kept in [0, 32768); the draw takes them · 65536. Key +0x20 the blend
+/// (0xff: the model's), +0x22 the switches (2 semi-transparent, 1 flag 0x80), +0x23 / +0x24 flags 0x200 /
+/// 0x100, +0x25 facing the camera (and not flag 0x10).
+fn draw_mdl_loop(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _, wc) = works3(r, rf);
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let c = at(o, wc);
+    if r.m.u32(c) == 0 {
+        r.m.set_u32(c + 4, r.m.u32(key + 8));
+        r.m.set_u32(c + 0x10, r.m.u32(key + 0x14));
+        set(r, c + 8, &[0; 2]);
+        set(r, c + 0x14, &[0; 2]);
+        r.m.set_u32(c, key);
+    }
+    if !r.paused {
+        if r.m.u32(key) == r.m.u32(o + 0xc) {
+            for (w, k) in [(8, 0xc), (0xc, 0x10), (0x14, 0x18), (0x18, 0x1c)] {
+                let v = r.m.f32(key + k) + r.m.f32(c + w);
+                r.m.set_f32(c + w, v);
+            }
+        }
+        let du = r.m.f32(c + 0xc) + r.m.f32(c + 8);
+        r.m.set_f32(c + 8, du);
+        let dv = r.m.f32(c + 0x18) + r.m.f32(c + 0x14);
+        r.m.set_f32(c + 0x14, dv);
+        let u = du + r.m.f32(c + 4);
+        r.m.set_f32(c + 4, (f64::from(u) % 32768.0) as f32);
+        let v = r.m.f32(c + 0x10) + dv;
+        r.m.set_f32(c + 0x10, (f64::from(v) % 32768.0) as f32);
+    }
+    let colour = packed_colour(r, at(o, wa));
+    if colour[3] == 0 {
+        return;
+    }
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    let sw = r.m.u8(key + 0x22);
+    let mut f = model_flags(sw & 2 != 0, sw & 1 != 0, r.m.u8(model));
+    if r.m.u8(key + 0x23) != 0 {
+        f |= 0x200;
+    }
+    if r.m.u8(key + 0x24) != 0 {
+        f |= 0x100;
+    }
+    if r.m.u8(key + 0x25) != 0 {
+        f = f & !0x10 | 0x2000;
+    }
+    let blend = match r.m.u8(key + 0x20) {
+        0xff => r.m.u8(model + 0x16),
+        b => b,
+    };
+    let mut cr = blend_state(blend);
+    if f & 8 != 0 {
+        cr |= 0x40;
+    }
+    let u = (f64::from(r.m.f32(c + 4)) * 65536.0).trunc() as i32 as u32;
+    let v = (65536.0 * f64::from(r.m.f32(c + 0x10))).trunc() as i32 as u32;
+    let args = ModelArgs {
+        model_no: n,
+        flags: f,
+        blend,
+        texture_word: 0,
+        offsets: (u, v),
+        colour,
+        work: 0,
+        create: cr,
+        finish: false,
+        fade: None,
+    };
+    emit_model(r, o, args);
+}
+
+fn draw_mdl_loop_init(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    r.m.set_u32(at(o, wc), 0);
+}
+
+fn draw_mdl_loop_restart(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    let c = at(o, wc);
+    set(r, c + 8, &[0; 2]);
+    set(r, c + 0x14, &[0; 2]);
+}
+
+/// pppKeZCrctShp: into the first work, the object's rows scaled by the part's scale and its position (times
+/// the key's scale +0x20, w its own) by the key's mode (+0x30): 0 offset by the key's (+0x10), then through the
+/// camera (turn and position, w taken as 1); 1 through the camera, then offset; 2 the part's scale plus the
+/// scale times the key's offset (w the part's).
+fn ke_z_crct_shp(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let src = get_mat(r, o + 0x10);
+    let s = r.part_scale;
+    let mut m = src;
+    for row in 0..3 {
+        for c in 0..3 {
+            m[row * 4 + c] = s[row] * src[row * 4 + c];
+        }
+    }
+    let p = [
+        r.m.f32(key + 0x20) * src[12],
+        r.m.f32(key + 0x24) * src[13],
+        r.m.f32(key + 0x28) * src[14],
+        src[15],
+    ];
+    let off = vec4(r, key + 0x10);
+    let through = |m: &Mat, v: [f32; 4]| -> [f32; 4] {
+        let d = f64::from;
+        let x = ((d(v[0]) * d(m[0]) + d(v[1]) * d(m[4])) + d(v[2]) * d(m[8])) as f32;
+        let y = ((d(m[9]) * d(v[2]) + d(m[5]) * d(v[1])) + d(m[1]) * d(v[0])) as f32;
+        let z = ((d(m[10]) * d(v[2]) + d(m[6]) * d(v[1])) + d(m[2]) * d(v[0])) as f32;
+        let w = ((d(v[2]) * d(m[11]) + d(v[1]) * d(m[7])) + d(v[0]) * d(m[3])) as f32;
+        [x + m[12], m[13] + y, m[14] + z, m[15] + w]
+    };
+    let pos = match r.m.u8(key + 0x30) {
+        0 => through(&r.camera, [p[0] + off[0], p[1] + off[1], p[2] + off[2], off[3] + p[3]]),
+        1 => {
+            let q = through(&r.camera, p);
+            [q[0] + off[0], q[1] + off[1], q[2] + off[2], off[3] + q[3]]
+        }
+        2 => [s[0] + s[0] * off[0], s[1] + s[1] * off[1], s[2] + s[2] * off[2], s[3]],
+        _ => [0.0; 4],
+    };
+    m[12..16].copy_from_slice(&pos);
+    put_mat(r, at(o, wa), &m);
+}
+
+/// A shape's frame record (the list entry's shape: +6 the frame count, frames of 8 bytes from +0x10: i16 offset
+/// of the frame's sprites, i16 duration, flags (0x80 loop)) and the blend of the frame's sprites.
+fn shape_frame(r: &Run, shape: u32, frame: u32) -> (u32, u8) {
+    let rec = shape + (frame + 2) * 8;
+    let sprites = shape.wrapping_add(r.m.u16(rec) as i16 as i32 as u32);
+    let packet = sprites.wrapping_add(r.m.u32(sprites + 4));
+    (rec, r.m.u8(packet + 4))
+}
+
+/// A shape's frame step: the timer (u16 A +0) by the key's speed (i16 +8); past the frame's duration the next
+/// frame; past the last, the first again (loop flag) or the last held.
+fn shape_step(r: &mut Run, a: u32, key: u32, shape: u32, rec: u32) {
+    if r.paused {
+        return;
+    }
+    let t = r.m.u16(a).wrapping_add(r.m.u16(key + 8));
+    r.m.set_u16(a, t);
+    let dur = r.m.u16(rec + 2) as i16 as i32;
+    if dur <= i32::from(t) {
+        let f = r.m.u16(a + 2).wrapping_add(1);
+        r.m.set_u16(a + 2, f);
+        r.m.set_u16(a, t.wrapping_sub(dur as u16));
+        if (r.m.u16(shape + 6) as i16 as i32) <= i32::from(f) {
+            if r.m.u8(rec + 4) & 0x80 != 0 {
+                r.m.set_u32(a, 0);
+                return;
+            }
+            r.m.set_u16(a, 0);
+            r.m.set_u16(a + 2, f.wrapping_sub(1));
+        }
+    }
+}
+
+/// One shape draw (the third path for pppDrawShape, the plain one for pppDrawShapeX): shape key +4 (0xffff:
+/// none) of the group's +0x18 list, the timer and frame in the first work, the colour from the second.
+fn draw_shape_one(r: &mut Run, o: u32, key: u32, rf: u32, path3: bool) {
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let pair = r.m.u32(rf + 0xc);
+    let (wa, wb, wd) = (r.m.u32(pair), r.m.u32(pair + 4), r.m.u32(pair + 0xc));
+    let a = at(o, wa);
+    let entry = r.env.lists[1].wrapping_add(4 * n);
+    let shape = r.m.u32(entry);
+    let mut flags = 0x80u16;
+    let mut work = 0;
+    if !path3 {
+        if r.m.u8(key + 0xc) != 0 {
+            flags |= 0x800;
+        }
+        if r.m.u8(key + 0xd) != 0 {
+            flags |= 0x400;
+        }
+        if r.m.u8(key + 0xe) != 0 {
+            work = at(o, wd);
+        }
+    }
+    let colour = packed_colour(r, at(o, wb));
+    let frame = u32::from(r.m.u16(a + 2));
+    let (rec, mut blend) = shape_frame(r, shape, frame);
+    let magic = r.magic;
+    let k = r.ref_index;
+    let mut create = None;
+    if path3 {
+        if magic == 499 {
+            blend = 0x48;
+        }
+        create = Some(blend_state(blend));
+    } else {
+        if (magic == 0x241 && k == 9)
+            || ((magic == 0x251 || magic == 0x267) && k == 0xd)
+            || magic == 0x1e6
+            || magic == 0x1dd
+        {
+            work = 0;
+        }
+        if magic == 0x1a8 && blend == b'D' {
+            blend = 0x48;
+        }
+        let mut c = blend_state(blend);
+        let skip = r.scene.event == 0x6c && r.scene.map_part_id == 0x4d && k == 8;
+        if (r.scene.event == 0x137 && magic == 0x13c) || (magic == 0x241 && k == 9) {
+            c |= 0x800;
+        }
+        if !skip {
+            create = Some(c);
+        }
+    }
+    let draw = super::ShapeDraw {
+        object: o,
+        ref_index: k,
+        entry,
+        shape,
+        frame,
+        flags,
+        colour,
+        matrix: get_mat(r, o + 0x50),
+        work_matrix: (work != 0).then(|| get_mat(r, work)),
+        create,
+        path3,
+    };
+    r.render.push(super::RenderCall::Shape(Box::new(draw)));
+    shape_step(r, a, key, shape, rec);
+}
+
+/// pppDrawShape / pppDrawShapeX (part-level entries): unless the definition skips its draws (+0xc bit 0), each
+/// object of the slot with its key moved on to the next when that one's time has come, then drawn.
+fn draw_shape_group(r: &mut Run, s: u32, def: u32, rf: u32, k: u32, path3: bool) {
+    if r.m.u32(def + 0xc) & 1 != 0 {
+        return;
+    }
+    let stride = u32::from(r.m.u16(rf + 4));
+    let mut o = r.m.u32(s + 4);
+    for _ in 0..r.m.u16(s + 0xc) {
+        let slot_at = o.wrapping_add(r.m.u32(def + 0x20)).wrapping_add(k * 4);
+        let mut key = r.m.u32(slot_at);
+        let next = key.wrapping_add(stride);
+        if r.m.u32(next) == r.m.u32(o + 0xc) {
+            r.m.set_u32(slot_at, next);
+            key = next;
+        }
+        draw_shape_one(r, o, key, rf, path3);
+        o = r.m.u32(o);
+    }
+}
+
+fn draw_shape(r: &mut Run, s: u32, def: u32, rf: u32, k: u32) {
+    draw_shape_group(r, s, def, rf, k, true)
+}
+fn draw_shape_x(r: &mut Run, s: u32, def: u32, rf: u32, k: u32) {
+    draw_shape_group(r, s, def, rf, k, false)
+}
+fn zero_a1(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    r.m.set_u32(at(o, wa), 0);
+}
+
+// The lens family. pppKeLnsLp keeps a light's state in its first work (the "Th" engine): +0 a matrix, +0x30 the
+// object's place through the camera, +0x40 a turn towards the light on the screen (and its row +0x70 placed
+// along it), +0x7c the alpha, +0x80 the object's position, +0x8e a near margin byte, +0x8f facing (the
+// object's own direction at +0x90), +0x9c / +0xa8 ramped values (+0xa8 the fade distance), +0xa4 the distance
+// on the screen, +0xac 1. pppKeLnsFls draws a shape frame along it.
+
+fn d(x: f32) -> f64 {
+    f64::from(x)
+}
+
+/// The three- and two-dimensional lengths (summed in the original's order).
+fn len3(v: [f32; 4]) -> f32 {
+    (((d(v[0]) * d(v[0]) + d(v[1]) * d(v[1])) + d(v[2]) * d(v[2])).sqrt()) as f32
+}
+fn len2(v: [f32; 4]) -> f32 {
+    ((d(v[0]) * d(v[0]) + d(v[1]) * d(v[1])).sqrt()) as f32
+}
+
+fn sub4f(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]]
+}
+
+fn scale4(v: [f32; 4], k: f32) -> [f32; 4] {
+    [k * v[0], v[1] * k, v[2] * k, k * v[3]]
+}
+
+/// The light state's update (the "Th" engine) for the light work at `a` and the position at `pos`.
+fn ke_th(r: &mut Run, a: u32, pos: u32) {
+    let camera = r.camera;
+    let cp = r.camera_pos;
+    let facing = r.m.u8(a + 0x8f) != 0;
+    let (mut p, mut q, mut dir);
+    if !facing {
+        let mut t = IDENTITY_M;
+        t[12] = r.m.f32(a + 0x80) + cp[0];
+        t[13] = r.m.f32(a + 0x84) + cp[1];
+        t[14] = r.m.f32(a + 0x88) + cp[2];
+        p = crate::chr::elements::apply4(&t, [0.0, 0.0, 0.0, 1.0]);
+        p = scale4(p, 1.0 / p[3]);
+        let mut u = IDENTITY_M;
+        u[12..16].copy_from_slice(&cp);
+        q = crate::chr::elements::apply4(&u, [0.0, 0.0, 0.0, 1.0]);
+        q = scale4(q, 1.0 / q[3]);
+        dir = sub4f(q, p);
+        dir[1] *= 0.923_076_87;
+        dir[2] = 512.0;
+    } else {
+        let mut m = camera;
+        m[12] = 0.0;
+        m[13] = 0.0;
+        m[14] = 0.0;
+        p = crate::chr::elements::apply4(&m, vec4(r, pos));
+        q = scale4([camera[12], camera[13], camera[14], camera[15]], -1.0);
+        dir = sub4f(q, p);
+    }
+    set(r, a, &IDENTITY_M.map(f32::to_bits));
+    let at_cam = crate::chr::elements::apply4(&camera, vec4(r, pos));
+    put_vec4(r, a + 0x30, at_cam);
+    if dir[0] != 0.0 || dir[1] != 0.0 {
+        let f = len2(dir);
+        let rows = [dir[0] / f, dir[1] / f, 0.0, 0.0, dir[1] / f, -dir[0] / f, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        for (i, v) in rows.iter().enumerate() {
+            r.m.set_f32(a + 0x40 + 4 * i as u32, *v);
+        }
+    }
+    put_vec4(r, a + 0x70, at_cam);
+    let z = if facing { r.m.f32(a + 0x38) } else { r.m.f32(a + 0x88) + cp[2] };
+    let z = (d(z) * 0.001953125) as f32;
+    r.m.set_f32(a + 0x78, z);
+    let n = crate::chr::elements::normalize(dir);
+    r.m.set_f32(a + 0x70, z * n[0]);
+    r.m.set_f32(a + 0x74, z * n[1]);
+    let v = sub4f(q, p);
+    let l3 = len3(v);
+    r.m.set_f32(a + 0xa4, len2(v));
+    let nv = crate::chr::elements::normalize(v);
+    let dot = |x: [f32; 4], y: [f32; 4]| ((d(x[2]) * d(y[2]) + d(x[0]) * d(y[0])) + d(x[1]) * d(y[1])) as f32;
+    let alpha = if !facing {
+        let fade = r.m.f32(a + 0xa8);
+        if 0.0 < fade {
+            let f = r.m.f32(a + 0xa4) / fade;
+            if 1.0 < f { 0.0 } else { 1.0 - f }
+        } else {
+            0.0
+        }
+    } else {
+        let t = (((1.0 - 0.5 * (1.0 - d(dot([0.0, 0.0, 1.0, 0.0], nv)))) as f32) as f64 / 0.3) as f32;
+        let mut al = if d(t) <= 1.0 { (1.0 - d(t)) as f32 } else { 0.0 };
+        let k = r.m.f32(a + 0x9c);
+        if k > 0.0 {
+            let d2 = dot(vec4(r, a + 0x90), nv);
+            let f = if k == 0.0 { 0.0 } else { ((0.5 * (1.0 - d(d2))) as f32) / k };
+            let g = if d(f) <= 1.0 { (1.0 - d(f)) as f32 } else { 0.0 };
+            al *= g;
+        }
+        let near = r.m.f32(a + 0xa8) - f32::from(r.m.u8(a + 0x8e));
+        if near <= 0.0 {
+            0.0
+        } else {
+            let f = l3 / near;
+            (if f < 1.0 { 1.0 - f } else { 0.0 }) * al
+        }
+    };
+    r.m.set_f32(a + 0x7c, alpha);
+}
+
+const IDENTITY_M: Mat = crate::chr::elements::IDENTITY;
+
+/// pppKeLnsLp: on the key's time +0xa8 += key +8, +0x8e = key byte +0xc, +0x9c += key +4, +0x8f = key byte
+/// +0xd; facing: +0x90 = the object's z axis (w kept); +0x80 = the object's position; then the light state.
+fn ke_lns_lp(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        r.m.set_f32(a + 0xa8, r.m.f32(key + 8) + r.m.f32(a + 0xa8));
+        r.m.set_u8(a + 0x8e, r.m.u8(key + 0xc));
+        r.m.set_f32(a + 0x9c, r.m.f32(key + 4) + r.m.f32(a + 0x9c));
+        r.m.set_u8(a + 0x8f, r.m.u8(key + 0xd));
+    }
+    if r.m.u8(a + 0x8f) != 0 {
+        let v = crate::chr::elements::apply4(&get_mat(r, o + 0x10), [0.0, 0.0, 1.0, 1.0]);
+        for (i, x) in v.iter().take(3).enumerate() {
+            r.m.set_f32(a + 0x90 + 4 * i as u32, *x);
+        }
+    }
+    for i in 0..3 {
+        r.m.set_u32(a + 0x80 + 4 * i, r.m.u32(o + 0x40 + 4 * i));
+    }
+    ke_th(r, a, o + 0x40);
+}
+
+fn ke_lns_lp_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    set(r, a + 0x40, &IDENTITY_M.map(f32::to_bits));
+    r.m.set_f32(a + 0xac, 1.0);
+    r.m.set_u32(a + 0x9c, 0);
+    r.m.set_u32(a + 0xa8, 0);
+}
+
+fn ke_lns_lp_restart(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u32(a + 0x9c, 0);
+    r.m.set_u32(a + 0xa8, 0);
+}
+
+/// pppKeLnsFls: on the key's time the first work takes the light (+0 the address of the second work) and the
+/// shape (+4 the list entry of key +4, its timer +8 set to the first frame's duration and its frame +0xa to 0 when
+/// it changes; none for 0xffff); then a flare: the shape frame along the light, scaled (key +0xc, by the
+/// distance on the screen over key u16 +0x10: modes key +0x12 / +0x13 for x / y: 1 the fade, 2 one plus the
+/// ratio) and by the part's scale, coloured by the key's bytes +8..+0xb times the part's and the light's alpha.
+fn ke_lns_fls(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, wb) = works(r, rf);
+    let a = at(o, wa);
+    if r.m.u32(key) == r.m.u32(o + 0xc) {
+        r.m.set_u32(a, at(o, wb));
+        let n = r.m.u32(key + 4);
+        if n == 0xffff {
+            r.m.set_u32(a + 4, 0);
+        } else {
+            let entry = r.env.lists[1].wrapping_add(4 * n);
+            if r.m.u32(a + 4) != entry {
+                r.m.set_u32(a + 4, entry);
+                let shape = r.m.u32(entry);
+                r.m.set_u16(a + 8, r.m.u16(shape + 0x12));
+                r.m.set_u8(a + 0xa, 0);
+            }
+        }
+    }
+    let pc = r.part_colour;
+    let ch = |i: usize, b: u32| ((u32::from(pc[i]) * u32::from(r.m.u8(key + b))) >> 12) as u8;
+    let colour = [ch(0, 8), ch(1, 9), ch(2, 0xa), ch(3, 0xb)];
+    r.m.set_u8(a + 0xb, r.ref_index as u8);
+    let id = r.m.u8(a + 0xb) as i8 as i32 as u32;
+    let lp = r.m.u32(a);
+    let entry = r.m.u32(a + 4);
+    if lp == super::SCRATCH_VECTOR || entry == 0 || r.m.f32(lp + 0x7c) == 0.0 {
+        r.render.push(super::RenderCall::Hide { object: o, ref_index: id });
+        return;
+    }
+    let ratio = r.m.f32(lp + 0xa4) / f32::from(r.m.u16(key + 0x10));
+    let fade = if ratio <= 1.0 { 1.0 - ratio } else { 0.0 };
+    let mut m = if r.m.u8(lp + 0x8f) == 0 {
+        let mut t = IDENTITY_M;
+        t[12] = r.m.f32(lp + 0x80) + r.camera_pos[0];
+        t[13] = r.m.f32(lp + 0x84) + r.camera_pos[1];
+        t[14] = r.m.f32(lp + 0x88) + r.camera_pos[2];
+        t
+    } else {
+        get_mat(r, lp)
+    };
+    let size = r.m.f32(key + 0xc);
+    let by = |mode: u8| match mode {
+        1 => size * fade,
+        2 => size * (ratio + 1.0),
+        _ => size,
+    };
+    m[0] = by(r.m.u8(key + 0x12));
+    m[5] = by(r.m.u8(key + 0x13));
+    let ps = r.part_scale;
+    for c in 0..4 {
+        m[c] *= ps[0];
+        m[4 + c] *= ps[1];
+    }
+    let alpha = (f32::from(colour[3]) * r.m.f32(lp + 0x7c) * fade).round_ties_even() as i32 as u8;
+    // The shape's frame step (by 0x200 a frame) before the draw.
+    let shape = r.m.u32(entry);
+    let frame = u32::from(r.m.u8(a + 0xa));
+    let rec = shape + frame * 8;
+    let t = r.m.u16(a + 8).wrapping_add(0x200);
+    r.m.set_u16(a + 8, t);
+    let dur = r.m.u16(rec + 0x12) as i16;
+    if dur <= t as i16 {
+        r.m.set_u16(a + 8, t.wrapping_sub(dur as u16));
+        let f = r.m.u8(a + 0xa).wrapping_add(1);
+        r.m.set_u8(a + 0xa, f);
+        if (r.m.u16(shape + 6) as i16) <= i16::from(f) {
+            r.m.set_u16(a + 8, 0);
+            if r.m.u8(rec + 0x14) & 0x80 != 0 {
+                r.m.set_u8(a + 0xa, 0);
+            } else {
+                r.m.set_u8(a + 0xa, f.wrapping_sub(1));
+            }
+        }
+    }
+    let frame = u32::from(r.m.u8(a + 0xa));
+    let (_, blend) = shape_frame(r, shape, frame);
+    let draw = super::ShapeDraw {
+        object: o,
+        ref_index: id,
+        entry,
+        shape,
+        frame,
+        flags: 0,
+        colour: [colour[0], colour[1], colour[2], alpha],
+        matrix: m,
+        work_matrix: None,
+        create: Some(blend_state(blend) | 0x800),
+        path3: false,
+    };
+    r.render.push(super::RenderCall::Shape(Box::new(draw)));
+}
+
+fn ke_lns_fls_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u32(a, super::SCRATCH_VECTOR);
+    r.m.set_u32(a + 4, 0);
+}
+
+/// A copy of `n` bytes at `at`.
+fn bytes(r: &Run, at_: u32, n: u32) -> Vec<u8> {
+    (0..n).map(|i| r.m.u8(at_.wrapping_add(i))).collect()
+}
+
+fn geometry(
+    r: &mut Run,
+    program: &'static str,
+    o: u32,
+    key: u32,
+    rf: u32,
+    sizes: (u32, u32, u32),
+    extra: Vec<u8>,
+) {
+    let (wa, wb) = works(r, rf);
+    let n = r.m.u32(key + 4);
+    let entry = r.env.lists[1].wrapping_add(4 * n);
+    let draw = super::GeometryDraw {
+        program,
+        object: o,
+        ref_index: r.ref_index,
+        key: bytes(r, key, sizes.0),
+        work: bytes(r, at(o, wa), sizes.1),
+        colour_work: bytes(r, at(o, wb), sizes.2),
+        entry,
+        shape: r.m.u32(entry),
+        matrix: get_mat(r, o + 0x10),
+        age: r.m.u32(o + 0xc),
+        part_scale: r.part_scale,
+        part_colour: r.part_colour,
+        camera: r.camera,
+        extra,
+    };
+    r.render.push(super::RenderCall::Geometry(Box::new(draw)));
+}
+
+/// The tails' position history: on the object's first frame every entry is its position (w 1); then the
+/// ring's index steps back (from `len` when 0) and that entry takes the position (w kept).
+fn tail_ring(r: &mut Run, o: u32, ring: u32, index: u32, len: u8) {
+    let pos = vec4(r, o + 0x40);
+    if r.m.u32(o + 0xc) == 0 {
+        for i in 0..u32::from(len) {
+            put_vec4(r, ring + 0x10 * i, [pos[0], pos[1], pos[2], 1.0]);
+        }
+    }
+    if r.m.u8(index) == 0 {
+        r.m.set_u8(index, len);
+    }
+    let k = r.m.u8(index).wrapping_sub(1);
+    r.m.set_u8(index, k);
+    let e = ring + 0x10 * u32::from(k);
+    for i in 0..3 {
+        r.m.set_f32(e + 4 * i, pos[i as usize]);
+    }
+}
+
+/// pppKeShpTail2 (update): the first work's byte +0 is the ring's length, +1 its index, the ring from +0x10.
+fn ke_shp_tail2(r: &mut Run, o: u32, _key: u32, rf: u32) {
+    if r.paused {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    let len = r.m.u8(a);
+    tail_ring(r, o, a + 0x10, a + 1, len);
+}
+
+/// pppKeShpTail2 (draw): the trail (its geometry built by the renderer from the ring), then the shape's frame
+/// step (timer u16 +2 by key i16 +8, frame u16 +4).
+fn ke_shp_tail2_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let len = u32::from(r.m.u8(at(o, works(r, rf).0)));
+    geometry(r, "pppKeShpTail2", o, key, rf, (0x24, 0x10 + 0x10 * len, 8), Vec::new());
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    let shape = r.m.u32(r.env.lists[1].wrapping_add(4 * n));
+    let rec = shape + 0x10 + 8 * u32::from(r.m.u16(a + 4));
+    if !r.paused {
+        let t = r.m.u16(a + 2).wrapping_add(r.m.u16(key + 8));
+        r.m.set_u16(a + 2, t);
+        let dur = r.m.u16(rec + 2) as i16 as i32;
+        if dur <= i32::from(t) {
+            let f = r.m.u16(a + 4).wrapping_add(1);
+            r.m.set_u16(a + 4, f);
+            r.m.set_u16(a + 2, t.wrapping_sub(dur as u16));
+            if (r.m.u16(shape + 6) as i16 as i32) <= i32::from(f) {
+                if r.m.u8(rec + 4) & 0x80 != 0 {
+                    r.m.set_u32(a + 2, 0);
+                    return;
+                }
+                r.m.set_u16(a + 2, 0);
+                r.m.set_u16(a + 4, f.wrapping_sub(1));
+            }
+        }
+    }
+}
+
+fn ke_shp_tail2_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u32(a + 2, 0);
+    r.m.set_u16(a, 0x1f);
+}
+
+/// pppKeShpTail3 (update): the ring of 0x1c positions from +0x30 (index byte +0x1f8) and two colours of four
+/// i16 (+0 and +8) with their rates (+0x10, +0x20) and accelerations (+0x18, +0x28), on the key's time each
+/// taking the key's (+0x20.., +0x28.., +0x30.., +0x40.., +0x38.., +0x48..).
+fn ke_shp_tail3(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.paused {
+        return;
+    }
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    tail_ring(r, o, a + 0x30, a + 0x1f8, 0x1c);
+    let h = |r: &Run, i: u32| r.m.u16(a + 2 * i);
+    let mut v: Vec<u16> = (0..24).map(|i| h(r, i)).collect();
+    for set in [0usize, 4] {
+        let (val, rate, acc) = (set, 8 + 2 * set, 12 + 2 * set);
+        for c in 0..4 {
+            v[val + c] = v[val + c].wrapping_add(v[rate + c]);
+            v[rate + c] = v[rate + c].wrapping_add(v[acc + c]);
+        }
+    }
+    if r.m.u32(o + 0xc) == r.m.u32(key) {
+        let k = |r: &Run, off: u32| r.m.u16(key + off);
+        for c in 0..4u32 {
+            let ci = c as usize;
+            v[ci] = v[ci].wrapping_add(k(r, 0x20 + 2 * c));
+            v[8 + ci] = v[8 + ci].wrapping_add(k(r, 0x30 + 2 * c));
+            v[12 + ci] = v[12 + ci].wrapping_add(k(r, 0x38 + 2 * c));
+            v[4 + ci] = v[4 + ci].wrapping_add(k(r, 0x28 + 2 * c));
+            v[16 + ci] = v[16 + ci].wrapping_add(k(r, 0x40 + 2 * c));
+            v[20 + ci] = v[20 + ci].wrapping_add(k(r, 0x48 + 2 * c));
+        }
+    }
+    for (i, x) in v.iter().enumerate() {
+        r.m.set_u16(a + 2 * i as u32, *x);
+    }
+}
+
+/// pppKeShpTail3 (draw, unpaused only): the trail (built by the renderer), then the time +0x1f0 += key +8.
+fn ke_shp_tail3_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if r.paused {
+        return;
+    }
+    geometry(r, "pppKeShpTail3", o, key, rf, (0x50, 0x200, 8), Vec::new());
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u32(a + 0x1f0, r.m.u32(a + 0x1f0).wrapping_add(r.m.u32(key + 8)));
+}
+
+/// The init: the index, time and a C-runtime random seed (+0x1f6), the colours cleared.
+fn ke_shp_tail3_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u8(a + 0x1f8, 0);
+    r.m.set_u16(a + 0x1f4, 0);
+    r.m.set_u32(a + 0x1f0, 0);
+    let v = r.crt.rand();
+    r.m.set_u16(a + 0x1f6, v as u16);
+    set(r, a, &[0; 12]);
+}
+
+fn ke_shp_tail3_restart(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    r.m.set_u8(a + 0x1f8, 0);
+    r.m.set_u16(a + 0x1f4, 0);
+    r.m.set_u32(a + 0x1f0, 0);
+    set(r, a, &[0; 12]);
+}
+
+/// The random vector helpers of the shape field: each of x, y, z += the symmetric draw of the key's (times a
+/// unit draw when `scaled`); and += (r · k − k) with r a double symmetric draw.
+fn rand_add(r: &mut Run, v: u32, k: u32, scaled: bool) {
+    for i in 0..3 {
+        let x = r.m.f32(k + 4 * i);
+        let d = if scaled {
+            let s = r.vu_sym(x);
+            r.vu_unit(1.0) * s
+        } else {
+            r.vu_sym(x)
+        };
+        let out = (d + f64::from(r.m.f32(v + 4 * i))) as f32;
+        r.m.set_f32(v + 4 * i, out);
+    }
+}
+
+fn rand_spread(r: &mut Run, v: u32, k: u32) {
+    let a = r.vu_sym(1.0) as f32;
+    let f = ((f64::from(a)) + f64::from(a)) as f32;
+    let kv = |i: u32| r.m.f32(k + 4 * i);
+    let (k0, k1, k2) = (kv(0), kv(1), kv(2));
+    r.m.set_f32(v, r.m.f32(v) + (f * k0 - k0));
+    r.m.set_f32(v + 4, (k1 * f - k1) + r.m.f32(v + 4));
+    r.m.set_f32(v + 8, (f * k2 - k2) + r.m.f32(v + 8));
+}
+
+/// The shape field's spawn: every key byte +0xc1 frames, key byte +0xc0 sprites at the next index (of key +8):
+/// live; timer, frame, age 0; position (+0x10) about key +0x10 by the random key +0x10 (scaled by the key's flag
+/// +0x20); velocity (+0x20) key +0x40 ± key +0x50; +0x30 key +0x70 spread by key +0x80; its rate +0x40 key +0x90;
+/// +0x50 random by key +0xb0, whose z (degrees, wrapped into [0, 360]) turns the sprite's matrix (+0x60).
+fn field_spawn(r: &mut Run, a: u32, key: u32) {
+    let wait = r.m.u32(a + 0x48);
+    let wait = if wait == 0 {
+        for _ in 0..r.m.u8(key + 0xc0) {
+            let p = r.m.u32(a + 0x40) + r.m.u32(a + 0x4c) * 0xa0;
+            r.m.set_u32(p, r.m.u32(p) | 1);
+            r.m.set_u32(p + 4, 0);
+            r.m.set_u32(p + 8, 0);
+            put_vec4(r, p + 0x10, [0.0, 0.0, 0.0, 1.0]);
+            for (dst, src) in [(0x20, 0x40), (0x30, 0x70), (0x40, 0x90)] {
+                for i in 0..3 {
+                    r.m.set_u32(p + dst + 4 * i, r.m.u32(key + src + 4 * i));
+                }
+                r.m.set_u32(p + dst + 0xc, 0);
+            }
+            rand_add(r, p + 0x20, key + 0x50, false);
+            rand_spread(r, p + 0x30, key + 0x80);
+            put_vec4(r, p + 0x50, [0.0, 0.0, 0.0, 1.0]);
+            rand_add(r, p + 0x50, key + 0xb0, false);
+            let t = r.m.f32(p + 0x58);
+            let t = if 0.0 > t {
+                (f64::from(t) + 360.0) as f32
+            } else if 360.0 < t {
+                (f64::from(t) - 360.0) as f32
+            } else {
+                t
+            };
+            let ang = ((f64::from(t) * 4096.0 * 16.0) / 360.0).trunc() as i32 as u32;
+            put_mat(r, p + 0x60, &turn(b'z', ang));
+            put_vec4(r, p + 0x10, [0.0, 0.0, 0.0, 1.0]);
+            let scaled = r.m.u8(key + 0x20) != 0;
+            rand_add(r, p + 0x10, key + 0x10, scaled);
+            let next = r.m.u32(a + 0x4c) + 1;
+            r.m.set_u32(a + 0x4c, if r.m.u32(key + 8) <= next { 0 } else { next });
+        }
+        u32::from(r.m.u8(key + 0xc1))
+    } else {
+        wait
+    };
+    r.m.set_u32(a + 0x48, wait.wrapping_sub(1));
+}
+
+/// The shape field's step: each live sprite ages (dying at the life +0x54), its velocity takes key +0x60 and its
+/// position the velocity, +0x40 takes key +0xa0 and +0x30 that; its frame steps (key i16 +0xc) through the shape.
+fn field_step(r: &mut Run, a: u32, key: u32, shape: u32) {
+    let ps = r.m.u32(a + 0x40);
+    for i in 0..r.m.u32(key + 8) {
+        let p = ps + i * 0xa0;
+        if r.m.u32(p) & 1 == 0 {
+            continue;
+        }
+        let frame = r.m.u16(p + 6);
+        let age = r.m.u32(p + 8).wrapping_add(1);
+        r.m.set_u32(p + 8, age);
+        if r.m.u32(a + 0x54) <= age {
+            r.m.set_u32(p, r.m.u32(p) & !1);
+        }
+        for i in 0..3 {
+            let v = r.m.f32(key + 0x60 + 4 * i) + r.m.f32(p + 0x20 + 4 * i);
+            r.m.set_f32(p + 0x20 + 4 * i, v);
+        }
+        for i in 0..4 {
+            let v = r.m.f32(p + 0x10 + 4 * i) + r.m.f32(p + 0x20 + 4 * i);
+            r.m.set_f32(p + 0x10 + 4 * i, v);
+        }
+        for i in 0..3 {
+            let v = r.m.f32(key + 0xa0 + 4 * i) + r.m.f32(p + 0x40 + 4 * i);
+            r.m.set_f32(p + 0x40 + 4 * i, v);
+        }
+        for i in 0..3 {
+            let v = r.m.f32(p + 0x30 + 4 * i) + r.m.f32(p + 0x40 + 4 * i);
+            r.m.set_f32(p + 0x30 + 4 * i, v);
+        }
+        let t = r.m.u16(key + 0xc).wrapping_add(r.m.u16(p + 4));
+        r.m.set_u16(p + 4, t);
+        let rec = shape + 0x10 + 8 * u32::from(frame);
+        let dur = r.m.u16(rec + 2) as i16 as i32;
+        if dur <= i32::from(t) {
+            let f = frame.wrapping_add(1);
+            r.m.set_u16(p + 4, t.wrapping_sub(dur as u16));
+            r.m.set_u16(p + 6, f);
+            if (r.m.u16(shape + 6) as i16 as i32) <= i32::from(f) {
+                if r.m.u8(rec + 4) & 0x80 == 0 {
+                    r.m.set_u16(p + 4, 0);
+                    r.m.set_u16(p + 6, frame);
+                } else {
+                    r.m.set_u32(p + 4, 0);
+                }
+            }
+        }
+    }
+}
+
+/// Maps whose shape fields keep their render entries (they are freed with the sprites instead).
+fn field_keeps_entries(map: u32) -> bool {
+    matches!(map, 0x76f | 0x18e7 | 0x5c8 | 0x1f7 | 0x4c4 | 0x1b8a | 0x324 | 0x1e8a | 0x1139)
+}
+
+/// pppDrawShapeField: a field of sprites (key +8 of them, 0xa0 bytes each in the pool at the first work's +0x40,
+/// with a 0xc-byte buffer at +0x44 and a colour history of the life's frames at +0x50, made on the first
+/// draw): the second work's colour into the history while the object is young; near the definition's end the
+/// object's age held while sprites live; unless paused (and the part not draining) the spawn; the draw; the
+/// step.
+fn draw_shape_field(r: &mut Run, o: u32, key: u32, rf: u32) {
+    let (wa, wb) = works(r, rf);
+    let a = at(o, wa);
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let entry = r.env.lists[1].wrapping_add(4 * n);
+    let shape = r.m.u32(entry);
+    if shape == 0 {
+        return;
+    }
+    if r.m.u32(a + 0x40) == 0 {
+        let count = r.m.u32(key + 8);
+        let p = r.env.alloc(r.m, count.wrapping_mul(0xa0));
+        r.m.set_u32(a + 0x40, p);
+        if p == 0 {
+            return;
+        }
+        for i in 0..count * 0xa0 {
+            r.m.set_u8(p + i, 0);
+        }
+        let q = r.env.alloc(r.m, 0xc);
+        r.m.set_u32(a + 0x44, q);
+        if q == 0 {
+            return;
+        }
+        let life = r.m.u32(a + 0x54);
+        let h = r.env.alloc(r.m, life << 3);
+        r.m.set_u32(a + 0x50, h);
+        if h == 0 {
+            return;
+        }
+        for i in 0..life << 3 {
+            r.m.set_u8(h + i, 0);
+        }
+    }
+    let age = r.m.u32(o + 0xc) as i32;
+    let t = ((age + (age >> 31 & 0xfff)) >> 12) as u32;
+    if r.m.u32(a + 0x58) == 0 && t < r.m.u32(a + 0x54) {
+        let h = r.m.u32(a + 0x50) + t * 8;
+        let b = at(o, wb);
+        for i in 0..4 {
+            r.m.set_u16(h + 2 * i, r.m.u16(b + 2 * i));
+        }
+    }
+    let def = r.m.u32(r.m.u32(o + 8));
+    if (r.m.u32(def + 0x1c).wrapping_sub(0x1000) as i32) <= age {
+        let ps = r.m.u32(a + 0x40);
+        let count = r.m.u32(key + 8);
+        if (0..count).any(|i| r.m.u32(ps + i * 0xa0) & 1 != 0) {
+            r.m.set_u32(o + 0xc, (age - 0x1000) as u32);
+        }
+        r.m.set_u32(a + 0x58, 1);
+    }
+    if !r.paused && !r.part_draining {
+        field_spawn(r, a, key);
+    }
+    let count = r.m.u32(key + 8);
+    let extra = bytes(r, r.m.u32(a + 0x40), count * 0xa0);
+    let mut hist = bytes(r, r.m.u32(a + 0x50), r.m.u32(a + 0x54) * 8);
+    let mut all = extra;
+    all.append(&mut hist);
+    geometry(r, "pppDrawShapeField", o, key, rf, (0xc4, 0x5c, 8), all);
+    if !r.paused {
+        field_step(r, a, key, shape);
+    }
+}
+
+fn draw_shape_field_init(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    set(r, a, &IDENTITY_M.map(f32::to_bits));
+    set(r, a + 0x40, &[0; 5]);
+    let def = r.m.u32(r.m.u32(o + 8));
+    let span = r.m.u32(def + 0x1c).wrapping_sub(r.m.u32(def + 0x18)) as i32;
+    r.m.set_u32(a + 0x54, (((span + (span >> 31 & 0xfff)) >> 12) + 1) as u32);
+    r.m.set_u32(a + 0x58, 0);
+}
+
+fn draw_shape_field_free(r: &mut Run, o: u32, rf: u32) {
+    let (wa, _) = works(r, rf);
+    let a = at(o, wa);
+    if !field_keeps_entries(r.map_id) {
+        r.render.push(super::RenderCall::Destroy { object: o, ref_index: r.ref_index });
+    }
+    for off in [0x40, 0x44, 0x50] {
+        let p = r.m.u32(a + off);
+        if p != 0 {
+            r.env.free(r.m, p);
+        }
+    }
+}
+
+/// Maps with a sea (pppDrawMdlSea draws only there).
+fn sea_map(map: u32) -> bool {
+    matches!(
+        map,
+        0x199
+            | 0x17e6
+            | 0x24c9
+            | 0xa95
+            | 0x245b
+            | 0xa27
+            | 0x170a
+            | 0xe58
+            | 0x1b3b
+            | 0xb3
+            | 0x1acd
+            | 0x99
+            | 0xe6c
+            | 0xf48
+    )
+}
+
+/// pppDrawMdlSea (on the sea maps): the third work (+0x40 a wave phase vector, +0x50.. u and v with speeds and
+/// accelerations, +0x68 the model's resting vertices, +0x6c a byte per vertex, +0x70 the key, +0x74 / +0x75 /
+/// +0x76 the texture animation's wait, frame and count, +0x77 waves on), made on the first draw; unless paused,
+/// the scroll ramps (key +8..+0x1c), and with waves each flagged vertex of the model moved from rest by the sine
+/// of (phase + x + z) · key +0x40 / +0x44 / +0x48, times key +0x20 / +0x24 / +0x28, the phase moving by key
+/// +0x30..; the draw (always semi-transparent; key +0x52 the blend (0xff: the model's), +0x54 flag 0x10, +0x55
+/// facing, +0x56 / +0x57 flags 0x200 / 8).
+fn draw_mdl_sea(r: &mut Run, o: u32, key: u32, rf: u32) {
+    if !sea_map(r.map_id) {
+        return;
+    }
+    let n = r.m.u32(key + 4);
+    if n == 0xffff {
+        return;
+    }
+    let (wa, _, wc) = works3(r, rf);
+    let c = at(o, wc);
+    let model = r.m.u32(image_record(r, n) + 0x1c);
+    if r.m.u32(c + 0x70) == 0 && !sea_setup(r, key, c, model) {
+        return;
+    }
+    if !r.paused {
+        if r.m.u32(key) == r.m.u32(o + 0xc) {
+            for i in 0..6 {
+                let v = r.m.f32(key + 8 + 4 * i) + r.m.f32(c + 0x50 + 4 * i);
+                r.m.set_f32(c + 0x50 + 4 * i, v);
+            }
+        }
+        let du = r.m.f32(c + 0x58) + r.m.f32(c + 0x54);
+        r.m.set_f32(c + 0x54, du);
+        let dv = r.m.f32(c + 0x64) + r.m.f32(c + 0x60);
+        r.m.set_f32(c + 0x60, dv);
+        let u = du + r.m.f32(c + 0x50);
+        r.m.set_f32(c + 0x50, (f64::from(u) % 32768.0) as f32);
+        let v = dv + r.m.f32(c + 0x5c);
+        r.m.set_f32(c + 0x5c, (f64::from(v) % 32768.0) as f32);
+        if r.m.u8(c + 0x77) != 0 {
+            let base = r.m.u32(c + 0x68);
+            let flags = r.m.u32(c + 0x6c);
+            let verts = model.wrapping_add(r.m.u32(model + 8));
+            let t = crate::traced_tables::sine();
+            let sine = |x: i32| t[((x >> 4) & 0xfff) as usize];
+            let ftol = |x: f64| x.trunc() as i32;
+            for i in 0..(r.m.u16(model + 0x12) as i16).max(0) as u32 {
+                if r.m.u8(flags + i) == 0 {
+                    continue;
+                }
+                let b = [r.m.u16(base + 6 * i), r.m.u16(base + 6 * i + 2), r.m.u16(base + 6 * i + 4)];
+                let s = (i32::from(b[0] as i16) + i32::from(b[2] as i16)) as f32;
+                let ph = |k: u32| f64::from(r.m.f32(c + 0x40 + 4 * k));
+                let kf = |off: u32| f64::from(r.m.f32(key + off));
+                let e1 = ftol((ph(1) + f64::from(s)) * kf(0x44));
+                let e2 = ftol((ph(2) + f64::from(s)) * kf(0x48));
+                let e3 = ftol((f64::from(s) + ph(0)) * kf(0x40));
+                let x = ftol(f64::from(sine(e3)) * kf(0x20)) as u16;
+                let y = ftol(f64::from(sine(e1)) * kf(0x24)) as u16;
+                let z = ftol(f64::from(sine(e2)) * kf(0x28)) as u16;
+                let out = verts + 6 * i;
+                r.m.set_u16(out, x.wrapping_add(b[0]));
+                r.m.set_u16(out + 2, y.wrapping_add(b[1]));
+                r.m.set_u16(out + 4, z.wrapping_add(b[2]));
+            }
+            for k in 0..3 {
+                let v = r.m.f32(key + 0x30 + 4 * k) + r.m.f32(c + 0x40 + 4 * k);
+                r.m.set_f32(c + 0x40 + 4 * k, v);
+            }
+        }
+        if r.m.u8(key + 0x51) != 0 {
+            let w = r.m.u8(c + 0x74).wrapping_add(1);
+            r.m.set_u8(c + 0x74, w);
+            if r.m.u8(key + 0x51) <= w {
+                // The texture animation's next frame (the map's texture animation objects, which drive the
+                // remaster's texture swap) goes to the renderer.
+                r.render.push(super::RenderCall::TextureStep { id: u32::from(r.m.u8(key + 0x50)) });
+                r.m.set_u8(c + 0x74, 0);
+            }
+        }
+    }
+    let colour = packed_colour(r, at(o, wa));
+    if colour[3] == 0 {
+        return;
+    }
+    let mut f = if r.m.u8(key + 0x54) != 0 { 0x14 } else { 4 };
+    if r.m.u8(key + 0x55) != 0 {
+        f = f & !0x10 | 0x2000;
+    }
+    if r.m.u8(key + 0x56) != 0 {
+        f |= 0x200;
+    }
+    if r.m.u8(key + 0x57) != 0 {
+        f |= 8;
+    }
+    let blend = match r.m.u8(key + 0x52) {
+        0xff => r.m.u8(model + 0x16),
+        b => b,
+    };
+    let mut cr = blend_state(blend);
+    if f & 8 != 0 {
+        cr |= 0x40;
+    }
+    let u = (f64::from(r.m.f32(c + 0x50)) * 65536.0).trunc() as i32 as u32;
+    let v = (65536.0 * f64::from(r.m.f32(c + 0x5c))).trunc() as i32 as u32;
+    let args = ModelArgs {
+        model_no: n,
+        flags: f,
+        blend,
+        texture_word: 0,
+        offsets: (u, v),
+        colour,
+        work: 0,
+        create: cr,
+        finish: true,
+        fade: None,
+    };
+    emit_model(r, o, args);
+}
+
+/// The sea's set-up: its ramps cleared, the key kept, the texture animation's wait from key +0x51; waves when
+/// key +0x20..+0x28 are not all 0: the model's resting vertices copied into the pool (6 bytes each) and a flag
+/// byte of 1 per vertex.
+fn sea_setup(r: &mut Run, key: u32, c: u32, model: u32) -> bool {
+    set(r, c + 0x40, &[0; 3]);
+    set(r, c + 0x50, &[0; 6]);
+    r.m.set_u32(c + 0x68, 0);
+    r.m.set_u32(c + 0x6c, 0);
+    r.m.set_u32(c + 0x70, key);
+    r.m.set_u8(c + 0x74, r.m.u8(key + 0x51));
+    r.m.set_u16(c + 0x75, 0);
+    let waves = !(r.m.f32(key + 0x20) == 0.0 && r.m.f32(key + 0x24) == 0.0 && r.m.f32(key + 0x28) == 0.0);
+    r.m.set_u8(c + 0x77, u8::from(waves));
+    if waves {
+        let count = (r.m.u16(model + 0x12) as i16) as i32 as u32;
+        let base = r.env.alloc(r.m, count.wrapping_mul(6));
+        r.m.set_u32(c + 0x68, base);
+        if base == 0 {
+            return false;
+        }
+        let flags = r.env.alloc(r.m, count);
+        r.m.set_u32(c + 0x6c, flags);
+        if flags == 0 {
+            return false;
+        }
+        for i in 0..count {
+            r.m.set_u8(flags + i, 1);
+        }
+        let verts = model.wrapping_add(r.m.u32(model + 8));
+        for i in 0..count * 3 {
+            r.m.set_u16(base + 2 * i, r.m.u16(verts + 2 * i));
+        }
+    }
+    set(r, c, &IDENTITY_M.map(f32::to_bits));
+    true
+}
+
+fn draw_mdl_sea_init(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    let c = at(o, wc);
+    set(r, c + 0x68, &[0; 3]);
+}
+
+fn draw_mdl_sea_restart(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    let c = at(o, wc);
+    for off in [0x54, 0x58, 0x60, 0x64] {
+        r.m.set_u32(c + off, 0);
+    }
+}
+
+fn draw_mdl_sea_free(r: &mut Run, o: u32, rf: u32) {
+    let (_, _, wc) = works3(r, rf);
+    let c = at(o, wc);
+    for off in [0x68, 0x6c] {
+        let p = r.m.u32(c + off);
+        if p != 0 {
+            r.env.free(r.m, p);
+        }
+    }
+}
+
 const ONE_W: [u32; 4] = [0, 0, 0, 0x3f80_0000];
 
 fn set(r: &mut Run, dst: u32, v: &[u32]) {
@@ -1968,6 +3167,87 @@ pub fn by_name(name: &'static str) -> Option<Program> {
         "pppMatrixZXY" => upd(matrix_zxy),
         "pppMatrixZYX" => upd(matrix_zyx),
         "pppMatrixLoc" => upd(matrix_loc),
+        // (The loop matrices run the same code as the plain ones.)
+        "pppMatrixLoop" => upd(matrix_xyz),
+        "pppDrawMatrixLoop" => Program { name, second: Some(draw_matrix), ..Program::default() },
+        "pppAngleLoop" => Program {
+            name,
+            update: Some(angle_loop),
+            init: Some(loop_init),
+            restart: Some(angle_loop_back),
+            ..Program::default()
+        },
+        "pppPointLoop" | "pppScaleLoop" => Program {
+            name,
+            update: Some(float_loop),
+            init: Some(loop_init),
+            restart: Some(float_loop_back),
+            ..Program::default()
+        },
+        "pppDrawMdlLoop" => Program {
+            name,
+            second: Some(draw_mdl_loop),
+            init: Some(draw_mdl_loop_init),
+            restart: Some(draw_mdl_loop_restart),
+            ..Program::default()
+        },
+        "pppKeZCrctShp" => Program { name, second: Some(ke_z_crct_shp), ..Program::default() },
+        "pppDrawShape" => Program {
+            name,
+            group: Some(draw_shape),
+            init: Some(zero_a1),
+            restart: Some(zero_a1),
+            ..Program::default()
+        },
+        "pppDrawShapeX" => Program {
+            name,
+            group: Some(draw_shape_x),
+            init: Some(zero_a1),
+            restart: Some(zero_a1),
+            ..Program::default()
+        },
+        "pppKeLnsLp" => Program {
+            name,
+            second: Some(ke_lns_lp),
+            init: Some(ke_lns_lp_init),
+            restart: Some(ke_lns_lp_restart),
+            ..Program::default()
+        },
+        "pppKeLnsFls" => {
+            Program { name, second: Some(ke_lns_fls), init: Some(ke_lns_fls_init), ..Program::default() }
+        }
+        "pppKeShpTail2" => Program {
+            name,
+            update: Some(ke_shp_tail2),
+            second: Some(ke_shp_tail2_draw),
+            init: Some(ke_shp_tail2_init),
+            ..Program::default()
+        },
+        "pppKeShpTail3" => Program {
+            name,
+            update: Some(ke_shp_tail3),
+            second: Some(ke_shp_tail3_draw),
+            init: Some(ke_shp_tail3_init),
+            restart: Some(ke_shp_tail3_restart),
+            ..Program::default()
+        },
+        "pppDrawShapeField" => Program {
+            name,
+            second: Some(draw_shape_field),
+            init: Some(draw_shape_field_init),
+            free: Some(draw_shape_field_free),
+            ..Program::default()
+        },
+        "pppDrawMdlSea" => Program {
+            name,
+            second: Some(draw_mdl_sea),
+            init: Some(draw_mdl_sea_init),
+            restart: Some(draw_mdl_sea_restart),
+            free: Some(draw_mdl_sea_free),
+            ..Program::default()
+        },
+        // (No entry points.)
+        "pppSMatrix" => Program { name, ..Program::default() },
         "pppMatrixScl" => upd(matrix_scl),
         "pppParMatrix" => upd(par_matrix),
         "pppKeParMatR" => upd(ke_par_mat_r),

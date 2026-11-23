@@ -317,6 +317,16 @@ pub struct Run<'a> {
     /// first, then the second).
     pub frame: crate::chr::elements::Mat,
     pub world: crate::chr::elements::Mat,
+    /// The engine's screen matrix and the camera-space position the map effects' second draw-matrix kind
+    /// keeps (the lens and thunder programs read them).
+    pub screen: crate::chr::elements::Mat,
+    pub camera_pos: [f32; 4],
+    /// The index of the program reference running (with the object, the key of the remaster's render entry).
+    pub ref_index: u32,
+    /// The running part is draining (+0x1d; some programs stop spawning then).
+    pub part_draining: bool,
+    /// The remaster's map id (the sea and shape-field programs test it).
+    pub map_id: u32,
     /// The remaster's slower vertex spawning in one scene (map 0xe6c, event 0xcc6, magic 0x207 loaded, one of
     /// workers 5–7 running): pppVertexAp's interval × 1.8. The host sets it.
     pub vertex_ap_slow: bool,
@@ -351,8 +361,9 @@ pub struct Scene {
 /// render entry per object (made on its first draw with `create`, updated on every later one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelDraw {
-    /// The object (its entry's key, with the effect).
+    /// The object and the program reference index (its entry's key).
     pub object: u32,
+    pub ref_index: u32,
     /// The image record (0x20 bytes of the group's +0x14 list) and its model (the record's +0x1c).
     pub record: u32,
     pub model: u32,
@@ -385,10 +396,33 @@ pub struct ModelDraw {
     pub fade: Option<(u32, u32, f32)>,
 }
 
+/// A shape draw: one frame of a shape (the group's +0x18 list: frames of sprites) for one object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeDraw {
+    pub object: u32,
+    pub ref_index: u32,
+    /// The shape's entry in the list and the shape, and the frame drawn.
+    pub entry: u32,
+    pub shape: u32,
+    pub frame: u32,
+    /// The draw flags (0x80 always; 0x800, 0x400 from the key).
+    pub flags: u16,
+    /// The object's colour times the part's.
+    pub colour: [u8; 4],
+    /// The object's draw matrix and, when the key names one, a work matrix.
+    pub matrix: crate::chr::elements::Mat,
+    pub work_matrix: Option<crate::chr::elements::Mat>,
+    /// The render state a new entry is made with (from the frame's blend); `None`: no new entry this frame.
+    pub create: Option<u32>,
+    /// Drawn through the remaster's third path (pppDrawShape) rather than the plain one (pppDrawShapeX).
+    pub path3: bool,
+}
+
 /// A frame-buffer distortion draw of a model (pppKeMdlDtt).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistortDraw {
     pub object: u32,
+    pub ref_index: u32,
     pub model: u32,
     /// The colour (the part's u16 times the work's i16, · 2⁻²⁶).
     pub colour: [f32; 4],
@@ -407,6 +441,41 @@ pub struct DistortDraw {
     pub pointer: Option<(u32, u32)>,
 }
 
+/// A value rounded to single and taken as its bits.
+trait F32Bits {
+    fn to_bits_f32(self) -> u32;
+}
+
+impl F32Bits for f64 {
+    fn to_bits_f32(self) -> u32 {
+        (self as f32).to_bits()
+    }
+}
+
+/// The inputs of a draw whose geometry the renderer builds (the tails, the shape field): the program, the
+/// object and reference, copies of the key and the program's work (and the second work, the colour), the
+/// object's matrix and the part's scale, colour and the camera.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeometryDraw {
+    pub program: &'static str,
+    pub object: u32,
+    pub ref_index: u32,
+    pub key: Vec<u8>,
+    pub work: Vec<u8>,
+    pub colour_work: Vec<u8>,
+    /// The shape list entry the key names and the shape.
+    pub entry: u32,
+    pub shape: u32,
+    /// The object's matrix (+0x10) and age.
+    pub matrix: crate::chr::elements::Mat,
+    pub age: u32,
+    pub part_scale: [f32; 4],
+    pub part_colour: [u16; 4],
+    pub camera: crate::chr::elements::Mat,
+    /// A buffer the program keeps in the pool (the shape field's sprites and colours).
+    pub extra: Vec<u8>,
+}
+
 /// A program's request to the renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderCall {
@@ -414,6 +483,22 @@ pub enum RenderCall {
     Accumulation(u32, u32),
     Model(Box<ModelDraw>),
     Distort(Box<DistortDraw>),
+    Shape(Box<ShapeDraw>),
+    Geometry(Box<GeometryDraw>),
+    /// The render entry of (object, reference index) destroyed.
+    Destroy {
+        object: u32,
+        ref_index: u32,
+    },
+    /// The map texture animation `id` steps to its next frame (the remaster swaps the texture).
+    TextureStep {
+        id: u32,
+    },
+    /// The render entry of (object, reference index) made invisible this frame.
+    Hide {
+        object: u32,
+        ref_index: u32,
+    },
 }
 
 impl Run<'_> {
@@ -433,6 +518,33 @@ impl Run<'_> {
         v + -1.0
     }
 
+    /// The step of the vector-unit seed the engine's other two draws share: the float of the seed's LFSR step
+    /// (1.0 while the generator is off, which these turn on).
+    fn vu_step(&mut self) -> f32 {
+        let l = if self.vu.on {
+            let s = self.vu.seed;
+            f32::from_bits(((s >> 18 ^ s) >> 4 & 1) | ((s & 0x3f_ffff) | 0x1fc0_0000) << 1)
+        } else {
+            1.0
+        };
+        self.vu.on = true;
+        l
+    }
+
+    /// The symmetric draw: (2l − 3) · `p` in (−p, p); the seed becomes 2l − 1.8872414.
+    pub fn vu_sym(&mut self, p: f32) -> f64 {
+        let l = f64::from(self.vu_step());
+        self.vu.seed = ((l + l) - 1.887_241_4).to_bits_f32();
+        ((l + l) - 3.0) * f64::from(p)
+    }
+
+    /// The unit draw: (l − 1) · `p` in [0, p); the seed becomes l − 1 − 1.8872414.
+    pub fn vu_unit(&mut self, p: f32) -> f64 {
+        let l = f64::from(self.vu_step());
+        self.vu.seed = ((l - 1.0) - 1.887_241_4).to_bits_f32();
+        (l - 1.0) * f64::from(p)
+    }
+
     /// The vector-unit integer draw (two draws; the second's value · 32768, truncated).
     pub fn vu_int(&mut self) -> i32 {
         self.vu_draw();
@@ -447,7 +559,7 @@ impl Run<'_> {
 }
 
 /// A running part (the part state the part start fills).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Part {
     /// 0, or 0xfffff000 when its sub-part slots could not be allocated.
     pub status: u32,
@@ -517,9 +629,41 @@ impl Part {
         r.part_scale = [self.place[8], self.place[9], self.place[10], self.place[11]];
         r.part_colour = self.colour;
         r.part_word = self.word;
+        r.part_draining = self.drained;
         let done = self.step(r, flags);
         self.objects = r.objects;
         done
+    }
+
+    /// The map effects' step (the update with `flags`): as [`Part::update`], but a pool that runs out while the
+    /// part spawns or runs its programs ends the step there and the part with it (true).
+    pub fn update_map(&mut self, r: &mut Run, flags: u8) -> bool {
+        r.objects = self.objects;
+        r.slots = self.slots;
+        r.part_scale = [self.place[8], self.place[9], self.place[10], self.place[11]];
+        r.part_colour = self.colour;
+        r.part_word = self.word;
+        r.part_draining = self.drained;
+        if flags & 0x10 != 0 {
+            self.each_program(r, |pg| pg.pre);
+        }
+        r.env.alloc_failed = false;
+        self.spawn(r);
+        if !r.env.alloc_failed {
+            self.run(r, true);
+            if !r.env.alloc_failed {
+                if flags & 0x20 != 0 {
+                    self.each_program(r, |pg| pg.post);
+                }
+                self.objects = r.objects;
+                return self.advance(r);
+            }
+        }
+        if flags & 0x20 != 0 {
+            self.each_program(r, |pg| pg.post);
+        }
+        self.objects = r.objects;
+        true
     }
 
     fn step(&mut self, r: &mut Run, flags: u8) -> bool {
@@ -527,10 +671,15 @@ impl Part {
             self.each_program(r, |pg| pg.pre);
         }
         self.spawn(r);
-        self.run(r);
+        self.run(r, false);
         if flags & 0x20 != 0 {
             self.each_program(r, |pg| pg.post);
         }
+        self.advance(r)
+    }
+
+    /// The time step after the run (unless paused) and whether the part is done.
+    fn advance(&mut self, r: &mut Run) -> bool {
         if r.paused {
             return false;
         }
@@ -675,7 +824,9 @@ pub fn free_object(r: &mut Run, o: u32) {
 impl Part {
     /// The part run: each slot's objects through its definition's programs (keys advanced on their time),
     /// their ages stepped; then objects past their definition's times restart or go.
-    fn run(&mut self, r: &mut Run) {
+    /// The part run over every slot; `abortable` (the map effects' run) stops at the first program call after
+    /// which a pool has run out.
+    fn run(&mut self, r: &mut Run, abortable: bool) {
         for i in 0..self.subs.0 {
             let s = self.slots + i * 0x10;
             if self.slots == 0 {
@@ -690,8 +841,12 @@ impl Part {
             for k in 0..refs.max(0) as u32 {
                 let rf = def + 0x28 + k * 0x10;
                 let Some(pg) = r.program(rf) else { continue };
+                r.ref_index = k;
                 if let Some(g) = pg.group {
                     g(r, s, def, rf, k);
+                    if abortable && r.env.alloc_failed {
+                        return;
+                    }
                     continue;
                 }
                 let skip_second = r.m.u32(def + 0xc) & 1 != 0;
@@ -708,9 +863,15 @@ impl Part {
                     let after = r.m.u32(o);
                     if let Some(f) = pg.update {
                         f(r, o, key, rf);
+                        if abortable && r.env.alloc_failed {
+                            return;
+                        }
                     }
                     if !skip_second && let Some(f) = pg.second {
                         f(r, o, key, rf);
+                        if abortable && r.env.alloc_failed {
+                            return;
+                        }
                     }
                     o = after;
                 }

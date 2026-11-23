@@ -24,10 +24,9 @@ pub struct Effects {
     pub request: u32,
     /// The bodies' effects held off (0244) / let on (0245): bit 0x800 of the effect system's flags.
     pub et_flags: u32,
-    /// The running effect's driver, the engine's vector-unit random generator and the particle runtime's pause.
+    /// The running effect's driver and the engine's vector-unit random generator.
     pub effect: Option<Box<crate::ppp::driver::Effect>>,
     pub vu: crate::ppp::VuRand,
-    pub particles_paused: bool,
 }
 
 /// The effect `id` from the magic files, when its driver is ported.
@@ -45,7 +44,7 @@ fn with_driver<T>(
     f: impl FnOnce(&mut crate::ppp::driver::Effect, &mut crate::ppp::driver::Host) -> T,
 ) -> Option<T> {
     let mut e = g.effects.effect.take()?;
-    let mut paused = g.effects.particles_paused;
+    let mut paused = g.map_effect_230fd34 != 0;
     let mut vu = g.effects.vu;
     let mut h = crate::ppp::driver::Host {
         ticking: true,
@@ -56,9 +55,12 @@ fn with_driver<T>(
         vu: &mut vu,
         crt: &mut g.crt_rand,
         event: u32::from(g.scene.unwrap_or(0)),
+        map_id: g.map_id,
     };
     let out = f(&mut e, &mut h);
-    g.effects.particles_paused = paused;
+    if paused {
+        g.map_effect_230fd34 = 1;
+    }
     g.effects.vu = vu;
     g.effects.effect = Some(e);
     Some(out)

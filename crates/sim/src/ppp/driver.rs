@@ -59,8 +59,9 @@ pub struct Host<'a> {
     pub paused: &'a mut bool,
     pub vu: &'a mut VuRand,
     pub crt: &'a mut crate::field::face::CrtRand,
-    /// The current event (for the draw adjustments).
+    /// The current event and the remaster's map id (for the draw adjustments).
     pub event: u32,
+    pub map_id: u32,
 }
 
 /// What a driver call asks of the event system.
@@ -227,6 +228,11 @@ impl Effect {
             camera: self.camera,
             frame: self.frame,
             world: self.world,
+            screen: IDENTITY,
+            camera_pos: [0.0; 4],
+            ref_index: 0,
+            part_draining: false,
+            map_id: h.map_id,
             vertex_ap_slow: false,
             vertex_lc_extend: false,
             magic: self.magic,

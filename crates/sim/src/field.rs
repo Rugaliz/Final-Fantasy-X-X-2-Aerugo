@@ -1199,7 +1199,9 @@ pub struct FieldState {
     /// The map's particle effects as natives switch them.
     pub map_effects: map_fx::MapEffects,
     pub map_effects_on: map_fx::EffectsOn,
-    /// A map display switch (805c) and a map effect value (8066).
+    /// The map effects' particle runtime (from the map package's table).
+    pub map_runtime: Option<Box<map_fx::MapRuntime>>,
+    /// A map display switch (805c), and the particle runtime's pause (8066 sets it; an effect may too).
     pub map_switch_5eb8: u8,
     pub map_effect_230fd34: i32,
     /// The PS2 map's pre-rendered background layers.
@@ -2831,6 +2833,7 @@ impl Event {
             state.map_fog = MapFog::from_map_package(&d);
             state.ps_fog = fog::PsFog::from_map_package(&d).unwrap_or_default();
             state.map_effects = map_fx::MapEffects::from_map_package(&d);
+            state.map_runtime = map_fx::MapRuntime::new(&d).map(Box::new);
             state.pre_bg = pre_bg::PreBg::from_map_package(&d, name.get(..6).unwrap_or(&name));
             state.map_display = 0x11 | if state.pre_bg.main { 0x4000 } else { 0 };
             state.map_package = Some(d.clone().into());
@@ -2946,7 +2949,9 @@ impl Event {
                 }
             }
         }
-        // The draw phase's effect step (the running effect's draw and its frame callback).
+        // The draw phase: the map's effects (while they are on and the map is shown), then the running effect's
+        // draw and its frame callback.
+        map_fx::frame_draw(&mut self.state);
         effects::frame_draw(&mut self.state);
         // The remaster's own animations step by the frame time (a 30 Hz frame here).
         if let Some(t) = &mut self.state.texture_animations {
