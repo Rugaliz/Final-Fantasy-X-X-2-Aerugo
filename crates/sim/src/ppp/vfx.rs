@@ -6,8 +6,9 @@
 //! object's draw matrix.
 //!
 //! Packet kinds (header 0x10 bytes: +1 kind, i16 +2 count, +8 the texture word): 0–3 triangles of 0x14,
-//! 0x1c, 0x20, 0x28 bytes; 4–7 quads of 0x18, 0x20, 0x28, 0x30 bytes. Textured: 2, 3, 6, 7. Kinds 2 and 6 are
-//! built so far (the others' packets are skipped, their segments empty).
+//! 0x1c, 0x20, 0x28 bytes; 4–7 quads of 0x18, 0x20, 0x28, 0x30 bytes. Textured: 2, 3, 6, 7; lit (normal
+//! indices): 1, 3, 5, 7, whose normals are (0, 0, 1) unless the draw is lit (flag 0x40: its normals and lighting
+//! come with the draw request, not ported yet).
 
 use super::{ModelDraw, Space};
 use crate::chr::elements::{Mat, apply4, mul};
@@ -163,6 +164,12 @@ pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
         f32::from(c[2]) * f32::from_bits(0x3800_0000),
         f32::from(c[3]) * (0.0078125 / alpha_scale) as f32,
     ];
+    if d.flags & 0x40 != 0 {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::error!("GAP: a lit effect draw (its normals and vertex lighting) is not ported");
+        }
+    }
     let cull = d.flags & 0x40 == 0 && d.flags & 0x10 != 0 && s.map_id != 0x52b;
     let projection = d.work_matrix.map_or_else(|| mul(&s.screen, &d.matrix), |w| mul(&s.screen, &w));
     let projected = |i: u32| -> [f32; 2] {
@@ -249,6 +256,54 @@ pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
                         let u = (i32::from(m.u16(r + 0x18 + 4 * j) as i16) + bias) as f32;
                         let v = (i32::from(m.u16(r + 0x1a + 4 * j) as i16) + bias) as f32;
                         seg.uvs.push([(u + uo) * 0.000_244_140_62, 1.0 - (v + vo) * 0.000_244_140_62]);
+                    }
+                    let culled = cull && back(u32::from(idx[0]), u32::from(idx[1]), u32::from(idx[2]));
+                    seg.indices.extend(if culled {
+                        [0; 6]
+                    } else {
+                        [base, base + 2, base + 1, base + 2, base + 3, base + 1]
+                    });
+                }
+                0 | 1 | 3 => {
+                    // Triangles: untextured (0), lit untextured (1: normal indices at +0x14), lit textured (3: UVs
+                    // at +0x14, normal indices at +0x20); colours +0/+4/+8, indices +0xc/+0xe/+0x10.
+                    let idx = [m.u16(r + 0xc), m.u16(r + 0xe), m.u16(r + 0x10)];
+                    let base = seg.positions.len() as u16;
+                    for &v in &idx {
+                        seg.positions.push(position(u32::from(v)));
+                        seg.normals.push(if kind == 0 { [0.0; 3] } else { [0.0, 0.0, 1.0] });
+                    }
+                    for j in 0..3 {
+                        colour(&mut seg, r + 4 * j, &mut dim);
+                        if kind == 3 {
+                            let u = f32::from(m.u16(r + 0x14 + 4 * j));
+                            let v = f32::from(m.u16(r + 0x16 + 4 * j));
+                            seg.uvs.push([(u + uo) * 0.000_244_140_62, 1.0 - (v + vo) * 0.000_244_140_62]);
+                        } else {
+                            seg.uvs.push([0.0, 0.0]);
+                        }
+                    }
+                    let culled = cull && back(u32::from(idx[0]), u32::from(idx[1]), u32::from(idx[2]));
+                    seg.indices.extend(if culled { [0, 0, 0] } else { [base, base + 2, base + 1] });
+                }
+                4 | 5 | 7 => {
+                    // Quads: untextured (4), lit untextured (5: normal indices at +0x18), lit textured (7: UVs at
+                    // +0x18, normal indices at +0x28); colours +0…+0xc, indices +0x10…+0x16.
+                    let idx = [m.u16(r + 0x10), m.u16(r + 0x12), m.u16(r + 0x14), m.u16(r + 0x16)];
+                    let base = seg.positions.len() as u16;
+                    for &v in &idx {
+                        seg.positions.push(position(u32::from(v)));
+                        seg.normals.push(if kind == 4 { [0.0; 3] } else { [0.0, 0.0, 1.0] });
+                    }
+                    for j in 0..4 {
+                        colour(&mut seg, r + 4 * j, &mut dim);
+                        if kind == 7 {
+                            let u = f32::from(m.u16(r + 0x18 + 4 * j));
+                            let v = f32::from(m.u16(r + 0x1a + 4 * j));
+                            seg.uvs.push([(u + uo) * 0.000_244_140_62, 1.0 - (v + vo) * 0.000_244_140_62]);
+                        } else {
+                            seg.uvs.push([0.0, 0.0]);
+                        }
                     }
                     let culled = cull && back(u32::from(idx[0]), u32::from(idx[1]), u32::from(idx[2]));
                     seg.indices.extend(if culled {
