@@ -297,6 +297,8 @@ pub struct Globals {
     pub first_c6: u8,
     /// A value a menu sets (−1 at start; 01fa reads it).
     pub menu_value_fa: i32,
+    /// The save read's argument 01c5 keeps ([1330230]).
+    pub save_read_1330230: i32,
     /// The scene's colour transform: multipliers and offsets (zero at start; an event effect's end, or a
     /// battle's start, sets the multipliers to 1). The map effects take their colour from the multipliers, and
     /// the fog and background colours use both while the display flags' bit 2 is set.
@@ -310,6 +312,7 @@ impl Default for Globals {
             turn_limit_deg: 179.0,
             first_c6: 1,
             menu_value_fa: -1,
+            save_read_1330230: 0,
             colour_mul: [0.0; 4],
             colour_add: [0.0; 4],
         }
@@ -3350,16 +3353,27 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     );
     // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
     // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
-    // Reading the save dictionary (01c5): done at once but the worker's turn ends there; nothing to report (0).
+    // 01c5(a, mode): the Al Bhed dictionary read from the save (85b1a0 / 85b590 / 85d8f0): +0x210 bit 4 off,
+    // [1330230] = a; the read's state starts at 2, so the result is 0 with mode 1, else 2; bit 4 on again. The
+    // remaster's save screen path of worker 0x5045 is not ported (reported).
     n.register(
         0x01C5,
         Native {
-            init: Some(|_, c| {
-                c.stack.pop_int();
-                c.stack.pop_int();
+            init: Some(|g, c| {
+                let mode = c.stack.pop_int();
+                let a = c.stack.pop_int();
+                g.workers.sys.flags210 &= !0x10;
+                g.globals.save_read_1330230 = a;
+                c.scratch[1] = mode as i8 as i32;
+                if g.workers.list.get(c.worker).is_some_and(|w| w.u16(crate::workers::BIND_ID) == 0x5045) {
+                    log::error!("GAP: 01c5 on worker 0x5045 (the remaster's save screen) is not ported");
+                }
             }),
             wait: Some(|_, _| WAIT_DONE),
-            result: Some(|_, _| Value::Int(0)),
+            result: Some(|g, c| {
+                g.workers.sys.flags210 |= 0x10;
+                Value::Int(if c.scratch[1] == 1 { 0 } else { 2 })
+            }),
         },
     );
     // 00fb(window): the highlighted choice of a window whose text has choices and whose choice record runs
