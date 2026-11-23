@@ -11,6 +11,7 @@
 pub mod driver;
 pub mod programs;
 pub mod relocate;
+pub mod vfx;
 
 /// A byte region at an address.
 #[derive(Debug, Clone, PartialEq, Eq)]

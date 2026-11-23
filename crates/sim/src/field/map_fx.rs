@@ -466,7 +466,7 @@ pub fn frame_draw(g: &mut FieldState) {
     let Some(mut rt) = g.map_runtime.take() else { return };
     let mut h = MapHost {
         view: g.cam_view.unwrap_or(IDENTITY),
-        screen: IDENTITY,
+        screen: g.cam_screen.unwrap_or(IDENTITY),
         paused: g.map_effect_230fd34 != 0,
         vu: &mut g.effects.vu,
         crt: &mut g.crt_rand,
@@ -476,6 +476,13 @@ pub fn frame_draw(g: &mut FieldState) {
         map_id: g.map_id,
     };
     rt.frame(&mut g.map_effects, &mut h);
+    let magic = h.magic;
+    let scene = super::effects::vfx_scene(g, magic, Some(0));
+    for c in &rt.render {
+        if let RenderCall::Model(d) = c {
+            g.vfx.push((crate::ppp::vfx::model(&rt.space, d, &scene), String::new()));
+        }
+    }
     g.map_runtime = Some(rt);
 }
 

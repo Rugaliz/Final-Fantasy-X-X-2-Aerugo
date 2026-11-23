@@ -53,8 +53,9 @@ pub struct Host<'a> {
     pub busy: bool,
     /// The event bits the scripts set.
     pub event_bits: u32,
-    /// The camera's view matrix.
+    /// The camera's view and screen matrices.
     pub view: Mat,
+    pub screen: Mat,
     /// The particle runtime's pause.
     pub paused: &'a mut bool,
     pub vu: &'a mut VuRand,
@@ -143,7 +144,7 @@ impl PartialEq for Effect {
 }
 
 /// The rigid inverse of a matrix: its turn transposed and the translation turned back (w row 0, 0, 0, 1).
-fn rigid_inverse(p: &Mat) -> Mat {
+pub(crate) fn rigid_inverse(p: &Mat) -> Mat {
     let d = f64::from;
     let mut o = [0.0; 16];
     for i in 0..3 {
@@ -228,7 +229,7 @@ impl Effect {
             camera: self.camera,
             frame: self.frame,
             world: self.world,
-            screen: IDENTITY,
+            screen: h.screen,
             camera_pos: [0.0; 4],
             ref_index: 0,
             part_draining: false,

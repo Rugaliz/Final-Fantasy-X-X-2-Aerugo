@@ -1129,6 +1129,11 @@ pub struct FieldState {
     /// The event camera system's memory.
     pub cam: crate::event_camera::CamMem,
     /// The shown camera's view matrix as the original builds it (row-major, points as rows).
+    /// The camera's screen matrix (screen slot 0), published with the view.
+    pub cam_screen: Option<[f32; 16]>,
+    /// The effect geometry of the frame's draw phase (the event effect's, then the map effects'), with the
+    /// folder its textures are in.
+    pub vfx: Vec<(crate::ppp::vfx::Mesh, String)>,
     pub cam_view: Option<[f32; 16]>,
     /// Each worker's camera handle (the original's worker +0x3c), 0 until a camera native first needs one.
     pub cam_slots: Vec<u32>,
@@ -2951,6 +2956,7 @@ impl Event {
         }
         // The draw phase: the map's effects (while they are on and the map is shown), then the running effect's
         // draw and its frame callback.
+        self.state.vfx.clear();
         map_fx::frame_draw(&mut self.state);
         effects::frame_draw(&mut self.state);
         // The remaster's own animations step by the frame time (a 30 Hz frame here).

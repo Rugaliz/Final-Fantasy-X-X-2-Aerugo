@@ -79,6 +79,8 @@ impl FieldState {
             self.cam.vec4(rec),
             self.cam.f32(rec + 0xc90),
         ));
+        let cam = &self.cam;
+        self.cam_screen = Some(crate::event_camera::view::screen_matrix(|o| cam.f32(SCREENS + o)));
     }
 
     /// The frame's camera step (after the workers ran), then each screen slot's step.

@@ -32,6 +32,26 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// The screen (projection) matrix of a screen slot's record `f` (its floats by byte offset): x scale +0x48 ·
+/// +0x1c · +0x10 / +0x58, y scale +0x4c · +0x14 · +0x1c / +0x5c, the centre (+0x70 + +0x30 + +0x20 − +0x50,
+/// +0x74 + +0x34 + +0x24 − +0x54) and +0x28 in the third row (w 1), +0x18 as the fourth row's z.
+pub fn screen_matrix(f: impl Fn(u32) -> f32) -> [f32; 16] {
+    let d = |o: u32| f64::from(f(o));
+    let sx = ((d(0x48) * d(0x1c) * d(0x10)) / d(0x58) + 0.0) as f32;
+    let sy = ((d(0x4c) * d(0x14) * d(0x1c)) / d(0x5c) + 0.0) as f32;
+    let cx = ((f(0x70) + f(0x30)) + f(0x20)) - f(0x50);
+    let cy = ((f(0x74) + f(0x34)) + f(0x24)) - f(0x54);
+    let mut m = [0.0; 16];
+    m[0] = sx;
+    m[5] = sy;
+    m[8] = cx;
+    m[9] = cy;
+    m[10] = f(0x28);
+    m[11] = 1.0;
+    m[14] = f(0x18);
+    m
+}
+
 /// The view matrix for an eye and a focus (view points, four lanes compared), an up vector and a roll.
 pub fn view_matrix(eye: [f32; 4], focus: [f32; 4], up: [f32; 4], roll: f32) -> [f32; 16] {
     if (0..4).all(|k| eye[k].to_bits() == focus[k].to_bits()) {

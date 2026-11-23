@@ -51,6 +51,7 @@ fn with_driver<T>(
         busy: false,
         event_bits: g.engine.event_bits,
         view: g.cam_view.unwrap_or(crate::chr::elements::IDENTITY),
+        screen: g.cam_screen.unwrap_or(crate::chr::elements::IDENTITY),
         paused: &mut paused,
         vu: &mut vu,
         crt: &mut g.crt_rand,
@@ -134,6 +135,28 @@ pub fn frame_draw(g: &mut FieldState) {
     }
     if with_driver(g, |e, h| e.draw(h)).is_some_and(|s| s.done) {
         g.effects.state = 6;
+    }
+    if let Some(e) = &g.effects.effect {
+        let scene = vfx_scene(g, e.magic, None);
+        let dir = format!("ffx_data/gamedata/ps3data/magic/magic_{:04}/tex/d3d11", e.magic);
+        for c in &e.render {
+            if let crate::ppp::RenderCall::Model(d) = c {
+                g.vfx.push((crate::ppp::vfx::model(&e.space, d, &scene), dir.clone()));
+            }
+        }
+    }
+}
+
+/// The scene the effect geometry is built in (the camera's screen matrix and inverse view, the ids).
+pub fn vfx_scene(g: &FieldState, magic: u32, map_part: Option<u32>) -> crate::ppp::vfx::Scene {
+    let view = g.cam_view.unwrap_or(crate::chr::elements::IDENTITY);
+    crate::ppp::vfx::Scene {
+        screen: g.cam_screen.unwrap_or(crate::chr::elements::IDENTITY),
+        inverse_view: crate::ppp::driver::rigid_inverse(&view),
+        magic,
+        map_id: g.map_id,
+        event: u32::from(g.scene.unwrap_or(0)),
+        map_part,
     }
 }
 
