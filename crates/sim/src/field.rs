@@ -4503,10 +4503,16 @@ fn register_queries(n: &mut Natives<FieldState>) {
     );
     // The pad: the word, one bit of it, and a wait until the given bits are let go.
     n.register(0x0046, Native::result(|g, _| Value::Int((pad_word(g) & 0xFFFF) as i32)));
+    // 004d: event 0x31 reads 0 for worker 0xb while the save's byte at global 0xa4d has bit 0x20.
     n.register(
         0x004D,
         Native::result(|g, c| {
             let bit = c.stack.pop_int() as u32 & 31;
+            let id = g.workers.list.get(c.worker).map_or(0, crate::workers::Worker::id);
+            let flag = c.memory.global[0].get(0xa4d).copied().unwrap_or(0);
+            if g.scene == Some(0x31) && flag & 0x20 != 0 && id == 0xb {
+                return Value::Int(0);
+            }
             Value::Int(i32::from(pad_word(g) & 0xFFFF & (1 << bit) != 0))
         }),
     );
@@ -5963,8 +5969,16 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0065,
         Native::result(|g, c| {
             let align = c.stack.pop_int();
-            let y = c.stack.pop_int();
-            let x = c.stack.pop_int();
+            let mut y = c.stack.pop_int();
+            let mut x = c.stack.pop_int();
+            // Three windows placed by event and language type.
+            let lang = g.language_type;
+            match g.scene {
+                Some(0x17) if (x, y) == (0x1e6, 0x104) => (x, y) = (0x1c7, 199),
+                Some(0xab) if (x, y) == (0x100, 0x14f) && matches!(lang, Some(2 | 3)) => y = 0x140,
+                Some(0xd4) if (x, y) == (0x16, 0xdc) && lang == Some(4) => y = 0x82,
+                _ => {}
+            }
             let w = window(c);
             g.windows[w].x = x;
             g.windows[w].y = y;
