@@ -240,9 +240,6 @@ fn engine_joint(v: [f32; 9]) -> aerugo_formats::motion::JointPose {
     }
 }
 
-/// The title's two choices (pictures in the original).
-const TITLE_CHOICES: [&str; 2] = ["New Game", "Load Game"];
-
 /// The menu the title asks for to load a game.
 const LOAD_GAME_MENU: u32 = 0x4010_0000;
 
@@ -1313,36 +1310,28 @@ impl FieldView {
             }
             renderer.submit_frame(frame);
         }
-        // Message windows over the view, placed in the original's 512 × 448 frame (the stand-in when the game's
-        // 2D layer is not drawn).
+        // A window the game's 2D layer did not draw is a gap on the game screen; the debug viewer shows its text.
         let rect = response.rect;
         for (i, w) in st.windows.iter().enumerate().filter(|(i, w)| w.open && !drawn_windows.contains(i)) {
+            if self.game {
+                log::error!(
+                    "GAP: message window {i} (frame type {:?}) is not drawn by the 2D layer",
+                    w.style
+                );
+                continue;
+            }
             let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
             // Revealed so far; the last lines of a choice message are its choices.
             let shown: String = msg.text.chars().take(w.shown).collect();
             let lines: Vec<&str> = shown.lines().collect();
             let total = msg.text.lines().count();
             let first_choice = total.saturating_sub(usize::from(msg.choices));
-            // The title's choices are pictures in the original; the window only holds blank slots for them.
-            let title = self.game && msg.choices > 0 && msg.text.lines().all(|l| l.trim().is_empty());
             let text = lines
                 .iter()
                 .enumerate()
                 .map(|(k, l)| {
                     if msg.choices > 0 && k >= first_choice {
-                        let label = if title {
-                            TITLE_CHOICES.get(k - first_choice).copied().unwrap_or("")
-                        } else {
-                            l.trim_end()
-                        };
-                        let cursor = if !self.game {
-                            "▸"
-                        } else if k - first_choice == w.choice {
-                            ">"
-                        } else {
-                            "  "
-                        };
-                        format!("{cursor} {label}")
+                        format!("▸ {}", l.trim_end())
                     } else {
                         (*l).to_owned()
                     }
@@ -1351,7 +1340,6 @@ impl FieldView {
                 .join("\n");
             let pos =
                 rect.min + egui::vec2(w.x as f32 / 512.0 * rect.width(), w.y as f32 / 448.0 * rect.height());
-            let game = self.game;
             let pivot = match w.align {
                 4 => egui::Align2::CENTER_CENTER,
                 2 => egui::Align2::RIGHT_CENTER,
@@ -1360,15 +1348,11 @@ impl FieldView {
             egui::Area::new(egui::Id::new(("field-window", i))).fixed_pos(pos).pivot(pivot).show(
                 ui.ctx(),
                 |ui| {
-                    if game {
-                        message_box(ui, &text, rect.width(), w.shown >= w.reveal);
-                    } else {
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.set_max_width(rect.width() * 0.6);
-                            ui.label(text);
-                            ui.weak("Enter ▸");
-                        });
-                    }
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(rect.width() * 0.6);
+                        ui.label(text);
+                        ui.weak("Enter ▸");
+                    });
                 },
             );
         }
@@ -1502,25 +1486,6 @@ fn game_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(196, 204, 230)))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(18, 12))
-}
-
-/// A message window on the game screen: the text so far (sized to it), and a marker once it is all shown.
-fn message_box(ui: &mut egui::Ui, text: &str, view_width: f32, complete: bool) {
-    let size = (view_width / 48.0).clamp(16.0, 30.0);
-    game_frame().show(ui, |ui| {
-        ui.set_max_width(view_width * 0.7);
-        let mut job = egui::text::LayoutJob::default();
-        let body = egui::TextFormat::simple(egui::FontId::proportional(size), egui::Color32::WHITE);
-        job.append(text, 0.0, body);
-        if complete {
-            let mark = egui::TextFormat::simple(
-                egui::FontId::proportional(size * 0.6),
-                egui::Color32::from_rgb(230, 220, 160),
-            );
-            job.append("  ▼", 0.0, mark);
-        }
-        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
-    });
 }
 
 /// What the field shows at one tick: each actor's position and heading, and the camera.
