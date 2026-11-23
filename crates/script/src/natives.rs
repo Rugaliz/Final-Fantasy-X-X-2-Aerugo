@@ -66,6 +66,8 @@ pub struct Replay {
 pub struct Coverage {
     pub calls: BTreeMap<u16, u64>,
     pub missing: BTreeSet<u16>,
+    /// Stand-ins already reported.
+    pub stand_ins: BTreeSet<u16>,
 }
 
 impl Coverage {
@@ -201,14 +203,21 @@ impl<G: World> Host for Bound<'_, G> {
         *self.natives.coverage.calls.entry(id).or_default() += 1;
         match self.natives.table.get(&id).copied() {
             Some(n) => {
+                // A stand-in is reported the first time it runs.
+                if self.natives.stubs.contains(&id) && self.natives.coverage.stand_ins.insert(id) {
+                    log::error!(
+                        "GAP: native {} runs as a stand-in (its engine part is not ported)",
+                        script::native(self.natives.game, id).display(id)
+                    );
+                }
                 if let Some(init) = n.init {
                     init(self.game, call);
                 }
             }
             None => {
                 if self.natives.coverage.missing.insert(id) {
-                    log::debug!(
-                        "native {} not implemented",
+                    log::error!(
+                        "GAP: native {} not implemented",
                         script::native(self.natives.game, id).display(id)
                     );
                 }
