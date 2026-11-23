@@ -739,7 +739,7 @@ impl MapRuntime {
                 _ => mul(&world, &frame),
             };
             for k in 0..4 {
-                let c = (h.colour[k].min(1.0) * 4096.0).round_ties_even();
+                let c = (h.colour[k].min(1.0) * 4096.0).trunc();
                 e.part.colour[k] = c as i32 as u16;
             }
             e.part.drained = e.mode != 0;
