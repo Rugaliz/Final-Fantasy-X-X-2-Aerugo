@@ -971,10 +971,12 @@ impl FieldView {
         });
         ui.separator();
         ui.strong("Message windows");
-        for (i, w) in ev.state.windows.iter().enumerate().filter(|(_, w)| w.open || w.message.is_some()) {
+        for (i, w) in
+            ev.state.windows.iter().enumerate().filter(|(_, w)| w.atel_state != 0 || w.message.is_some())
+        {
             let text =
                 w.message.and_then(|m| ev.state.messages.get(m)).map(|m| m.raw.clone()).unwrap_or_default();
-            ui.label(format!("{i}{} #{:?}: {text}", if w.open { " (open)" } else { "" }, w.message));
+            ui.label(format!("{i} (state {}) #{:?}: {text}", w.atel_state, w.message));
         }
         ui.separator();
         ui.strong("Workers");
@@ -1312,7 +1314,9 @@ impl FieldView {
         }
         // A window the game's 2D layer did not draw is a gap on the game screen; the debug viewer shows its text.
         let rect = response.rect;
-        for (i, w) in st.windows.iter().enumerate().filter(|(i, w)| w.open && !drawn_windows.contains(i)) {
+        for (i, w) in
+            st.windows.iter().enumerate().filter(|(i, w)| w.to.text.on && !drawn_windows.contains(i))
+        {
             if self.game {
                 log::error!(
                     "GAP: message window {i} (frame type {:?}) is not drawn by the 2D layer",
@@ -1322,7 +1326,7 @@ impl FieldView {
             }
             let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
             // Revealed so far; the last lines of a choice message are its choices.
-            let shown: String = msg.text.chars().take(w.shown).collect();
+            let shown: String = msg.text.chars().take(w.to.text.shown.max(0) as usize).collect();
             let lines: Vec<&str> = shown.lines().collect();
             let total = msg.text.lines().count();
             let first_choice = total.saturating_sub(usize::from(msg.choices));
@@ -1456,24 +1460,33 @@ fn message_canvas(
     let mut canvas = aerugo_sim::ui2d::Canvas::new();
     let mut drawn = Vec::new();
     let metrics = msgwin::Metrics::new(px.0, px.1);
-    for (i, w) in st.windows.iter().enumerate().filter(|(_, w)| w.open) {
+    // TODrawMessageWindow: each window's frame (while up), then its text (while on) — the current page.
+    for (i, w) in st.windows.iter().enumerate() {
+        let (f, t) = (&w.to.frame, &w.to.text);
+        if t.hidden || !(f.on || t.on) {
+            continue;
+        }
         let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
         let frame_type = usize::from(w.style.unwrap_or(0));
-        if msg.bytes.is_empty() || frame_type > 2 {
+        if frame_type > 2 {
             continue;
         }
         drawn.push(i);
-        let kind = msgwin::TextKind::from_flags(w.flags);
-        let (tw, th) = msgwin::measure(&msg.bytes, font, &metrics, kind, frame_type);
+        let end = t.end.unwrap_or(msg.bytes.len()).min(msg.bytes.len());
+        let page = msg.bytes.get(t.start.min(end)..end).unwrap_or_default();
+        let kind = msgwin::TextKind::from_flags(w.flags as u16);
+        let (tw, th) = msgwin::measure(page, font, &metrics, kind, frame_type);
         let placement = msgwin::place(&metrics, frame_type, w.align, w.x, w.y, tw, th);
         let draw = msgwin::WindowDraw {
-            bytes: &msg.bytes,
+            bytes: page,
             placement,
             frame_type,
             kind,
-            shown: w.shown,
-            choice: (msg.choices > 0).then_some(w.choice),
+            shown: if t.on { t.shown.max(0) as usize } else { 0 },
+            choice: (t.choices && f.state == 2).then_some(w.to.choice.highlighted.max(0) as usize),
             time,
+            frame_on: f.on,
+            frame_t: if frame_type == 0 { f.t } else { 0x1000 },
         };
         msgwin::draw(&mut canvas, font, &metrics, &draw, lang == Language::Japanese);
     }

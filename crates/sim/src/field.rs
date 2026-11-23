@@ -24,6 +24,7 @@ pub mod map_change;
 pub mod map_fx;
 pub mod map_objects;
 pub mod motion_engine;
+pub mod msg_to;
 pub mod pad;
 pub mod pos_sound;
 pub mod pre_bg;
@@ -335,8 +336,8 @@ pub struct Attachment {
     pub hidden: bool,
 }
 
-/// One of the eight message windows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// One of the eight message windows: the event side's record (msg_window) and the message module's part.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Window {
     pub message: Option<usize>,
     /// Screen position in the original's 512 × 448 frame, and how the window sits on it (4: centred there, 2: its
@@ -344,30 +345,21 @@ pub struct Window {
     pub x: i32,
     pub y: i32,
     pub align: i32,
-    pub open: bool,
-    /// Characters revealed so far (text appears over a few ticks).
-    pub shown: usize,
-    /// Highlighted choice for messages that offer choices.
-    pub choice: usize,
-    /// Ticks left of the opening animation (text appears once it is over).
-    pub opening: u8,
-    /// Ticks left of the closing animation (a message wait ends once it is over).
-    pub closing: u8,
-    /// How many characters the text reveal counts for the open message (names spelled out).
-    pub reveal: usize,
-    /// Where the reveal stops until confirm is pressed, in the same count.
-    pub stops: Vec<usize>,
-    /// Flags a script set for the window (0x2000: a label left on screen).
-    pub flags: u16,
-    /// Opened to show its text at once (choice windows).
-    pub instant: bool,
+    /// +0x14: 0 closed, 1 asked to open, 2 shown, 3 closing (the frame's state each frame after the workers).
+    pub atel_state: i16,
+    /// +0x1d: the open mode (bit 1 choices, bit 3 an explicit size, bit 4 a message wait, bit 5 a choice wait, bit
+    /// 6 the number entry).
+    pub mode: u8,
+    /// +0x18: the text flags (009d; low nibble the text type, 0x400 pages go on by themselves, 0x2000/0x8000 the
+    /// size type).
+    pub flags: u32,
     /// The choice highlighted when the window opens, and the one cancel picks.
     pub first_choice: u8,
     pub cancel_choice: u8,
-    /// Ticks the taken choice stays readable after a choice window starts closing.
-    pub choice_live: u8,
-    /// The style a script set (0066); 0 is the system window (slower to close).
+    /// The frame type a script set (0066).
     pub style: Option<u8>,
+    /// The message module's frame, text and choice records.
+    pub to: msg_to::To,
     /// The values the text's placeholders show (009e): per slot, a type byte and the value.
     pub values: Vec<(u8, i32)>,
     /// The window's colour word (00a2: four bytes) and its +0x28 word (0256 / 0257).
@@ -460,30 +452,9 @@ impl NumberEntry {
 /// Characters further apart than this vertically do not touch (cdsp0100: one falling past another 16 apart).
 const BUMP_HEIGHT: f32 = 10.0;
 
-/// Ticks a window takes to open (the original reports "opening" for the frame it opens and the next).
-const OPEN_TICKS: u8 = 2;
-
-/// Ticks a window takes to close (a wait on it polls as not done on the frame it closes and the next).
-const CLOSE_TICKS: u8 = 2;
-
-/// Extra ticks a style-0 (system) window takes to close: 013b choices and 015b pickups end 9 ticks after the
-/// press, style-1 dialogue windows 4.
-const SYSTEM_CLOSE_EXTRA: u8 = 5;
-
-/// Characters revealed per tick.
-const TEXT_SPEED: usize = 2;
-
 /// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
 pub(crate) const NAMES: usize = 0x634C;
 pub(crate) const NAME_SLOT: usize = 0x14;
-
-/// Characters in a character's name as the save image spells it.
-fn name_chars(image: &[u8], chr: u8) -> usize {
-    let at = NAMES + usize::from(chr) * NAME_SLOT;
-    let slot = image.get(at..at + NAME_SLOT).unwrap_or_default();
-    // Page leads and the extension prefix start two-byte characters.
-    slot.iter().take_while(|&&b| b != 0).filter(|&&b| !matches!(b, 0x04 | 0x2C..=0x2F)).count()
-}
 
 /// One event message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -497,24 +468,9 @@ pub struct Message {
     /// The text table's word for it (the window's +0x16: the choices in the high byte, a number entry's digits in
     /// the low nibble).
     pub word: u16,
-    /// What the text reveal goes through: everything but line breaks, after a first line that is only control
-    /// codes (the speaker's name, shown at once).
-    pub reveal: Vec<RevealPart>,
-    /// The text starts with {09:30}: it shows at once.
-    pub instant: bool,
     /// The message as stored (up to its NUL): what the 2D layer measures and draws. Empty for messages made at
     /// run time.
     pub bytes: Vec<u8>,
-}
-
-/// A piece of a message's text reveal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevealPart {
-    Chars(usize),
-    /// A character's name, counted by its length in the save image.
-    Name(u8),
-    /// The reveal waits here for confirm.
-    Pause,
 }
 
 impl Message {
@@ -524,24 +480,6 @@ impl Message {
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
-    }
-}
-
-impl Window {
-    /// The window's state as scripts see it: 0 closed, 1 opening, 2 showing.
-    pub fn close(&mut self) {
-        if self.open {
-            self.open = false;
-            self.closing = CLOSE_TICKS + if self.style == Some(0) { SYSTEM_CLOSE_EXTRA } else { 0 };
-        }
-    }
-
-    pub fn state(&self) -> i32 {
-        match (self.open, self.opening) {
-            (false, _) => 0,
-            (true, 0) => 2,
-            (true, _) => 1,
-        }
     }
 }
 
@@ -1009,6 +947,8 @@ pub struct FieldState {
     /// ; the character light table 4023 allocates (0x2c bytes each: +0xc and +0x1c
     /// 1.0, +0x28 the byte 402a sets).
     pub values_5b98: [f32; 2],
+    /// The message module's menu pad (pressed and repeating buttons).
+    pub menu_pad: msg_to::MenuPad,
     /// The player control's heading state.
     pub sg: SgControl,
     /// Remaster switches natives hand over: the shadow solution (025e → graphicSwitchShadowSolution) and the
@@ -1260,9 +1200,8 @@ impl FieldState {
     fn begin_talk(&mut self) {
         let pressed = self.input.confirm || self.input.alt;
         // Windows flagged 0x2000 (labels left on screen) do not hold talking up.
-        self.talk =
-            (pressed && self.user_control && !self.windows.iter().any(|w| w.open && w.flags & 0x2000 == 0))
-                .then(|| Talk::new(if self.input.confirm { trigger::TALK } else { trigger::TALK_ALT }));
+        self.talk = (pressed && self.user_control && msg_to::waiting(self) == 0)
+            .then(|| Talk::new(if self.input.confirm { trigger::TALK } else { trigger::TALK_ALT }));
     }
 
     fn actor(&mut self, w: usize) -> &mut Actor {
@@ -1309,25 +1248,6 @@ impl FieldState {
             self.hidden_map_groups &= !0x100;
         }
         self.hidden_map_groups |= 1 << 3;
-        for w in &mut self.windows {
-            w.closing = w.closing.saturating_sub(1);
-            w.choice_live = w.choice_live.saturating_sub(1);
-        }
-        for w in self.windows.iter_mut().filter(|w| w.open) {
-            if w.opening > 0 {
-                w.opening -= 1;
-                continue;
-            }
-            // Up to the next pause; confirm there lets the reveal go on from the next tick.
-            let stop = w.stops.first().copied().unwrap_or(w.reveal).min(w.reveal);
-            if w.shown >= stop && stop < w.reveal {
-                if self.input.confirm {
-                    w.stops.remove(0);
-                }
-                continue;
-            }
-            w.shown = if w.instant { stop } else { (w.shown + TEXT_SPEED).min(stop) };
-        }
         // The character engine's step of each body: the velocity this frame (from the speed its worker's engine
         // handed over, along the heading of travel: speed · 0.05 · 30 · the frame time; the player's from last
         // tick's push unless a script move runs on it), then the body step: a body that follows the ground
@@ -1874,9 +1794,7 @@ pub fn message_from_bytes(bytes: Vec<u8>, word: u16, charset: &Charset) -> Messa
             _ => None,
         })
         .collect();
-    let reveal = reveal_parts(&tokens);
-    let instant = starts_instant(&tokens);
-    Message { text, raw: text::to_display(&tokens), choices: (word >> 8) as u8, word, reveal, instant, bytes }
+    Message { text, raw: text::to_display(&tokens), choices: (word >> 8) as u8, word, bytes }
 }
 
 pub fn decode_event_text(data: &[u8], charset: &Charset) -> Vec<Message> {
@@ -2290,40 +2208,6 @@ pub fn parse_video_list(text: &str) -> std::collections::HashMap<u32, String> {
             Some((n.trim().parse().ok()?, file.to_owned()))
         })
         .collect()
-}
-
-/// Name code: the character's name (argument 0x30 + character id).
-const NAME_CODE: u8 = 0x13;
-
-/// Pause code: the text waits for confirm before going on.
-const PAUSE_CODE: u8 = 0x01;
-
-/// What the text reveal goes through in a message: characters, names spelled out, and pauses.
-/// Whether a text opens with the {09:30} code, which shows it at once.
-fn starts_instant(tokens: &[text::Token]) -> bool {
-    matches!(tokens.first(), Some(text::Token::Control { code: 0x09, arg: Some(0x30) }))
-}
-
-fn reveal_parts(tokens: &[text::Token]) -> Vec<RevealPart> {
-    let first_break = tokens.iter().position(|t| matches!(t, text::Token::LineBreak));
-    let speaker_line =
-        first_break.filter(|&n| !tokens[..n].iter().any(|t| matches!(t, text::Token::Char(_))));
-    let body = speaker_line.map_or(tokens, |n| &tokens[n + 1..]);
-    let mut parts = Vec::new();
-    for t in body {
-        match *t {
-            text::Token::Char(_) | text::Token::Unmapped(_) => match parts.last_mut() {
-                Some(RevealPart::Chars(n)) => *n += 1,
-                _ => parts.push(RevealPart::Chars(1)),
-            },
-            text::Token::Control { code: NAME_CODE, arg: Some(a) } if a >= 0x30 => {
-                parts.push(RevealPart::Name(a - 0x30))
-            }
-            text::Token::Control { code: PAUSE_CODE, arg: None } => parts.push(RevealPart::Pause),
-            _ => {}
-        }
-    }
-    parts
 }
 
 /// An event's map number: the script header's word at +4 is the offset (from the script base, header word +4
@@ -2818,7 +2702,14 @@ impl Event {
             st.pos_sounds.frame(&self.vm.memory, &st.workers, scene, story, &mut st.sound);
         }
         let before = self.state.player.and_then(|p| self.state.actors.get(p)).map(|a| a.pos);
+        // The block's press check before its workers (a press while a window waits sets the advance bit).
+        let pressed = pad_word(&self.state);
+        msg_to::press(&mut self.state, pressed);
         self.vm.frame(&mut self.natives.host(&mut self.state));
+        // After the workers the windows' states follow their frames; then the message module's frame.
+        msg_to::status(&mut self.state);
+        let held = held_word(&self.state);
+        msg_to::step(&mut self.state, held, &self.vm.memory.global[0]);
         // The event system counts the frames it runs once its setup is over.
         if self.vm.phase == aerugo_script::vm::Phase::Running {
             self.state.workers.sys.frames = self.state.workers.sys.frames.wrapping_add(1);
@@ -2855,6 +2746,8 @@ impl Event {
         if let Some(t) = &mut self.state.texture_animations {
             t.update(1.0 / 30.0);
         }
+        // The message draw's effects on the reveal (late in the frame).
+        msg_to::draw_pass(&mut self.state, &self.vm.memory.global[0]);
         self.walk_encounters(before);
         self.tick += 1;
         // The next frame's map change check (it comes before that frame's scripts; nothing runs in between).
@@ -3323,15 +3216,18 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             result: Some(|_, _| Value::Int(0)),
         },
     );
-    // The highlighted choice of a choice window whose text is all shown (or that is closing), else -1.
+    // 00fb(window): the highlighted choice of a window whose text has choices and whose choice record runs
+    // (8b8010), else −1.
     n.register(
         0x00FB,
         Native::result(|g, c| {
             let w = window(c);
-            let win = &g.windows[w];
-            let choices = win.message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.choices);
-            let ready = (win.open && win.opening == 0 && win.shown >= win.reveal) || win.choice_live > 0;
-            Value::Int(if ready && choices > 0 { win.choice as i32 } else { -1 })
+            let to = &g.windows[w].to;
+            Value::Int(if to.text.choices && to.choice.state > 0 {
+                i32::from(to.choice.highlighted)
+            } else {
+                -1
+            })
         }),
     );
     // A worker's position into three float variables (worker, x, y, z descriptors); a line's midpoint for
@@ -3562,30 +3458,105 @@ fn store_float_var(c: &mut NativeCall<'_>, areas: [u32; 3], desc: i32, v: f32) {
     c.memory.store_float(place, var.ty, v, false);
 }
 
-/// Open a window on its message: the text reveal starts over.
-pub(crate) fn open_window_pub(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
-    open_window(g, image, w, instant);
+/// A window's place as 0065 sets it: three windows move by event and language type.
+fn window_place(g: &FieldState, x: i32, y: i32) -> (i32, i32) {
+    let lang = g.language_type;
+    match g.scene {
+        Some(0x17) if (x, y) == (0x1e6, 0x104) => (0x1c7, 199),
+        Some(0xab) if (x, y) == (0x100, 0x14f) && matches!(lang, Some(2 | 3)) => (x, 0x140),
+        Some(0xd4) if (x, y) == (0x16, 0xdc) && lang == Some(4) => (x, 0x82),
+        _ => (x, y),
+    }
 }
 
-fn open_window(g: &mut FieldState, image: &[u8], w: usize, instant: bool) {
-    let text_instant = g.windows[w].message.and_then(|m| g.messages.get(m)).is_some_and(|m| m.instant);
-    let (mut reveal, mut stops) = (0, Vec::new());
-    for part in g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(&[][..], |m| &m.reveal) {
-        match *part {
-            RevealPart::Chars(n) => reveal += n,
-            RevealPart::Name(chr) => reveal += name_chars(image, chr),
-            RevealPart::Pause => stops.push(reveal),
+/// Native 006a's open (858b50) on the window record: state 1; with mode bit 1 the choice counts of +0x16 clamp
+/// the record's choice bytes (871210: no digits → +0x22 = 0 and mode bit 6 off; no choices → mode bit 1 off and
+/// +0x1e/+0x1f = 0); the mode is kept (+0x1d); the number entry (mode bit 6); the message module opens it.
+pub(crate) fn msg_open(g: &mut FieldState, image: &[u8], w: usize, mode: u32) {
+    let mut mode = mode;
+    let win = &mut g.windows[w];
+    win.atel_state = 1;
+    if mode & 2 != 0 {
+        let digits = (win.word16 & 0xf) as u8;
+        let choices = (win.word16 >> 8) as u8;
+        if digits == 0 {
+            win.byte22 = 0;
+            mode &= !0x40;
+        } else {
+            if digits <= win.byte22 {
+                win.byte22 = digits - 1;
+            }
+            if digits <= win.byte23 {
+                win.byte23 = digits - 1;
+            }
+        }
+        if choices == 0 {
+            mode &= !2;
+            win.first_choice = 0;
+            win.cancel_choice = 0;
+        } else {
+            if i32::from(choices) <= i32::from(win.first_choice as i8) {
+                win.first_choice = choices - 1;
+            }
+            if i32::from(choices) <= i32::from(win.cancel_choice as i8) {
+                win.cancel_choice = choices - 1;
+            }
         }
     }
-    let win = &mut g.windows[w];
-    win.reveal = reveal;
-    win.stops = stops;
-    win.open = true;
-    win.shown = 0;
-    win.choice = usize::from(win.first_choice);
-    win.opening = OPEN_TICKS;
-    win.closing = 0;
-    win.instant = instant || text_instant;
+    win.mode = mode as u8;
+    if mode & 0x40 != 0 {
+        open_number(g, w, mode as i32);
+    } else {
+        g.windows[w].number = None;
+    }
+    msg_to::open(g, w, image);
+}
+
+/// 0084's init (85abd0): the window (0–7), the message wait's mode bit 4.
+pub(crate) fn msg_wait_init(g: &mut FieldState, w: usize) {
+    g.windows[w].mode |= 0x10;
+}
+
+/// 0084's wait (85ae90): closed (or closed state) → done; shown with its text all shown and the advance bit →
+/// close it (the bit goes off) and wait on.
+pub(crate) fn msg_wait(g: &mut FieldState, w: usize) -> u32 {
+    match g.windows[w].atel_state {
+        0 | 4 => WAIT_DONE,
+        2 if g.windows[w].text_state() == 3 && g.workers.sys.flags0 & 4 != 0 => {
+            msg_to::close(g, w);
+            g.workers.sys.flags0 &= !4;
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// 007d's wait (859c50): once shown with its text all shown and its choice taken, the pick is kept and the window
+/// closes; done when closed. Scratch 1: the pick (−1 none).
+fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
+    let w = c.scratch[0] as usize;
+    let pick = |win: &Window| -> i32 {
+        if let Some(e) = win.number {
+            return if e.state == 2 { 0 } else { -1 };
+        }
+        win.to.choice.picks.first().map_or(-1, |&p| i32::from(p))
+    };
+    match g.windows[w].atel_state {
+        0 | 4 => {
+            c.scratch[1] = pick(&g.windows[w]);
+            WAIT_DONE
+        }
+        2 => {
+            let win = &g.windows[w];
+            let chosen = win.number.map_or(win.to.choice.state, |e| e.state) == 2;
+            if win.text_state() == 3 && chosen {
+                c.scratch[1] = pick(win);
+                msg_to::close(g, w);
+            }
+            0
+        }
+        _ => 0,
+    }
 }
 
 /// With mode flag 0x40 a window whose text has digits (+0x16 low nibble) takes a number entry: the cursor from
@@ -3601,17 +3572,7 @@ fn open_number(g: &mut FieldState, w: usize, mode: i32) {
 
 /// A message made at run time (not from the event's text).
 fn runtime_message(text: &str) -> Message {
-    let tokens: Vec<text::Token> =
-        text.chars().map(|c| if c == '\n' { text::Token::LineBreak } else { text::Token::Char(c) }).collect();
-    Message {
-        text: text.to_owned(),
-        raw: text.to_owned(),
-        choices: 0,
-        word: 0,
-        reveal: reveal_parts(&tokens),
-        instant: true,
-        bytes: Vec::new(),
-    }
+    Message { text: text.to_owned(), raw: text.to_owned(), choices: 0, word: 0, bytes: Vec::new() }
 }
 
 /// Treasure: give treasure `index` (the item, key item, equipment or gil) into the save image. Returns whether
@@ -3781,8 +3742,9 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // A choice window in one call (window, message, ?, ?, x, y, alignment): placed, opened, and waited on; the
-    // result is the choice.
+    // 013b / 0267(window, message, first, cancel, x, y, alignment): a choice window in one call (8607a0): 0065
+    // placement, frame type 0 (0066), the message (0064), text flags 0 (009d), first and cancel (0069), opened
+    // with mode 2 (006a), then the choice wait (007d).
     for id in [0x013B, 0x0267] {
         n.register(
             id,
@@ -3795,22 +3757,26 @@ fn register_menus(n: &mut Natives<FieldState>) {
                     let first = c.stack.pop_int();
                     let msg = c.stack.pop_int();
                     let w = window(c);
-                    g.windows[w].first_choice = first as u8;
-                    g.windows[w].cancel_choice = cancel as u8;
-                    g.windows[w].style = Some(0);
-                    g.windows[w].message = usize::try_from(msg).ok();
-                    g.windows[w].x = x;
-                    g.windows[w].y = y;
-                    g.windows[w].align = align;
-                    g.windows[w].flags = 0;
-                    open_window(g, &c.memory.global[0], w, true);
+                    let (x, y) = window_place(g, x, y);
+                    g.last_text = msg;
+                    let word =
+                        usize::try_from(msg).ok().and_then(|m| g.messages.get(m)).map_or(0, |m| m.word);
+                    let win = &mut g.windows[w];
+                    win.x = x;
+                    win.y = y;
+                    win.align = align;
+                    win.style = Some(0);
+                    win.message = usize::try_from(msg).ok();
+                    win.word16 = word;
+                    win.flags = 0;
+                    win.first_choice = first as u8;
+                    win.cancel_choice = cancel as u8;
+                    msg_open(g, &c.memory.global[0], w, 2);
                     c.scratch[0] = w as i32;
-                    c.scratch[1] = 0;
-                    c.scratch[2] = 0;
-                    c.scratch[3] = 1;
+                    c.scratch[1] = -1;
+                    g.windows[w].mode |= 0x20;
                 }),
-                wait: Some(choice_wait),
-                ..message_wait()
+                ..choice_native()
             },
         );
     }
@@ -3839,12 +3805,10 @@ fn register_menus(n: &mut Natives<FieldState>) {
                 win.byte22 = cursor as u8;
                 win.byte23 = start as u8;
                 win.word24 = value as u32;
-                open_window(g, &c.memory.global[0], w, true);
-                open_number(g, w, 0x42);
+                msg_open(g, &c.memory.global[0], w, 0x42);
                 c.scratch[0] = w as i32;
-                c.scratch[1] = 0;
-                c.scratch[2] = 0;
-                c.scratch[3] = 0;
+                c.scratch[1] = -1;
+                g.windows[w].mode |= 0x20;
             }),
             wait: Some(choice_wait),
             result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].number.map_or(0, |e| e.value))),
@@ -3858,19 +3822,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(g.windows[w].number.map_or(0, |e| e.value))
         }),
     );
-    n.register(
-        0x007D,
-        Native {
-            init: Some(|_, c| {
-                c.scratch[0] = window(c) as i32;
-                c.scratch[1] = 0;
-                c.scratch[2] = 0;
-                c.scratch[3] = 0;
-            }),
-            wait: Some(choice_wait),
-            ..message_wait()
-        },
-    );
+    n.register(0x007D, choice_native());
     // Battles: a scripted battle by label (area id << 16 | formation), starting when the frame ends; the
     // encounter area scripts set in place of the save image's (the walking counters start over); whether the
     // save image allows encounters.
@@ -3974,11 +3926,11 @@ fn register_queries(n: &mut Natives<FieldState>) {
                 c.scratch[1] = c.stack.pop_int();
                 let w = c.stack.pop_int().clamp(0, 7);
                 c.scratch[0] = w;
-                g.windows[w as usize].close();
+                msg_to::close(g, w as usize);
             }),
             wait: Some(|g, c| {
                 let w = &g.windows[c.scratch[0] as usize];
-                if c.scratch[1] == 0 || (!w.open && w.closing == 0) { WAIT_DONE } else { 0 }
+                if c.scratch[1] == 0 || w.atel_state == 0 { WAIT_DONE } else { 0 }
             }),
             result: Some(|_, _| Value::Int(1)),
         },
@@ -4105,7 +4057,8 @@ fn register_treasure(n: &mut Natives<FieldState>) {
                 g.windows[w].x = 0x100;
                 g.windows[w].y = 0xD0;
                 g.windows[w].style = Some(0);
-                open_window(g, image, w, false);
+                msg_open(g, image, w, 0);
+                msg_wait_init(g, w);
                 c.scratch[0] = w as i32;
                 c.scratch[1] = 0;
                 c.scratch[2] = i32::from(full);
@@ -4113,7 +4066,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
             wait: Some(|g, c| match c.scratch[1] {
                 // The message, then a tick (with the "full" sound when the equipment did not fit), then done.
                 0 => {
-                    if message_wait().wait.is_some_and(|w| w(g, c) & WAIT_DONE != 0) {
+                    if msg_wait(g, c.scratch[0] as usize) & WAIT_DONE != 0 {
                         c.scratch[1] = 1;
                     }
                     0
@@ -4149,98 +4102,40 @@ fn register_treasure(n: &mut Natives<FieldState>) {
     );
 }
 
-/// The message wait: the init takes the window (and a flag), the wait reveals the text and closes the window on
-/// confirm (moving between choices with the stick), the result is the chosen choice.
+/// The message wait (0084): the window and a value; done once the window has closed (msg_wait); the result
+/// closes it (again) and is 0.
 pub(crate) fn message_wait() -> Native<FieldState> {
     Native {
-        init: Some(|_, c| {
+        init: Some(|g, c| {
             let _b = c.stack.pop_int();
-            c.scratch[0] = window(c) as i32;
+            let w = window(c);
+            c.scratch[0] = w as i32;
+            msg_wait_init(g, w);
         }),
-        wait: Some(|g, c| {
-            let w = c.scratch[0] as usize;
-            let msg = g.windows[w].message.and_then(|m| g.messages.get(m)).cloned().unwrap_or_default();
-            let win = &mut g.windows[w];
-            if !win.open {
-                return if win.closing == 0 { WAIT_DONE } else { 0 };
-            }
-            if msg.choices > 0 && g.input.stick[1] != 0.0 && g.input.stick_pressed {
-                let n = usize::from(msg.choices);
-                win.choice = if g.input.stick[1] > 0.0 {
-                    win.choice.saturating_sub(1)
-                } else {
-                    (win.choice + 1).min(n - 1)
-                };
-            }
-            if g.input.confirm {
-                if win.shown < win.reveal {
-                    // The rest appears at once (up to a pause, which the tick's update lets go of).
-                    win.shown =
-                        win.stops.first().copied().unwrap_or(win.reveal).min(win.reveal).max(win.shown);
-                } else {
-                    win.close();
-                    return 0;
-                }
-            }
-            0
+        wait: Some(|g, c| msg_wait(g, c.scratch[0] as usize)),
+        result: Some(|g, c| {
+            msg_to::close(g, c.scratch[0] as usize);
+            Value::Int(0)
         }),
-        result: Some(|g, c| Value::Int(g.windows[c.scratch[0] as usize].choice as i32)),
     }
 }
 
-/// The choice window wait (007D, 013B): like the message wait, but the window takes the choice on the tick
-/// after the press and closes then. Scratch 1: 1 once chosen.
-fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
-    let w = c.scratch[0] as usize;
-    if c.scratch[1] == 1 {
-        c.scratch[1] = 2;
-        g.windows[w].close();
-        // Scripts still read the choice until the wait ends.
-        g.windows[w].choice_live = g.windows[w].closing + 2;
-        return 0;
+/// The choice wait (007d): the window (mode bit 5); done once it has closed; the result closes it and is the pick
+/// (−1 none).
+fn choice_native() -> Native<FieldState> {
+    Native {
+        init: Some(|g, c| {
+            let w = window(c);
+            c.scratch[0] = w as i32;
+            c.scratch[1] = -1;
+            g.windows[w].mode |= 0x20;
+        }),
+        wait: Some(choice_wait),
+        result: Some(|g, c| {
+            msg_to::close(g, c.scratch[0] as usize);
+            Value::Int(c.scratch[1] as i16 as i32)
+        }),
     }
-    // Cursor moves take effect on the tick after the press.
-    let n = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| usize::from(m.choices));
-    let win = &mut g.windows[w];
-    if c.scratch[2] != 0 && n > 0 {
-        // The cursor stops at the first and the last choice (cdsp0000: up on the first stays there).
-        win.choice =
-            if c.scratch[2] > 0 { win.choice.saturating_sub(1) } else { (win.choice + 1).min(n - 1) };
-    }
-    c.scratch[2] = 0;
-    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal && win.number.is_some() {
-        // A number entry: its input handler, until confirmed.
-        let pad = pad_word(g);
-        let win = &mut g.windows[w];
-        if let Some(e) = win.number.as_mut() {
-            e.step(pad, pad);
-            if e.state == 2 {
-                c.scratch[1] = 1;
-            }
-        }
-        return 0;
-    }
-    if c.scratch[1] == 0 && win.open && win.shown >= win.reveal {
-        if g.input.stick_pressed && g.input.stick[1] != 0.0 {
-            c.scratch[2] = if g.input.stick[1] > 0.0 { 1 } else { -1 };
-        }
-        if g.input.confirm || g.input.cancel {
-            if !g.input.confirm {
-                win.choice = usize::from(win.cancel_choice);
-            }
-            c.scratch[1] = 1;
-        }
-        return 0;
-    }
-    if c.scratch[1] == 0 && win.open {
-        // Still revealing: confirm shows the rest, as in message waits (no cursor moves yet).
-        let stick = std::mem::take(&mut g.input.stick_pressed);
-        let r = message_wait().wait.map_or(0, |f| f(g, c));
-        g.input.stick_pressed = stick;
-        return r;
-    }
-    let win = &g.windows[w];
-    if !win.open && win.closing == 0 { WAIT_DONE } else { 0 }
 }
 
 /// Workers turned off (they stop running, but keep their requests) and on again.
@@ -5046,12 +4941,16 @@ pub fn register(n: &mut Natives<FieldState>) {
         );
     }
     // Messages: text, position, open, wait for the player, close.
+    // 0064(window, message): the text ([1325ac0] keeps the message), +0x16 its choice and digit word (86bf10).
     n.register(
         0x0064,
         Native::result(|g, c| {
             let msg = c.stack.pop_int();
             let w = window(c);
+            g.last_text = msg;
+            let word = usize::try_from(msg).ok().and_then(|m| g.messages.get(m)).map_or(0, |m| m.word);
             g.windows[w].message = usize::try_from(msg).ok();
+            g.windows[w].word16 = word;
             Value::Int(0)
         }),
     );
@@ -5059,16 +4958,9 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0065,
         Native::result(|g, c| {
             let align = c.stack.pop_int();
-            let mut y = c.stack.pop_int();
-            let mut x = c.stack.pop_int();
-            // Three windows placed by event and language type.
-            let lang = g.language_type;
-            match g.scene {
-                Some(0x17) if (x, y) == (0x1e6, 0x104) => (x, y) = (0x1c7, 199),
-                Some(0xab) if (x, y) == (0x100, 0x14f) && matches!(lang, Some(2 | 3)) => y = 0x140,
-                Some(0xd4) if (x, y) == (0x16, 0xdc) && lang == Some(4) => y = 0x82,
-                _ => {}
-            }
+            let y = c.stack.pop_int();
+            let x = c.stack.pop_int();
+            let (x, y) = window_place(g, x, y);
             let w = window(c);
             g.windows[w].x = x;
             g.windows[w].y = y;
@@ -5088,27 +4980,36 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(w as i32)
         }),
     );
+    // 006a(window, mode): open (msg_open).
     n.register(
         0x006A,
         Native::result(|g, c| {
-            // Mode bit 2 shows the text at once (choice windows).
             let mode = c.stack.pop_int();
             let w = window(c);
-            open_window(g, &c.memory.global[0], w, mode & 2 != 0);
-            open_number(g, w, mode);
+            msg_open(g, &c.memory.global[0], w, mode as u32);
             Value::Int(w as i32)
         }),
     );
     n.register(0x0084, message_wait());
     // The other wait takes only the window.
-    n.register(0x007C, Native { init: Some(|_, c| c.scratch[0] = window(c) as i32), ..message_wait() });
-    // Window state queries: done when closed or fully shown; the raw state.
+    n.register(
+        0x007C,
+        Native {
+            init: Some(|g, c| {
+                let w = window(c);
+                c.scratch[0] = w as i32;
+                msg_wait_init(g, w);
+            }),
+            ..message_wait()
+        },
+    );
+    // 008f(window): closed, or shown with its text all shown.
     n.register(
         0x008F,
         Native::result(|g, c| {
             let w = window(c);
             let win = &g.windows[w];
-            Value::Int(i32::from(!win.open || (win.opening == 0 && win.shown >= win.reveal)))
+            Value::Int(i32::from(win.atel_state == 0 || (win.atel_state == 2 && win.text_state() == 3)))
         }),
     );
     // Window flags.
@@ -5117,16 +5018,18 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let flags = c.stack.pop_int();
             let w = window(c);
-            g.windows[w].flags = flags as u16;
-            Value::Int(0)
+            g.windows[w].flags = flags as u32;
+            Value::Int(w as i32)
         }),
     );
-    n.register(0x0097, Native::result(|g, c| Value::Int(g.windows[window(c)].state())));
+    // 0097(window): the window's state (+0x14).
+    n.register(0x0097, Native::result(|g, c| Value::Int(i32::from(g.windows[window(c)].atel_state))));
+    // 006b(window): msg_close.
     n.register(
         0x006B,
         Native::result(|g, c| {
             let w = window(c);
-            g.windows[w].close();
+            msg_to::close(g, w);
             Value::Int(w as i32)
         }),
     );
@@ -5245,69 +5148,6 @@ mod tests {
         assert!(xs.iter().all(|&x| x <= 0x7FFF_FFFF));
         assert_eq!(xs, (0..100).map(|_| b.next_value()).collect::<Vec<_>>());
         assert!(xs.windows(2).any(|w| w[0] != w[1]));
-    }
-
-    #[test]
-    fn message_window_reveals_and_closes_on_confirm() {
-        use aerugo_script::asm::{Op, WorkerSrc, assemble};
-        let imm = |v: i16| Op(0x2E, Some(v as u16));
-        // set_text(0, 0); open(0, 0); wait(0, 0); global[0] = 1
-        let w = WorkerSrc {
-            kind: 1,
-            entries: vec![vec![
-                imm(0),
-                imm(0),
-                Op(0x58, Some(0x0064)),
-                imm(0),
-                imm(0),
-                Op(0x58, Some(0x006A)),
-                imm(0),
-                imm(0),
-                Op(0x58, Some(0x0084)),
-                imm(1),
-                Op(0x20, Some(0)),
-                Op(0x3C, None),
-            ]],
-            vars: vec![(5 << 28, 1)],
-            ..Default::default()
-        };
-        let script = Script::parse(&assemble(&[w])).unwrap();
-        let mut vm = Vm::new(Arc::new(script));
-        let mut natives = Natives::new(Game::Ffx);
-        register(&mut natives);
-        let mut state = FieldState {
-            messages: vec![Message {
-                text: "Hello there".into(),
-                raw: String::new(),
-                choices: 0,
-                word: 0,
-                reveal: vec![RevealPart::Chars(11)],
-                instant: false,
-                bytes: Vec::new(),
-            }],
-            ..FieldState::default()
-        };
-        let done = |vm: &Vm| vm.memory.global[0][aerugo_script::memory::AREA0_OFFSET] == 1;
-        let mut tick = |vm: &mut Vm, state: &mut FieldState, confirm: bool| {
-            state.input.confirm = confirm;
-            vm.frame(&mut natives.host(state));
-            state.update();
-        };
-        tick(&mut vm, &mut state, false);
-        assert!(state.windows[0].open);
-        assert!(state.windows[0].shown < 11);
-        // The first confirm reveals the rest, the second closes the window and resumes the script.
-        tick(&mut vm, &mut state, true);
-        assert!(state.windows[0].open);
-        assert_eq!(state.windows[0].shown, 11);
-        tick(&mut vm, &mut state, true);
-        assert!(!state.windows[0].open);
-        // The wait ends once the window has finished closing, and the script goes on the tick after.
-        tick(&mut vm, &mut state, false);
-        tick(&mut vm, &mut state, false);
-        assert!(!done(&vm));
-        tick(&mut vm, &mut state, false);
-        assert!(done(&vm));
     }
 
     #[test]

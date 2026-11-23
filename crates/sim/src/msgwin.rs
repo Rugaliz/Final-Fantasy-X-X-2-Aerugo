@@ -298,13 +298,18 @@ pub struct WindowDraw<'a> {
     pub choice: Option<usize>,
     /// Seconds of the graphics clock (the cursor sways with it).
     pub time: f32,
+    /// The frame is up, and how far frame type 0 has opened (of 0x1000: its right edge is the left one plus
+    /// width · t / 0x1000).
+    pub frame_on: bool,
+    pub frame_t: i16,
 }
 
 /// Draw a window: its frame (frame type 0), its revealed text and the choice cursor.
 pub fn draw(c: &mut Canvas, font: &Ftc, m: &Metrics, w: &WindowDraw<'_>, language_jp: bool) {
     let [fx, fy, fw, fh] = w.placement.frame;
+    let fw = (fw as i32 * i32::from(w.frame_t) / 0x1000) as f32;
     c.set_scissor(0.0, 0.0, 512.0, 416.0);
-    if w.frame_type == 0 {
+    if w.frame_type == 0 && w.frame_on {
         let y = if language_jp { fy } else { fy - 1.0 };
         c.plate_10(fx + 4.0, y, fw - 8.0, fh, false);
     }
@@ -485,6 +490,8 @@ mod tests {
                 kind: TextKind::from_flags(0),
                 shown: 99,
                 choice: Some(1),
+                frame_on: true,
+                frame_t: 0x1000,
                 time: 0.0,
             },
             false,
@@ -544,6 +551,8 @@ mod tests {
                 kind: TextKind::from_flags(0),
                 shown: 2,
                 choice: None,
+                frame_on: true,
+                frame_t: 0x1000,
                 time: 0.0,
             },
             false,

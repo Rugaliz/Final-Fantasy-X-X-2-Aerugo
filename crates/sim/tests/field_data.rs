@@ -31,7 +31,7 @@ fn ffx_events_load_and_run() {
         let mut window_opened = false;
         for _ in 0..300 {
             ev.step(Input { confirm: true, ..Input::default() });
-            window_opened |= ev.state.windows.iter().any(|w| w.open);
+            window_opened |= ev.state.windows.iter().any(|w| w.to.open);
         }
         initialized += usize::from(ev.initialized());
         opened += usize::from(window_opened);

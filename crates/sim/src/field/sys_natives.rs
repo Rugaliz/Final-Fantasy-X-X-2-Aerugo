@@ -328,11 +328,12 @@ pub fn register(n: &mut Natives<FieldState>) {
                 win.message = m;
                 win.word16 = 0;
                 win.flags = 0;
-                super::open_window_pub(g, &c.memory.global[0], wi, false);
+                super::msg_open(g, &c.memory.global[0], wi, 0);
+                super::msg_wait_init(g, wi);
             }),
             wait: Some(|g, c| match c.scratch[1] {
                 0 => {
-                    let r = super::message_wait().wait.map_or(0, |f| f(g, c));
+                    let r = super::msg_wait(g, c.scratch[0] as usize);
                     if r & 1 != 0 {
                         c.scratch[1] = 1;
                     }
