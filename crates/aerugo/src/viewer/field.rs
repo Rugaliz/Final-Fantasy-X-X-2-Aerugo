@@ -1125,7 +1125,9 @@ impl FieldView {
                 scene.fog_far = st.fog.far.unwrap_or(f.far);
                 scene.fog_curve = st.fog.curve.unwrap_or(f.curve);
                 scene.fog_limit = st.fog.limit;
-                scene.background = [set.background[0], set.background[1], set.background[2]];
+                // The scene's background: the map's, until a script sets one (8045 → yiSetBackColor).
+                scene.background =
+                    st.background.unwrap_or([set.background[0], set.background[1], set.background[2]]);
             }
             None if self.game => {}
             None => scene.background = [0.05, 0.05, 0.08],
