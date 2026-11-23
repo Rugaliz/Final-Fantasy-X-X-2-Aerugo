@@ -157,18 +157,16 @@ impl VfxRenderer {
                 missing.push(format!("event shape texture {texture}"));
                 continue;
             };
-            // Runs of pieces with one blend, in drawing order.
-            let mut start = 0;
-            while start < d.pieces.len() {
-                let props = aerugo_sim::ppp::vfx::blend_properties(d.pieces[start].blend);
-                let mut end = start + 1;
-                while end < d.pieces.len()
-                    && aerugo_sim::ppp::vfx::blend_properties(d.pieces[end].blend) == props
-                {
-                    end += 1;
+            // The slot's six render entries, one per blend group (none, additive, the three subtractive ones,
+            // opaque), in that order; each holds its pieces in piece order.
+            for group in [0u32, 2, 0x10, 0x20, 0x100, 0x200] {
+                let idx: Vec<usize> = (0..d.pieces.len())
+                    .filter(|&i| aerugo_sim::ppp::vfx::blend_properties(d.pieces[i].blend) & !8 == group)
+                    .collect();
+                if idx.is_empty() {
+                    continue;
                 }
-                let idx = start..end;
-                start = end;
+                let props = group | 8;
                 let Some(path) = self.effect_path(vfs, props) else { continue };
                 let key =
                     ProgramKey { cluster: path.clone(), pass: "Transparent".into(), shader: 0, index: 0 };
