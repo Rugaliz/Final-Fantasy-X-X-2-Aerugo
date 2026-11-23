@@ -8,6 +8,7 @@
 //!   sub-part definitions that spawn objects, each running its definition's programs).
 //! - The programs are in [`programs`], by name; an effect's driver lists the ones its table holds.
 
+pub mod driver;
 pub mod programs;
 pub mod relocate;
 

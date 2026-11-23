@@ -2,11 +2,10 @@
 //! state goes 0 idle → 1 loading (00db) → 3 loaded (its tick, the frame after) → 4 running (00dc) → 5
 //! signalled (by the effect program) → 6 freed → 0.
 //!
-//! The program's signal is ported: an event effect's run (after the scripts, each unpaused frame) signals on its
-//! first run, as nothing in the field holds the effect system busy (only battle effect commands set that).
-//!
-//! Not ported yet: the rest of the effect programs (their particle runtime, the end that frees the effect, the
-//! draw). Nothing is drawn.
+//! The effect's driver runs as the original's: loaded when 00dc starts it (from the magic file's data), its run
+//! after the scripts (the ready signal: state 4 → 5), its draw in the draw phase (its frame callback: the
+//! particles and their render requests; the end it reports: state 6). An effect whose driver is not ported, or
+//! whose file is missing, signals on its first run and never ends.
 
 use aerugo_script::natives::{Native, Natives};
 use aerugo_script::vm::Value;
@@ -25,6 +24,44 @@ pub struct Effects {
     pub request: u32,
     /// The bodies' effects held off (0244) / let on (0245): bit 0x800 of the effect system's flags.
     pub et_flags: u32,
+    /// The running effect's driver, the engine's vector-unit random generator and the particle runtime's pause.
+    pub effect: Option<Box<crate::ppp::driver::Effect>>,
+    pub vu: crate::ppp::VuRand,
+    pub particles_paused: bool,
+}
+
+/// The effect `id` from the magic files, when its driver is ported.
+fn load_effect(g: &FieldState, id: i32) -> Option<Box<crate::ppp::driver::Effect>> {
+    let magic = u32::try_from(id).ok()?;
+    crate::ppp::driver::driver(magic)?;
+    let file = g.vfs.as_ref()?.read(&format!("FFX/magic_{magic:04}.dll")).ok()?;
+    let dll = aerugo_formats::magic::DllData::read(&file)?;
+    crate::ppp::driver::Effect::load(magic, &dll).map(Box::new)
+}
+
+/// Run `f` on the running effect's driver with the engine around it.
+fn with_driver<T>(
+    g: &mut FieldState,
+    f: impl FnOnce(&mut crate::ppp::driver::Effect, &mut crate::ppp::driver::Host) -> T,
+) -> Option<T> {
+    let mut e = g.effects.effect.take()?;
+    let mut paused = g.effects.particles_paused;
+    let mut vu = g.effects.vu;
+    let mut h = crate::ppp::driver::Host {
+        ticking: true,
+        busy: false,
+        event_bits: g.engine.event_bits,
+        view: g.cam_view.unwrap_or(crate::chr::elements::IDENTITY),
+        paused: &mut paused,
+        vu: &mut vu,
+        crt: &mut g.crt_rand,
+        event: u32::from(g.scene.unwrap_or(0)),
+    };
+    let out = f(&mut e, &mut h);
+    g.effects.particles_paused = paused;
+    g.effects.vu = vu;
+    g.effects.effect = Some(e);
+    Some(out)
 }
 
 /// Whether the calling worker is bound to a body (+0xaa 1, +0x9c set).
@@ -69,14 +106,32 @@ pub fn frame_start(g: &mut FieldState) {
     }
 }
 
-/// After the scripts: the running effect's program (its first run signals: state 4 → 5), then the loader's
-/// process (a freed effect goes).
+/// After the scripts: the running effect's run (its ready signal: state 4 → 5; without a driver, on the first
+/// run), then the loader's process (a freed effect goes).
 pub fn frame_after_scripts(g: &mut FieldState) {
-    if g.effects.state == 4 {
-        g.effects.state = 5;
+    if matches!(g.effects.state, 4 | 5) {
+        let ready = match with_driver(g, |e, h| e.run(h)) {
+            Some(s) => s.ready,
+            None => true,
+        };
+        if ready && g.effects.state == 4 {
+            g.effects.state = 5;
+        }
     }
     if g.effects.state == 6 {
         g.effects.state = 0;
+        g.effects.effect = None;
+    }
+}
+
+/// The draw phase: the running effect's draw (its frame callback runs the particles; the end it reports frees
+/// the effect: state 6).
+pub fn frame_draw(g: &mut FieldState) {
+    if !matches!(g.effects.state, 4 | 5) {
+        return;
+    }
+    if with_driver(g, |e, h| e.draw(h)).is_some_and(|s| s.done) {
+        g.effects.state = 6;
     }
 }
 
@@ -112,6 +167,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             init: None,
             wait: Some(|g, _| match g.effects.state {
                 3 => {
+                    g.effects.effect = load_effect(g, g.effects.id);
                     g.effects.state = 4;
                     0
                 }

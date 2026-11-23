@@ -1,7 +1,8 @@
 # Magic files (effects)
 
 The remaster ships each effect as a Windows DLL, `magicFiles/FFX/magic_NNNN.dll`. Aerugo reads only the
-DLL's initialised data section (`.data`), which carries the effect's data in its PS2 layout. The DLL's code is
+DLL's initialised data section (`.data`), which carries the effect's data in its PS2 layout, and its
+read-only data (`.rdata`, for the particle programs' names). The DLL's code is
 never run: each effect's small driver is ported to Rust, and it names where in the data its files start.
 
 All values are little-endian. Offsets are relative, as described per table; the game turns them into pointers
@@ -52,3 +53,18 @@ program references (u16 `+0x26`) and the references themselves from `+0x28`, 16 
 
 A track is a list of keys, `stride` bytes apart, each starting with its time. An object moves on to the next
 key when that key's time equals its age.
+
+## Program table
+
+The driver's particle program table lies in `.data`: 0x28-byte entries whose first word is the address of the
+program's name in `.rdata` ("pppAccele", "pppDrawMdl3", …), then the program's nine entry points (code, not
+read). A part's sub-part definitions name programs by their index in this table. Aerugo reads the names and
+runs its own port of each program.
+
+## Drivers
+
+Each file's driver (its overlay table: set-up, run, draw, …) is code and is ported per shape (files that share
+a driver differ only in where their data lies: the OEF2 file, the program table and the work buffer). The
+looping-part driver (files 662 and 711) keeps one part placed in front of the camera at (−16, −13, 259) with
+scale 0.0916, restarts it whenever it ends, and runs it from a frame callback the event's bit 0 starts and bit 1
+ends.

@@ -44,13 +44,18 @@ impl Vfs {
         Self::default()
     }
 
-    /// Mount the archives of an installation that are present and valid.
+    /// Mount the archives of an installation that are present and valid, then its effect files (the
+    /// `magicFiles` folder, as loose files: `FFX/magic_0662.dll`).
     pub fn mount_install(&mut self, install: &Install) -> Result<(), VfsError> {
         for id in ArchiveId::ALL {
             if matches!(install.archive_status(id), crate::install::ArchiveStatus::Ok { .. }) {
                 let archive = VbfArchive::open(install.archive_path(id))?;
                 self.sources.push(Source::Archive { id: Some(id), archive: Arc::new(archive) });
             }
+        }
+        let magic = install.root.join("magicFiles");
+        if magic.is_dir() {
+            self.sources.push(Source::Loose(magic));
         }
         Ok(())
     }

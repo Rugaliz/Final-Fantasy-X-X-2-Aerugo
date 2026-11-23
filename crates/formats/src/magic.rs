@@ -3,7 +3,8 @@
 //! section as data only (the DLL's code is never run; each effect's small driver is ported to Rust). See
 //! `docs/formats/magic.md`.
 //!
-//! - [`DllData`]: a DLL's image base and its `.data` section (virtual address and bytes).
+//! - [`DllData`]: a DLL's image base, its `.data` section (virtual address and bytes) and its read-only data
+//!   (where the names of the effect's particle programs are).
 //! - [`Oef2`]: the effect file container: a directory header with typed tables (images, palettes, slots, and the
 //!   particle groups), and a second header at `+0x3c` holding the same counts with offsets into the data.
 //! - [`Ppp`]: a particle group: its parts (each a timed list of sub-part definitions that spawn objects and run
@@ -13,13 +14,16 @@
 //! part's sub-part definitions and their program references from the part record. The readers keep them as
 //! offsets into the section bytes and never panic on bad input.
 
-/// A DLL's data section, zero filled up to its size in memory.
+/// A DLL's data section, zero filled up to its size in memory, and its read-only data section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DllData {
     pub base: u32,
     /// The section's virtual address (absolute, with the base) and its bytes.
     pub va: u32,
     pub bytes: Vec<u8>,
+    /// The read-only data (`.rdata`): its virtual address and bytes (empty when the image has none).
+    pub rdata_va: u32,
+    pub rdata: Vec<u8>,
 }
 
 fn u16_at(d: &[u8], o: usize) -> Option<u16> {
@@ -44,22 +48,52 @@ impl DllData {
         let opt = pe + 0x18;
         let opt_size = usize::from(u16_at(file, pe + 0x14)?);
         let base = u32_at(file, opt + 0x1c)?;
-        for i in 0..sections {
-            let s = opt + opt_size + i * 0x28;
-            let name = file.get(s..s + 8)?;
-            if !name.starts_with(b".data\0") {
-                continue;
+        let section = |want: &[u8]| -> Option<(u32, Vec<u8>)> {
+            for i in 0..sections {
+                let s = opt + opt_size + i * 0x28;
+                let name = file.get(s..s + 8)?;
+                if !name.starts_with(want) {
+                    continue;
+                }
+                let (vsize, va) = (u32_at(file, s + 8)?, u32_at(file, s + 0xc)?);
+                let (raw_size, raw) = (u32_at(file, s + 0x10)?, u32_at(file, s + 0x14)?);
+                let mut bytes =
+                    file.get(raw as usize..(raw as usize).checked_add(raw_size as usize)?)?.to_vec();
+                // (The part past the file's bytes reads as zero, as the loader leaves it.)
+                if vsize as usize > bytes.len() && vsize <= 0x1000_0000 {
+                    bytes.resize(vsize as usize, 0);
+                }
+                return Some((base.wrapping_add(va), bytes));
             }
-            let (vsize, va) = (u32_at(file, s + 8)?, u32_at(file, s + 0xc)?);
-            let (raw_size, raw) = (u32_at(file, s + 0x10)?, u32_at(file, s + 0x14)?);
-            let mut bytes = file.get(raw as usize..(raw as usize).checked_add(raw_size as usize)?)?.to_vec();
-            // (The part past the file's bytes reads as zero, as the loader leaves it.)
-            if vsize as usize > bytes.len() && vsize <= 0x1000_0000 {
-                bytes.resize(vsize as usize, 0);
+            None
+        };
+        let (va, bytes) = section(b".data\0")?;
+        let (rdata_va, rdata) = section(b".rdata\0").unwrap_or((0, Vec::new()));
+        Some(DllData { base, va, bytes, rdata_va, rdata })
+    }
+
+    /// The zero-terminated string at absolute address `va` in the read-only data (`None` outside it or when it
+    /// is not text).
+    pub fn c_str(&self, va: u32) -> Option<&str> {
+        let o = va.checked_sub(self.rdata_va)? as usize;
+        let rest = self.rdata.get(o..)?;
+        let end = rest.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&rest[..end]).ok()
+    }
+
+    /// The names of the particle program table at `table` (0x28-byte entries whose first word names the
+    /// program), in order, while the entries name a program ("ppp…").
+    pub fn program_names(&self, table: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(mut o) = self.offset(table) else { return out };
+        while let Some(name) = u32_at(&self.bytes, o).and_then(|p| self.c_str(p)) {
+            if !name.starts_with("ppp") {
+                break;
             }
-            return Some(DllData { base, va: base.wrapping_add(va), bytes });
+            out.push(name.to_owned());
+            o += 0x28;
         }
-        None
+        out
     }
 
     /// The section offset of absolute address `va`.

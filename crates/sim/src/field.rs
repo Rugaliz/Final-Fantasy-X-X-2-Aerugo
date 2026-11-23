@@ -2946,6 +2946,8 @@ impl Event {
                 }
             }
         }
+        // The draw phase's effect step (the running effect's draw and its frame callback).
+        effects::frame_draw(&mut self.state);
         // The remaster's own animations step by the frame time (a 30 Hz frame here).
         if let Some(t) = &mut self.state.texture_animations {
             t.update(1.0 / 30.0);
