@@ -2745,7 +2745,8 @@ impl Event {
         // The walk mesh from the PS2 map package next to the drawn map.
         // (Maps drawn as pre-rendered backgrounds have no 3D model but still have a walk mesh.)
         state.shapes.file_base = file_base;
-        let vpa = map_model.as_deref().and_then(walk_mesh_path).or_else(|| {
+        // A map drawn only as pre-rendered layers names its package through its 2D model's folder.
+        let vpa = map_model.as_deref().or(map_layers.as_deref()).and_then(walk_mesh_path).or_else(|| {
             (game == Game::Ffx && name.len() >= 6 && name.is_ascii())
                 .then(|| format!("ffx_ps2/ffx/master/jppc/map/{}/{}/bin/mapout.vpa", &name[..4], &name[..6]))
         });

@@ -40,6 +40,8 @@ pub enum Image {
     Stone,
     /// A page of the base font, or of its shadow (`base_ftc/font_0_<page>`, `shadow_0_<page>`).
     Font { page: u8, shadow: bool },
+    /// A texture of the game data by its archive path (the pre-rendered background's layers).
+    Asset(String),
 }
 
 impl Image {
@@ -53,6 +55,7 @@ impl Image {
                 let kind = if *shadow { "shadow" } else { "font" };
                 format!("{root}/menu_{lang}/base_ftc/d3d11/{kind}_0_{page}.dds.phyre")
             }
+            Image::Asset(path) => path.clone(),
         }
     }
 }
@@ -241,6 +244,27 @@ impl Canvas {
         ];
         let shading = if image.is_some() { Shading::Textured } else { Shading::Plain };
         let d = self.run_draw(shading, image);
+        self.draws[d].quads.push(quad);
+    }
+
+    /// A layer of the map's pre-rendered background: a rectangle (x0, y0, x1, y1) of the PS2's 512 × 448 frame
+    /// with its texture coordinates at the top-left and bottom-right corners as the layer mesh holds them, at
+    /// `alpha` (0x80 = opaque). The frame is laid over the whole HD screen as the 2D layer's frame is (x · 3.75,
+    /// y · 1080 / 448). (The remaster draws these meshes through its prerender scene's camera, not traced: this
+    /// placement is unverified.)
+    pub fn prebg_layer(&mut self, image: Image, rect: [f32; 4], uv: [[f32; 2]; 2], alpha: u8) {
+        let hx = |x: f32| x * SCALE_X - HD_W / 2.0;
+        let hy = |y: f32| (f64::from(y) * f64::from(HD_H) / 448.0) as f32 - HD_H / 2.0;
+        let c = shade([0x80, 0x80, 0x80, alpha]);
+        let [x0, y0, x1, y1] = rect;
+        let [[u0, v0], [u1, v1]] = uv;
+        let quad = [
+            Vertex { pos: [hx(x0), hy(y1)], uv: [u0, v1], color: c },
+            Vertex { pos: [hx(x1), hy(y1)], uv: [u1, v1], color: c },
+            Vertex { pos: [hx(x1), hy(y0)], uv: [u1, v0], color: c },
+            Vertex { pos: [hx(x0), hy(y0)], uv: [u0, v0], color: c },
+        ];
+        let d = self.run_draw(Shading::Textured, Some(image));
         self.draws[d].quads.push(quad);
     }
 

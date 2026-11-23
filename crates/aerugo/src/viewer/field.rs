@@ -49,6 +49,8 @@ struct Session {
     jump_choices: Vec<String>,
     /// Stored cameras of the map's 2D layers.
     map_cameras: Option<Vec<aerugo_formats::camera::Camera>>,
+    /// The pre-rendered background's layer meshes (the map's 2D model).
+    prebg: Vec<PreBgQuad>,
     /// Character models by model id (None when missing).
     actors: HashMap<u16, Option<ModelInfo>>,
     notes: Vec<String>,
@@ -407,11 +409,13 @@ impl FieldView {
             .and_then(|d| Cluster::parse(d).ok())
             .map(|c| aerugo_formats::camera::read_cameras(&c))
             .filter(|c| !c.is_empty());
+        let prebg = event.map_layers.as_deref().map(|p| read_prebg_quads(vfs, p)).unwrap_or_default();
         log::info!("field: {path} (map {})", event.map_model.as_deref().unwrap_or("none"));
         self.session = Some(Session {
             restore_position,
             jump_choices: Vec::new(),
             map_cameras,
+            prebg,
             event,
             map,
             layers,
@@ -1297,7 +1301,7 @@ impl FieldView {
                 });
                 if let Some(font) = font.as_ref() {
                     let (canvas, drawn) =
-                        message_canvas(st, font, px, lang, self.started.elapsed().as_secs_f32());
+                        message_canvas(st, &s.prebg, font, px, lang, self.started.elapsed().as_secs_f32());
                     s.ui.draw(vfs, renderer, &mut s.phyre.programs, &canvas, lang.code(), px, &mut frame);
                     drawn_windows = drawn;
                 }
@@ -1451,6 +1455,7 @@ fn caster_source(
 /// the other types are not ported yet.
 fn message_canvas(
     st: &aerugo_sim::field::FieldState,
+    prebg: &[PreBgQuad],
     font: &aerugo_formats::ftc::Ftc,
     px: (u32, u32),
     lang: Language,
@@ -1459,6 +1464,21 @@ fn message_canvas(
     use aerugo_sim::msgwin;
     let mut canvas = aerugo_sim::ui2d::Canvas::new();
     let mut drawn = Vec::new();
+    // The pre-rendered background's layers of the current scene that are shown, farthest first (they go under the
+    // windows; the remaster draws them first, into its prerender scene).
+    let scene = st.pre_bg.current;
+    let mut layers: Vec<&PreBgQuad> = prebg.iter().filter(|q| q.scene == scene).collect();
+    layers.sort_by(|a, b| b.z.total_cmp(&a.z));
+    for q in layers {
+        let Some(l) = st.pre_bg.remaster.get(q.layer) else { continue };
+        if l.hidden || !l.material_visible {
+            continue;
+        }
+        let alpha = l.alpha.unwrap_or(0x80).clamp(0, 0xff) as u8;
+        let [mx, my] = l.moved.map(|v| v as f32);
+        let rect = [q.rect[0] + mx, q.rect[1] + my, q.rect[2] + mx, q.rect[3] + my];
+        canvas.prebg_layer(aerugo_sim::ui2d::Image::Asset(q.texture.clone()), rect, q.uv, alpha);
+    }
     let metrics = msgwin::Metrics::new(px.0, px.1);
     // TODrawMessageWindow: each window's frame (while up), then its text (while on) — the current page.
     for (i, w) in st.windows.iter().enumerate() {
@@ -1560,4 +1580,54 @@ mod view_tests {
         assert_eq!(v.actors[1].0, [100.0, 0.0, 0.0]);
         assert_eq!(v.eye, Some([2.5, 0.0, 0.0]));
     }
+}
+
+/// One layer mesh of a map's 2D model (`scene<s>layer<l>Shape`): its rectangle in the PS2's 512 × 448 frame,
+/// depth, the texture coordinates at its top-left and bottom-right corners and its texture.
+#[derive(Debug, Clone)]
+struct PreBgQuad {
+    scene: usize,
+    layer: usize,
+    z: f32,
+    rect: [f32; 4],
+    uv: [[f32; 2]; 2],
+    texture: String,
+}
+
+/// The layer meshes of a map's 2D model.
+fn read_prebg_quads(vfs: &Vfs, path: &str) -> Vec<PreBgQuad> {
+    let Some(c) = vfs.read(path).ok().and_then(|d| Cluster::parse(d).ok()) else { return Vec::new() };
+    let Ok(model) = aerugo_formats::mesh::read_model(&c) else { return Vec::new() };
+    let mut out = Vec::new();
+    for m in &model.meshes {
+        let Some(rest) = m.name.strip_prefix("scene") else { continue };
+        let Some((s, l)) = rest.strip_suffix("Shape").and_then(|r| r.split_once("layer")) else { continue };
+        let (Ok(scene), Ok(layer)) = (s.parse::<usize>(), l.parse::<usize>()) else { continue };
+        let Some(seg) = m.segments.first() else { continue };
+        let (Some(ps), Some(st)) = (seg.positions(), seg.stream("ST")) else { continue };
+        let pos = aerugo_formats::mesh::stream_floats(&c, ps);
+        let uv = aerugo_formats::mesh::stream_floats(&c, st);
+        let verts: Vec<([f32; 3], [f32; 2])> = pos
+            .chunks_exact(3)
+            .zip(uv.chunks_exact(2))
+            .map(|(p, t)| ([p[0], p[1], p[2]], [t[0], t[1]]))
+            .collect();
+        let Some(texture) = m
+            .materials
+            .get(seg.material as usize)
+            .and_then(|mat| mat.textures.first())
+            .map(|t| aerugo_formats::mesh::texture_cluster_path(path, &t.asset))
+        else {
+            continue;
+        };
+        let x0 = verts.iter().map(|v| v.0[0]).fold(f32::MAX, f32::min);
+        let y0 = verts.iter().map(|v| v.0[1]).fold(f32::MAX, f32::min);
+        let x1 = verts.iter().map(|v| v.0[0]).fold(f32::MIN, f32::max);
+        let y1 = verts.iter().map(|v| v.0[1]).fold(f32::MIN, f32::max);
+        let at = |x: f32, y: f32| verts.iter().find(|v| v.0[0] == x && v.0[1] == y).map(|v| v.1);
+        let (Some(tl), Some(br)) = (at(x0, y0), at(x1, y1)) else { continue };
+        let z = verts.first().map_or(0.0, |v| v.0[2]);
+        out.push(PreBgQuad { scene, layer, z, rect: [x0, y0, x1, y1], uv: [tl, br], texture });
+    }
+    out
 }

@@ -282,6 +282,24 @@ fn new_page(g: &mut FieldState, w: usize, image: &[u8]) {
     t.phase = 1;
     t.state = 1;
     t.step = t.resume;
+    // A choice text's records (8b9a60): one per {10:xx} marker on the page (not {10:ff}, not the name markers
+    // 0x50–0x5f); the first is 0.
+    if t.choices {
+        let (start, end) = (t.start, t.end.unwrap_or(bytes.len()).min(bytes.len()));
+        let mut at = start;
+        let mut n = 0i8;
+        while at < end {
+            if bytes[at] == 0x10
+                && bytes.get(at + 1).is_some_and(|&a| a != 0xff && !(0x50..0x60).contains(&a))
+            {
+                n += 1;
+            }
+            at += step_len(&bytes[at..]).max(1);
+        }
+        let c = &mut g.windows[w].to.choice;
+        c.first = 0;
+        c.count = n;
+    }
 }
 
 /// Whether the page is the text's last (the byte after it is the end).
@@ -366,12 +384,6 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     t.start = 0;
     t.end = None;
     new_page(g, w, image);
-    if g.windows[w].to.text.choices {
-        let n = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.choices);
-        let c = &mut g.windows[w].to.choice;
-        c.first = 0;
-        c.count = n as i8;
-    }
 }
 
 /// msg_close (8640f0): unless closed or closing, the event side's state 3 and the frame and text close.
