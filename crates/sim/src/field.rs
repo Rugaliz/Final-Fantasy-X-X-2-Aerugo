@@ -3990,13 +3990,13 @@ fn register_queries(n: &mut Natives<FieldState>) {
     );
     // The pad: the word, one bit of it, and a wait until the given bits are let go.
     n.register(0x0046, Native::result(|g, _| Value::Int((pad_word(g) & 0xFFFF) as i32)));
-    // 004d: event 0x31 reads 0 for worker 0xb while the save's byte at global 0xa4d has bit 0x20.
+    // 004d: event 0x31 reads 0 for worker 0xb while the save's byte at offset 0xc39 has bit 0x20.
     n.register(
         0x004D,
         Native::result(|g, c| {
             let bit = c.stack.pop_int() as u32 & 31;
             let id = g.workers.list.get(c.worker).map_or(0, crate::workers::Worker::id);
-            let flag = c.memory.global[0].get(0xa4d).copied().unwrap_or(0);
+            let flag = c.memory.global[0].get(0xc39).copied().unwrap_or(0);
             if g.scene == Some(0x31) && flag & 0x20 != 0 && id == 0xb {
                 return Value::Int(0);
             }
