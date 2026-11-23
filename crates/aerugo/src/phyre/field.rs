@@ -80,6 +80,20 @@ pub struct ActorDraw<'a> {
     /// The character's face sprites and its face layer stack.
     pub face: Option<&'a CharFace>,
     pub face_layers: &'a [FaceLayer],
+    /// What the shadow manager registers for this character when it casts this frame.
+    pub caster: Option<CasterSource>,
+}
+
+/// A casting character's values for the shadow manager: its body (the grid key), model name and id, the
+/// length of its root's second column × 1000, its ground height and its shade.
+#[derive(Debug, Clone)]
+pub struct CasterSource {
+    pub key: usize,
+    pub name: String,
+    pub id: u16,
+    pub scale: f32,
+    pub ground: f32,
+    pub shade: f32,
 }
 
 /// The face materials' texture parameters, layer by layer.
@@ -220,6 +234,43 @@ impl FieldRenderer {
         Some(t)
     }
 
+    /// The casting characters' registration in the shadow manager's grid this frame: each one's instances
+    /// (their worlds as drawn and their local boxes).
+    fn register_casters(&mut self, vfs: &Vfs, renderer: &mut Renderer, actors: &[ActorDraw<'_>], size: u32) {
+        self.shadow.casters.begin_frame();
+        for a in actors {
+            let Some(c) = &a.caster else { continue };
+            if !self.model(vfs, renderer, a.path) {
+                continue;
+            }
+            let model = self.models[a.path].as_ref().expect("loaded above");
+            let placed = instance_worlds(&model.model.meshes, &a.parts, a.all_skinned, a.world);
+            let instances = model
+                .meshes
+                .iter()
+                .map(|mesh| {
+                    let source = &model.model.meshes[mesh.source];
+                    super::shadow::CasterInstance {
+                        world: placed[mesh.source]
+                            .unwrap_or_else(|| a.world * Mat4::from_cols_array(&source.world)),
+                        min: source.bounds_min,
+                        size: source.bounds_size,
+                    }
+                })
+                .collect();
+            let input = super::shadow::CasterInput {
+                key: c.key,
+                name: c.name.clone(),
+                id: c.id,
+                instances,
+                scale: c.scale,
+                ground: c.ground,
+                shade: c.shade,
+            };
+            self.shadow.casters.register(&input, size);
+        }
+    }
+
     /// The event's 2D shapes (the credits) over a finished frame.
     pub fn draw_2d_shapes(
         &mut self,
@@ -284,7 +335,11 @@ impl FieldRenderer {
                 depth: Some(depth),
             },
         ];
-        // The shadow maps (cleared when a map loads) and what the receiving materials are given this frame.
+        // The shadow maps (cleared when a map loads) and what the receiving materials are given this frame: in
+        // modes 2 and 3 the casting characters register in the manager's grid, the seen ones whose instances
+        // lie in the cascade's view cast into the advanced map; the light matrices follow this frame's fit only
+        // when that set of casters changed, else last frame's stay.
+        let mut shadow_plan: Option<ShadowPlan> = None;
         let receivers = match (objects.shadow, map) {
             (Some(setup), Some(path)) => {
                 let mode = super::shadow::map_shadow(setup.map_id, false, setup.event, setup.progress);
@@ -292,31 +347,60 @@ impl FieldRenderer {
                 let mut clears = Vec::new();
                 let maps = self.shadow.frame(renderer, size, path, setup.map_id, &mut clears);
                 ops.splice(0..0, clears);
-                maps.map(|t| {
-                    let lvp = match mode.mode {
-                        2 | 3 => {
-                            super::shadow::light_fit(
-                                scene.view,
-                                scene.projection,
-                                scene.near,
-                                mode.near[0],
-                                mode.far[0],
-                            )
-                            .light_view_projection
-                        }
-                        4 => {
-                            if self.reported.insert("shadow mode 4".into()) {
-                                log::error!("GAP: the two-cascade shadow fit (mode 4) is not ported");
+                match maps {
+                    Some(t) => {
+                        let (lvp, chr_y) = match mode.mode {
+                            2 | 3 => {
+                                self.register_casters(vfs, renderer, actors, size);
+                                let casters = &mut self.shadow.casters;
+                                casters.visibility(scene.projection * scene.view, mode.visibility_test);
+                                let fit = super::shadow::light_fit(
+                                    scene.view,
+                                    scene.projection,
+                                    scene.near,
+                                    mode.near[0],
+                                    mode.far[0],
+                                );
+                                let mut now = casters.cascade(fit.raw());
+                                now.sort_unstable();
+                                let chosen = match self.shadow.kept.take() {
+                                    Some((kept, _)) => {
+                                        let mut before = casters.cascade(kept.raw());
+                                        before.sort_unstable();
+                                        if before != now { fit } else { kept }
+                                    }
+                                    None => fit,
+                                };
+                                self.shadow.kept = Some((chosen, now.clone()));
+                                let rects = casters.atlas(&now, chosen.light_view_projection, size);
+                                let keys: Vec<usize> = now
+                                    .iter()
+                                    .filter_map(|&i| {
+                                        casters.cells.get(i).and_then(Option::as_ref).map(|c| c.key)
+                                    })
+                                    .collect();
+                                if setup.quality != 0 && !self.shadow.fresh {
+                                    shadow_plan =
+                                        Some(ShadowPlan { maps: t, size, light: chosen, rects, keys });
+                                }
+                                (chosen.light_view_projection, casters.main_chr_y())
                             }
-                            Mat4::ZERO
-                        }
-                        _ => Mat4::ZERO,
-                    };
-                    super::shadow::Receivers::new(t, mode.mode, size, [lvp, Mat4::ZERO], 0.0)
-                })
+                            4 => {
+                                if self.reported.insert("shadow mode 4".into()) {
+                                    log::error!("GAP: the two-cascade shadow fit (mode 4) is not ported");
+                                }
+                                (Mat4::ZERO, 0.0)
+                            }
+                            _ => (Mat4::ZERO, 0.0),
+                        };
+                        Some(super::shadow::Receivers::new(t, mode.mode, size, [lvp, Mat4::ZERO], chr_y))
+                    }
+                    None => None,
+                }
             }
             _ => None,
         };
+        let mut shadow_draws: Vec<GameOp> = Vec::new();
         let shadow_textures = |o: &mut Overrides| {
             if let Some(r) = receivers {
                 o.textures.push(("MySMSampler", Some(ImageRef::Target(r.map))));
@@ -482,11 +566,95 @@ impl FieldRenderer {
                         &mut missing,
                     );
                     let draws = draws.into_iter().map(|d| GameOp::Draw(Box::new(d)));
-                    if transparent || a.material[3] < 1.0 { later.extend(draws) } else { ops.extend(draws) }
+                    if transparent || a.material[3] < 1.0 {
+                        later.extend(draws)
+                    } else {
+                        ops.extend(draws)
+                    }
+                    // A caster of the cascade: its instances' "Shadow" pass from the light, into the advanced map's
+                    // inner square.
+                    if let (Some(plan), Some(c)) = (&shadow_plan, &a.caster)
+                        && plan.keys.contains(&c.key)
+                    {
+                        let lf = plan.light;
+                        let lit = object_values(world, lf.view, lf.projection);
+                        let values = |name: &str| {
+                            lit(name)
+                                .or_else(|| scene.value(name))
+                                .or_else(|| character_value(name, a, light, &bones))
+                        };
+                        let inner = (plan.size - 64) as f32;
+                        let draws = segment_draws(
+                            vfs,
+                            renderer,
+                            &mut self.programs,
+                            model,
+                            mesh,
+                            seg,
+                            "Shadow",
+                            0,
+                            &values,
+                            anisotropy,
+                            [32.0, 32.0, inner, inner, 0.0, 1.0],
+                            &Overrides::default(),
+                            &mut missing,
+                        );
+                        shadow_draws.extend(draws.into_iter().map(|d| GameOp::Draw(Box::new(d))));
+                    }
                 }
             }
         }
         ops.extend(later);
+        // The advanced map: cleared, the casters drawn, then blurred across (into the temporary map) and back,
+        // rectangle by rectangle of the atlas (each in the inner square, 32 texels in).
+        if let Some(plan) = &shadow_plan {
+            let [adv, _, temp, _, _] = plan.maps;
+            let s = plan.size as f32;
+            let mut pre = vec![
+                GameOp::ClearColor(TargetRef::Target(adv), [0.0; 4]),
+                GameOp::ClearColor(TargetRef::Target(temp), [0.0; 4]),
+                GameOp::SetTargets { colors: vec![TargetRef::Target(adv)], depth: None },
+            ];
+            pre.append(&mut shadow_draws);
+            let game = aerugo_formats::Game::Ffx;
+            self.post.set_value("shadowblur", "GaussianBlurBufferSize", Value::Floats(vec![s, s, 0.0, 0.0]));
+            self.post.set_value("shadowblur", "OutputScale", Value::Floats(vec![1.0; 4]));
+            for (from, to, technique) in
+                [(adv, temp, "ShadowGaussianBlurX"), (temp, adv, "ShadowGaussianBlurY")]
+            {
+                for r in &plan.rects {
+                    let (x, y, w, h) =
+                        ((r[0] + 32) as f32, (r[1] + 32) as f32, (r[2] - r[0]) as f32, (r[3] - r[1]) as f32);
+                    self.post.set_value(
+                        "shadowblur",
+                        "UvScaleBias",
+                        Value::Floats(vec![w / s, h / s, x / s, y / s]),
+                    );
+                    self.post.pass_in(
+                        vfs,
+                        renderer,
+                        &mut self.programs,
+                        game,
+                        "shadowblur",
+                        technique,
+                        "shadowblur",
+                        &[("ColorBuffer", ImageRef::Target(from))],
+                        TargetRef::Target(to),
+                        None,
+                        [x, y, w, h],
+                        super::post::Shape::Quad,
+                        scene,
+                        anisotropy,
+                        &mut pre,
+                    );
+                }
+            }
+            let at = ops
+                .iter()
+                .position(|o| matches!(o, GameOp::ClearDepth(..)))
+                .map_or(0, |i| i.saturating_sub(1));
+            ops.splice(at..at, pre);
+        }
         // The effects after the scene's transparent draws.
         let mut transient = Vec::new();
         ops.extend(self.vfx.draws(
@@ -538,6 +706,16 @@ impl FieldRenderer {
         }
         Some(GameFrame { ops, transient })
     }
+}
+
+/// What the advanced map's draw needs: the maps, their size, the light matrices in use, the atlas and the
+/// casting bodies.
+struct ShadowPlan {
+    maps: [TargetHandle; 5],
+    size: u32,
+    light: super::shadow::LightFit,
+    rects: Vec<[i32; 4]>,
+    keys: Vec<usize>,
 }
 
 /// Values only characters take: their lights, colours and bones.

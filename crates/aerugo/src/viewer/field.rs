@@ -1170,6 +1170,7 @@ impl FieldView {
                 Some(r) => (rig_parts(r, pose.as_ref(), world), r.skinned.iter().all(|&s| s)),
                 None => (Vec::new(), false),
             };
+            let caster = caster_source(st, w, id, path.as_str(), a.shade.value);
             paths.push((
                 path,
                 (world, parts, all_skinned),
@@ -1178,6 +1179,7 @@ impl FieldView {
                 k,
                 a.color[3].value.min(1.0),
                 (st.model_faces.get(&id).and_then(|f| f.1.as_deref()), a.face_layers.as_slice()),
+                caster,
             ));
         }
         let poses: Vec<_> = paths
@@ -1199,7 +1201,7 @@ impl FieldView {
         let actors: Vec<crate::phyre::field::ActorDraw<'_>> = paths
             .iter()
             .zip(&poses)
-            .map(|((path, (world, parts, all_skinned), _, rgb, k, alpha, (face, layers)), pose)| {
+            .map(|((path, (world, parts, all_skinned), _, rgb, k, alpha, (face, layers), caster), pose)| {
                 crate::phyre::field::ActorDraw {
                     path,
                     world: *world,
@@ -1210,6 +1212,7 @@ impl FieldView {
                     shade: *rgb,
                     face: *face,
                     face_layers: layers,
+                    caster: caster.clone(),
                 }
             })
             .collect();
@@ -1419,6 +1422,45 @@ fn carry_over(image: &mut [u8], target: i32, entrance: i32) {
     image[0..2].copy_from_slice(&(target as u16).to_le_bytes());
     image[0xD] = image[0xC];
     image[0xC] = entrance as u8;
+}
+
+/// Ids that never cast a shadow.
+const NO_SHADOW: [u16; 9] = [0x106a, 0x106d, 0x1077, 0x1088, 0x1083, 0x1089, 0x108c, 0x109f, 0x3016];
+
+/// A character's shadow-manager values when it casts this frame: in use and shown (+0x198 bit 0x10), not in
+/// motion modes 2 or 3, its shadow type (+0x183, after the hand-off's per-model rules for this map) 1 or 3,
+/// and not one of the ids that never cast. The scale is the root's second column's length × 1000.
+fn caster_source(
+    st: &aerugo_sim::field::FieldState,
+    w: usize,
+    id: u16,
+    path: &str,
+    shade: f32,
+) -> Option<crate::phyre::field::CasterSource> {
+    let ch = st.chrs.get(w)?.as_ref()?;
+    if ch.u8(2) == 0 || ch.u32(0x198) & 0x10 == 0 || matches!(ch.u8(0x186), 2 | 3) || NO_SHADOW.contains(&id)
+    {
+        return None;
+    }
+    let map = st.map_id;
+    let mut kind = ch.u8(0x183);
+    let model = ch.u16(0);
+    if matches!(model, 0x5009 | 0x500a | 0x501d | 0x5034 | 0x5055 | 0x5056)
+        || (model == 0x5033 && map != 0x200f)
+        || (model == 0x4029 && map != 0xfc1 && map != 0x1c36)
+    {
+        kind = 1;
+    }
+    if kind != 1 && kind != 3 {
+        return None;
+    }
+    let root = st.chr_frames.get(w).cloned().flatten()?.world;
+    let scale = (((f64::from(root[4]) * f64::from(root[4]) + f64::from(root[5]) * f64::from(root[5]))
+        + f64::from(root[6]) * f64::from(root[6]))
+    .sqrt()
+        * 1000.0) as f32;
+    let name = path.rsplit('/').next()?.split('.').next()?.to_owned();
+    Some(crate::phyre::field::CasterSource { key: w, name, id, scale, ground: ch.f32(0x16c), shade })
 }
 
 /// The frame of a game box: deep blue, half see-through, with a light edge (the look of FFX's windows).

@@ -213,6 +213,7 @@ impl ModelBrowser {
             };
             let path = self.loaded.as_ref().map(|(p, _)| p.as_str()).unwrap_or_default();
             let actor = crate::phyre::field::ActorDraw {
+                caster: None,
                 path,
                 world: Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0)),
                 parts: Vec::new(),

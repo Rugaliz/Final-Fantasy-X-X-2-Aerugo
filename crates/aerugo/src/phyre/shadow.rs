@@ -159,6 +159,11 @@ pub struct ShadowMaps {
     targets: Option<[TargetHandle; 5]>,
     /// The map the last clear was for.
     cleared_for: Option<(String, u32)>,
+    /// The frame after a map load only clears (the manager's first-draw flag).
+    pub fresh: bool,
+    /// The casters and the light matrices kept from the last change of the cascade's casters.
+    pub casters: Casters,
+    pub kept: Option<(LightFit, Vec<usize>)>,
 }
 
 impl ShadowMaps {
@@ -195,11 +200,14 @@ impl ShadowMaps {
     ) -> Option<[TargetHandle; 5]> {
         let t = self.ensure(renderer, size)?;
         let key = (map.to_owned(), map_id);
+        self.fresh = false;
         if self.cleared_for.as_ref() != Some(&key) {
             for h in [t[0], t[1], t[2], t[3], t[4]] {
                 ops.push(GameOp::ClearColor(TargetRef::Target(h), [0.0; 4]));
             }
             self.cleared_for = Some(key);
+            self.fresh = true;
+            self.kept = None;
         }
         Some(t)
     }
@@ -271,6 +279,13 @@ pub struct LightFit {
     pub light_view_projection: Mat4,
 }
 
+impl LightFit {
+    /// The cascade's light view-projection before the texture bias.
+    pub fn raw(&self) -> Mat4 {
+        self.projection * self.view
+    }
+}
+
 /// The light's turn about X (straight down) and its offset along Y.
 /// The game's constant is −1.5708 (not exactly −π/2).
 #[allow(clippy::approx_constant)]
@@ -332,4 +347,428 @@ pub fn light_fit(view: Mat4, projection: Mat4, camera_near: f32, near: f32, far:
         0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 0.5, 1.0,
     ]);
     LightFit { view: light_view, projection, light_view_projection: bias * projection * light_view }
+}
+
+/// A mesh instance of a casting character: its world, and its local bounds (minimum corner and size).
+#[derive(Debug, Clone, Copy)]
+pub struct CasterInstance {
+    pub world: Mat4,
+    pub min: [f32; 3],
+    pub size: [f32; 3],
+}
+
+/// A character casting a shadow this frame: its identity (the body), its model name and id, its instances,
+/// the length of its root's second column × 1000, its ground height and its shade.
+#[derive(Debug, Clone)]
+pub struct CasterInput {
+    pub key: usize,
+    pub name: String,
+    pub id: u16,
+    pub instances: Vec<CasterInstance>,
+    pub scale: f32,
+    pub ground: f32,
+    pub shade: f32,
+}
+
+/// A grid cell's caster: whose it is, its size (1 or 2 cells a side), whether it registered this frame and
+/// is seen, the cell camera's matrix, the light-space extents, the drawn texel size, the UV rectangle of its
+/// part of the map, 1 / scale and shade / 2.
+#[derive(Debug, Clone)]
+pub struct Cell {
+    pub key: usize,
+    pub span: u32,
+    pub registered: bool,
+    pub visible: bool,
+    pub name: String,
+    pub id: f32,
+    pub matrix: Mat4,
+    pub extent: [f32; 2],
+    pub texels: [i32; 2],
+    pub uv: [f32; 4],
+    pub inv_scale: f32,
+    pub half_shade: f32,
+    pub instances: Vec<CasterInstance>,
+}
+
+/// The shadow manager's 8 × 8 grid of casters (a cell per character; a large one takes a 2 × 2 block).
+#[derive(Debug, Default)]
+pub struct Casters {
+    pub cells: Vec<Option<Cell>>,
+    taken: Vec<bool>,
+    /// The main character's cell (the model named "c001").
+    pub main: Option<usize>,
+}
+
+/// The box (minimum corner, size) through `m`: the component-wise bounds of its eight corners.
+fn box_through(m: &Mat4, min: [f32; 3], size: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let o = m.transform_point3(glam::Vec3::from(min));
+    let (x, y, z) =
+        (m.x_axis.truncate() * size[0], m.y_axis.truncate() * size[1], m.z_axis.truncate() * size[2]);
+    let corners = [o, o + x, o + y, o + x + y, o + z, o + x + z, o + y + z, o + x + y + z];
+    let lo = corners.iter().fold(glam::Vec3::splat(f32::MAX), |a, c| a.min(*c));
+    let hi = corners.iter().fold(glam::Vec3::splat(-f32::MAX), |a, c| a.max(*c));
+    (lo.to_array(), hi.to_array())
+}
+
+/// The texel size of a cell for light-space extents (a, b) under a limit: when the larger fits, each extent
+/// + 1 (truncated); else the larger becomes the limit and the other keeps the proportion.
+fn texel_size(a: f32, b: f32, limit: i32) -> [i32; 2] {
+    let l = limit as f32;
+    if b < a {
+        if l > a {
+            return [(a + 1.0) as i32, (b + 1.0) as i32];
+        }
+        let r = if b == 0.0 { 0.0 } else { a / b };
+        [limit, if r == 0.0 { 0 } else { (d(l) / d(r)) as i32 }]
+    } else {
+        if l > b {
+            return [(a + 1.0) as i32, (b + 1.0) as i32];
+        }
+        let r = if a == 0.0 { 0.0 } else { b / a };
+        [if r == 0.0 { 0 } else { (d(l) / d(r)) as i32 }, limit]
+    }
+}
+
+fn d(x: f32) -> f64 {
+    f64::from(x)
+}
+
+impl Casters {
+    /// Every cell unregistered (the hand-off does this before the characters register).
+    pub fn begin_frame(&mut self) {
+        self.cells.resize(64, None);
+        self.taken.resize(64, false);
+        for c in self.cells.iter_mut().flatten() {
+            c.registered = false;
+        }
+    }
+
+    /// A body's cell taken back (its character is gone).
+    pub fn remove(&mut self, key: usize) {
+        self.cells.resize(64, None);
+        self.taken.resize(64, false);
+        for i in 0..64 {
+            if self.cells[i].as_ref().is_some_and(|c| c.key == key) {
+                let span = self.cells[i].as_ref().map_or(1, |c| c.span);
+                for (dr, dc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    if span > 1 || (dr, dc) == (0, 0) {
+                        let j = i + dr * 8 + dc;
+                        if j < 64 {
+                            self.taken[j] = false;
+                        }
+                    }
+                }
+                self.cells[i] = None;
+                if self.main == Some(i) {
+                    self.main = None;
+                }
+            }
+        }
+    }
+
+    /// The first free cell (or 2 × 2 block), row by row.
+    fn insert(&mut self, c: &CasterInput, span: u32) -> Option<usize> {
+        let limit = if span == 1 { 8 } else { 7 };
+        for row in 0..limit {
+            for col in 0..limit {
+                let i = row * 8 + col;
+                let free = if span == 1 {
+                    !self.taken[i]
+                } else {
+                    !self.taken[i] && !self.taken[i + 1] && !self.taken[i + 8] && !self.taken[i + 9]
+                };
+                if !free {
+                    continue;
+                }
+                self.taken[i] = true;
+                if span > 1 {
+                    self.taken[i + 1] = true;
+                    self.taken[i + 8] = true;
+                    self.taken[i + 9] = true;
+                }
+                if c.name == "c001" && span == 1 {
+                    self.main = Some(i);
+                }
+                self.cells[i] = Some(Cell {
+                    key: c.key,
+                    span,
+                    registered: false,
+                    visible: true,
+                    name: c.name.chars().take(11).collect(),
+                    id: f32::from(c.id),
+                    matrix: Mat4::IDENTITY,
+                    extent: [0.0; 2],
+                    texels: [1, 1],
+                    uv: [0.0; 4],
+                    inv_scale: 0.0,
+                    half_shade: 0.0,
+                    instances: Vec::new(),
+                });
+                return Some(i);
+            }
+        }
+        log::warn!("Insert failed, maybe the shadow map is full");
+        None
+    }
+
+    /// A character's registration this frame (see the module notes): its cell (found or inserted), the cell
+    /// camera, the extents, the texel size and the UV rectangle it returns (cell 0's when the grid is full).
+    pub fn register(&mut self, c: &CasterInput, size: u32) -> [f32; 4] {
+        self.cells.resize(64, None);
+        self.taken.resize(64, false);
+        let Some(first) = c.instances.first().copied() else { return [0.0; 4] };
+        let found = self.cells.iter().position(|x| x.as_ref().is_some_and(|x| x.key == c.key));
+        let i = match found {
+            Some(i) => i,
+            None => {
+                let span = if first.size[0] > 30.0 || first.size[2] > 30.0 { 2 } else { 1 };
+                match self.insert(c, span) {
+                    Some(i) => i,
+                    None => return self.cells[0].as_ref().map_or([0.0; 4], |x| x.uv),
+                }
+            }
+        };
+        let (row, col) = (i / 8, i % 8);
+        let centre =
+            glam::Vec3::new(first.min[0] + first.size[0] * 0.5, 0.0, first.size[2] * 0.5 + first.min[2]);
+        let inv = if c.scale == 0.0 { 0.0 } else { 1.0 / c.scale };
+        let mut a = first.world * Mat4::from_scale(glam::Vec3::splat(inv));
+        let ty = a.w_axis.y.min(-c.ground) - 0.2;
+        a.w_axis.y = ty;
+        let b = a * Mat4::from_translation(centre);
+        a.w_axis = glam::Vec4::new(b.w_axis.x, b.w_axis.y, b.w_axis.z, 1.0);
+        let (s, cs) = LIGHT_PITCH.sin_cos();
+        let turn = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0, 0.0, cs, s, 0.0, 0.0, -s, cs, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let matrix = a * turn;
+        let (mut lo, mut hi) = ([f32::MAX; 3], [-f32::MAX; 3]);
+        for inst in &c.instances {
+            let m = inst.world * matrix;
+            let (l, h) = box_through(&m, inst.min, inst.size);
+            for k in 0..3 {
+                lo[k] = lo[k].min(l[k]);
+                hi[k] = hi[k].max(h[k]);
+            }
+        }
+        let extent = [hi[0] - lo[0], hi[1] - lo[1]];
+        let eighth = size as i32 / 8;
+        let span = self.cells[i].as_ref().map_or(1, |x| x.span);
+        let (k, factor) = if span == 1 { (eighth, 10.0) } else { (eighth * 2, 20.0) };
+        let mut t = texel_size(extent[0] * factor, extent[1] * factor, k - 4);
+        let cap = eighth * 2 - 4;
+        for v in &mut t {
+            if cap <= *v {
+                *v = cap;
+            }
+            if *v < 1 {
+                *v = 1;
+            }
+        }
+        let s8 = (size as i32 & !7) as f32;
+        let uv = [
+            0.0 / s8 + col as f32 * 0.125,
+            0.0 / s8 + row as f32 * 0.125,
+            ((t[0] + 4) as f32 * 0.5) / s8 + col as f32 * 0.125,
+            ((t[1] + 4) as f32 * 0.5) / s8 + row as f32 * 0.125,
+        ];
+        if let Some(cell) = self.cells[i].as_mut() {
+            cell.registered = true;
+            cell.matrix = matrix;
+            cell.extent = extent;
+            cell.texels = t;
+            cell.uv = uv;
+            cell.inv_scale = inv;
+            cell.half_shade = c.shade * 0.5;
+            cell.instances = c.instances.clone();
+        }
+        uv
+    }
+}
+
+/// The clip-space outcode of a point (x, y, z, w): bits for x > w, y > w, z > w, x < −w, y < −w, z < −w.
+fn outcode(p: glam::Vec4) -> u8 {
+    let mut c = 0;
+    if p.x - p.w > 0.0 {
+        c |= 1;
+    }
+    if p.y - p.w > 0.0 {
+        c |= 2;
+    }
+    if p.z - p.w > 0.0 {
+        c |= 4;
+    }
+    if p.w + p.x < 0.0 {
+        c |= 8;
+    }
+    if p.w + p.y < 0.0 {
+        c |= 0x10;
+    }
+    if p.w + p.z < 0.0 {
+        c |= 0x20;
+    }
+    c
+}
+
+/// The eight corners of a box (minimum corner, size) through `m`, in clip space.
+fn clip_corners(m: &Mat4, min: [f32; 3], size: [f32; 3]) -> [glam::Vec4; 8] {
+    let o = *m * glam::Vec4::new(min[0], min[1], min[2], 1.0);
+    let (x, y, z) = (m.x_axis * size[0], m.y_axis * size[1], m.z_axis * size[2]);
+    [o, o + x, o + y, o + x + y, o + z, o + x + z, o + y + z, o + x + y + z]
+}
+
+/// Whether the box is not wholly outside one clip plane.
+fn box_meets_view(m: &Mat4, min: [f32; 3], size: [f32; 3]) -> bool {
+    clip_corners(m, min, size).iter().fold(0xff, |a, p| a & outcode(*p)) == 0
+}
+
+/// Whether the box lies wholly inside the view.
+fn box_inside_view(m: &Mat4, min: [f32; 3], size: [f32; 3]) -> bool {
+    clip_corners(m, min, size).iter().all(|p| outcode(*p) == 0)
+}
+
+/// A character instance's visibility for the shadow manager: four points of its footprint (the box's
+/// minimum x and z, its height less a third of its width and depth, and the corners across x and z), each
+/// lifted to 0.9 of its w: unseen when they share an outcode bit, or when all four lie below −1.1 in y / w.
+fn instance_seen(m: &Mat4, min: [f32; 3], size: [f32; 3]) -> bool {
+    let y = (size[1] + min[1]) - (size[2] + size[0]) / 3.0;
+    let p0 = *m * glam::Vec4::new(min[0], y, min[2], 1.0);
+    let (x, z) = (m.x_axis * size[0], m.z_axis * size[2]);
+    let pts = [p0 + x + z, p0 + z, p0 + x, p0];
+    let lifted = pts.map(|p| glam::Vec4::new(p.x, p.w * 0.9, p.z, p.w));
+    if lifted.iter().fold(0xff, |a, p| a & outcode(*p)) != 0 {
+        return false;
+    }
+    !pts.iter().all(|p| p.y / p.w <= -1.1)
+}
+
+/// Cells bigger than this (light-space extent) only need to meet the cascade's view, smaller ones must lie in
+/// it.
+const LARGE: f32 = 120.0;
+
+impl Casters {
+    /// The cells registered this frame, row by row.
+    fn registered(&self) -> impl Iterator<Item = (usize, &Cell)> {
+        self.cells.iter().enumerate().filter_map(|(i, c)| c.as_ref().filter(|c| c.registered).map(|c| (i, c)))
+    }
+
+    /// Which registered cells are seen by the camera (`view_projection`): characters whose name starts with
+    /// 'c' when one of their instances is seen, every other one always; all of them when the map turns the test
+    /// off.
+    pub fn visibility(&mut self, view_projection: Mat4, test: bool) {
+        for c in self.cells.iter_mut().flatten().filter(|c| c.registered) {
+            c.visible = !test
+                || !c.name.starts_with('c')
+                || c.instances.iter().any(|i| instance_seen(&(view_projection * i.world), i.min, i.size));
+        }
+    }
+
+    /// The cells cast into cascade 0 under the cascade's light view-projection: registered, seen, and every
+    /// instance in the cascade's view (meeting it for large cells, inside it for the rest). Returns the cells.
+    pub fn cascade(&self, light: Mat4) -> Vec<usize> {
+        self.registered()
+            .filter(|(_, c)| c.visible)
+            .filter(|(_, c)| {
+                c.instances.iter().all(|i| {
+                    let m = light * i.world;
+                    if c.extent[0] > LARGE || c.extent[1] > LARGE {
+                        box_meets_view(&m, i.min, i.size)
+                    } else {
+                        box_inside_view(&m, i.min, i.size)
+                    }
+                })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// mainChrYPos: the main character's first instance's height when it is registered and seen, else the
+    /// mean over the seen characters whose name starts with 'c', else over those starting with 'n', else 0.
+    pub fn main_chr_y(&self) -> f32 {
+        let y = |c: &Cell| c.instances.first().map_or(0.0, |i| i.world.w_axis.y);
+        if let Some(c) = self.main.and_then(|m| self.cells.get(m)).and_then(Option::as_ref)
+            && c.registered
+            && c.visible
+        {
+            return y(c);
+        }
+        for first in ['c', 'n'] {
+            let seen: Vec<f32> = self
+                .registered()
+                .filter(|(_, c)| c.visible && c.name.starts_with(first))
+                .map(|(_, c)| y(c))
+                .collect();
+            if !seen.is_empty() {
+                return seen.iter().sum::<f32>() / seen.len() as f32;
+            }
+        }
+        0.0
+    }
+}
+
+/// Two rectangles (x0, y0, x1, y1): their union when they overlap.
+fn merge(a: [i32; 4], b: [i32; 4]) -> Option<[i32; 4]> {
+    let (ix0, ix1, iy0, iy1) = (a[0].max(b[0]), a[2].min(b[2]), a[1].max(b[1]), a[3].min(b[3]));
+    if ix1 < ix0 || iy1 < iy0 {
+        return None;
+    }
+    Some([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+}
+
+/// Overlapping rectangles merged (each merge padded by `pad`) until none overlap.
+fn merge_all(rects: &mut Vec<[i32; 4]>, pad: i32) {
+    'again: loop {
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                if let Some(u) = merge(rects[i], rects[j]) {
+                    rects[i] = [u[0] - pad, u[1] - pad, u[2] + pad, u[3] + pad];
+                    rects.remove(j);
+                    continue 'again;
+                }
+            }
+        }
+        return;
+    }
+}
+
+fn clamp_rects(rects: &mut [[i32; 4]], limit: i32) {
+    for r in rects {
+        for v in r.iter_mut() {
+            *v = (*v).min(limit).max(0);
+        }
+    }
+}
+
+impl Casters {
+    /// The cascade's atlas: each cell's instances' boxes through LightViewProjection, in texels of the map's
+    /// inner square (size − 64), widened by 3 and truncated; clamped, merged (padded by 3), clamped, aligned out
+    /// to 32 texels, merged again.
+    pub fn atlas(&self, cells: &[usize], light_view_projection: Mat4, size: u32) -> Vec<[i32; 4]> {
+        let k = (size as i32 - 64) as f32;
+        let mut rects = Vec::new();
+        for &i in cells {
+            let Some(c) = self.cells.get(i).and_then(Option::as_ref) else { continue };
+            let (mut lo, mut hi) = ([f32::MAX; 3], [-f32::MAX; 3]);
+            for inst in &c.instances {
+                let (l, h) = box_through(&(light_view_projection * inst.world), inst.min, inst.size);
+                for a in 0..3 {
+                    lo[a] = lo[a].min(l[a]);
+                    hi[a] = hi[a].max(h[a]);
+                }
+            }
+            let t = |v: f32, o: f64| (d(v) * d(k) + o) as i32;
+            rects.push([t(lo[0], -3.0), t(lo[1], -3.0), t(hi[0], 3.0), t(hi[1], 3.0)]);
+        }
+        let limit = size as i32 - 64;
+        clamp_rects(&mut rects, limit);
+        merge_all(&mut rects, 3);
+        clamp_rects(&mut rects, limit);
+        for r in &mut rects {
+            let down = |v: i32| (v + (v >> 31 & 31)) & !31;
+            let up = |v: i32| ((v + (v >> 31 & 31)) >> 5) * 32 + if v & 31 != 0 && v >= 0 { 32 } else { 0 };
+            *r = [down(r[0]), down(r[1]), up(r[2]), up(r[3])];
+        }
+        merge_all(&mut rects, 0);
+        rects
+    }
 }

@@ -78,7 +78,7 @@ struct Geometry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
+pub enum Shape {
     /// One triangle over the screen (copies, glow).
     Triangle,
     /// Two triangles (HDAO, unsharp mask, brightness).
@@ -238,6 +238,39 @@ impl PostChain {
         anisotropy: f32,
         ops: &mut Vec<GameOp>,
     ) {
+        let rect = [0.0, 0.0, viewport.0 as f32, viewport.1 as f32];
+        self.pass_in(
+            vfs, renderer, programs, game, effect, pass, material, textures, target, depth, rect, shape,
+            scene, anisotropy, ops,
+        );
+    }
+
+    /// A material's value for later passes.
+    pub fn set_value(&mut self, material: &'static str, name: &str, v: Value) {
+        self.set(material, name, v);
+    }
+
+    /// One pass drawn into the viewport rectangle `rect` (x, y, width, height) of `target` (a fullscreen quad
+    /// through that viewport).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pass_in(
+        &mut self,
+        vfs: &Vfs,
+        renderer: &mut Renderer,
+        programs: &mut Programs,
+        game: Game,
+        effect: &str,
+        pass: &str,
+        material: &'static str,
+        textures: &[(&str, ImageRef)],
+        target: TargetRef,
+        depth: Option<TargetHandle>,
+        rect: [f32; 4],
+        shape: Shape,
+        scene: &SceneConstants,
+        anisotropy: f32,
+        ops: &mut Vec<GameOp>,
+    ) {
         let root = match game {
             Game::Ffx => "ffx_data",
             Game::Ffx2 => "ffx-2_data",
@@ -305,7 +338,7 @@ impl PostChain {
             constants,
             images,
             samplers,
-            viewport: [0.0, 0.0, viewport.0 as f32, viewport.1 as f32, 0.0, 1.0],
+            viewport: [rect[0], rect[1], rect[2], rect[3], 0.0, 1.0],
             blend_factor: [1.0; 4],
             sample_mask: u32::MAX,
             stencil_ref: p.state.stencil_ref,
