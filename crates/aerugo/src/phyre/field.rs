@@ -206,6 +206,23 @@ impl FieldRenderer {
         Some(t)
     }
 
+    /// The event's 2D shapes (the credits) over a finished frame.
+    pub fn draw_2d_shapes(
+        &mut self,
+        vfs: &Vfs,
+        renderer: &mut Renderer,
+        draws: &[aerugo_sim::field::shapes::ShapeDraw2d],
+        dir: &str,
+        size: (u32, u32),
+        frame: &mut GameFrame,
+    ) {
+        for m in self.vfx.draws_2d(vfs, renderer, &mut self.programs, draws, dir, size, frame) {
+            if self.reported.insert(m.clone()) {
+                log::info!("game shaders: nothing supplies {m}");
+            }
+        }
+    }
+
     /// Release everything (the models, the targets).
     pub fn clear(&mut self, renderer: &mut Renderer) {
         self.post.clear(renderer);

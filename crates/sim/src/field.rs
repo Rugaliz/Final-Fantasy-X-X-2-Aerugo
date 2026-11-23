@@ -2734,6 +2734,11 @@ impl Event {
     pub fn load(vfs: &Vfs, game: Game, path: &str, lang: Language) -> Result<Event, String> {
         let data = vfs.read(path).map_err(|e| e.to_string())?;
         let script = Script::parse(&data).map_err(|e| e.to_string())?;
+        let file_base = if data.starts_with(b"EV01") {
+            data.get(4..8).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        } else {
+            0
+        };
         let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".ebp").to_owned();
         let actors = script
             .workers
@@ -2822,6 +2827,7 @@ impl Event {
         }
         // The walk mesh from the PS2 map package next to the drawn map.
         // (Maps drawn as pre-rendered backgrounds have no 3D model but still have a walk mesh.)
+        state.shapes.file_base = file_base;
         let vpa = map_model.as_deref().and_then(walk_mesh_path).or_else(|| {
             (game == Game::Ffx && name.len() >= 6 && name.is_ascii())
                 .then(|| format!("ffx_ps2/ffx/master/jppc/map/{}/{}/bin/mapout.vpa", &name[..4], &name[..6]))

@@ -1257,6 +1257,18 @@ impl FieldView {
         if let Some(mut frame) =
             s.phyre.frame(vfs, renderer, &objects, &scene, &lighting, px, msaa, post, 4.0, false)
         {
+            // The event's 2D shapes (the credits), from the event's texture folder.
+            let shapes = st.shapes.draws(&s.event.vm.memory, st.scene.unwrap_or(0));
+            if !shapes.is_empty() {
+                let dir = s
+                    .event
+                    .path
+                    .split_once("/event/")
+                    .map(|(_, rest)| rest.rsplit_once('/').map_or(rest, |(d, _)| d))
+                    .map(|d| format!("ffx_data/gamedata/ps3data/event/{d}/tex/d3d11"))
+                    .unwrap_or_default();
+                s.phyre.draw_2d_shapes(vfs, renderer, &shapes, &dir, px, &mut frame);
+            }
             if self.game {
                 let lang = self.lang;
                 let font = s.font.get_or_insert_with(|| {

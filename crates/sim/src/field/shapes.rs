@@ -72,6 +72,33 @@ pub struct Shapes {
     pub tex_loaded: bool,
     /// The drawing switch (023f; on at the event start).
     pub drawn: i32,
+    /// Where the script's data starts in the event file (the EV01 header's size): the texture page is the
+    /// texture table's offset from the file's start.
+    pub file_base: u32,
+}
+
+/// One sprite of a shape frame: its rectangle (x0, y0, x1, y1 in 1/16 units), its texture rectangle (u, v, w,
+/// h in 1/4096) and colour (r, g, b, a) and blend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Piece {
+    pub rect: [i16; 4],
+    pub uv: [i16; 4],
+    pub colour: [u8; 4],
+    pub blend: u8,
+}
+
+/// One slot's shape as the remaster draws it this frame (the 2D effect path): its matrix (scale ÷ 256 on x
+/// and y, its place), colour (rgb × brightness ÷ 255, alpha), the frame's pieces, the texture's page and size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeDraw2d {
+    pub slot: usize,
+    pub scale: [f32; 2],
+    pub place: [f32; 2],
+    pub colour: [u8; 4],
+    pub pieces: Vec<Piece>,
+    pub page: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Default for Shapes {
@@ -83,6 +110,7 @@ impl Default for Shapes {
             tex_table: None,
             tex_loaded: false,
             drawn: 1,
+            file_base: 0,
         }
     }
 }
@@ -125,6 +153,66 @@ impl Shapes {
             s.frame = next as u16;
             s.clock = 0;
         }
+    }
+
+    /// The frame's draws (011a set, drawing on): every slot that is on with data and a visible alpha, at its
+    /// current frame (scene 0x17e draws only slots 5, 0xb, 0x11, 0x15); frames whose shape has no pieces are
+    /// left out. The rectangle-piece layout is read (flag bit 3 clear).
+    pub fn draws(&self, mem: &Memory, scene: u16) -> Vec<ShapeDraw2d> {
+        let mut out = Vec::new();
+        if self.base.is_none() || self.drawn == 0 {
+            return out;
+        }
+        let page = match self.tex_table {
+            Some(Place::Script(o)) => o as u32 + self.file_base,
+            _ => 0,
+        };
+        for (i, s) in self.slots.iter().enumerate() {
+            if scene == 0x17e && !matches!(i, 5 | 0xb | 0x11 | 0x15) {
+                continue;
+            }
+            let Some(data) = s.data.filter(|_| s.on) else { continue };
+            let shape = i32::from(i16_at(mem, Some(data), 0x10 + usize::from(s.frame) * 8)) as usize;
+            let at = |off: usize| shape + off;
+            let n = i16_at(mem, Some(data), at(2));
+            if n == 0 || s.color[3] == 0 {
+                continue;
+            }
+            let flags = u8_at(mem, Some(data), at(0));
+            if flags & 8 != 0 {
+                continue;
+            }
+            let u32_at = |off: usize| -> u32 {
+                bytes(mem, data, off, 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let headers = shape + u32_at(at(4)) as usize;
+            let tex = crate::ppp::vfx::Texture::from_words(u32_at(at(0x10)), u32_at(at(0x14)));
+            let pieces = (0..n.max(0) as usize)
+                .map(|k| {
+                    let p = at(0x20) + k * 0x10;
+                    let h = headers + k * 8;
+                    Piece {
+                        rect: std::array::from_fn(|j| i16_at(mem, Some(data), p + 2 * j)),
+                        uv: std::array::from_fn(|j| i16_at(mem, Some(data), p + 8 + 2 * j)),
+                        colour: std::array::from_fn(|j| u8_at(mem, Some(data), h + j)),
+                        blend: u8_at(mem, Some(data), h + 4),
+                    }
+                })
+                .collect();
+            let b = u32::from(s.bright);
+            let c = |v: u8| ((u32::from(v) * b) / 0xff) as u8;
+            out.push(ShapeDraw2d {
+                slot: i,
+                scale: [f32::from(s.scale[0]) * 0.003_906_25, f32::from(s.scale[1]) * 0.003_906_25],
+                place: [f32::from(s.x), f32::from(s.y)],
+                colour: [c(s.color[0]), c(s.color[1]), c(s.color[2]), s.color[3]],
+                pieces,
+                page,
+                width: tex.width,
+                height: tex.height,
+            });
+        }
+        out
     }
 
     fn slot(&mut self, n: i32) -> &mut ShapeSlot {

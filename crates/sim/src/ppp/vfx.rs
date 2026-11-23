@@ -84,6 +84,18 @@ pub struct Scene {
     pub map_part: Option<u32>,
 }
 
+/// The shader properties of a textured piece by its blend (modulate, additive, the three subtracts, none).
+pub fn blend_properties(blend: u8) -> u32 {
+    8 | match blend {
+        0x41 => 0x100,
+        0x42 => 0x10,
+        0x46 => 0x20,
+        0x48 => 2,
+        0x88 => 0x200,
+        _ => 0,
+    }
+}
+
 /// The packet record sizes by kind, and whether the kind is textured.
 fn record(kind: u8) -> Option<(u32, bool)> {
     Some(match kind {
