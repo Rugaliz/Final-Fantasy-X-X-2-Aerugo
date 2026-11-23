@@ -156,8 +156,6 @@ pub struct Actor {
     pub face_layers: Vec<face::FaceLayer>,
     /// The script level whose move advances (the worker's running level).
     pub level: u8,
-    /// Move state per script level: a level's move waits while a higher level runs.
-    moves: [MoveState; MOVE_LEVELS],
     turn_target: f32,
     turn_speed: [f32; 2],
     turning: bool,
@@ -246,7 +244,6 @@ impl Default for Actor {
             face: None,
             face_layers: Vec::new(),
             level: 0,
-            moves: [MoveState::default(); MOVE_LEVELS],
             turn_target: 0.0,
             turn_speed: [0.0; 2],
             turning: false,
@@ -264,12 +261,6 @@ impl Default for Actor {
     }
 }
 
-/// Degrees as radians, with the original's steps (single-precision pi, the product and quotient in extended
-/// precision).
-fn radians(deg: f32) -> f32 {
-    (deg as f64 * 3.1415927410125732 / 180.0) as f32
-}
-
 /// A camera part following a script path: the path, the place along it and the step a tick.
 #[derive(Debug, Clone, PartialEq)]
 struct PathMove {
@@ -284,67 +275,13 @@ const DEFAULT_RADIUS: f32 = 4.0;
 /// How far past the sum of the radii two characters still touch.
 const CONTACT_SLACK: f32 = 1e-3;
 
-/// Script levels with their own move state.
-const MOVE_LEVELS: usize = 9;
-
-/// One script level's move settings and the move it runs.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-struct MoveState {
-    target: [f32; 3],
-    /// Frame count of a timed move.
-    frames: f32,
-    /// Walking speed (a walk covers speed / 20 per tick) and arrival radius (0: none).
-    speed: f32,
-    radius: f32,
-    /// The heading and pitch the next move starts along (0021, 0022).
-    start_heading: Option<f32>,
-    start_pitch: Option<f32>,
-    active: Option<ActorMove>,
-}
-
-/// A move under way.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ActorMove {
-    /// From `from` to `to` over `frames` ticks; `count` ticks done.
-    Timed { from: [f32; 3], to: [f32; 3], count: f32, frames: f32, mode: u32 },
-    /// Towards `to` at a speed, on the ground plane only or in space; `mode` is move.start's mode word (0x8000:
-    /// steered, the heading turning toward the target at a limited rate; 0x4000: the turn ends with it).
-    Walk { to: [f32; 3], speed: f32, ground_only: bool, radius: f32, mode: u32 },
-}
-
-/// The settings key of a worker's level.
-fn level_key(worker: usize, level: u8) -> usize {
-    worker | (usize::from(level) + 1) << 16
-}
-
 /// The frame time the character engine scales its steps by.
 const FRAME_TIME: f32 = 1.0 / 30.0;
-
-/// A turn block's rate before a script sets one (π/10 a tick).
-const DEFAULT_TURN_RATE: f32 = std::f32::consts::PI / 10.0;
 
 impl Actor {
     /// Radius for collisions between characters.
     pub fn collision_radius(&self) -> f32 {
         self.radius.or(self.model_radius).unwrap_or(DEFAULT_RADIUS)
-    }
-
-    /// Whether the running level's move is a walk under way.
-    pub fn is_walking(&self) -> bool {
-        matches!(self.move_state().active, Some(ActorMove::Walk { .. }))
-    }
-
-    /// Whether the running level's move is under way.
-    pub fn is_moving(&self) -> bool {
-        self.move_state().active.is_some()
-    }
-
-    fn move_state(&self) -> &MoveState {
-        &self.moves[usize::from(self.level).min(MOVE_LEVELS - 1)]
-    }
-
-    fn move_at(&mut self, level: u8) -> &mut MoveState {
-        &mut self.moves[usize::from(level).min(MOVE_LEVELS - 1)]
     }
 
     /// The model's archive path.
@@ -666,157 +603,12 @@ impl CameraState {
         self.timers[5..8].iter().any(|&t| t > 0) || self.focus_path.is_some()
     }
 
-    /// Time the eye's channels (`mask`: bits 0–2 its values, 3 the roll, 4 the screen distance) for a wait of
-    /// `frames` (0: stops them).
-    fn time_eye(&mut self, mask: u8, frames: u32) {
-        for (bit, t) in self.timers[0..5].iter_mut().enumerate() {
-            if mask & (1 << bit) != 0 {
-                *t = if frames == 0 { 0 } else { frames + 1 };
-            }
-        }
-    }
-
-    /// Time the focus's channels for a wait of `frames`.
-    fn time_focus(&mut self, frames: u32) {
-        self.timers[5..8].fill(if frames == 0 { 0 } else { frames + 1 });
-    }
-
-    /// The eye channels the next eye move applies to (6043 picks them for one move; all by default).
-    fn take_mask(&mut self) -> u8 {
-        self.parts.take().unwrap_or(0x1F)
-    }
-
-    /// The eye is placed by heading, pitch and distance around the focus.
-    fn eye_by_polar(&self) -> bool {
-        self.eye_path.is_none() && self.follow.polar.is_some()
-    }
-
-    /// Time a move of the eye (`eye`) or the focus over `frames` frames (mode 1: linear), by angles around the
-    /// other part or along x, y and z; its start is where the part is now.
-    fn time_linear(&mut self, eye: bool, by_angles: bool, frames: i16) {
-        if eye {
-            let mask = self.take_mask();
-            self.time_eye(mask, frames.max(0) as u32);
-            self.eye_move.set(by_angles, mask, 1, frames);
-            if mask & 8 != 0 {
-                self.roll_move.channel.set(1, frames);
-            }
-            if mask & 0x10 != 0 {
-                self.distance_move.channel.set(1, frames);
-            }
-            self.move_from_here(true, mask);
-        } else {
-            self.time_focus(frames.max(0) as u32);
-            self.focus_move.set(by_angles, 7, 1, frames);
-            self.move_from_here(false, 7);
-        }
-    }
-
-    /// Time a speeding up / steady / slowing down move (frames for each, and the lead frames).
-    fn time_profile(&mut self, eye: bool, by_angles: bool, profile: [i16; 4]) {
-        let total = profile[0].wrapping_add(profile[1]).wrapping_add(profile[2]).max(0) as u32;
-        if eye {
-            let mask = self.take_mask();
-            self.time_eye(mask, total);
-            self.eye_move.set_profile(by_angles, mask, profile);
-            let [a, s, d, lead] = profile;
-            if mask & 8 != 0 {
-                self.roll_move.channel.set_profile(a, s, d, lead);
-            }
-            if mask & 0x10 != 0 {
-                self.distance_move.channel.set_profile(a, s, d, lead);
-            }
-            self.move_from_here(true, mask);
-        } else {
-            self.time_focus(total);
-            self.focus_move.set_profile(by_angles, 7, profile);
-            self.move_from_here(false, 7);
-        }
-    }
-
-    /// Take the start of the part's timed moves from where it is now (`mask`: the channels timed).
-    fn move_from_here(&mut self, eye: bool, mask: u8) {
-        let by_polar = eye && self.eye_by_polar();
-        let (at, anchor) = if eye { (self.position, self.focus) } else { (self.focus, self.position) };
-        let at = at.unwrap_or_default();
-        let anchor = anchor.unwrap_or(at);
-        let part = if eye { &mut self.eye_move } else { &mut self.focus_move };
-        part.start(mask, at, anchor, by_polar);
-        if eye {
-            if mask & 8 != 0 {
-                self.roll_move.from = self.roll_move.value;
-            }
-            if mask & 0x10 != 0 {
-                self.distance_move.from = self.distance_move.value;
-            }
-        }
-    }
-
-    /// Stop the eye's (`eye`) or the focus's moves and keep it where it is (6016 / 6034).
-    fn stop_moves(&mut self, eye: bool) {
-        if eye {
-            self.eye_move.stop();
-            self.roll_move.channel.frames = 0;
-            self.distance_move.channel.frames = 0;
-            self.timers[0..5].fill(0);
-            if let Some(at) = self.position {
-                self.place_eye(at);
-            }
-            self.set_roll(self.roll_move.value);
-            self.set_screen_distance(self.distance_move.value);
-        } else {
-            self.focus_move.stop();
-            self.timers[5..8].fill(0);
-            if let Some(at) = self.focus {
-                self.place_focus(at);
-            }
-        }
-    }
-
-    /// Fix the eye at a point (6002).
-    fn place_eye(&mut self, at: [f32; 3]) {
-        self.follow.clear_eye();
-        self.eye_path = None;
-        self.parts = None;
-        self.eye_fixed = Some(at);
-        self.position = Some(at);
-    }
-
-    /// Fix the focus at a point (6020).
-    fn place_focus(&mut self, at: [f32; 3]) {
-        self.follow.stop();
-        self.focus_path = None;
-        self.focus_fixed = Some(at);
-        self.focus = Some(at);
-    }
-
-    /// Place the eye at a heading, pitch and distance (radians) around the focus (6004 / 6005).
-    fn place_eye_polar(&mut self, polar: [f32; 3]) {
-        self.follow.clear_eye();
-        self.eye_path = None;
-        self.eye_fixed = None;
-        self.parts = None;
-        self.follow.polar = Some(polar);
-        self.eye_move.polar = polar;
-        if let Some(focus) = self.focus {
-            self.position = Some(crate::camera_move::polar_point(focus, polar));
-        }
-    }
-
     /// Set the roll (radians); it takes effect at once unless its move runs.
     fn set_roll(&mut self, roll: f32) {
         self.roll_target = roll;
         self.roll_move.value = roll;
         if !self.roll_move.channel.active() {
             self.roll = roll;
-        }
-    }
-
-    fn set_screen_distance(&mut self, d: f32) {
-        self.distance_target = d;
-        self.distance_move.value = d;
-        if !self.distance_move.channel.active() {
-            self.screen_distance = d;
         }
     }
 
@@ -861,39 +653,6 @@ impl CameraState {
         }
         self.roll = self.roll_move.apply(self.roll_target, true);
         self.screen_distance = self.distance_move.apply(self.distance_target, false);
-    }
-
-    /// Record the focus's or the eye's place and the roll as the next point of a script path (at most 32).
-    fn record(&mut self, eye: bool) {
-        let at = if eye { self.position } else { self.focus };
-        let roll = crate::camera_move::angle_near(0.0, self.roll_move.value);
-        let list = if eye { &mut self.eye_record } else { &mut self.focus_record };
-        if let Some([x, y, z]) = at.filter(|_| list.len() < 32) {
-            list.push([x, y, z, roll]);
-        }
-    }
-
-    /// Follow a path from `start` by `step` a tick (6046 the eye, 6047 the focus): the first point is taken at
-    /// once.
-    fn start_path(&mut self, eye: bool, path: crate::follow_camera::Path, start: f32, step: f32) {
-        let m = Some(PathMove { path, t: start, step });
-        if eye {
-            self.follow.clear_eye();
-            self.eye_fixed = None;
-            self.parts = None;
-            self.eye_path = m;
-        } else {
-            self.follow.stop();
-            self.focus_fixed = None;
-            self.focus_path = m;
-        }
-        if let Some(at) = self.path_tick(eye) {
-            if eye {
-                self.position = Some(at);
-            } else {
-                self.focus = Some(at);
-            }
-        }
     }
 
     /// One tick along a script path: the point at the place (clamped to 0..1), with its roll set; the place
@@ -3258,121 +3017,6 @@ fn register_settings(n: &mut Natives<FieldState>) {
     fn keep(g: &mut FieldState, id: u16, w: usize, values: Vec<Value>) {
         g.settings.insert((id, w), values);
     }
-    // One float, returned (worker settings: 002d, 006d–0071, 00e4).
-    macro_rules! float_back {
-        ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
-                let v = c.stack.pop_float();
-                keep(g, $id, c.worker, vec![Value::Float(v)]);
-                Value::Float(v)
-            }));
-        )*};
-    }
-    float_back!(0x006D, 0x006E);
-    // A turn block value of all nine levels (the worker's level blocks, stride 0x44): 006f the rate (what 002e
-    // sets for the running level), 00e4 the other rate (00e3's), 0070 the value 002f sets, 0071 the next one;
-    // each returns its value.
-    macro_rules! all_levels {
-        ($id:expr, $as:expr) => {
-            n.register(
-                $id,
-                Native::result(|g, c| {
-                    let v = c.stack.pop_float();
-                    for lvl in 0..9 {
-                        keep(g, $as, level_key(c.worker, lvl), vec![Value::Float(v)]);
-                    }
-                    Value::Float(v)
-                }),
-            );
-        };
-    }
-    all_levels!(0x006F, 0x002E);
-    all_levels!(0x00E4, 0x00E3);
-    all_levels!(0x0070, 0x002F);
-    all_levels!(0x0071, 0x0071);
-    // (The turn update reads the 002f / 0071 values only once the level blocks are ported whole.)
-    for id in [0x0070, 0x0071] {
-        n.mark_stub(id);
-    }
-    // One int, returned (00bb/00bc/00f3 field settings, 0116 actor flag).
-    macro_rules! int_back {
-        ($($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                let v = c.stack.pop_int();
-                keep(g, $id, c.worker, vec![Value::Int(v)]);
-                Value::Int(v)
-            }));
-        )*};
-    }
-    int_back!(0x00F3);
-    // The move record value at +0xc (16 bits) of the worker's level blocks: 0074 sets all nine levels, 0072 the
-    // running level; each returns its value. (Read once the move records are ported whole.)
-    n.register(
-        0x0074,
-        Native::result(|g, c| {
-            let v = c.stack.pop_int();
-            for lvl in 0..9 {
-                keep(g, 0x0074, level_key(c.worker, lvl), vec![Value::Int(i32::from(v as u16))]);
-            }
-            Value::Int(v)
-        }),
-    );
-    n.register(
-        0x0072,
-        Native::result(|g, c| {
-            let v = c.stack.pop_int();
-            keep(g, 0x0074, level_key(c.worker, c.level), vec![Value::Int(i32::from(v as u16))]);
-            Value::Int(v)
-        }),
-    );
-    for id in [0x0072, 0x0074] {
-        n.mark_stub(id);
-    }
-    // One float kept, nothing useful returned (per-level move settings: 002e, 002f, 0030).
-    macro_rules! float_set {
-        ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
-                let v = c.stack.pop_float();
-                keep(g, $id, c.worker, vec![Value::Float(v)]);
-                Value::Int(0)
-            }));
-        )*};
-    }
-    float_set!(0x002F, 0x0030, 0x002C);
-    n.mark_stub(0x002F);
-    n.mark_stub(0x0030);
-    // Per-level turn and steering rates (002e the turn rate, 00e3 the other one, 002b the steering rate): kept
-    // by worker and level.
-    macro_rules! level_float_set {
-        ($($id:expr),*) => {$(
-            n.register($id, Native::result(|g, c| {
-                let v = c.stack.pop_float();
-                keep(g, $id, level_key(c.worker, c.level), vec![Value::Float(v)]);
-                Value::Int(0)
-            }));
-        )*};
-    }
-    level_float_set!(0x002E, 0x00E3, 0x002B);
-    // The calling worker's facing (wrapped).
-    n.register(
-        0x0025,
-        Native::result(|g, c| {
-            let v = wrap_angle(c.stack.pop_float());
-            g.actor(c.worker).yaw = v;
-            Value::Int(0)
-        }),
-    );
-    // One int kept, 1 returned (0007, 0151).
-    macro_rules! int_one {
-        ($($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                let v = c.stack.pop_int();
-                keep(g, $id, c.worker, vec![Value::Int(v)]);
-                Value::Int(1)
-            }));
-        )*};
-    }
-    int_one!(0x0007);
     // The entrance and the area id in the save image.
     n.register(
         0x0010,
@@ -3435,23 +3079,6 @@ fn register_settings(n: &mut Natives<FieldState>) {
 /// motion blending, screen effects, map layer animation): they take their arguments (by the native's arity),
 /// keep them, and return what the original returns.
 fn register_engine_settings(n: &mut Natives<FieldState>) {
-    fn take(g: &mut FieldState, c: &mut NativeCall<'_>, id: u16) -> Vec<Value> {
-        let (ints, floats) = aerugo_formats::script::arity(Game::Ffx, id).map_or((0, 0), |a| (a.0, a.1));
-        let mut v: Vec<Value> = (0..u32::from(ints) + u32::from(floats)).map(|_| c.stack.pop()).collect();
-        v.reverse();
-        g.settings.insert((id, c.worker), v.clone());
-        v
-    }
-    // Returning 0.
-    macro_rules! zero {
-        ($($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                take(g, c, $id);
-                Value::Int(0)
-            }));
-        )*};
-    }
-    zero!(0x500B, 0x5014, 0x6003, 0x6021);
     // Field light: index (0–2 directional, 3 ambient), colour 0–255, yaw and pitch in degrees.
     n.register(
         0x4013,
@@ -3547,20 +3174,6 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    n.register(
-        0x4034,
-        Native::result(|g, c| {
-            take(g, c, 0x4034);
-            Value::Float(0.0)
-        }),
-    );
-    n.register(
-        0x8009,
-        Native::result(|g, c| {
-            take(g, c, 0x8009);
-            Value::Int(1)
-        }),
-    );
     // Map group on (non-zero) or off; returns the group. Scene 0x188 keeps group 14 on.
     n.register(
         0x8000,
@@ -3598,20 +3211,9 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             _ => 0,
         }
     }
-    macro_rules! fixed {
-        ($ret:expr; $($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                take(g, c, $id);
-                Value::Int($ret)
-            }));
-        )*};
-    }
-    fixed!(0; 0x6076, 0x603F, 0x6041, 0x6044, 0x6045, 0x6060);
     // Camera shakes, offsets and moves the follow camera does not take yet; map layer switches; 00a3 (effects).
-    fixed!(0; 0x606B, 0x6071, 0x6081, 0x6082, 0x6083, 0x6084, 0x605C, 0x605D);
     // Character data disposal, binding and motion switches whose results scripts do not branch on (the recordings
     // show these constants).
-    fixed!(0; 0x00D1, 0x504E);
     // The model's drawing offset from its position (x, y, z), for a worker with a character.
     n.register(
         0x5016,
@@ -3692,9 +3294,6 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     );
     // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
     // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
-    fixed!(1; 0x01C6);
-    fixed!(3; 0x0243);
-    fixed!(0; 0x400E);
     // Reading the save dictionary (01c5): done at once but the worker's turn ends there; nothing to report (0).
     n.register(
         0x01C5,
@@ -3706,39 +3305,6 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             wait: Some(|_, _| WAIT_DONE),
             result: Some(|_, _| Value::Int(0)),
         },
-    );
-    // Results that echo an argument: 00cb its value, 00e7 its second as a byte.
-    n.register(0x00CB, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00CB), 0))));
-    n.register(0x00E7, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00E7), 1) & 0xFF)));
-    // Character switches that return the value they replace (1 at first): 5009 the push weight (float), 502a,
-    // 5029.
-    macro_rules! swap {
-        ($($id:expr),*) => {$(
-            n.register_stub($id, Native::result(|g, c| {
-                let old = g.settings.get(&($id, c.worker)).and_then(|v| v.first().copied());
-                take(g, c, $id);
-                match old {
-                    Some(v) => v,
-                    None if $id == 0x5009 => Value::Float(1.0),
-                    None => Value::Int(1),
-                }
-            }));
-        )*};
-    }
-    swap!(0x5009);
-    // A message variable (window, slot, kind, value) for the window's text; returns the window.
-    n.register(0x009E, Native::result(|g, c| Value::Int(int(&take(g, c, 0x009E), 0))));
-    // Play a sound (returns the first argument).
-    n.register(0x00FD, Native::result(|g, c| Value::Int(int(&take(g, c, 0x00FD), 0))));
-    // The calling worker's facing.
-    n.register(0x0091, Native::result(|g, c| Value::Float(g.actor(c.worker).yaw)));
-    // A zone or line worker's mode bits (other kinds: nothing, 0).
-    n.register(
-        0x007F,
-        Native::result(|g, c| {
-            take(g, c, 0x007F);
-            Value::Int(i32::from(matches!(c.kind, 2 | 3 | 5 | 6)))
-        }),
     );
     // The highlighted choice of a choice window whose text is all shown (or that is closing), else -1.
     n.register(
@@ -3899,22 +3465,6 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The ground distance (x, z) between two workers.
-    n.register(
-        0x00A5,
-        Native::result(|g, c| {
-            let b = target(c);
-            let a = target(c);
-            let pos = |w: usize| g.actors.get(w).map_or([0.0; 3], |x| x.pos);
-            let (p, q) = (pos(a), pos(b));
-            let (dx, dz) = (f64::from(q[0] - p[0]), f64::from(q[2] - p[2]));
-            Value::Float((dx * dx + dz * dz).sqrt() as f32)
-        }),
-    );
-    fixed!(1; 0x019C, 0x0103, 0x0104, 0x01CE, 0x01CF, 0x0205, 0x0209);
-    // Switches that return whether they were turned on: the only argument (013e), the second (01d4), the int of
-    // (int, float) (c02f).
-    n.register(0x013E, Native::result(|g, c| Value::Int(i32::from(int(&take(g, c, 0x013E), 0) != 0))));
     // Results that only follow from the arguments: the engine parts behind them are not ported yet.
     for id in [0x4034, 0x007F, 0x00CB, 0x00E7, 0x009E, 0x00FD, 0x013E] {
         n.mark_stub(id);
@@ -4416,35 +3966,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
         },
     );
     use aerugo_script::natives::heading;
-    // Heading from the worker to its move target / to a point (x, y, z), on the ground plane.
-    n.register(
-        0x001F,
-        Native::result(|g, c| {
-            let level = c.level;
-            let a = g.actor(c.worker);
-            let t = a.move_at(level).target;
-            Value::Float(heading(a.pos[0], a.pos[2], t[0], t[2]))
-        }),
-    );
-    n.register(
-        0x00F4,
-        Native::result(|g, c| {
-            let [x, _, z] = pop3(c);
-            let a = g.actor(c.worker);
-            Value::Float(heading(a.pos[0], a.pos[2], x, z))
-        }),
-    );
-    // Pitch towards the move target: the heading of (ground distance, height) from (0, own height).
-    n.register(
-        0x0020,
-        Native::result(|g, c| {
-            let level = c.level;
-            let a = g.actor(c.worker);
-            let t = a.move_at(level).target;
-            let d = ((t[0] - a.pos[0]).powi(2) + (t[2] - a.pos[2]).powi(2)).sqrt();
-            Value::Float(heading(0.0, a.pos[1], d, t[1]))
-        }),
-    );
     // The heading moves go along: set, read.
     n.register(
         0x0023,
@@ -4452,29 +3973,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
             let v = c.stack.pop_float();
             g.actor(c.worker).move_heading = v;
             Value::Float(v)
-        }),
-    );
-    n.register(0x0090, Native::result(|g, c| Value::Float(g.actor(c.worker).move_heading)));
-    // Target pitch of a turn (wrapped; turns in pitch are not modelled).
-    n.register(0x0029, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
-    // Whether the current level's move is under way.
-    n.register(
-        0x00C4,
-        Native::result(|g, c| {
-            let level = c.level;
-            Value::Int(i32::from(g.actor(c.worker).move_at(level).active.is_some()))
-        }),
-    );
-    // Whether worker w is within r of this one (in space).
-    n.register(
-        0x0128,
-        Native::result(|g, c| {
-            let r = c.stack.pop_float();
-            let w = c.stack.pop_int().max(0) as usize;
-            let b = g.actor(w).pos;
-            let a = g.actor(c.worker).pos;
-            let d2 = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
-            Value::Int(i32::from(d2 <= r * r))
         }),
     );
     // Facing test: whether (x1, z1) lies within `half` of `yaw` seen from (x0, z0).
@@ -4488,17 +3986,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
             let half = c.stack.pop_float();
             let yaw = c.stack.pop_float();
             Value::Int(i32::from(wrap_angle(heading(x0, z0, x1, z1) - yaw).abs() < half))
-        }),
-    );
-    // Stop worker w's turn where it is.
-    n.register(
-        0x0078,
-        Native::result(|g, c| {
-            let w = c.stack.pop_int().max(0) as usize;
-            let a = g.actor(w);
-            a.turning = false;
-            a.turn_steps = None;
-            Value::Int(0)
         }),
     );
     // The pad: the word, one bit of it, and a wait until the given bits are let go.
@@ -4572,36 +4059,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(g.user_control))
         }),
     );
-    // Distance in space between two workers; a worker's facing.
-    n.register(
-        0x00A4,
-        Native::result(|g, c| {
-            let b = c.stack.pop_int().max(0) as usize;
-            let a = c.stack.pop_int().max(0) as usize;
-            let (p, q) = (g.actor(a).pos, g.actor(b).pos);
-            Value::Float(((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt())
-        }),
-    );
-    n.register(
-        0x0093,
-        Native::result(|g, c| {
-            let w = c.stack.pop_int().max(0) as usize;
-            Value::Float(g.actor(w).yaw)
-        }),
-    );
-    // End every level's move of worker w.
-    n.register(
-        0x0036,
-        Native::result(|g, c| {
-            let w = c.stack.pop_int().max(0) as usize;
-            for m in &mut g.actor(w).moves {
-                m.active = None;
-            }
-            Value::Int(0)
-        }),
-    );
-    // Target roll of a turn (wrapped; not modelled).
-    n.register(0x002A, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
     // Sound effects (not played yet): the result is the sound.
     for id in [0x00DFu16, 0x00E0] {
         n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
@@ -4816,147 +4273,8 @@ fn register_control(n: &mut Natives<FieldState>) {
 
 /// Trigger shapes: lines (kinds 2 and 5), boxes (3 and 6), and the touch and talk sizes of characters.
 fn register_triggers(n: &mut Natives<FieldState>) {
-    // A line: two points; no height limit.
-    n.register(
-        0x0054,
-        Native::result(|g, c| {
-            let b = pop3(c);
-            let a = pop3(c);
-            let kind = c.kind;
-            let actor = g.actor(c.worker);
-            if !matches!(kind, 2 | 5) {
-                return Value::Int(0);
-            }
-            actor.pos = a;
-            actor.trigger.b = b;
-            actor.trigger.height = -1.0;
-            actor.trigger.active = true;
-            actor.trigger.dirty = true;
-            Value::Int(1)
-        }),
-    );
-    // Height limit of a line or box.
-    n.register(
-        0x0055,
-        Native::result(|g, c| {
-            let h = c.stack.pop_float();
-            let kind = c.kind;
-            let t = &mut g.actor(c.worker).trigger;
-            if !matches!(kind, 2 | 3 | 5 | 6) {
-                return Value::Int(0);
-            }
-            t.height = h;
-            t.dirty = true;
-            Value::Int(1)
-        }),
-    );
-    // Trigger on or off (two natives do the same).
-    for id in [0x0056u16, 0x005C] {
-        n.register(
-            id,
-            Native::result(|g, c| {
-                let on = c.stack.pop_int() != 0;
-                let kind = c.kind;
-                let t = &mut g.actor(c.worker).trigger;
-                if !matches!(kind, 2 | 3 | 5 | 6) {
-                    return Value::Int(0);
-                }
-                t.active = on;
-                t.dirty = true;
-                Value::Int(1)
-            }),
-        );
-    }
-    // A box's centre.
-    n.register(
-        0x0057,
-        Native::result(|g, c| {
-            let p = pop3(c);
-            let kind = c.kind;
-            let a = g.actor(c.worker);
-            if !matches!(kind, 3 | 6) {
-                return Value::Int(0);
-            }
-            a.pos = p;
-            a.trigger.active = true;
-            a.trigger.dirty = true;
-            Value::Int(1)
-        }),
-    );
     // A box's half width and depth, with (0x59) or without (0x58) a half height.
     n.register(0x0058, Native::result(|g, c| box_size(g, c, -1.0)));
-    n.register(
-        0x0059,
-        Native::result(|g, c| {
-            let h = c.stack.pop_float();
-            box_size(g, c, h)
-        }),
-    );
-    // Lengthen a line at both ends.
-    n.register(
-        0x007A,
-        Native::result(|g, c| {
-            let after = c.stack.pop_float();
-            let before = c.stack.pop_float();
-            let kind = c.kind;
-            let a = g.actor(c.worker);
-            if !matches!(kind, 2 | 5) {
-                return Value::Int(0);
-            }
-            a.trigger.dirty = true;
-            let d: [f32; 3] = std::array::from_fn(|k| a.trigger.b[k] - a.pos[k]);
-            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            if len <= 0.0 {
-                return Value::Int(0);
-            }
-            for (k, dk) in d.iter().enumerate() {
-                a.pos[k] -= dk * before / len;
-                a.trigger.b[k] += dk * after / len;
-            }
-            Value::Int(1)
-        }),
-    );
-    // Talk radius (whole units), talk facing half angle, touch radius; two values not used here yet.
-    n.register(
-        0x0061,
-        Native::result(|g, c| {
-            let r = c.stack.pop_float().trunc();
-            let t = &mut g.actor(c.worker).trigger;
-            t.talk_radius = r;
-            t.dirty = true;
-            Value::Float(r)
-        }),
-    );
-    n.register(
-        0x0063,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            let t = &mut g.actor(c.worker).trigger;
-            t.talk_angle = v;
-            t.dirty = true;
-            Value::Float(v)
-        }),
-    );
-    n.register(
-        0x0085,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            let t = &mut g.actor(c.worker).trigger;
-            t.radius = v;
-            t.dirty = true;
-            Value::Int(0)
-        }),
-    );
-    for id in [0x0062u16, 0x008D] {
-        n.register(
-            id,
-            Native::result(|g, c| {
-                let v = c.stack.pop_float();
-                g.actor(c.worker).trigger.dirty = true;
-                Value::Float(v)
-            }),
-        );
-    }
 }
 
 fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
@@ -4971,56 +4289,6 @@ fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
     t.height = h;
     t.dirty = true;
     Value::Int(1)
-}
-
-/// Speeding up, steady and slowing down frame counts, then the lead frames (see `Channel`): a move of the eye
-/// (`eye`) or the focus, by angles around the other part (`by_angles`) or along x, y and z.
-fn camera_move_time(g: &mut FieldState, c: &mut NativeCall, eye: bool, by_angles: bool) -> Value {
-    let lead = c.stack.pop_int() as i16;
-    let decel = c.stack.pop_int() as i16;
-    let steady = c.stack.pop_int() as i16;
-    let accel = c.stack.pop_int() as i16;
-    g.camera.time_profile(eye, by_angles, [accel, steady, decel, lead]);
-    Value::Int(0)
-}
-
-/// A linear move over a number of frames.
-fn camera_move_frames(g: &mut FieldState, c: &mut NativeCall, eye: bool, by_angles: bool) -> i16 {
-    let frames = c.stack.pop_int() as i16;
-    g.camera.time_linear(eye, by_angles, frames);
-    frames
-}
-
-/// 6046 (eye) / 6047 (focus): (path, start, step, mode). Path 0 / 1 is the points recorded for the focus / the
-/// eye (at least three, else nothing happens), any other value a script table; mode & 3 == 3 a cubic spline,
-/// else a quadratic one. (Mode bit 2, which adds the path's direction to the point, is not ported.)
-fn path_move(g: &mut FieldState, c: &mut NativeCall, eye: bool) -> Value {
-    let mode = c.stack.pop_int();
-    let step = c.stack.pop_float();
-    let start = c.stack.pop_float();
-    let path = c.stack.pop_int();
-    let cubic = mode & 3 == 3;
-    let path = match path {
-        0 | 1 => {
-            let rec = if path == 0 { &g.camera.focus_record } else { &g.camera.eye_record };
-            (rec.len() >= 3).then(|| crate::follow_camera::Path::from_points(rec, cubic))
-        }
-        var => camera_table(g, c, var as u32).and_then(|t| crate::follow_camera::Path::read(t, cubic)),
-    };
-    if let Some(p) = path {
-        g.camera.start_path(eye, p, start, step);
-    }
-    Value::Int(0)
-}
-
-/// A script table a camera native names by variable (data areas 2–4 of the calling worker).
-fn camera_table<'a>(g: &FieldState, c: &'a NativeCall, var: u32) -> Option<&'a [u8]> {
-    let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
-    let area = ((var >> 25) & 7) as usize;
-    if !(2..=4).contains(&area) {
-        return None;
-    }
-    c.memory.script.get(areas[area - 2] as usize + (var & 0xFF_FFFF) as usize..)
 }
 
 /// Natives that set values for engine parts: save bytes, event and sound switches, the character ID effect
@@ -5352,24 +4620,9 @@ pub fn register(n: &mut Natives<FieldState>) {
         }
         let a = g.actor(c.worker);
         a.pos = p;
-        a.move_at(c.level).active = None;
         Value::Int(0)
     }
-    n.register(0x0013, Native::result(|g, c| place(g, c, false)));
     n.register(0x0126, Native::result(|g, c| place(g, c, true)));
-    n.register(
-        0x0095,
-        Native::result(|g, c| {
-            let yaw = wrap_angle(c.stack.pop_float());
-            let a = g.actor(c.worker);
-            a.yaw = yaw;
-            if a.turn_level == c.level {
-                a.turning = false;
-                a.turn_steps = None;
-            }
-            Value::Float(yaw)
-        }),
-    );
     for id in [0x5008u16, 0x500D] {
         n.register(
             id,
@@ -5498,10 +4751,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Position of a worker (negative: the caller).
-    n.register(0x0038, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[0])));
-    n.register(0x0039, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[1])));
-    n.register(0x003A, Native::result(|g, c| Value::Float(g.actor(target(c)).pos[2])));
     // Motions: the motion a body plays (the renderer picks it from the body's motion groups).
     for id in [0x501Bu16, 0x5040] {
         n.register(
@@ -5733,23 +4982,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(g.actor(c.worker).params[i])
         }),
     );
-    n.register(
-        0x0034,
-        Native::result(|g, c| {
-            // A byte of flags: bits 8 and up shift out.
-            let bit = c.stack.pop_int() as u32 & 31;
-            g.actor(c.worker).flags |= (1u32 << bit) & 0xff;
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x0035,
-        Native::result(|g, c| {
-            let bit = c.stack.pop_int() as u32 & 31;
-            g.actor(c.worker).flags &= !((1u32 << bit) & 0xff);
-            Value::Int(0)
-        }),
-    );
     // Random numbers from the script stream.
     n.register(0x00A9, Native::result(|g, _| Value::Int((g.random() & 0xFFFF) as i32)));
     n.register(
@@ -5758,188 +4990,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             let n = c.stack.pop_int().max(1);
             Value::Int((((g.random() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
         }),
-    );
-    // Movement (per script level): target, walking speed (0x6C sets every level's) and arrival radius, duration,
-    // start, wait.
-    n.register(
-        0x0015,
-        Native::result(|g, c| {
-            let p = pop3(c);
-            g.actor(c.worker).move_at(c.level).target = p;
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x0016,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            g.actor(c.worker).move_at(c.level).speed = v;
-            Value::Float(v)
-        }),
-    );
-    n.register(
-        0x006C,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            for m in &mut g.actor(c.worker).moves {
-                m.speed = v;
-            }
-            Value::Float(v)
-        }),
-    );
-    // The heading and pitch the current level's next move starts along (wrapped).
-    n.register(
-        0x0021,
-        Native::result(|g, c| {
-            let v = wrap_angle(c.stack.pop_float());
-            g.actor(c.worker).move_at(c.level).start_heading = Some(v);
-            Value::Float(v)
-        }),
-    );
-    n.register(
-        0x0022,
-        Native::result(|g, c| {
-            let v = wrap_angle(c.stack.pop_float());
-            g.actor(c.worker).move_at(c.level).start_pitch = Some(v);
-            Value::Float(v)
-        }),
-    );
-    // Arrival radius of every level's move (0x0017: the current level's).
-    n.register(
-        0x002D,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            for m in &mut g.actor(c.worker).moves {
-                m.radius = v;
-            }
-            Value::Float(v)
-        }),
-    );
-    n.register(
-        0x0017,
-        Native::result(|g, c| {
-            let v = c.stack.pop_float();
-            g.actor(c.worker).move_at(c.level).radius = v;
-            Value::Float(v)
-        }),
-    );
-    // A starting count (the start of a timed move sets it back to 0) and the frame count.
-    n.register(
-        0x001C,
-        Native::result(|g, c| {
-            let frames = c.stack.pop_float();
-            let _count = c.stack.pop_float();
-            g.actor(c.worker).move_at(c.level).frames = frames;
-            Value::Float(0.0)
-        }),
-    );
-    n.register(
-        0x0018,
-        Native::result(|g, c| {
-            let _b = c.stack.pop_int();
-            let mode = c.stack.pop_int();
-            let _a = c.stack.pop_int();
-            let a = g.actor(c.worker);
-            let from = a.pos;
-            a.started_late |= a.first_pass_done;
-            let (h, p) = (a.move_at(c.level).start_heading, a.move_at(c.level).start_pitch);
-            if let Some(h) = h {
-                a.move_heading = h;
-            }
-            if let Some(p) = p {
-                a.move_pitch = p;
-            }
-            let m = a.move_at(c.level);
-            // Modes 1 and 2 walk at the set speed (1 on the ground plane, 2 in space); the others run over the
-            // frame count.
-            m.active = Some(match mode & 0x7F {
-                1 | 2 if m.speed > 0.0 => ActorMove::Walk {
-                    to: m.target,
-                    speed: m.speed,
-                    ground_only: mode & 0x7F == 1,
-                    radius: m.radius,
-                    mode: mode as u32,
-                },
-                _ => ActorMove::Timed { from, to: m.target, count: 0.0, frames: m.frames, mode: mode as u32 },
-            });
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x001A,
-        Native {
-            init: None,
-            wait: Some(|g, c| if g.actor(c.worker).move_at(c.level).active.is_some() { 0 } else { 5 }),
-            result: None,
-        },
-    );
-    n.register(
-        0x0077,
-        Native::result(|g, c| {
-            let w = c.stack.pop_int();
-            // Ends the move of the worker's current level (other levels keep theirs).
-            if let Ok(w) = usize::try_from(w) {
-                let level = if w == c.worker { c.level } else { g.actor(w).level };
-                g.actor(w).move_at(level).active = None;
-            }
-            Value::Int(0)
-        }),
-    );
-    // Turning.
-    n.register(
-        0x0028,
-        Native::result(|g, c| {
-            let yaw = wrap_angle(c.stack.pop_float());
-            g.actor(c.worker).turn_target = yaw;
-            Value::Float(yaw)
-        }),
-    );
-    n.register(
-        0x001D,
-        Native::result(|g, c| {
-            let b = c.stack.pop_float();
-            let a = c.stack.pop_float();
-            g.actor(c.worker).turn_speed = [a, if b <= 0.0 { 1.0 } else { b }];
-            Value::Float(0.0)
-        }),
-    );
-    n.register(
-        0x0019,
-        Native::result(|g, c| {
-            c.stack.pop_int();
-            let mode = c.stack.pop_int() as u32;
-            c.stack.pop_int();
-            let rate = g
-                .settings
-                .get(&(0x002E, level_key(c.worker, c.level)))
-                .and_then(|v| v.first())
-                .map_or(DEFAULT_TURN_RATE, |v| match v {
-                    Value::Float(f) => *f,
-                    Value::Int(x) => *x as f32,
-                });
-            let a = g.actor(c.worker);
-            a.turning = true;
-            a.started_late |= a.first_pass_done;
-            a.turn_mode = mode;
-            a.turn_level = c.level;
-            // An eased turn (kind 2) goes through its progress in steps of 5/6 of the rate over the whole turns
-            // of the angle left (truncated; none: it stays at the start).
-            if mode & 0x1F == 2 {
-                let n = wrap_angle(a.yaw - a.turn_target) as i32;
-                a.turn_t = 0.0;
-                a.turn_inc = if n == 0 { 0.0 } else { (rate * 0.833_333_3 / n as f32).abs() };
-            }
-            // Modes 3 and 4 without a speed turn at an even rate over the set number of frames, the short way.
-            a.turn_steps = (matches!(mode & 0xffff_001f, 3 | 4) && a.turn_speed[0] == 0.0).then(|| {
-                let frames = a.turn_speed[1].max(1.0) as u32;
-                (wrap_angle(a.turn_target - a.yaw) / frames as f32, frames)
-            });
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x001B,
-        Native { init: None, wait: Some(|g, c| if g.actor(c.worker).turning { 0 } else { 5 }), result: None },
     );
     // Map change: target and entrance; the session carries it out between ticks.
     // (00ab is the same native: (target, entrance, 1).)
@@ -6040,115 +5090,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(w as i32)
         }),
     );
-    // Camera: position and focus.
-    n.register(
-        0x6002,
-        Native::result(|g, c| {
-            let to = pop3(c);
-            g.camera.place_eye(to);
-            Value::Int(0)
-        }),
-    );
-    // The eye at a heading and pitch (degrees) and a distance from the focus, kept there as the focus moves
-    // (moving there over the frames a move time sets); 0x6005 adds to the heading, pitch and distance it has (an
-    // eye placed otherwise is first measured that way).
-    n.register(
-        0x6004,
-        Native::result(|g, c| {
-            let [yaw, pitch, dist] = pop3(c);
-            g.camera.place_eye_polar([radians(yaw), radians(pitch), dist]);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6005,
-        Native::result(|g, c| {
-            let [yaw, pitch, dist] = pop3(c);
-            let cam = &mut g.camera;
-            let now = cam.follow.polar.or_else(|| {
-                let (eye, focus) = (cam.position?, cam.focus?);
-                Some(crate::follow_camera::to_polar(focus, eye))
-            });
-            if let Some([y, p, d]) = now {
-                cam.place_eye_polar([y + radians(yaw), p + radians(pitch), d + dist]);
-            }
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6010,
-        Native::result(|g, c| {
-            let frames = camera_move_frames(g, c, true, false).max(1) as u32;
-            // The following camera's eye moves there from where it is over the frames.
-            if let Some(from) = g.camera.position {
-                g.camera.follow.eye_move = Some((from, frames, 0));
-            }
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x602E,
-        Native::result(|g, c| {
-            let frames = camera_move_frames(g, c, false, false).max(1) as u32;
-            if let Some(from) = g.camera.focus {
-                g.camera.follow.focus_move = Some((from, frames, 0));
-            }
-            Value::Int(0)
-        }),
-    );
-    // Speeding up, steady and slowing down frame counts, then a fourth value: 0x6014 the eye, 0x6032 the focus;
-    // 0x6015 / 0x6033 the same moving by angles and distance around the other.
-    n.register(0x6014, Native::result(|g, c| camera_move_time(g, c, true, false)));
-    n.register(0x6015, Native::result(|g, c| camera_move_time(g, c, true, true)));
-    n.register(0x6032, Native::result(|g, c| camera_move_time(g, c, false, false)));
-    n.register(0x6033, Native::result(|g, c| camera_move_time(g, c, false, true)));
-    // Linear move times: 0x6011 the eye around the focus, 0x602F the focus around the eye.
-    n.register(
-        0x6011,
-        Native::result(|g, c| {
-            camera_move_frames(g, c, true, true);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x602F,
-        Native::result(|g, c| {
-            camera_move_frames(g, c, false, true);
-            Value::Int(0)
-        }),
-    );
-    // Eye and focus along a path: (path, start, step per tick, mode).
-    n.register(0x6046, Native::result(|g, c| path_move(g, c, true)));
-    n.register(0x6047, Native::result(|g, c| path_move(g, c, false)));
-    // Points for those paths: 604a / 6048 clear the focus's / the eye's, 604b / 6049 add where it is now.
-    n.register(
-        0x604A,
-        Native::result(|g, _| {
-            g.camera.focus_record.clear();
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6048,
-        Native::result(|g, _| {
-            g.camera.eye_record.clear();
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x604B,
-        Native::result(|g, _| {
-            g.camera.record(false);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6049,
-        Native::result(|g, _| {
-            g.camera.record(true);
-            Value::Int(0)
-        }),
-    );
     register_triggers(n);
     register_control(n);
     register_workers(n);
@@ -6172,183 +5113,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             if let Ok(w) = usize::try_from(w) {
                 c.effects.push(aerugo_script::vm::Effect::ExtraPass(w));
             }
-            Value::Int(0)
-        }),
-    );
-    // The camera parts the following move times apply to.
-    n.register(
-        0x6043,
-        Native::result(|g, c| {
-            g.camera.parts = Some(c.stack.pop_int() as u8);
-            Value::Int(0)
-        }),
-    );
-    // (6062/6063 wait on the eye's / focus's move channels; which Aerugo timers they map to is not settled:
-    // replayed for now.)
-    n.register(
-        0x601A,
-        Native { init: None, wait: Some(|g, _| if g.camera.is_moving() { 0 } else { 5 }), result: None },
-    );
-    // Stop the eye's / the focus's moves where they are; wait for the focus's.
-    n.register(
-        0x6016,
-        Native::result(|g, _| {
-            g.camera.stop_moves(true);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6034,
-        Native::result(|g, _| {
-            g.camera.stop_moves(false);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6038,
-        Native { init: None, wait: Some(|g, _| if g.camera.focus_moving() { 0 } else { 5 }), result: None },
-    );
-    n.register(
-        0x603B,
-        Native::result(|g, c| {
-            let d = c.stack.pop_float();
-            g.camera.set_screen_distance(d);
-            Value::Int(0)
-        }),
-    );
-    // The follow camera: follow workers (−1: none) with a height offset; limits on the focus; easing; the eye
-    // around the focus.
-    n.register(
-        0x6027,
-        Native::result(|g, c| {
-            let f = c.stack.pop_float();
-            let b = c.stack.pop_int();
-            let a = c.stack.pop_int();
-            let w = |v: i32| usize::try_from(v).ok();
-            g.camera.follow.follow = Some(([w(a), w(b)], [0.0, f, 0.0]));
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x602D,
-        Native::result(|g, _| {
-            g.camera.follow.clear_limits();
-            g.camera.follow.rail = None;
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6029,
-        Native::result(|g, c| {
-            // (x0, z0) to (x1, z1), then the share kept past it.
-            let k = c.stack.pop_float();
-            let z1 = c.stack.pop_float();
-            let x1 = c.stack.pop_float();
-            let z0 = c.stack.pop_float();
-            let x0 = c.stack.pop_float();
-            let limit = crate::follow_camera::Limit::Line { start: [x0, z0], dir: [x1 - x0, z1 - z0], k };
-            g.camera.follow.add_limit(limit);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x602B,
-        Native::result(|g, c| {
-            let k = c.stack.pop_float();
-            let max = c.stack.pop_float();
-            let min = c.stack.pop_float();
-            g.camera.follow.add_limit(crate::follow_camera::Limit::Height { min, max, k });
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6035,
-        Native::result(|g, c| {
-            let _ = c.stack.pop_float();
-            let z = c.stack.pop_float();
-            let y = c.stack.pop_float();
-            let x = c.stack.pop_float();
-            g.camera.follow.ease = [x, y, z];
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6006,
-        Native::result(|g, c| {
-            let dist_div = c.stack.pop_float();
-            let dist = c.stack.pop_float();
-            let pitch_div = c.stack.pop_float();
-            let pitch = c.stack.pop_float().to_radians();
-            let b = c.stack.pop_float();
-            let a = c.stack.pop_float();
-            g.camera.follow.clear_eye();
-            g.camera.follow.orbit =
-                Some(crate::follow_camera::Orbit { anchor: [a, b], pitch, pitch_div, dist, dist_div });
-            Value::Int(0)
-        }),
-    );
-    // The eye from a table in the worker's data (a variable naming it), a heading change in degrees and the
-    // anchor point.
-    n.register(
-        0x601F,
-        Native::result(|g, c| {
-            let z = c.stack.pop_float();
-            let x = c.stack.pop_float();
-            let yaw = c.stack.pop_float().to_radians();
-            let var = c.stack.pop_int() as u32;
-            let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
-            let area = ((var >> 25) & 7) as usize;
-            if (2..=4).contains(&area) {
-                let at = areas[area - 2] as usize + (var & 0xFF_FFFF) as usize;
-                let table = c.memory.script.get(at..).unwrap_or_default();
-                g.camera.follow.clear_eye();
-                g.camera.follow.path = crate::follow_camera::EyePath::read(table, [x, z], yaw);
-            }
-            Value::Int(0)
-        }),
-    );
-    // Rails: the focus held near a path (605A: table, share kept, 3 for the cubic path) and the eye on a path at
-    // the focus's place along it (605B: table, 3 for cubic).
-    n.register(
-        0x605A,
-        Native::result(|g, c| {
-            let mode = c.stack.pop_int();
-            let k = c.stack.pop_float();
-            let var = c.stack.pop_int() as u32;
-            let rail = camera_table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3));
-            if let Some(r) = rail {
-                g.camera.follow.rail = Some((r, k));
-            }
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x605B,
-        Native::result(|g, c| {
-            let mode = c.stack.pop_int();
-            let var = c.stack.pop_int() as u32;
-            if let Some(r) =
-                camera_table(g, c, var).and_then(|t| crate::follow_camera::Path::read(t, mode == 3))
-            {
-                g.camera.follow.clear_eye();
-                g.camera.follow.eye_rail = Some(r);
-            }
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x6020,
-        Native::result(|g, c| {
-            let at = pop3(c);
-            g.camera.place_focus(at);
-            Value::Int(0)
-        }),
-    );
-    n.register(
-        0x603A,
-        Native::result(|g, c| {
-            let roll = radians(c.stack.pop_float());
-            g.camera.set_roll(roll);
             Value::Int(0)
         }),
     );
@@ -6409,42 +5173,6 @@ pub fn register(n: &mut Natives<FieldState>) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn recorded_points_make_a_path_the_camera_follows_to_its_end() {
-        use super::CameraState;
-        let mut cam = CameraState::default();
-        for x in [0.0, 0.0, 10.0, 10.0] {
-            cam.place_focus([x, 1.0, 2.0]);
-            cam.place_eye_polar([0.0, 0.0, 5.0]);
-            cam.record(false);
-            cam.record(true);
-        }
-        assert_eq!(cam.focus_record.len(), 4);
-        // The eye is recorded around the focus at its angles.
-        assert!((cam.eye_record[3][0] - 15.0).abs() < 1e-5);
-        let focus = crate::follow_camera::Path::from_points(&cam.focus_record, true);
-        let eye = crate::follow_camera::Path::from_points(&cam.eye_record, true);
-        cam.start_path(false, focus, 0.0, 0.25);
-        cam.start_path(true, eye, 0.0, 0.25);
-        assert_eq!(cam.follow.polar, None);
-        assert!(cam.focus_moving() && cam.is_moving());
-        assert!((cam.focus.unwrap()[0] - 5.0 / 3.0).abs() < 1e-5);
-        // Places 0.25, 0.5, 0.75, 1.0 (still moving), then 1.25 clamps: the move ends at the last point.
-        let mut ticks = 0;
-        while cam.is_moving() {
-            cam.update();
-            cam.process(None);
-            ticks += 1;
-        }
-        assert_eq!(ticks, 5);
-        assert!(!cam.focus_moving());
-        assert!((cam.focus.unwrap()[0] - 50.0 / 6.0).abs() < 1e-4);
-        assert!((cam.position.unwrap()[0] - 50.0 / 6.0 - 5.0).abs() < 1e-4);
-        // A step of zero places the camera and ends at once.
-        let p = crate::follow_camera::Path::from_points(&cam.focus_record, false);
-        cam.start_path(false, p, 0.5, 0.0);
-        assert!(!cam.focus_moving());
-    }
 
     #[test]
     fn walking_into_a_character_bumps_it_once_and_stops_at_contact() {

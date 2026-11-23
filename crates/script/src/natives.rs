@@ -98,6 +98,8 @@ pub struct Natives<G> {
     /// Natives registered only to take their arguments and give a fixed or kept result: the engine part behind
     /// them is not ported yet.
     stubs: std::collections::HashSet<u16>,
+    /// Every registration in order, with the source line that made it (the last one for an id is the one used).
+    sites: Vec<(u16, &'static std::panic::Location<'static>)>,
     pub coverage: Coverage,
     /// Recorded native behaviour used for natives without an implementation.
     pub replay: Option<Replay>,
@@ -116,6 +118,7 @@ impl<G> Natives<G> {
             game,
             table: HashMap::new(),
             stubs: Default::default(),
+            sites: Vec::new(),
             coverage: Coverage::default(),
             replay: None,
         };
@@ -123,16 +126,27 @@ impl<G> Natives<G> {
         n
     }
 
+    #[track_caller]
     pub fn register(&mut self, id: u16, native: Native<G>) {
+        self.sites.push((id, std::panic::Location::caller()));
         self.table.insert(id, native);
         self.stubs.remove(&id);
     }
 
     /// Register a stand-in: it keeps the stack and the results right, but the engine part behind the native is
     /// not ported yet.
+    #[track_caller]
     pub fn register_stub(&mut self, id: u16, native: Native<G>) {
+        self.sites.push((id, std::panic::Location::caller()));
         self.table.insert(id, native);
         self.stubs.insert(id);
+    }
+
+    /// Every registration in order: the id and the source line that made it.
+    pub fn registration_sites(
+        &self,
+    ) -> impl Iterator<Item = (u16, &'static std::panic::Location<'static>)> + '_ {
+        self.sites.iter().copied()
     }
 
     /// Mark a registered native as a stand-in.

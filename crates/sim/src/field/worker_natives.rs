@@ -384,6 +384,18 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(0.0)
         }),
     );
+    // 00c4: whether the running level's move is under way (its mode's low 7 bits).
+    n.register(
+        0x00C4,
+        Native::result(|g, c| {
+            let w = wk(g, c);
+            let m = w.own_move(i32::from(c.level));
+            Value::Int(i32::from(w.u16(m + mv::MODE) & 0x7f != 0))
+        }),
+    );
+    // 006d / 006e: every level's move turn yaw / pitch.
+    n.register(0x006D, Native::result(|g, c| all_move_f(g, c, mv::TURN_YAW)));
+    n.register(0x006E, Native::result(|g, c| all_move_f(g, c, mv::TURN_PITCH)));
     n.register(0x00E4, Native::result(|g, c| all_rot_f(g, c, rt::SPEED2)));
     n.register(0x0070, Native::result(|g, c| all_rot_f(g, c, rt::PITCH_SPEED)));
     n.register(0x0071, Native::result(|g, c| all_rot_f(g, c, rt::ROLL_SPEED)));
@@ -579,20 +591,22 @@ pub(super) fn register_shapes(n: &mut Natives<FieldState>) {
         }),
     );
     n.register(0x0055, Native::result(|g, c| shape_f(g, c, p::HEIGHT, &[2, 5, 3, 6], 1)));
-    // 0056(on): the engine steps a line, box or zone (kinds 2, 3, 5, 6).
-    n.register(
-        0x0056,
-        Native::result(|g, c| {
-            let on = c.stack.pop_int();
-            let w = wk(g, c);
-            if !matches!(w.kind, 2 | 3 | 5 | 6) {
-                return Value::Int(0);
-            }
-            w.set_u16(workers::FLAGS, w.flags() & !0x80 | u16::from(on != 0) << 7);
-            w.set_u16(workers::FLAGS2, w.flags2() | 1);
-            Value::Int(1)
-        }),
-    );
+    // 0056 / 005c (the same handler)(on): the engine steps a line, box or zone (kinds 2, 3, 5, 6).
+    for id in [0x0056u16, 0x005C] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let on = c.stack.pop_int();
+                let w = wk(g, c);
+                if !matches!(w.kind, 2 | 3 | 5 | 6) {
+                    return Value::Int(0);
+                }
+                w.set_u16(workers::FLAGS, w.flags() & !0x80 | u16::from(on != 0) << 7);
+                w.set_u16(workers::FLAGS2, w.flags2() | 1);
+                Value::Int(1)
+            }),
+        );
+    }
     // 0057(x, y, z): a box's or zone's centre (kinds 3, 6), stepped from now on.
     n.register(
         0x0057,
