@@ -35,7 +35,7 @@ pub struct TextureAnimations {
 }
 
 /// The files of an asset header's Direct3D 11 (32-bit) section in load order, and the index it names `name`.
-pub(crate) fn asset_header(text: &str, name: &str) -> (Vec<String>, Option<usize>) {
+pub fn asset_header(text: &str, name: &str) -> (Vec<String>, Option<usize>) {
     let mut index = None;
     let mut files = Vec::new();
     let mut inside = false;

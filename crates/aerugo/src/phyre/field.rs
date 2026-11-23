@@ -207,8 +207,30 @@ impl FieldRenderer {
         if !self.models.contains_key(path) {
             let m = GameModel::load(vfs, renderer, path).map_err(|e| log::warn!("{path}: {e}")).ok();
             self.models.insert(path.to_owned(), m);
+            self.load_asset_files(vfs, renderer, path);
         }
         self.models.get(path).is_some_and(Option::is_some)
+    }
+
+    /// The files the model's asset header lists (`<dir>/<name>.ahwin32` beside its `mdl` folder: the textures,
+    /// texture swaps, effect textures, shaders), loaded with the asset as the remaster's loader does: textures
+    /// into the run-time texture cache, the rest read.
+    fn load_asset_files(&mut self, vfs: &Vfs, renderer: &mut Renderer, model: &str) {
+        let Some((dir, _)) = model.rsplit_once("/mdl/") else { return };
+        let Some(name) = dir.rsplit('/').next() else { return };
+        let header = format!("{dir}/{name}.ahwin32");
+        let Ok(text) = vfs.read(&header) else { return };
+        let (files, _) =
+            aerugo_sim::field::texture_animation::asset_header(&String::from_utf8_lossy(&text), "");
+        for f in files {
+            if f.ends_with(".dds.phyre") {
+                if runtime_texture(&mut self.swaps, vfs, renderer, &f).is_none() {
+                    log::error!("GAP: {header} lists {f}, which does not load");
+                }
+            } else if f != model && vfs.read(&f).is_err() {
+                log::error!("GAP: {header} lists {f}, which does not load");
+            }
+        }
     }
 
     fn targets(&mut self, renderer: &mut Renderer, size: (u32, u32), msaa: u32) -> Option<[TargetHandle; 4]> {

@@ -58,6 +58,17 @@ impl GameModel {
             Cluster::parse(vfs.read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let model = mesh::read_model(&cluster).map_err(|e| e.to_string())?;
         let game = crate::assets::game_of_path(path);
+        // The asset loads every effect variant the cluster imports, also those of materials nothing draws
+        // with (the clusters keep such materials); read them as the asset does.
+        for u in 0..cluster.user_fixups.len() {
+            if let Some((id, class)) = cluster.import(u)
+                && class == "PEffectVariant"
+                && let Some(p) = aerugo_formats::effect::effect_cluster_path(game, &id)
+                && let Err(e) = vfs.read(&p)
+            {
+                log::error!("GAP: {path} imports {id}, which does not load: {e}");
+            }
+        }
         let vb = cluster.vertex_buffer();
         let ib = cluster.index_buffer();
         let mut buffers = Vec::new();
