@@ -306,13 +306,15 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(n)
         }),
     );
-    // 011f(slot, x, y). (The original moves (0x10e, 0xd5) to (0x122, 0xd5) in one language on one map, not
-    // checked here.)
+    // 011f(slot, x, y); language type 0xb on map 0x199 moves (0x10e, 0xd5) to (0x122, 0xd5).
     n.register(
         0x011F,
         Native::result(|g, c| {
             let y = c.stack.pop_int();
-            let x = c.stack.pop_int();
+            let mut x = c.stack.pop_int();
+            if g.language_type == Some(0xb) && g.map_id == 0x199 && (x, y) == (0x10e, 0xd5) {
+                x = 0x122;
+            }
             let n = c.stack.pop_int();
             let slot = g.shapes.slot(n);
             slot.x = x as i16;

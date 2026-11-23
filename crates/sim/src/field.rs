@@ -123,14 +123,6 @@ pub struct Actor {
     /// (0001), 2 the camera (0002), 3 (0003), 4 (0004) and 5 (0197) display objects; and the bound number.
     pub bind_kind: u8,
     pub bind_id: u16,
-    /// Character values natives set for engine parts (the character's +0x182 byte (5017), +0x183 byte (5029),
-    /// +0x726 short (505f), +0x17c shadow value (5085)) and its flag word bits 0 (5057), 3 (5087), 11 (502a)
-    /// and 20 (5069).
-    pub chr_mode_182: i8,
-    pub chr_byte_183: i8,
-    pub chr_motion_726: i16,
-    pub chr_shadow_17c: f32,
-    pub chr_flags: u32,
     /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
     /// height difference unless both test it.
     pub height_test: bool,
@@ -228,11 +220,6 @@ impl Default for Actor {
             display_object: None,
             bind_kind: 0,
             bind_id: 0,
-            chr_mode_182: 0,
-            chr_byte_183: 0,
-            chr_motion_726: 0,
-            chr_shadow_17c: 0.0,
-            chr_flags: 0,
             height_test: true,
             chr_textures: ChrTextures::default(),
             player: None,
@@ -1159,8 +1146,6 @@ pub struct FieldState {
     pub shop_rate: Option<i32>,
     /// A script warped the player this tick (cleared at the start of each tick).
     pub player_placed: bool,
-    /// A switch scripts turn off around menus they open (0241).
-    pub menu_switch_off: bool,
     /// Each worker's three data areas in the script (for natives that take tables there).
     pub data_areas: Vec<[u32; 3]>,
     /// Each worker's kind.
@@ -3122,23 +3107,35 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // On the ground (1) or not (0): the original's ground flag, which also switches the walk-mesh shade.
+    // 500e(v): the body's +0x194 bit 0x80 = v & 1 (set: it leaves the walk mesh, its ground normal (0, −1, 0)), and
+    // the walk-mesh shade bit 0x40000 the opposite (82aa70). 5060(v): the shade bit = v & 1 (8340f0).
     n.register(
         0x500E,
         Native::result(|g, c| {
-            let on = c.stack.pop_int() != 0;
+            let v = c.stack.pop_int() as u32 & 1;
             let w = c.worker;
-            g.actor(w).shade_from_ground = on;
+            if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
+                let f = ch.u32(crate::chr::FLAGS) & !0x80 | v << 7;
+                if v != 0 {
+                    ch.set_f32(0x7c, 0.0);
+                    ch.set_f32(0x80, -1.0);
+                    ch.set_f32(0x84, 0.0);
+                }
+                ch.set_u32(crate::chr::FLAGS, f & !0x40000 | (v ^ 1) << 18);
+                g.actor(w).shade_from_ground = v == 0;
+            }
             Value::Int(0)
         }),
     );
-    // Whether a character's shade follows the walk mesh.
     n.register(
         0x5060,
         Native::result(|g, c| {
-            let on = c.stack.pop_int() != 0;
+            let v = c.stack.pop_int() as u32 & 1;
             let w = c.worker;
-            g.actor(w).shade_from_ground = on;
+            if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
+                ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x40000 | v << 18);
+                g.actor(w).shade_from_ground = v != 0;
+            }
             Value::Int(0)
         }),
     );
@@ -3181,13 +3178,16 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Body hit off (1) or on (0): characters without it neither block nor bump.
+    // 500f(v): body hit off (+0x194 bit 0x100 = v & 1, Ch_DisableBodyHit): it neither blocks nor bumps.
     n.register(
         0x500F,
         Native::result(|g, c| {
-            let off = c.stack.pop_int() != 0;
+            let v = c.stack.pop_int() as u32 & 1;
             let w = c.worker;
-            g.actor(w).no_body_hit = off;
+            if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
+                ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x100 | v << 8);
+                g.actor(w).no_body_hit = v != 0;
+            }
             Value::Int(0)
         }),
     );
@@ -3665,12 +3665,13 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(number)
         }),
     );
-    // The switch scripts turn off around their menus.
+    // 0241(on): bit 3 of the system block's +0x210 word; returns on != 0.
     n.register(
         0x0241,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            g.menu_switch_off = !on;
+            let s = &mut g.workers.sys;
+            s.flags210 = s.flags210 & !8 | u32::from(on) << 3;
             Value::Int(i32::from(on))
         }),
     );
@@ -4396,17 +4397,19 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Character values, for a worker with a character: 5017 the +0x182 byte, 505f the +0x726 short, 5085 the shadow
-    // value; 5029 swaps the +0x183 byte and 502a flag bit 11, 5069 flag bit 20 (the old value comes back).
-    fn chr(g: &mut FieldState, w: usize) -> Option<&mut Actor> {
-        g.actors.get_mut(w).filter(|a| a.model.is_some())
+    // Character values on the worker's body record (none: nothing): 5017 +0x182 byte, 505f +0x726 short, 5085
+    // +0x17c; 5029 swaps +0x183 (the old value back, as a signed byte), 502a / 5069 bits 11 / 20 of +0x194 (the old
+    // bit back); 5057(worker, v) bit 0 of another worker's body (by index); 5087: every body with bit 0 clear gets
+    // bit 3.
+    fn body(g: &mut FieldState, w: usize) -> Option<&mut crate::chr::Chr> {
+        g.chrs.get_mut(w).and_then(Option::as_mut)
     }
     n.register(
         0x5017,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            if let Some(a) = chr(g, c.worker) {
-                a.chr_mode_182 = v as i8;
+            if let Some(ch) = body(g, c.worker) {
+                ch.set_u8(crate::chr::HEIGHT_MODE, v as u8);
             }
             Value::Int(0)
         }),
@@ -4415,8 +4418,8 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
         0x505F,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            if let Some(a) = chr(g, c.worker) {
-                a.chr_motion_726 = v as i16;
+            if let Some(ch) = body(g, c.worker) {
+                ch.set_u16(0x726, v as u16);
             }
             Value::Int(0)
         }),
@@ -4425,8 +4428,8 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
         0x5085,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
-            if let Some(a) = chr(g, c.worker) {
-                a.chr_shadow_17c = v;
+            if let Some(ch) = body(g, c.worker) {
+                ch.set_f32(0x17c, v);
             }
             Value::Int(0)
         }),
@@ -4435,48 +4438,50 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
         0x5029,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            let Some(a) = chr(g, c.worker) else { return Value::Int(0) };
-            let old = a.chr_byte_183;
-            a.chr_byte_183 = v as i8;
+            let Some(ch) = body(g, c.worker) else { return Value::Int(0) };
+            let old = ch.u8(0x183) as i8;
+            ch.set_u8(0x183, v as u8);
             Value::Int(i32::from(old))
         }),
     );
-    fn swap_bit(g: &mut FieldState, w: usize, bit: u32, v: i32) -> Value {
-        let Some(a) = chr(g, w) else { return Value::Int(0) };
-        let old = (a.chr_flags >> bit) & 1;
-        a.chr_flags = (a.chr_flags & !(1 << bit)) | (((v as u32) & 1) << bit);
-        Value::Int(old as i32)
+    fn swap_bit(ch: &mut crate::chr::Chr, bit: u32, v: i32) -> Value {
+        let f = ch.u32(crate::chr::FLAGS);
+        ch.set_u32(crate::chr::FLAGS, f & !(1 << bit) | ((v as u32) & 1) << bit);
+        Value::Int((f >> bit & 1) as i32)
     }
     n.register(
         0x502A,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            swap_bit(g, c.worker, 11, v)
+            body(g, c.worker).map_or(Value::Int(0), |ch| swap_bit(ch, 11, v))
         }),
     );
     n.register(
         0x5069,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            swap_bit(g, c.worker, 20, v)
+            body(g, c.worker).map_or(Value::Int(0), |ch| swap_bit(ch, 20, v))
         }),
     );
-    // Flag bit 0 of another worker's character (worker, value); the old bit comes back.
     n.register(
         0x5057,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            let w = c.stack.pop_int();
-            let w = if w < 0 { c.worker } else { w as usize };
-            swap_bit(g, w, 0, v)
+            let i = c.stack.pop_int();
+            // The worker by index: negative or past the last is worker 0.
+            let w = usize::try_from(i).ok().filter(|&w| w < g.workers.list.len()).unwrap_or(0);
+            body(g, w).map_or(Value::Int(0), |ch| swap_bit(ch, 0, v))
         }),
     );
-    // Every character whose flag bit 0 is clear gets bit 3.
     n.register(
         0x5087,
         Native::result(|g, _| {
-            for a in g.actors.iter_mut().filter(|a| a.model.is_some() && a.chr_flags & 1 == 0) {
-                a.chr_flags |= 8;
+            let attached = g.attachments.iter_mut().flatten().flatten().map(|a| &mut a.chr);
+            for ch in g.chrs.iter_mut().flatten().chain(attached).filter(|ch| ch.u8(2) != 0) {
+                let f = ch.u32(crate::chr::FLAGS);
+                if f & 1 == 0 {
+                    ch.set_u32(crate::chr::FLAGS, f | 8);
+                }
             }
             Value::Int(0)
         }),
@@ -4630,12 +4635,29 @@ pub fn register(n: &mut Natives<FieldState>) {
         Value::Int(0)
     }
     n.register(0x0126, Native::result(|g, c| place(g, c, true)));
+    // 5008 / 500d(v): the body's hide bit (+0x180 bit 0 = v; showing it marks +0x820 bit 2). In a battle on map
+    // 0x21e8 only body 0x108a stays shown (the battle side is not ported: reported).
     for id in [0x5008u16, 0x500D] {
         n.register(
             id,
             Native::result(|g, c| {
-                let hidden = c.stack.pop_int() != 0;
-                g.actor(c.worker).visible = !hidden;
+                let v = c.stack.pop_int();
+                if g.battle.as_ref().is_some_and(|(_, started)| *started) {
+                    log::error!(
+                        "GAP: 5008/500d during a battle (the battle id test of 82b2c0 is not ported)"
+                    );
+                }
+                let w = c.worker;
+                if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
+                    let b = ch.u8(0x180);
+                    if v == 0 {
+                        ch.set_u32(0x820, ch.u32(0x820) | 4);
+                        ch.set_u8(0x180, b & !1);
+                    } else {
+                        ch.set_u8(0x180, b | 1);
+                    }
+                    g.actor(w).visible = v == 0;
+                }
                 Value::Int(0)
             }),
         );
@@ -5116,9 +5138,10 @@ pub fn register(n: &mut Natives<FieldState>) {
     // Have a worker run again at the end of this frame (its new requests start then); returns the worker.
     n.register(
         0x0116,
-        Native::result(|_, c| {
+        Native::result(|g, c| {
             let w = c.stack.pop_int();
-            let t = if w < 0 { c.worker } else { w as usize };
+            // The worker by index: negative or past the last is worker 0.
+            let t = usize::try_from(w).ok().filter(|&i| i < g.workers.list.len()).unwrap_or(0);
             c.effects.push(aerugo_script::vm::Effect::PassAgain(t));
             Value::Int(w)
         }),

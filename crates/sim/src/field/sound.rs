@@ -46,8 +46,6 @@ pub struct SoundState {
     /// Sequence sounds started (never 0 once counting).
     pub seq_count: u32,
     pub seq_played: u32,
-    /// The background sounds' fade rate (−1 / (frames / 2), −1 at once).
-    pub bg_fade_rate: f32,
     /// Two sound switch masks (bit n: sound n on).
     pub mask_a: u32,
     pub mask_b: u32,
@@ -87,7 +85,6 @@ impl Default for SoundState {
             seq_off: false,
             seq_count: 0,
             seq_played: 0,
-            bg_fade_rate: 0.0,
             mask_a: 0,
             mask_b: 0,
             pos_fade_rate: 0.0,
@@ -365,7 +362,8 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0143,
         Native::result(|g, c| {
             let frames = c.stack.pop_int();
-            g.sound.bg_fade_rate = if frames == 0 { -1.0 } else { -1.0 / (frames as f32 * 0.5) };
+            // The positional sounds' fade step (877450).
+            g.pos_sounds.rate = if frames == 0 { -1.0 } else { -1.0 / (frames as f32 * 0.5) };
             let save28 = c.memory.global[0].get(0x28).copied().unwrap_or(0);
             fade_background(&mut g.sound, &c.memory.script, save28, frames, 0, false);
             Value::Int(frames)
