@@ -241,6 +241,7 @@ impl ModelBrowser {
                 texture_animations: None,
                 models: &[],
                 actors: &actors,
+                vfx: &[],
             };
             let msaa = renderer.msaa();
             let culling = self.culling;

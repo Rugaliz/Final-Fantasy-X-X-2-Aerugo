@@ -375,6 +375,7 @@ impl MapBrowser {
             texture_animations: None,
             models: &models,
             actors: &[],
+            vfx: &[],
         };
         let light = crate::phyre::field::Lighting::default();
         let msaa = renderer.msaa();
@@ -634,6 +635,7 @@ mod tests {
                         texture_animations: None,
                         models: &models,
                         actors: &[],
+                        vfx: &[],
                     };
                     let frame = phyre
                         .frame(

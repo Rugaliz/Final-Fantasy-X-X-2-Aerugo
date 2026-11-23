@@ -297,6 +297,11 @@ fn instance_world(cluster: &Cluster, inst: ObjectId) -> [f32; 16] {
         .unwrap_or(IDENTITY)
 }
 
+/// The first material of a cluster (an effect file's own material holds its parameters' defaults).
+pub fn first_material(cluster: &Cluster) -> Option<Material> {
+    cluster.objects("PMaterial").into_iter().next().map(|m| material(cluster, m))
+}
+
 fn material(cluster: &Cluster, mat: ObjectId) -> Material {
     let effect = match cluster.pointer(mat, "m_effectVariant") {
         Some(Pointer::User(u)) => cluster.import(u).map(|(id, _)| id).unwrap_or_default(),

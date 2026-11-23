@@ -10,6 +10,7 @@ pub mod model;
 pub mod post;
 pub mod scene;
 pub mod ui;
+pub mod vfx;
 
 use std::collections::HashMap;
 use std::rc::Rc;

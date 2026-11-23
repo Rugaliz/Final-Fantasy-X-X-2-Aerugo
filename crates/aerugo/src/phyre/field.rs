@@ -129,6 +129,8 @@ pub struct Objects<'a> {
     pub actors: &'a [ActorDraw<'a>],
     /// Map groups not drawn (bit per mesh instance group).
     pub hidden_map_groups: u32,
+    /// The frame's effect geometry (each with the folder of its textures).
+    pub vfx: &'a [(aerugo_sim::ppp::vfx::Mesh, String)],
 }
 
 /// The character light constants.
@@ -154,6 +156,8 @@ pub struct FieldRenderer {
     swaps: HashMap<String, Option<aerugo_gfx::TextureHandle>>,
     /// Whether an effect (by asset id) sets the `CHR_TEXTURE_ANIMATION_UV` switch.
     uv_effects: HashMap<String, bool>,
+    /// The effect draws' state.
+    vfx: super::vfx::VfxRenderer,
 }
 
 /// Whether a material's effect variant sets the switch `CHR_TEXTURE_ANIMATION_UV` (to anything but ""), as
@@ -216,6 +220,7 @@ impl FieldRenderer {
         for h in std::mem::take(&mut self.swaps).into_values().flatten() {
             renderer.destroy_texture(h);
         }
+        self.vfx.clear(renderer);
     }
 
     /// A frame of `objects` seen with `scene`'s camera: through the post chain when `post` is given, else
@@ -403,6 +408,18 @@ impl FieldRenderer {
             }
         }
         ops.extend(later);
+        // The effects after the scene's transparent draws.
+        let mut transient = Vec::new();
+        ops.extend(self.vfx.draws(
+            vfs,
+            renderer,
+            &mut self.programs,
+            objects.vfx,
+            scene,
+            viewport,
+            &mut transient,
+            &mut missing,
+        ));
         if both_sides {
             for op in &mut ops {
                 if let GameOp::Draw(d) = op {
@@ -440,7 +457,7 @@ impl FieldRenderer {
                 log::info!("game shaders: nothing supplies {m}");
             }
         }
-        Some(GameFrame { ops, transient: Vec::new() })
+        Some(GameFrame { ops, transient })
     }
 }
 

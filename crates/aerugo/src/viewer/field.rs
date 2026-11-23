@@ -1249,6 +1249,7 @@ impl FieldView {
             texture_animations: s.event.state.texture_animations.as_ref(),
             models: &layers,
             actors: &actors,
+            vfx: &s.event.state.vfx,
         };
         let post = self.game.then_some(&post);
         // Windows the game's 2D layer drew (the rest keep the stand-in).
