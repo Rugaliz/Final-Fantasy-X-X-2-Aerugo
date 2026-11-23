@@ -5628,8 +5628,9 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x0034,
         Native::result(|g, c| {
+            // A byte of flags: bits 8 and up shift out.
             let bit = c.stack.pop_int() as u32 & 31;
-            g.actor(c.worker).flags |= 1 << bit;
+            g.actor(c.worker).flags |= (1u32 << bit) & 0xff;
             Value::Int(0)
         }),
     );
@@ -5637,7 +5638,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0035,
         Native::result(|g, c| {
             let bit = c.stack.pop_int() as u32 & 31;
-            g.actor(c.worker).flags &= !(1 << bit);
+            g.actor(c.worker).flags &= !((1u32 << bit) & 0xff);
             Value::Int(0)
         }),
     );
@@ -5838,7 +5839,8 @@ pub fn register(n: &mut Natives<FieldState>) {
         n.register(
             id,
             Native::result(|g, c| {
-                let entrance = c.stack.pop_int();
+                // The entrance goes on as a signed byte.
+                let entrance = i32::from(c.stack.pop_int() as i8);
                 let target = c.stack.pop_int();
                 g.jump = Some((target, entrance));
                 Value::Int(0)
