@@ -1324,6 +1324,8 @@ pub struct FieldState {
     player_start: Option<[f32; 3]>,
     /// The player has control (scripts turn it on and off); talking needs it.
     pub user_control: bool,
+    /// The body the player's control moves (the control system's choice).
+    pub controlled: Option<usize>,
     /// The player was walking on the last tick it had control.
     player_was_walking: bool,
     /// Added to every talk radius (a script sets it; 0 by default).
@@ -1594,7 +1596,7 @@ impl FieldState {
                 let m = wk.move_of(i32::from(wk.level()));
                 wk.u16(m + crate::workers::mv::MODE) & 0x7f != 0
             });
-            let is_player = Some(i) == self.player;
+            let is_player = Some(i) == self.controlled;
             let a = &mut self.actors[i];
             let (vx, vz) = if is_player && !scripted {
                 match player_push {
@@ -2716,6 +2718,76 @@ impl FieldState {
     /// The game's file table.
     pub fn file_table(vfs: &Vfs) -> Option<FileTable> {
         FileTable::load(vfs)
+    }
+
+    /// A worker's switch (flag 0x200 of +0x34); returns the new state.
+    pub fn worker_switch(&mut self, w: usize, on: bool) -> bool {
+        let Some(wk) = self.workers.list.get_mut(w) else { return false };
+        let f = wk.u16(0x34);
+        wk.set_u16(0x34, if on { f | 0x200 } else { f & !0x200 });
+        on
+    }
+
+    /// Whether control is blocked (system block byte 1 bit 4, byte 3 bits 0x84).
+    fn control_blocked(&self) -> bool {
+        self.workers.sys.flags1 & 4 != 0 || self.workers.sys.mode3 & 0x84 != 0
+    }
+
+    /// Control on: unless blocked, every kind-1 worker with a body, a party character and its switch on
+    /// (flag 0x200 of +0x34, or with byte 0 bit 0x20 flag 8 of +0x36) is taken over (+0x34 |= 0x20), and the
+    /// player's one becomes the controlled body; byte 0 bit 1 set.
+    pub fn control_on(&mut self) {
+        let mut controlled = None;
+        if !self.control_blocked() {
+            let alt = self.workers.sys.flags0 & 0x20 != 0;
+            let player = self.workers.sys.player;
+            for w in 0..self.workers.list.len() {
+                let wk = &mut self.workers.list[w];
+                if wk.kind != 1 {
+                    continue;
+                }
+                let switch = if alt { wk.u16(0x36) >> 3 & 1 } else { wk.u16(0x34) >> 9 & 1 };
+                if wk.u8(crate::workers::BIND) == 1 && wk.i32(0x40) != -1 && switch != 0 {
+                    wk.set_u16(0x34, wk.u16(0x34) | 0x20);
+                    if wk.id() as i16 == player && self.chrs.get(w).is_some_and(Option::is_some) {
+                        controlled = Some(w);
+                    }
+                }
+            }
+        }
+        self.controlled = controlled;
+        self.workers.sys.flags0 |= 2;
+        self.user_control = true;
+    }
+
+    /// Control off: every taken-over kind-1 worker with a body is let go (its record's +0x564 and its body's
+    /// speed 0); no body controlled; byte 0 bit 1 cleared.
+    pub fn control_off(&mut self) {
+        for w in 0..self.workers.list.len() {
+            let wk = &mut self.workers.list[w];
+            if wk.kind == 1 && wk.u8(crate::workers::BIND) == 1 && wk.u16(0x34) & 0x20 != 0 {
+                wk.set_u16(0x34, wk.u16(0x34) & !0x20);
+                wk.set_u32(0x564, 0);
+                if let Some(ch) = self.chrs.get_mut(w).and_then(Option::as_mut) {
+                    ch.set_f32(crate::chr::SPEED, 0.0);
+                }
+            }
+        }
+        self.controlled = None;
+        self.workers.sys.flags0 &= !2;
+        self.user_control = false;
+    }
+
+    /// Control checked again: off, then on when not blocked and the kept byte 0 had 0x22; bit 1 of byte 0
+    /// restored from the kept byte.
+    pub fn control_recheck(&mut self) {
+        let kept = self.workers.sys.flags0;
+        self.control_off();
+        if !self.control_blocked() && kept & 0x22 != 0 {
+            self.control_on();
+        }
+        self.workers.sys.flags0 = self.workers.sys.flags0 & !2 | kept & 2;
+        self.user_control = self.workers.sys.flags0 & 2 != 0;
     }
 
     /// A new walk mesh: every body in use looks its triangle up again.
@@ -3871,23 +3943,36 @@ fn register_worker_switches(n: &mut Natives<FieldState>) {
         0x0060,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            g.settings.insert((0x0060, c.worker), vec![Value::Int(i32::from(on))]);
-            Value::Int(i32::from(on))
+            let state = g.worker_switch(c.worker, on);
+            g.control_recheck();
+            Value::Int(i32::from(state))
         }),
     );
     n.register(
         0x0031,
         Native::result(|g, c| {
-            g.settings.insert((0x0060, c.worker), vec![Value::Int(1)]);
+            g.worker_switch(c.worker, true);
+            g.control_recheck();
             Value::Int(1)
         }),
     );
     // The calling worker becomes the one the player controls; returns its number.
+    // 0043: the system's player becomes the calling worker (its id, and its position as the player's current and
+    // previous positions; none for kind 4); returns its id.
     n.register(
         0x0043,
         Native::result(|g, c| {
             g.player = Some(c.worker);
-            Value::Int(c.worker as i32)
+            let Some(wk) = g.workers.list.get(c.worker) else { return Value::Int(c.worker as i32) };
+            let id = wk.id();
+            g.workers.sys.player = id as i16;
+            if wk.kind != 4 {
+                let p = wk.position();
+                let v = [p[0], p[1], p[2], 1.0];
+                g.workers.sys.player_pos = v;
+                g.workers.sys.player_prev = v;
+            }
+            Value::Int(i32::from(id))
         }),
     );
 }
@@ -4703,14 +4788,14 @@ fn register_control(n: &mut Natives<FieldState>) {
     n.register(
         0x005D,
         Native::result(|g, _| {
-            g.user_control = true;
+            g.control_on();
             Value::Int(1)
         }),
     );
     n.register(
         0x005E,
         Native::result(|g, _| {
-            g.user_control = false;
+            g.control_off();
             Value::Int(0)
         }),
     );
@@ -5593,20 +5678,37 @@ pub fn register(n: &mut Natives<FieldState>) {
     );
     // The party character a worker plays (actors only); character 0 is taken as the player until the
     // native that names the player is known.
+    // 0042(n): the worker's party character (kind 1 workers: +0x40 = n and the body's battle character
+    // number), its switch on when n is 0, control rechecked; the slot (n below 8, else 15) goes to the body and
+    // the party slot table unless the script mode is set.
     n.register(
         0x0042,
         Native::result(|g, c| {
-            let chr = c.stack.pop_int();
+            let n = c.stack.pop_int();
             if c.kind == 1 {
-                g.actor(c.worker).character = u8::try_from(chr).ok();
-                if chr == 0 && g.player.is_none() {
-                    g.player = Some(c.worker);
+                if let Some(wk) = g.workers.list.get_mut(c.worker) {
+                    wk.set_i32(0x40, n);
+                }
+                g.actor(c.worker).character = u8::try_from(n).ok();
+            }
+            g.worker_switch(c.worker, n == 0);
+            g.control_recheck();
+            let slot = if (n as u32) < 8 { n as u8 } else { 0xf };
+            if g.workers.sys.mode1a == 0 {
+                if let Some(wk) = g.workers.list.get_mut(c.worker) {
+                    wk.set_u8(0xaf, slot);
+                }
+                if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut) {
+                    ch.set_u8(0x184, slot);
+                }
+                if slot < 16 {
+                    let id = g.workers.list.get(c.worker).map_or(0, crate::workers::Worker::id);
+                    g.workers.sys.body_slots[usize::from(slot)] = i32::from(id);
                 }
             }
-            Value::Int(chr)
+            Value::Int(n)
         }),
     );
-    // Per-worker values and flags.
     n.register(
         0x00C5,
         Native::result(|g, c| {

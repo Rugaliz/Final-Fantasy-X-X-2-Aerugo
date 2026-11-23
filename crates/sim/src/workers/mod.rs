@@ -280,6 +280,9 @@ pub struct System {
     pub mode3: u8,
     /// The first flags byte (bit 0 on; bit 7 set by 00be) and the +0x210 word (bit 0: 00aa).
     pub flags0: u8,
+    /// Byte 1 (bit 4 blocks control) and the script mode word (+0x1a of the current block).
+    pub flags1: u8,
+    pub mode1a: u16,
     pub flags210: u32,
     /// Every joined member is free (the party code's global flag) and the flag 00ca(0xf) sets.
     pub full_member: u8,
@@ -318,6 +321,8 @@ impl Default for System {
     fn default() -> Self {
         System {
             player: -1,
+            flags1: 0,
+            mode1a: 0,
             player_pos: [0.0, 0.0, 0.0, 1.0],
             player_prev: [0.0, 0.0, 0.0, 1.0],
             talk_mode: 0,
