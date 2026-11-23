@@ -36,6 +36,7 @@ pub mod text_space;
 pub mod texture_animation;
 pub mod vibration;
 pub mod voice;
+pub mod walk_mesh;
 pub mod worker_bridge;
 pub mod worker_natives;
 
@@ -1210,6 +1211,8 @@ pub struct FieldState {
     /// Worker the player controls.
     pub player: Option<usize>,
     pub ground: Option<Ground>,
+    /// The character engine's walk mesh (the map package's, page by page).
+    pub walk_mesh: Option<walk_mesh::WalkMesh>,
     /// The map's fog from its PS2 map package (the scripts may change it).
     pub map_fog: Option<MapFog>,
     /// The map's particle effects as natives switch them.
@@ -1572,62 +1575,78 @@ impl FieldState {
             }
             w.shown = if w.instant { stop } else { (w.shown + TEXT_SPEED).min(stop) };
         }
-        // The character engine's step of each body: the velocity this frame from the speed its worker's engine
-        // handed over, along the heading of travel (speed · 0.05 · 30 · the frame time), the rise added, and a
-        // walking body kept from sinking under the ground. The player moves by the pad instead unless a script
-        // move runs on it.
-        for (i, a) in self.actors.iter_mut().enumerate() {
-            if a.model.is_none() {
+        // The character engine's step of each body: the velocity this frame (from the speed its worker's engine
+        // handed over, along the heading of travel: speed · 0.05 · 30 · the frame time; the player's from last
+        // tick's push unless a script move runs on it), then the body step: a body that follows the ground
+        // (flag 0x80 of +0x194 clear) takes the ground step on the walk mesh and its rise, else it moves by the
+        // whole velocity; the velocity is cleared. A walking body (height mode 0) stays above its ground height.
+        let player_push = self.player_step.take();
+        let event = self.scene.unwrap_or(0);
+        let mut remap = [0u32; 64];
+        for (k, v) in self.engine.id_vars.iter().take(64).enumerate() {
+            remap[k] = *v as u32;
+        }
+        for i in 0..self.actors.len() {
+            if self.actors[i].model.is_none() {
                 continue;
             }
             let scripted = self.workers.list.get(i).is_some_and(|wk| {
                 let m = wk.move_of(i32::from(wk.level()));
                 wk.u16(m + crate::workers::mv::MODE) & 0x7f != 0
             });
-            if Some(i) == self.player && !scripted {
-                continue;
-            }
-            let (vx, vz) = if a.engine_speed == 0.0 {
+            let is_player = Some(i) == self.player;
+            let a = &mut self.actors[i];
+            let (vx, vz) = if is_player && !scripted {
+                match player_push {
+                    Some([dx, dz]) => {
+                        a.yaw = dz.atan2(dx);
+                        (dx, dz)
+                    }
+                    None => (0.0, 0.0),
+                }
+            } else if a.engine_speed == 0.0 {
                 (0.0, 0.0)
             } else {
                 let v = (f64::from(a.engine_speed) * 0.05 * 30.0 * f64::from(FRAME_TIME)) as f32;
                 let h = f64::from(a.move_heading);
                 ((h.cos() as f32) * v, (h.sin() as f32) * v)
             };
-            a.pos[0] += vx;
-            a.pos[1] += a.chr_rise;
-            a.pos[2] += vz;
-            if a.chr_mode == 0
-                && let Some(y) = self.ground.as_ref().and_then(|g| g.floor(a.pos))
-                && y < a.pos[1]
-            {
-                a.pos[1] = y;
-            }
-        }
-        let mut player_speed = 0.0;
-        // The player covers last tick's push, then this tick's input makes the next one (only while the
-        // player has control).
-        if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
-            // With no floor under the player (in water), the ground does not hold the step back.
-            let swimming =
-                self.ground.as_ref().is_some_and(|g| !g.is_empty() && !g.standing(self.actors[p].pos));
-            if let Some([dx, dz]) = self.player_step.take() {
-                let a = &self.actors[p];
-                let next = [a.pos[0] + dx, a.pos[1], a.pos[2] + dz];
-                let next = match &self.ground {
-                    // Blocked: slide along the wall on one axis.
-                    Some(g) if !swimming => g
-                        .slide(a.pos, next)
-                        .or_else(|| g.slide(a.pos, [next[0], a.pos[1], a.pos[2]]))
-                        .or_else(|| g.slide(a.pos, [a.pos[0], a.pos[1], next[2]])),
-                    _ => Some(next),
-                };
-                if let Some(n) = next {
-                    let a = &mut self.actors[p];
-                    a.pos = n;
-                    a.yaw = dz.atan2(dx);
+            let rise = if is_player && !scripted { 0.0 } else { a.chr_rise };
+            let Some(ch) = self.chrs.get_mut(i).and_then(Option::as_mut) else {
+                a.pos[0] += vx;
+                a.pos[1] += rise;
+                a.pos[2] += vz;
+                continue;
+            };
+            ch.set_pos_keep_previous(a.pos);
+            ch.set_f32(0x4c, vx);
+            ch.set_f32(0x50, rise);
+            ch.set_f32(0x54, vz);
+            let id = ch.u16(0);
+            if ch.u32(crate::chr::FLAGS) & 0x80 == 0 {
+                // The engine's re-find flag is only set by its debug pad handling.
+                walk_mesh::ground_step(self.walk_mesh.as_ref(), ch, id, event, is_player, &remap, false);
+                ch.set_f32(0x10, ch.f32(0x50) + ch.f32(0x10));
+            } else {
+                for k in 0..3u32 {
+                    ch.set_f32(0xc + k * 4, ch.f32(0x4c + k * 4) + ch.f32(0xc + k * 4));
                 }
             }
+            for k in 0..3u32 {
+                ch.set_f32(0x4c + k * 4, 0.0);
+            }
+            let mut p = ch.pos();
+            if a.chr_mode == 0 && ch.u32(crate::chr::FLAGS) & 0x80 == 0 && self.walk_mesh.is_some() {
+                let ground = ch.f32(crate::chr::GROUND);
+                if ground < p[1] {
+                    p[1] = ground;
+                }
+            }
+            a.pos = p;
+        }
+        let mut player_speed = 0.0;
+        // This tick's input makes the player's next push (only while the player has control).
+        if let Some(p) = self.player.filter(|&p| p < self.actors.len()) {
             // The water speed while the character engine is in water (mode 2, as the player control reads it).
             let in_water = self.actors[p].chr_mode == 2;
             let push = self.control.tick(self.input.stick, self.input.walk, in_water);
@@ -1815,6 +1834,21 @@ impl FieldState {
         let world = parent.unwrap_or_else(|| el::body_world(b30, b38, scale, tilt, facing, place));
         let entries = opt.as_ref().map_or(&[][..], |o| &o.entries[..]);
         let points = el::option_points(&world, &elems, entries, b30, b38);
+        // The shadow centre (+0x694..+0x6a0, the old one kept at +0x684): between the feet (points 7 and 8: their
+        // mean x and z, the higher y) and point 1, in x and z; the feet's height.
+        let body = [world[12], world[13], world[14]];
+        let p1 = el::point(&points, 1, body);
+        let p7 = el::point(&points, 7, body);
+        let p8 = el::point(&points, 8, body);
+        let feet = [(p7[0] + p8[0]) * 0.5, if p7[1] <= p8[1] { p8[1] } else { p7[1] }, (p7[2] + p8[2]) * 0.5];
+        let centre = [(feet[0] + p1[0]) * 0.5, feet[1], (feet[2] + p1[2]) * 0.5, p7[3]];
+        if let Some(ch) = self.chrs[w].as_mut() {
+            for k in 0..4u32 {
+                let old = ch.f32(0x694 + k * 4);
+                ch.set_f32(0x684 + k * 4, old);
+                ch.set_f32(0x694 + k * 4, centre[k as usize]);
+            }
+        }
         self.chr_frames[w] = Some(ChrFrame { world, elems, points });
     }
 
@@ -2684,6 +2718,15 @@ impl FieldState {
         FileTable::load(vfs)
     }
 
+    /// A new walk mesh: every body in use looks its triangle up again.
+    fn forget_triangles(&mut self) {
+        for c in self.chrs.iter_mut().flatten() {
+            if c.u8(2) != 0 {
+                c.set_u16(0x824, 0xffff);
+            }
+        }
+    }
+
     /// Kind 1 loads the first page's walk mesh (and sets the guide map model), kind 2 the second page's
     ///; the kind is cleared.
     pub fn apply_page_switch(&mut self) {
@@ -2697,6 +2740,8 @@ impl FieldState {
             && let Some(g) = Ground::from_walk_mesh_page(d, p as usize)
         {
             self.ground = Some(g);
+            self.walk_mesh = walk_mesh::WalkMesh::from_map_package(d, p as usize);
+            self.forget_triangles();
         }
         self.page_switch.0 = 0;
     }
@@ -2852,6 +2897,8 @@ impl Event {
         state.distortion.reset();
         if let Some(d) = vpa.and_then(|p| vfs.read(&p).ok()) {
             state.ground = Ground::from_walk_mesh(&d);
+            state.walk_mesh = walk_mesh::WalkMesh::from_map_package(&d, 0);
+            state.forget_triangles();
             state.map_fog = MapFog::from_map_package(&d);
             state.ps_fog = fog::PsFog::from_map_package(&d).unwrap_or_default();
             state.map_effects = map_fx::MapEffects::from_map_package(&d);

@@ -101,6 +101,14 @@ impl Chr {
     }
 
     /// Place the body (its previous place too), as the engine's position set does.
+    /// The position the body step starts from (the actor's, which the scripts and the engine bridge move),
+    /// without the placement's side effects.
+    pub fn set_pos_keep_previous(&mut self, p: [f32; 3]) {
+        for k in 0..3 {
+            self.set_f32(POS + k * 4, p[k as usize]);
+        }
+    }
+
     pub fn set_pos(&mut self, p: [f32; 3]) {
         for k in 0..3 {
             self.set_f32(POS + k * 4, p[k as usize]);
