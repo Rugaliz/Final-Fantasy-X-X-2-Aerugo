@@ -38,9 +38,10 @@ pub struct Block {
     pub scale: f32,
 }
 
+/// The values a block has without an info block (825ee0's defaults).
 impl Default for Block {
     fn default() -> Self {
-        Block { h24: 0.0, h28: 0.0, h2c: 0.0, scale: 1.0 }
+        Block { h24: 1.0, h28: 0.0, h2c: 8.0, scale: 1.0 }
     }
 }
 

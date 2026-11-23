@@ -1043,6 +1043,8 @@ pub struct FieldState {
     pub model_rigs: std::collections::HashMap<u16, Option<std::sync::Arc<ChrRig>>>,
     /// Collision radii of models by id (None: no character data).
     pub model_radii: std::collections::HashMap<u16, Option<f32>>,
+    /// Each model's block values (height defaults, scale).
+    pub model_blocks: std::collections::HashMap<u16, Option<crate::chr::Block>>,
     /// Movie files by number (the game's video list).
     pub videos: std::collections::HashMap<u32, String>,
     /// The movie playing, if any.
@@ -1515,7 +1517,11 @@ impl FieldState {
     /// model block's +0x1c, the character data's info block +4 (82b880 with −1).
     pub(crate) fn allocate_body(&mut self, m: u16) -> crate::chr::Chr {
         self.model_data(m);
-        let mut ch = crate::chr::Chr::allocate(m, crate::chr::Block::default());
+        let block = self.model_blocks.get(&m).copied().flatten();
+        if block.is_none() {
+            log::error!("GAP: model {m:#x} has no character data block (its block values are unset)");
+        }
+        let mut ch = crate::chr::Chr::allocate(m, block.unwrap_or_default());
         match self.model_radii.get(&m).copied().flatten() {
             Some(r) => ch.set_f32(0x4e4, r),
             None => log::error!("GAP: model {m:#x} has no character data block (its radius base is unset)"),
@@ -1532,6 +1538,7 @@ impl FieldState {
         let (Some(vfs), Some(game)) = (self.vfs.clone(), self.game) else { return };
         let chr = chr_path(game, m).and_then(|p| vfs.read(&p).ok());
         self.model_radii.insert(m, chr.as_deref().and_then(chr_radius));
+        self.model_blocks.insert(m, chr.as_deref().and_then(chr_block));
         self.model_motion_lists.insert(m, chr.as_deref().and_then(chr_motion_lists));
         self.model_optpos.insert(m, chr.as_deref().and_then(chr_optpos).map(std::sync::Arc::new));
         self.model_motion_scales.insert(m, chr.as_deref().and_then(chr_motion_scale));
@@ -1957,6 +1964,18 @@ pub fn chr_motion_scale(d: &[u8]) -> Option<f32> {
 
 /// A character's collision radius from its `.chr` data: header version (u32 at 4) 10 or later has an info block
 /// (offset at 0x58) whose second float is the radius; older data takes 1.
+/// A model's block values (825ee0): with a version above 9 from the info block (file +0x58): +0x24 ← info +0x18,
+/// +0x28 ← +0x14, +0x2c ← +8, the scale +0x34 ← +0x1c; else 1, 0, 8 and 1.
+pub fn chr_block(d: &[u8]) -> Option<crate::chr::Block> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if u32_at(4)? < 10 {
+        return Some(crate::chr::Block::default());
+    }
+    let info = u32_at(0x58)? as usize;
+    let f = |o: usize| u32_at(info + o).map(f32::from_bits);
+    Some(crate::chr::Block { h24: f(0x18)?, h28: f(0x14)?, h2c: f(8)?, scale: f(0x1c)? })
+}
+
 pub fn chr_radius(d: &[u8]) -> Option<f32> {
     let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     if u32_at(4)? < 10 {
