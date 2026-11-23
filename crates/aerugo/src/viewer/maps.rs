@@ -369,6 +369,7 @@ impl MapBrowser {
         }
         let scene = layer_scene(view_proj, px.0 as f32, px.1 as f32);
         let objects = crate::phyre::field::Objects {
+            shadow: None,
             hidden_map_groups: 0,
             map: None,
             map_poses: &[],
@@ -629,6 +630,7 @@ mod tests {
                     scene.background = [CLEAR[0], CLEAR[1], CLEAR[2]];
                     let models = [(layers_path.as_str(), Mat4::IDENTITY)];
                     let objects = crate::phyre::field::Objects {
+                        shadow: None,
                         hidden_map_groups: 0,
                         map: None,
                         map_poses: &[],

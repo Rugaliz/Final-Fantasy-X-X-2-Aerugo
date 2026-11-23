@@ -134,6 +134,8 @@ pub struct Renderer {
     samples: vk::SampleCountFlags,
     /// Sharpen the 3D viewport with the remaster's unsharp mask.
     sharpen: bool,
+    /// The remaster's shadow setting (0 none, 1–3 the map size).
+    shadow: u32,
     textures: HashMap<u64, TextureEntry>,
     next_texture: u64,
     wanted_size: (u32, u32),
@@ -240,6 +242,7 @@ impl Renderer {
             game: Default::default(),
             samples: vk::SampleCountFlags::TYPE_1,
             sharpen: false,
+            shadow: 1,
             textures: HashMap::new(),
             next_texture: 1,
             wanted_size: size,
@@ -364,6 +367,16 @@ impl Renderer {
     /// The remaster's ambient occlusion (its HDAO setting): 0 off, 1 low, 2 medium, 3 high.
     pub fn set_hdao(&mut self, level: u32) {
         self.scene.hdao_level = level.min(3);
+    }
+
+    /// The remaster's shadow setting (0 none, 1–3 the map size).
+    pub fn set_shadow(&mut self, setting: u32) {
+        self.shadow = setting;
+    }
+
+    /// The shadow setting.
+    pub fn shadow(&self) -> u32 {
+        self.shadow
     }
 
     /// The post-processing settings: HDAO level (0 off, 1–3), the unsharp mask, and the brightness offset

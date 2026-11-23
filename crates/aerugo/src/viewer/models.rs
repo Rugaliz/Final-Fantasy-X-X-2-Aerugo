@@ -235,6 +235,7 @@ impl ModelBrowser {
             scene.background = [r, g, b];
             let actors = [actor];
             let objects = crate::phyre::field::Objects {
+                shadow: None,
                 hidden_map_groups: 0,
                 map: None,
                 map_poses: &[],

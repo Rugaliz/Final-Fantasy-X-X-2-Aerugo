@@ -1392,7 +1392,8 @@ impl GameState {
                     let mut buffer_infos = Vec::new();
                     let mut image_infos = Vec::new();
                     let mut writes_meta = Vec::new();
-                    // A draw that samples a texture nobody bound is left out (logged once per program).
+                    // A draw whose program samples a texture nothing binds cannot be recorded: a gap in what the
+                    // port supplies, reported as an error (once per program).
                     let mut skip = false;
                     for &(stage, binding, kind) in &bindings {
                         let set = sets[stage.set()];
@@ -1466,7 +1467,7 @@ impl GameState {
                     }
                     if skip {
                         if self.skipped.insert(draw.program) {
-                            log::warn!("game draw left out: its program samples a texture that is not bound");
+                            log::error!("GAP: a game draw samples a texture nothing binds; not drawn");
                         }
                         continue;
                     }

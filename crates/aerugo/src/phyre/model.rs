@@ -165,11 +165,12 @@ fn material_value(m: &Material, name: &str) -> Option<Value> {
     m.value(name).map(|v| Value::Floats(v.to_vec()))
 }
 
-/// Material parameters the engine writes at run time (the texture animation managers): texture parameters by
-/// name (`None`: the engine's empty texture) and sampler parameters by name.
+/// Material parameters the engine writes at run time (the texture animation managers, the shadow manager):
+/// texture parameters by name (`None`: the engine's empty texture; a render target for the shadow maps) and
+/// sampler parameters by name.
 #[derive(Debug, Default)]
 pub struct Overrides {
-    pub textures: Vec<(&'static str, Option<TextureHandle>)>,
+    pub textures: Vec<(&'static str, Option<ImageRef>)>,
     pub samplers: Vec<(&'static str, SamplerState)>,
 }
 
@@ -245,8 +246,8 @@ fn draw(
             match r.kind {
                 aerugo_formats::dxbc::ResourceKind::Texture => {
                     if let Some((_, h)) = overrides.textures.iter().find(|(n, _)| *n == r.name) {
-                        match h.or(empty) {
-                            Some(h) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
+                        match h.or(empty.map(ImageRef::Texture)) {
+                            Some(h) => images.push((stage, r.bind_point, h)),
                             None => missing.push(format!("texture {} (run-time)", r.name)),
                         }
                         continue;
@@ -257,8 +258,9 @@ fn draw(
                         Some((t, None)) => {
                             missing.push(format!("texture {} ({} not loaded)", r.name, t.asset))
                         }
-                        // An empty animation slot reads zeros (see `Programs::empty_texture`); other empty
-                        // parameters may be written at run time by code not traced yet, so their draws stay out.
+                        // An empty animation slot reads zeros (see `Programs::empty_texture`); any other empty
+                        // parameter is one the engine writes at run time that the port does not supply yet (a
+                        // gap: reported below).
                         None => match empty.filter(|_| animation_slot(&r.name)) {
                             Some(h) => images.push((stage, r.bind_point, ImageRef::Texture(h))),
                             None => missing.push(format!("texture {} in {}", r.name, model.path)),

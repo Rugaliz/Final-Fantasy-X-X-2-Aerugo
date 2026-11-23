@@ -1250,6 +1250,15 @@ impl FieldView {
             models: &layers,
             actors: &actors,
             vfx: &s.event.state.vfx,
+            // The map table's story progress: the u16 at offset 0xa00 of the script's global area 0.
+            shadow: Some(crate::phyre::field::ShadowSetup {
+                map_id: st.map_id,
+                event: u32::from(st.scene.unwrap_or(0)),
+                progress: s.event.vm.memory.global[0]
+                    .get(0xa00..0xa02)
+                    .map_or(0, |b| u32::from(u16::from_le_bytes([b[0], b[1]]))),
+                quality: renderer.shadow(),
+            }),
         };
         let post = self.game.then_some(&post);
         // Windows the game's 2D layer drew (the rest keep the stand-in).

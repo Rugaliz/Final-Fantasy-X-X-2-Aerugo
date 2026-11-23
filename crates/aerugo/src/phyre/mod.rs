@@ -9,6 +9,7 @@ pub mod field;
 pub mod model;
 pub mod post;
 pub mod scene;
+pub mod shadow;
 pub mod ui;
 pub mod vfx;
 

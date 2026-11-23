@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use aerugo_formats::skeleton::Skeleton;
 use aerugo_gfx::Renderer;
-use aerugo_gfx::game::{GameFrame, GameOp, TargetDesc, TargetHandle, TargetRef};
+use aerugo_gfx::game::{GameFrame, GameOp, ImageRef, TargetDesc, TargetHandle, TargetRef};
 use aerugo_vfs::Vfs;
 use glam::{Mat4, Vec3};
 
@@ -131,6 +131,18 @@ pub struct Objects<'a> {
     pub hidden_map_groups: u32,
     /// The frame's effect geometry (each with the folder of its textures).
     pub vfx: &'a [(aerugo_sim::ppp::vfx::Mesh, String)],
+    /// What the shadow manager needs for a field map (none for the viewers' bare maps and models).
+    pub shadow: Option<ShadowSetup>,
+}
+
+/// The shadow manager's inputs: the scene's map id, the event number, the story progress (the map table's
+/// conditions) and the shadow quality setting.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowSetup {
+    pub map_id: u32,
+    pub event: u32,
+    pub progress: u32,
+    pub quality: u32,
 }
 
 /// The character light constants.
@@ -158,6 +170,8 @@ pub struct FieldRenderer {
     uv_effects: HashMap<String, bool>,
     /// The effect draws' state.
     vfx: super::vfx::VfxRenderer,
+    /// The shadow manager's maps.
+    shadow: super::shadow::ShadowMaps,
 }
 
 /// Whether a material's effect variant sets the switch `CHR_TEXTURE_ANIMATION_UV` (to anything but ""), as
@@ -238,6 +252,7 @@ impl FieldRenderer {
             renderer.destroy_texture(h);
         }
         self.vfx.clear(renderer);
+        self.shadow.clear(renderer);
     }
 
     /// A frame of `objects` seen with `scene`'s camera: through the post chain when `post` is given, else
@@ -269,6 +284,46 @@ impl FieldRenderer {
                 depth: Some(depth),
             },
         ];
+        // The shadow maps (cleared when a map loads) and what the receiving materials are given this frame.
+        let receivers = match (objects.shadow, map) {
+            (Some(setup), Some(path)) => {
+                let mode = super::shadow::map_shadow(setup.map_id, false, setup.event, setup.progress);
+                let size = super::shadow::map_size(setup.quality);
+                let mut clears = Vec::new();
+                let maps = self.shadow.frame(renderer, size, path, setup.map_id, &mut clears);
+                ops.splice(0..0, clears);
+                maps.map(|t| {
+                    let lvp = match mode.mode {
+                        2 | 3 => {
+                            super::shadow::light_fit(
+                                scene.view,
+                                scene.projection,
+                                scene.near,
+                                mode.near[0],
+                                mode.far[0],
+                            )
+                            .light_view_projection
+                        }
+                        4 => {
+                            if self.reported.insert("shadow mode 4".into()) {
+                                log::error!("GAP: the two-cascade shadow fit (mode 4) is not ported");
+                            }
+                            Mat4::ZERO
+                        }
+                        _ => Mat4::ZERO,
+                    };
+                    super::shadow::Receivers::new(t, mode.mode, size, [lvp, Mat4::ZERO], 0.0)
+                })
+            }
+            _ => None,
+        };
+        let shadow_textures = |o: &mut Overrides| {
+            if let Some(r) = receivers {
+                o.textures.push(("MySMSampler", Some(ImageRef::Target(r.map))));
+                o.textures.push(("MySMSampler2", Some(ImageRef::Target(r.map2))));
+            }
+        };
+        let shadow_value = |name: &str| receivers.as_ref().and_then(|r| r.value(name));
         let viewport = [0.0, 0.0, size.0 as f32, size.1 as f32, 0.0, 1.0];
         let mut missing = Vec::new();
         let mut later = Vec::new();
@@ -287,7 +342,8 @@ impl FieldRenderer {
                     .and_then(|o| objects.map_poses.get(o))
                     .map_or(world, |p| posed_world(world, p));
                 let object = object_values(world, scene.view, scene.projection);
-                let values = |name: &str| scene.value(name).or_else(|| object(name));
+                let values =
+                    |name: &str| scene.value(name).or_else(|| object(name)).or_else(|| shadow_value(name));
                 for seg in &mesh.segments {
                     let fseg = &source.segments[seg.source];
                     let Some(material) = source.materials.get(fseg.material as usize) else { continue };
@@ -298,10 +354,14 @@ impl FieldRenderer {
                         .then(|| objects.texture_animations.and_then(|t| t.texture(id)))
                         .flatten()
                         .and_then(|p| runtime_texture(&mut self.swaps, vfs, renderer, p));
-                    let overrides = Overrides {
-                        textures: swap.map(|h| ("TextureSampler", Some(h))).into_iter().collect(),
+                    let mut overrides = Overrides {
+                        textures: swap
+                            .map(|h| ("TextureSampler", Some(ImageRef::Texture(h))))
+                            .into_iter()
+                            .collect(),
                         ..Overrides::default()
                     };
+                    shadow_textures(&mut overrides);
                     let draws = segment_draws(
                         vfs,
                         renderer,
@@ -386,13 +446,14 @@ impl FieldRenderer {
                         face::shown_layers(a.face_layers, uv)
                     });
                     let mut overrides = Overrides::default();
+                    shadow_textures(&mut overrides);
                     if let Some(shown) = shown {
                         for (k, slot) in ANIM_SAMPLERS.into_iter().enumerate() {
                             let path =
                                 shown.get(k).zip(a.face).and_then(|(l, f)| f.texture(l.sprite, l.frame));
                             let texture =
                                 path.and_then(|p| runtime_texture(&mut self.swaps, vfs, renderer, p));
-                            overrides.textures.push((slot, texture));
+                            overrides.textures.push((slot, texture.map(ImageRef::Texture)));
                         }
                         overrides.samplers.push(("AnimSamplerState", ANIMATION_SAMPLER));
                     }
@@ -403,6 +464,7 @@ impl FieldRenderer {
                             .or_else(|| object(name))
                             .or_else(|| filled.and_then(|n| layer_value(name, n)))
                             .or_else(|| character_value(name, a, light, &bones))
+                            .or_else(|| shadow_value(name))
                     };
                     let draws = segment_draws(
                         vfs,

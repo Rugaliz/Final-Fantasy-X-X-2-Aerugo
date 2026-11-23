@@ -42,6 +42,9 @@ pub struct GraphicsSettings {
     pub hdao: u32,
     /// The remaster's brightness (0–100; 50 leaves the picture as it is).
     pub brightness: u32,
+    /// The remaster's shadow setting (its `Shadow` value): 1, 2, 3 → shadow maps of 4096, 2048, 1024 texels;
+    /// 0 draws none. The high preset's 1 is the default.
+    pub shadow: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +120,7 @@ impl Default for GraphicsSettings {
             sharpen: true,
             hdao: 3,
             brightness: 50,
+            shadow: 1,
         }
     }
 }

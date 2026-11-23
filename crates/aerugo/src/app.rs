@@ -139,6 +139,7 @@ impl App {
         renderer.set_sharpen(settings.graphics.sharpen);
         renderer.set_hdao(settings.graphics.hdao);
         renderer.set_brightness(settings.graphics.brightness);
+        renderer.set_shadow(settings.graphics.shadow);
 
         let mut egui = EguiSdl::new();
         egui.ui_scale = settings.ui.scale;
@@ -426,6 +427,9 @@ impl App {
         if new.graphics.brightness != old.graphics.brightness {
             self.renderer.set_brightness(new.graphics.brightness);
         }
+        if new.graphics.shadow != old.graphics.shadow {
+            self.renderer.set_shadow(new.graphics.shadow);
+        }
         if new.ui.scale != old.ui.scale {
             self.egui.ui_scale = new.ui.scale;
         }
@@ -489,6 +493,7 @@ fn without_untouched_overrides(current: &Settings, launch: &Settings, file: &Set
             &launch.graphics.brightness,
             &file.graphics.brightness,
         ),
+        shadow: keep(&current.graphics.shadow, &launch.graphics.shadow, &file.graphics.shadow),
     };
     out.game.dir = keep(&current.game.dir, &launch.game.dir, &file.game.dir);
     out
