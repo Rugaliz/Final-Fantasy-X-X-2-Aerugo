@@ -420,13 +420,34 @@ pub fn waiting(g: &FieldState) -> u8 {
 
 /// The window part of AtelUpdateWindowStatus (after the workers): the event side's state follows the frame (4
 /// reads as 0); the last shown window that takes input (mode 0x32) becomes the active one (window 0 when none).
+///
+/// The user control part: a window up with mode bit 1 (choices) is "a choice is up"; unless the script mode word
+/// (+0x1a) is set, byte 1 bit 2 follows it (when byte 1 bit 3 allows; else it is cleared) and when it changes the
+/// control is checked again (UcOff, then UcOn unless blocked when the kept byte 0 had 0x22; byte 0 bit 1 kept);
+/// byte 3 bit 4 = not (control on and byte 1 bit 2 clear). (The block's +0x1ea countdown that clears byte 3 bit 7
+/// is not set by any ported native.)
 pub fn status(g: &mut FieldState) {
     let mut active = 0;
+    let mut choice_up = false;
     for (i, w) in g.windows.iter_mut().enumerate() {
         w.atel_state = if w.to.frame.state == 4 { 0 } else { w.to.frame.state };
+        if w.atel_state != 0 && w.mode & 2 != 0 {
+            choice_up = true;
+        }
         if w.atel_state == 2 && w.mode & 0x32 != 0 {
             active = i;
         }
+    }
+    if g.workers.sys.mode1a == 0 {
+        let s = &mut g.workers.sys;
+        let b1 = s.flags1;
+        if (b1 >> 2 & 1 != 0) != choice_up {
+            s.flags1 = if b1 & 8 == 0 { b1 & !4 } else { b1 & !4 | u8::from(choice_up) << 2 };
+            g.control_recheck();
+        }
+        let s = &mut g.workers.sys;
+        let off = s.flags1 & 4 != 0 || s.flags0 & 2 == 0;
+        s.mode3 = s.mode3 & !0x10 | u8::from(off) << 4;
     }
     for (i, w) in g.windows.iter_mut().enumerate() {
         w.to.active = i == active;
