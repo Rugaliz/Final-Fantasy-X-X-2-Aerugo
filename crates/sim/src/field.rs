@@ -114,8 +114,6 @@ pub struct Actor {
     first_pass_done: bool,
     /// A move or turn started after that: it first advances next tick.
     started_late: bool,
-    /// The player touched this one walking (cleared once they are apart): a bump is this going on.
-    bumped: bool,
     /// Body hit turned off (500f): neither blocks nor bumps.
     pub no_body_hit: bool,
     /// The map display object this worker is bound to (0197), which its 0198/0199 keyframe requests act for.
@@ -124,9 +122,6 @@ pub struct Actor {
     /// (0001), 2 the camera (0002), 3 (0003), 4 (0004) and 5 (0197) display objects; and the bound number.
     pub bind_kind: u8,
     pub bind_id: u16,
-    /// Collisions with this body test heights too (on by default; 5073 switches it): two bodies touch across a
-    /// height difference unless both test it.
-    pub height_test: bool,
     /// The character's motion player (made when a model is bound).
     pub player: Option<motion_engine::Player>,
     /// The character's texture records' image bases as scripts set them (505a / 5071) and its texture
@@ -216,12 +211,10 @@ impl Default for Actor {
             move_heading: 0.0,
             first_pass_done: false,
             started_late: false,
-            bumped: false,
             no_body_hit: false,
             display_object: None,
             bind_kind: 0,
             bind_id: 0,
-            height_test: true,
             chr_textures: ChrTextures::default(),
             player: None,
             motion_slots: DEFAULT_MOTION_SLOTS,
@@ -260,9 +253,6 @@ struct PathMove {
 
 /// Collision radius of a character whose model size is not known (the party leader's: 4).
 const DEFAULT_RADIUS: f32 = 4.0;
-
-/// How far past the sum of the radii two characters still touch.
-const CONTACT_SLACK: f32 = 1e-3;
 
 /// The frame time the character engine scales its steps by.
 const FRAME_TIME: f32 = 1.0 / 30.0;
@@ -448,9 +438,6 @@ impl NumberEntry {
         }
     }
 }
-
-/// Characters further apart than this vertically do not touch (cdsp0100: one falling past another 16 apart).
-const BUMP_HEIGHT: f32 = 10.0;
 
 /// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
 pub(crate) const NAMES: usize = 0x634C;
@@ -1019,8 +1006,8 @@ pub struct FieldState {
     pub user_control: bool,
     /// The body the player's control moves (the control system's choice).
     pub controlled: Option<usize>,
-    /// The player was walking on the last tick it had control.
-    player_was_walking: bool,
+    /// The workers whose bodies a push bumped this frame (the bump signal, type 2).
+    pub bump_signals: Vec<usize>,
     /// Added to every talk radius (a script sets it; 0 by default).
     pub talk_reach: f32,
     /// The talk started this tick, while workers offer themselves.
@@ -1124,7 +1111,7 @@ impl World for FieldState {
             out.push(t);
         }
         self.talk = None;
-        out.extend(self.bumps().into_iter().map(|w| (w, trigger::BUMP)));
+        out.extend(std::mem::take(&mut self.bump_signals).into_iter().map(|w| (w, trigger::BUMP)));
         out
     }
 
@@ -1139,63 +1126,6 @@ impl World for FieldState {
 }
 
 impl FieldState {
-    /// The player pushes others back out (it does not walk through them), and walking into one bumps it: the
-    /// one touched gets a flag, and a bump is the flag going on. The flag goes off only once the two are apart
-    /// (further than the sum of their radii) while the player is not walking into it. Returns the workers bumped
-    /// this tick.
-    ///
-    /// The player's walking is the original controller's speed, which stays as it was while control is off: a
-    /// player that walked up to something and stood there a hair apart (pushed out, rounding to just past the
-    /// contact distance) bumps it again once control comes back (cdsp0000 f2719, bjyt0400 f1509); one left just
-    /// within it does not (bjyt0200 f113, bjyt0400 f252). Characters well above or below each other do not
-    /// touch. Only the player bumps (pairs of others, and others walking into the player, do not).
-    fn bumps(&mut self) -> Vec<usize> {
-        let Some(p) = self.player.filter(|&p| p < self.actors.len()) else { return Vec::new() };
-        let player_moved = {
-            let a = &self.actors[p];
-            a.pos[0] != self.player_prev[0] || a.pos[2] != self.player_prev[2]
-        };
-        let walking = self.user_control && (player_moved || self.player_was_walking);
-        if self.user_control {
-            self.player_was_walking = player_moved;
-        }
-        let body = |a: &Actor| a.model.is_some() && a.visible && !a.no_body_hit;
-        let mut out = Vec::new();
-        for o in 0..self.actors.len() {
-            if o == p {
-                continue;
-            }
-            let (a, b) = (&self.actors[p], &self.actors[o]);
-            if !body(a) || !body(b) {
-                self.actors[o].bumped = false;
-                continue;
-            }
-            let r = a.collision_radius() + b.collision_radius();
-            let (dx, dz) = (a.pos[0] - b.pos[0], a.pos[2] - b.pos[2]);
-            let d = (dx * dx + dz * dz).sqrt();
-            let level = !(a.height_test && b.height_test) || (a.pos[1] - b.pos[1]).abs() <= BUMP_HEIGHT;
-            // Pushed back out, the player stands at the contact distance give or take rounding: walking on into
-            // the other still touches it.
-            let touching = level && d <= r + CONTACT_SLACK;
-            let apart = !level || d > r;
-            let was = self.actors[o].bumped;
-            if walking && touching {
-                if !was {
-                    out.push(o);
-                }
-                self.actors[o].bumped = true;
-            } else if apart || walking {
-                self.actors[o].bumped = false;
-            }
-            if touching && d > 0.0 {
-                let push = (r - d) / d;
-                self.actors[p].pos[0] += dx * push;
-                self.actors[p].pos[2] += dz * push;
-            }
-        }
-        out
-    }
-
     /// Start a talk when a talk button is pressed while the player has control and no message window is open.
     fn begin_talk(&mut self) {
         let pressed = self.input.confirm || self.input.alt;
@@ -1259,6 +1189,7 @@ impl FieldState {
         for (k, v) in self.engine.id_vars.iter().take(64).enumerate() {
             remap[k] = *v as u32;
         }
+        let players: Vec<bool> = (0..self.actors.len()).map(|i| Some(i) == self.controlled).collect();
         for i in 0..self.actors.len() {
             if self.actors[i].model.is_none() {
                 continue;
@@ -1300,27 +1231,27 @@ impl FieldState {
             ch.set_f32(0x4c, vx);
             ch.set_f32(0x50, rise);
             ch.set_f32(0x54, vz);
-            let id = ch.u16(0);
-            if ch.u32(crate::chr::FLAGS) & 0x80 == 0 {
-                // The engine's re-find flag is only set by its debug pad handling.
-                walk_mesh::ground_step(self.walk_mesh.as_ref(), ch, id, event, is_player, &remap, false);
-                ch.set_f32(0x10, ch.f32(0x50) + ch.f32(0x10));
-            } else {
-                for k in 0..3u32 {
-                    ch.set_f32(0xc + k * 4, ch.f32(0x4c + k * 4) + ch.f32(0xc + k * 4));
-                }
-            }
-            for k in 0..3u32 {
-                ch.set_f32(0x4c + k * 4, 0.0);
+        }
+        // The body step and the collision push (83d3b0) over the worker bodies.
+        let walk_mesh = self.walk_mesh.take();
+        self.bump_signals = body_pass(&mut self.chrs, walk_mesh.as_ref(), event, &players, &remap);
+        self.walk_mesh = walk_mesh;
+        for i in 0..self.actors.len() {
+            let Some(ch) = self.chrs.get(i).and_then(Option::as_ref) else { continue };
+            if self.actors[i].model.is_none() {
+                continue;
             }
             let mut p = ch.pos();
-            if a.chr_mode == 0 && ch.u32(crate::chr::FLAGS) & 0x80 == 0 && self.walk_mesh.is_some() {
+            if self.actors[i].chr_mode == 0
+                && ch.u32(crate::chr::FLAGS) & 0x80 == 0
+                && self.walk_mesh.is_some()
+            {
                 let ground = ch.f32(crate::chr::GROUND);
                 if ground < p[1] {
                     p[1] = ground;
                 }
             }
-            a.pos = p;
+            self.actors[i].pos = p;
         }
         let mut player_speed = 0.0;
         // This tick's input makes the player's next push (only while the player has control).
@@ -1520,11 +1451,27 @@ impl FieldState {
         let p8 = el::point(&points, 8, body);
         let feet = [(p7[0] + p8[0]) * 0.5, if p7[1] <= p8[1] { p8[1] } else { p7[1] }, (p7[2] + p8[2]) * 0.5];
         let centre = [(feet[0] + p1[0]) * 0.5, feet[1], (feet[2] + p1[2]) * 0.5, p7[3]];
+        let p0 = el::point(&points, 0, body);
         if let Some(ch) = self.chrs[w].as_mut() {
             for k in 0..4u32 {
                 let old = ch.f32(0x694 + k * 4);
                 ch.set_f32(0x684 + k * 4, old);
                 ch.set_f32(0x694 + k * 4, centre[k as usize]);
+            }
+            // Point 0 (its height less +0x4f4) at +0x6b4; the centre at point 1's height at +0x6a4; the head-to-feet
+            // span +0x510 and the body's height above the feet +0x514; the centre lowered by 0.8 of the span at
+            // +0x6c4.
+            for (k, v) in [p0[0], p0[1] - ch.f32(0x4f4), p0[2], p0[3]].into_iter().enumerate() {
+                ch.set_f32(0x6b4 + k as u32 * 4, v);
+            }
+            for (k, v) in [centre[0], p1[1], centre[2], p1[3]].into_iter().enumerate() {
+                ch.set_f32(0x6a4 + k as u32 * 4, v);
+            }
+            let span = (ch.f32(0x6a8) - ch.f32(0x698)).abs();
+            ch.set_f32(0x510, span);
+            ch.set_f32(0x514, (ch.f32(0x10) - ch.f32(0x698)).abs());
+            for (k, v) in [centre[0], feet[1] - span * 0.8, centre[2], p7[3]].into_iter().enumerate() {
+                ch.set_f32(0x6c4 + k as u32 * 4, v);
             }
         }
         self.chr_frames[w] = Some(ChrFrame { world, elems, points });
@@ -1562,6 +1509,18 @@ impl FieldState {
                 face::apply_reports(&mut actor.face_layers, &s, &reports);
             }
         }
+    }
+
+    /// A new body record for model `m` (Ch_Allocate's setter chain): its collision radius base (+0x4e4) is the
+    /// model block's +0x1c, the character data's info block +4 (82b880 with −1).
+    pub(crate) fn allocate_body(&mut self, m: u16) -> crate::chr::Chr {
+        self.model_data(m);
+        let mut ch = crate::chr::Chr::allocate(m, crate::chr::Block::default());
+        match self.model_radii.get(&m).copied().flatten() {
+            Some(r) => ch.set_f32(0x4e4, r),
+            None => log::error!("GAP: model {m:#x} has no character data block (its radius base is unset)"),
+        }
+        ch
     }
 
     /// A model's character data (`.chr`), read once: collision radius, motion lists and translation scale, face
@@ -2460,6 +2419,174 @@ impl FieldState {
 }
 
 /// The remaster's map id: a hash of the map package path between `jppc` and `bin/` (`/map/bjyt/bjyt00/`).
+/// The body step and the collision push (83d3b0) over the bodies in use and shown: up to two passes, each
+/// stepping every body (the ground step for bodies on the walk mesh, else the whole velocity; the velocity is then
+/// cleared) and pushing overlapping pairs apart (their push goes into the velocity the next pass applies); then the
+/// bodies a walker touched for the first time get the bump signal. Returns the bumped bodies' workers.
+fn body_pass(
+    chrs: &mut [Option<crate::chr::Chr>],
+    walk_mesh: Option<&walk_mesh::WalkMesh>,
+    event: u16,
+    players: &[bool],
+    remap: &[u32; 64],
+) -> Vec<usize> {
+    use crate::chr::FLAGS;
+    let eligible = |ch: &crate::chr::Chr| ch.u8(2) != 0 && (ch.u8(0x180) == 0 || ch.u8(0x181) != 0);
+    for ch in chrs.iter_mut().flatten().filter(|ch| eligible(ch)) {
+        ch.set_u32(FLAGS, ch.u32(FLAGS) & !0x4000);
+    }
+    let mut pass = 0;
+    loop {
+        let mut list = Vec::new();
+        for (i, slot) in chrs.iter_mut().enumerate() {
+            let Some(ch) = slot.as_mut().filter(|ch| eligible(ch)) else { continue };
+            if ch.u32(FLAGS) & 0x100 == 0 {
+                list.push(i);
+            }
+            let id = ch.u16(0);
+            if ch.u32(FLAGS) & 0x80 == 0 {
+                // The engine's re-find flag is only set by its debug pad handling.
+                let player = players.get(i).copied().unwrap_or(false);
+                walk_mesh::ground_step(walk_mesh, ch, id, event, player, remap, false);
+                ch.set_f32(0x10, ch.f32(0x50) + ch.f32(0x10));
+            } else {
+                for k in 0..3u32 {
+                    ch.set_f32(0xc + k * 4, ch.f32(0x4c + k * 4) + ch.f32(0xc + k * 4));
+                }
+            }
+            for k in 0..3u32 {
+                ch.set_f32(0x4c + k * 4, 0.0);
+            }
+            ch.set_f32(0x4e8, (ch.f32(0x64) + ch.f32(0x5c)) * 0.5 * ch.f32(0x4e4));
+            let bottom = if ch.f32(0x51c) == 0.0 { ch.f32(0x6a8) } else { ch.f32(0x10) - ch.f32(0x51c) };
+            ch.set_f32(0x520, bottom);
+        }
+        // By depth (selection, the first of equals stays).
+        for a in 0..list.len() {
+            let mut m = a;
+            for b in a..list.len() {
+                let z = |k: usize| chrs[list[k]].as_ref().map_or(0.0, |c| c.f32(0x14));
+                if z(b) < z(m) {
+                    m = b;
+                }
+            }
+            list.swap(a, m);
+        }
+        let mut pushes = 0;
+        for a in 0..list.len() {
+            for b in a + 1..list.len() {
+                let (ia, ib) = (list[a], list[b]);
+                let (Some(ca), Some(cb)) = (chrs[ia].clone(), chrs[ib].clone()) else { continue };
+                let (ra2, rb2) = (ca.f32(0x4e8) * 2.0, cb.f32(0x4e8) * 2.0);
+                if ca.f32(0x14) + ra2 < cb.f32(0x14) - rb2 {
+                    break;
+                }
+                let both_height = ca.u32(FLAGS) & 0x4000_0000 != 0 && cb.u32(FLAGS) & 0x4000_0000 != 0;
+                if cb.f32(0xc) - rb2 > ca.f32(0xc) + ra2
+                    || ca.f32(0xc) - ra2 > rb2 + cb.f32(0xc)
+                    || (both_height && !(ca.f32(0x520) <= cb.f32(0x698) && cb.f32(0x520) <= ca.f32(0x698)))
+                {
+                    continue;
+                }
+                let r = ca.f32(0x4e8) + cb.f32(0x4e8);
+                let d = xz_distance(ca.pos(), cb.pos());
+                if r < d {
+                    continue;
+                }
+                let (mut ca, mut cb) = (ca, cb);
+                pushes += push_apart(&mut ca, &mut cb, r, d);
+                if ca.u32(FLAGS) & 0x200 != 0 && ca.f32(crate::chr::SPEED) != 0.0 {
+                    cb.set_u32(FLAGS, cb.u32(FLAGS) | 0x4000);
+                }
+                if cb.u32(FLAGS) & 0x200 != 0 && cb.f32(crate::chr::SPEED) != 0.0 {
+                    ca.set_u32(FLAGS, ca.u32(FLAGS) | 0x4000);
+                }
+                chrs[ia] = Some(ca);
+                chrs[ib] = Some(cb);
+            }
+        }
+        pass += 1;
+        if pushes == 0 || pass > 1 {
+            let mut bumped = Vec::new();
+            for (i, ch) in chrs.iter_mut().enumerate() {
+                let Some(ch) = ch.as_mut().filter(|ch| eligible(ch)) else { continue };
+                let f = ch.u32(FLAGS);
+                if f & 0x4000 != 0 && f & 0x8000 == 0 {
+                    bumped.push(i);
+                }
+                ch.set_u32(FLAGS, f & !0x8000 | (f & 0x4000) << 1);
+            }
+            return bumped;
+        }
+    }
+}
+
+/// The distance on the ground plane (83e3e0).
+fn xz_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let (dx, dz) = (b[0] - a[0], b[2] - a[2]);
+    (f64::from(dx * dx + dz * dz)).sqrt() as f32
+}
+
+/// chr_push_apart (83ecd0): the overlap `r − d` shared out by the push weights (+0x500; both negative: by how far
+/// each moved this frame) along the unit direction from b to a, into the velocities; a body given a push gets
+/// flag 0x20. Returns whether there was a push.
+fn push_apart(a: &mut crate::chr::Chr, b: &mut crate::chr::Chr, r: f32, d: f32) -> i32 {
+    use crate::chr::{FLAGS, PUSH_WEIGHT};
+    let (mut wa, mut wb) = (1.0f32, 1.0f32);
+    let mut moved = false;
+    if b.f32(PUSH_WEIGHT) >= 0.0 {
+        if a.f32(PUSH_WEIGHT) >= 0.0 {
+            wa = a.f32(PUSH_WEIGHT);
+            wb = b.f32(PUSH_WEIGHT);
+            if wa == 0.0 && wb == 0.0 {
+                (wa, wb) = (1.0, 1.0);
+            }
+        } else {
+            wb = 0.0;
+        }
+    } else {
+        wa = 0.0;
+        if a.f32(PUSH_WEIGHT) < 0.0 {
+            moved = true;
+            let prev = |c: &crate::chr::Chr| [c.f32(0x1c), c.f32(0x20), c.f32(0x24)];
+            let ma = xz_distance(prev(a), a.pos());
+            let mb = xz_distance(prev(b), b.pos());
+            if mb == ma {
+                return 0;
+            }
+            let m = if mb <= ma { ma } else { mb };
+            wa = ma / m;
+            wb = mb / m;
+        }
+    }
+    let (dx, dz) = (a.f32(0xc) - b.f32(0xc), a.f32(0x14) - b.f32(0x14));
+    let len = (f64::from(dx * dx + dz * dz)).sqrt() as f32;
+    let (ux, uz) = if len != 0.0 { (dx / len, dz / len) } else { (dx, dz) };
+    let fa = (wa * (r - d)) / (wa + wb);
+    if fa < 0.0 {
+        return 0;
+    }
+    let fb = (r - d) - fa;
+    // The moving case gives a the share measured for b and b the one for a.
+    let (sa, sb) = if moved { (fa, fb) } else { (fb, fa) };
+    let give = |c: &mut crate::chr::Chr, k: f32| {
+        let vx = c.f32(0x4c) + ux * k;
+        let vz = c.f32(0x54) + uz * k;
+        c.set_f32(0x4c, vx);
+        c.set_f32(0x54, vz);
+        if vx != 0.0 || vz != 0.0 {
+            c.set_u32(FLAGS, c.u32(FLAGS) | 0x20);
+        }
+    };
+    if sa != 0.0 {
+        give(a, sa);
+    }
+    if sb != 0.0 {
+        give(b, -sb);
+    }
+    1
+}
+
 pub fn map_id(path: &str) -> u32 {
     let (Some(i), Some(j)) = (path.find("jppc/"), path.find("bin/")) else { return 0 };
     let Some(part) = path.get(i + 4..j) else { return 0 };
@@ -3253,12 +3380,15 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Height test of the calling worker's body in collisions on or off.
+    // 5073(v): the body's collision height test (+0x194 bit 30 = v & 1, 82b420); without a body the value stays
+    // on the stack.
     n.register(
         0x5073,
         Native::result(|g, c| {
-            let v = c.stack.pop_int();
-            g.actor(c.worker).height_test = v != 0;
+            if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut) {
+                let v = c.stack.pop_int() as u32 & 1;
+                ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x4000_0000 | v << 30);
+            }
             Value::Int(0)
         }),
     );
@@ -4421,7 +4551,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         if g.chrs.len() <= c.worker {
             g.chrs.resize(c.worker + 1, None);
         }
-        let mut ch = crate::chr::Chr::allocate(id as u16, crate::chr::Block::default());
+        let mut ch = g.allocate_body(id as u16);
         ch.set_i32(0x190, i32::from(g.workers.list.get(c.worker).map_or(0, crate::workers::Worker::id)));
         // The body takes the worker's slot (+0xaf), and a slot below 16 names the worker.
         if let Some(wk) = g.workers.list.get(c.worker) {
@@ -5117,26 +5247,6 @@ pub fn register(n: &mut Natives<FieldState>) {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn walking_into_a_character_bumps_it_once_and_stops_at_contact() {
-        let body = |x: f32| Actor { model: Some(0x2001), pos: [x, 0.0, 0.0], ..Actor::default() };
-        let mut state =
-            FieldState { actors: vec![body(0.0), body(7.0)], player: Some(0), ..FieldState::default() };
-        state.user_control = true;
-        state.player_prev = [-1.0, 0.0, 0.0];
-        // Radii 4 + 4: the player is pushed back to 8 from the other.
-        assert_eq!(state.bumps(), vec![1]);
-        assert!((state.actors[0].pos[0] + 1.0).abs() < 1e-5);
-        state.player_prev = state.actors[0].pos;
-        state.actors[0].pos[0] += 0.5;
-        assert!(state.bumps().is_empty());
-        // Placed onto a character by a script (no player control): no bump.
-        state.user_control = false;
-        state.actors[1].bumped = false;
-        state.player_prev = [-1.0, 0.0, 0.0];
-        assert!(state.bumps().is_empty());
-    }
 
     use super::*;
 

@@ -948,7 +948,7 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
                 return Value::Int(0);
             }
             // (The attached body's own part settings for models 3, 7, 0x10a0 and 0x1075 are not tracked yet.)
-            let mut ch = crate::chr::Chr::allocate(model as u16, crate::chr::Block::default());
+            let mut ch = g.allocate_body(model as u16);
             ch.set_u8(0x184, 0xf);
             let wk = &g.workers.list[c.worker];
             let (bind_id, flags) = (wk.u16(workers::BIND_ID), wk.u32(0xb08 + k as u32 * 4));
