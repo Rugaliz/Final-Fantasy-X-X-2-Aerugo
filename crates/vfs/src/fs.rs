@@ -137,6 +137,7 @@ impl Vfs {
     /// Read part of a file (from archives, only the blocks that cover it are inflated).
     pub fn read_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, VfsError> {
         let norm = normalize_path(path);
+        trace_read(&norm);
         for s in &self.sources {
             match s {
                 Source::Loose(dir) => {
@@ -159,6 +160,7 @@ impl Vfs {
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let norm = normalize_path(path);
+        trace_read(&norm);
         for s in &self.sources {
             match s {
                 Source::Loose(dir) => {
@@ -193,6 +195,21 @@ fn find_loose(dir: &Path, norm: &str) -> Option<PathBuf> {
         current = entry.path();
     }
     current.is_file().then_some(current)
+}
+
+/// With `AERUGO_TRACE_READS` set, log each file the first time it is read (the scene asset audit compares this
+/// list with what the remaster's asset headers load).
+fn trace_read(norm: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("AERUGO_TRACE_READS").is_some()) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    if let Ok(mut seen) = SEEN.lock()
+        && seen.get_or_insert_with(Default::default).insert(norm.to_owned())
+    {
+        log::info!("vfs read {norm}");
+    }
 }
 
 #[cfg(test)]

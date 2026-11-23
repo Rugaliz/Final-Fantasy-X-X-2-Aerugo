@@ -380,11 +380,22 @@ pub struct Globals {
     pub first_c6: u8,
     /// A value a menu sets (−1 at start; 01fa reads it).
     pub menu_value_fa: i32,
+    /// The scene's colour transform: multipliers and offsets (zero at start; an event effect's end, or a
+    /// battle's start, sets the multipliers to 1). The map effects take their colour from the multipliers, and
+    /// the fog and background colours use both while the display flags' bit 2 is set.
+    pub colour_mul: [f32; 4],
+    pub colour_add: [f32; 4],
 }
 
 impl Default for Globals {
     fn default() -> Self {
-        Globals { turn_limit_deg: 179.0, first_c6: 1, menu_value_fa: -1 }
+        Globals {
+            turn_limit_deg: 179.0,
+            first_c6: 1,
+            menu_value_fa: -1,
+            colour_mul: [0.0; 4],
+            colour_add: [0.0; 4],
+        }
     }
 }
 

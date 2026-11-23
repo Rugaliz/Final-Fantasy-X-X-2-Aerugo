@@ -122,9 +122,20 @@ pub fn frame_after_scripts(g: &mut FieldState) {
         }
     }
     if g.effects.state == 6 {
+        if g.effects.effect.is_some() {
+            effect_free(g);
+        }
         g.effects.state = 0;
         g.effects.effect = None;
     }
+}
+
+/// The effect system's reset when an event effect is freed, as far as the field keeps its state: the scene's
+/// colour transform goes off (display flags bit 2) with its multipliers back at 1. (The effect-script and
+/// sound state it also clears is not kept here.)
+fn effect_free(g: &mut FieldState) {
+    g.map_display &= !4;
+    g.globals.colour_mul = [1.0; 4];
 }
 
 /// The draw phase: the running effect's draw (its frame callback runs the particles; the end it reports frees

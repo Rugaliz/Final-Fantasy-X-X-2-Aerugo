@@ -472,7 +472,7 @@ pub fn frame_draw(g: &mut FieldState) {
         crt: &mut g.crt_rand,
         event: u32::from(g.scene.unwrap_or(0)),
         magic: g.effects.effect.as_ref().map_or(u32::MAX, |e| e.magic),
-        colour: g.ps_fog.mul,
+        colour: g.globals.colour_mul,
         map_id: g.map_id,
     };
     rt.frame(&mut g.map_effects, &mut h);

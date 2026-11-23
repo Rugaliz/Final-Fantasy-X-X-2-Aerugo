@@ -22,22 +22,11 @@ pub struct PsFog {
     pub back: [u8; 4],
     /// The distance scale (32.0 at boot; each field frame sets 10.0).
     pub scale: f32,
-    pub mul: [f32; 4],
-    pub add: [f32; 4],
 }
 
 impl Default for PsFog {
     fn default() -> Self {
-        PsFog {
-            rgba: [0; 4],
-            limit: 0.0,
-            near: 0.0,
-            far: 0.0,
-            back: [0; 4],
-            scale: 10.0,
-            mul: [0.0; 4],
-            add: [0.0; 4],
-        }
+        PsFog { rgba: [0; 4], limit: 0.0, near: 0.0, far: 0.0, back: [0; 4], scale: 10.0 }
     }
 }
 
@@ -138,10 +127,11 @@ fn values(g: &FieldState) -> (f32, f32, f32) {
 /// colour from the remaster's (+0x50 with the transform, else its fog colour) × 255.
 fn colour(g: &FieldState) -> [i32; 4] {
     let f = &g.ps_fog;
+    let (mul, add) = (g.globals.colour_mul, g.globals.colour_add);
     let transform = g.map_display & 4 != 0;
     let a = if transform {
         ftol(f64::from(
-            (f64::from(f.add[3]) + f64::from(f.mul[3]) * f64::from(f.rgba[3])).clamp(0.0, 255.0) as f32
+            (f64::from(add[3]) + f64::from(mul[3]) * f64::from(f.rgba[3])).clamp(0.0, 255.0) as f32
         ))
     } else {
         i32::from(f.rgba[3])
@@ -154,11 +144,12 @@ fn colour(g: &FieldState) -> [i32; 4] {
 /// The background colour bytes (transformed with the display flags' bits 0 and 2).
 fn back(g: &FieldState) -> [i32; 4] {
     let f = &g.ps_fog;
+    let (mul, add) = (g.globals.colour_mul, g.globals.colour_add);
     if g.map_display & 1 == 0 || g.map_display & 4 == 0 {
         return f.back.map(i32::from);
     }
     std::array::from_fn(|i| {
-        let v = (f64::from(f.mul[i]) * f64::from(f.back[i]) + f64::from(f.add[i])) as f32;
+        let v = (f64::from(mul[i]) * f64::from(f.back[i]) + f64::from(add[i])) as f32;
         ftol(f64::from(v.clamp(0.0, 255.0)))
     })
 }
