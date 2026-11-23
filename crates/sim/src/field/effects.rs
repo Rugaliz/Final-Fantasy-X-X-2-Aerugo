@@ -204,6 +204,12 @@ pub fn register(n: &mut Natives<FieldState>) {
             wait: Some(|g, _| match g.effects.state {
                 3 => {
                     g.effects.effect = load_effect(g, g.effects.id);
+                    if g.effects.effect.is_none() {
+                        log::error!(
+                            "GAP: event effect {} has no ported driver (or no file): it signals at once and never ends",
+                            g.effects.id
+                        );
+                    }
                     g.effects.state = 4;
                     0
                 }
