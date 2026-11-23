@@ -1869,16 +1869,6 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(on))
         }),
     );
-    // 010c(target, entrance): a map change like 0011 (the fade the original picks for it is the front end's).
-    n.register(
-        0x010C,
-        Native::result(|g, c| {
-            let entrance = c.stack.pop_int();
-            let target = c.stack.pop_int();
-            g.jump = Some((target, entrance));
-            Value::Int(0)
-        }),
-    );
     // 012a(slot, on): a shape slot's +3 byte (1 / 0); returns the slot.
     n.register(
         0x012A,
@@ -3824,7 +3814,7 @@ fn register_party(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let chr = c.stack.pop_int();
             party_leave(g, c, chr);
-            Value::Int(0)
+            Value::Int(chr)
         }),
     );
     n.register(

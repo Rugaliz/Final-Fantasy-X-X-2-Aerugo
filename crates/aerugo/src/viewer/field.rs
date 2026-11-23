@@ -845,11 +845,13 @@ impl FieldView {
         if (self.follow_jumps && candidates.len() == 1) || (self.game && !candidates.is_empty()) {
             s.notes.push(format!("jump to map {target} entrance {entrance}: {}", candidates[0]));
             self.pending_open = Some(candidates[0].clone());
-            // The game goes on in the next event: the save image carries over, with the event and entrance
-            // moved to the previous ones and the new ones in their place (as the original's map change does).
+            // The game goes on in the next event: the save image carries over as the map change left it (the
+            // map and entrance moved to the previous ones, the new ones in their place).
             let mut save = s.event.save();
-            carry_over(&mut save.image, target, entrance);
             save.position = None;
+            if s.event.state.next_loading_screen {
+                log::error!("GAP: the remaster's loading screen before the next scene is not shown");
+            }
             self.pending_restore = Some(save);
         } else {
             s.notes.push(format!(
@@ -1416,16 +1418,6 @@ impl FieldView {
 
 /// A map change in the save image: word 0 is the event, word 2 the one before; byte 0xC the entrance, 0xD the one
 /// before.
-fn carry_over(image: &mut [u8], target: i32, entrance: i32) {
-    if image.len() < 0xE {
-        return;
-    }
-    image.copy_within(0..2, 2);
-    image[0..2].copy_from_slice(&(target as u16).to_le_bytes());
-    image[0xD] = image[0xC];
-    image[0xC] = entrance as u8;
-}
-
 /// Ids that never cast a shadow.
 const NO_SHADOW: [u16; 9] = [0x106a, 0x106d, 0x1077, 0x1088, 0x1083, 0x1089, 0x108c, 0x109f, 0x3016];
 
@@ -1576,17 +1568,6 @@ impl View {
 #[cfg(test)]
 mod view_tests {
     use super::*;
-
-    #[test]
-    fn map_changes_carry_the_save_image() {
-        let mut img = vec![0u8; 16];
-        img[0..2].copy_from_slice(&348u16.to_le_bytes());
-        img[0xC] = 2;
-        carry_over(&mut img, 23, 1);
-        assert_eq!(u16::from_le_bytes([img[0], img[1]]), 23);
-        assert_eq!(u16::from_le_bytes([img[2], img[3]]), 348);
-        assert_eq!((img[0xC], img[0xD]), (1, 2));
-    }
 
     #[test]
     fn views_blend_but_not_across_jumps() {

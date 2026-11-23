@@ -317,11 +317,13 @@ pub struct System {
     pub values_cf0: [i32; 4],
 }
 
+/// The block as the original's setup (86ee10) leaves it, turned on (871190): byte 0 0x80 | 1, byte 1 0x98, byte 2
+/// 0xc8, byte 3 0x30, the +0x210 word 0x49.
 impl Default for System {
     fn default() -> Self {
         System {
             player: -1,
-            flags1: 0,
+            flags1: 0x98,
             mode1a: 0,
             player_pos: [0.0, 0.0, 0.0, 1.0],
             player_prev: [0.0, 0.0, 0.0, 1.0],
@@ -330,10 +332,10 @@ impl Default for System {
             talk_target: -1,
             talk_dist: 0.0,
             talk_reach: 0.0,
-            flags2: 0,
-            mode3: 0,
-            flags0: 1,
-            flags210: 0,
+            flags2: 0xc8,
+            mode3: 0x30,
+            flags0: 0x81,
+            flags210: 0x49,
             full_member: 0,
             party_ac8: 0,
             value208: 0.0,

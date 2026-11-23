@@ -909,6 +909,10 @@ fn set_facing(g: &mut FieldState, c: &mut NativeCall) -> Value {
     w.set_pf(p::DIR_YAW, v);
     w.set_pf(p::YAW, v);
     let (bound, bind) = (w.chr_bound(), w.bind());
+    // 8703b0(w, 0): a bound body's flag 0x400 (+0x194) is cleared; then its facing and heading.
+    if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut).filter(|_| bound) {
+        ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x400);
+    }
     if bound {
         let a = g.actor(c.worker);
         a.yaw = v;

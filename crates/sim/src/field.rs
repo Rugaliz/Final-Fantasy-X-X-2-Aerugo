@@ -20,6 +20,7 @@ pub mod collision;
 pub mod effects;
 pub mod face;
 pub mod fog;
+pub mod map_change;
 pub mod map_fx;
 pub mod map_objects;
 pub mod motion_engine;
@@ -1068,8 +1069,14 @@ pub struct FieldState {
     pub lights: FieldLights,
     /// What the fog natives set over the map's scene fog.
     pub fog: FogOverride,
-    /// A map change the scripts asked for: target and entrance, for the session to carry out.
+    /// The next scene a map change set up (map, entrance from the save image), for the session to load, and the
+    /// map change under way.
     pub jump: Option<(i32, i32)>,
+    pub map_change: Option<map_change::MapChange>,
+    /// The remaster's loading screen comes up for the next scene.
+    pub next_loading_screen: bool,
+    /// A map change asked for the software reset (not ported: reported).
+    pub soft_reset: bool,
     pub rng: Rng,
     /// Character ids in the three party slots (from the save image, refreshed every tick).
     pub party: [u8; 3],
@@ -1380,6 +1387,11 @@ impl FieldState {
                 continue;
             };
             ch.set_pos_keep_previous(a.pos);
+            // The body record takes what the actor holds for it: speed (+0x154), facing (+0x158, Ch_SetRot),
+            // heading of travel (+0x168, Ch_SetDirF).
+            ch.set_f32(crate::chr::SPEED, a.engine_speed);
+            ch.set_f32(crate::chr::FACING, a.yaw);
+            ch.set_f32(crate::chr::HEADING, a.move_heading);
             ch.set_f32(0x4c, vx);
             ch.set_f32(0x50, rise);
             ch.set_f32(0x54, vz);
@@ -2860,6 +2872,11 @@ impl Event {
         }
         self.walk_encounters(before);
         self.tick += 1;
+        // The next frame's map change check (it comes before that frame's scripts; nothing runs in between).
+        if let Some(next) = map_change::frame(&mut self.state, &self.vm.memory.global[0]) {
+            self.state.next_loading_screen = next.loading_screen;
+            self.state.jump = Some((next.map, next.entrance));
+        }
     }
 
     /// Stop the playing movie (the player skipped it); scripts waiting for its end go on.
@@ -4067,16 +4084,6 @@ fn register_queries(n: &mut Natives<FieldState>) {
     for id in [0x00E9u16, 0x0177] {
         n.register(id, Native::result(|_, c| Value::Int(i32::from(c.stack.pop_int() != 0))));
     }
-    // Map change with a fade (as 0x0011).
-    n.register(
-        0x010B,
-        Native::result(|g, c| {
-            let entrance = c.stack.pop_int();
-            let target = c.stack.pop_int();
-            g.jump = Some((target, entrance));
-            Value::Int(0)
-        }),
-    );
 }
 
 fn register_treasure(n: &mut Natives<FieldState>) {
@@ -4993,14 +5000,25 @@ pub fn register(n: &mut Natives<FieldState>) {
     );
     // Map change: target and entrance; the session carries it out between ticks.
     // (00ab is the same native: (target, entrance, 1).)
+    // 0011 / 00ab(target, entrance): a map change with the save's fade; 010b / 010c without (map_change.rs).
     for id in [0x0011u16, 0x00AB] {
         n.register(
             id,
             Native::result(|g, c| {
-                // The entrance goes on as a signed byte.
-                let entrance = i32::from(c.stack.pop_int() as i8);
+                let entrance = c.stack.pop_int() as i8;
                 let target = c.stack.pop_int();
-                g.jump = Some((target, entrance));
+                map_change::request(g, c, target, entrance, true);
+                Value::Int(0)
+            }),
+        );
+    }
+    for id in [0x010Bu16, 0x010C] {
+        n.register(
+            id,
+            Native::result(|g, c| {
+                let entrance = c.stack.pop_int() as i8;
+                let target = c.stack.pop_int();
+                map_change::request(g, c, target, entrance, false);
                 Value::Int(0)
             }),
         );
