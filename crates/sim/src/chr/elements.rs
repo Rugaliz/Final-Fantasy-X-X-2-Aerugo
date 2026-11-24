@@ -271,16 +271,21 @@ pub fn hung_world(
     mul(parent_world, &m)
 }
 
-/// The world position of element `e`; `listed` (the element is in the
-/// relation's list) takes its translation × 1000 first.
-pub fn element_position(world: &Mat, elems: &[Mat], e: usize, listed: bool) -> [f32; 3] {
-    let Some(mut m) = elems.get(e).copied() else { return [world[12], world[13], world[14]] };
+/// The world matrix of element `e` (none past the last); `listed` (the element is in the relation's list)
+/// takes its translation × 1000 first.
+pub fn element_matrix(world: &Mat, elems: &[Mat], e: usize, listed: bool) -> Option<Mat> {
+    let mut m = elems.get(e).copied()?;
     if listed {
         for t in &mut m[12..15] {
             *t = (d(*t) * 1000.0) as f32;
         }
     }
-    let w = mul(world, &m);
+    Some(mul(world, &m))
+}
+
+/// The world position of element `e` (the body's own past the last element).
+pub fn element_position(world: &Mat, elems: &[Mat], e: usize, listed: bool) -> [f32; 3] {
+    let w = element_matrix(world, elems, e, listed).unwrap_or(*world);
     [w[12], w[13], w[14]]
 }
 

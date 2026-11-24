@@ -1446,7 +1446,7 @@ fn first_page(r: &Run, model: u32) -> u32 {
 }
 
 /// The render state a blend kind gives a new entry.
-fn blend_state(blend: u8) -> u32 {
+pub(super) fn blend_state(blend: u8) -> u32 {
     match blend {
         0x41 => 0x100,
         0x42 => 0x10,

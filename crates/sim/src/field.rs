@@ -1130,6 +1130,24 @@ impl World for FieldState {
 }
 
 impl FieldState {
+    /// The world matrix of element `e` of worker `w`'s body (an element the motion relation lists, or any
+    /// without one, takes its translation × 1000; past the last element the body's own). None without a body.
+    pub(crate) fn body_element_matrix(&self, w: usize, e: i32) -> Option<crate::chr::elements::Mat> {
+        if !self.actors.get(w).is_some_and(|a| a.model.is_some()) {
+            return None;
+        }
+        let f = self.chr_frames.get(w)?.as_ref()?;
+        let n = f.elems.len();
+        let listed = match self.actors[w].player.as_ref().and_then(|p| p.relation()) {
+            Some(r) => r.map.iter().take(n).any(|&m| i32::from(m) == e),
+            None => usize::try_from(e).is_ok_and(|e| e < n),
+        };
+        Some(
+            crate::chr::elements::element_matrix(&f.world, &f.elems, e.max(0) as usize, listed)
+                .unwrap_or(f.world),
+        )
+    }
+
     /// Start a talk when a talk button is pressed while the player has control and no message window is open.
     fn begin_talk(&mut self) {
         let pressed = self.input.confirm || self.input.alt;
@@ -3577,15 +3595,8 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             let x = c.stack.pop_int();
             let e = c.stack.pop_int();
             let w = c.stack.pop_int().max(0) as usize;
-            if g.actors.get(w).is_some_and(|a| a.model.is_some())
-                && let Some(f) = g.chr_frames.get(w).cloned().flatten()
-            {
-                let n = f.elems.len();
-                let listed = match g.actors[w].player.as_ref().and_then(|p| p.relation()) {
-                    Some(r) => r.map.iter().take(n).any(|&m| i32::from(m) == e),
-                    None => usize::try_from(e).is_ok_and(|e| e < n),
-                };
-                let p = crate::chr::elements::element_position(&f.world, &f.elems, e.max(0) as usize, listed);
+            if let Some(m) = g.body_element_matrix(w, e) {
+                let p = [m[12], m[13], m[14]];
                 let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
                 for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
                     store_float_var(c, areas, desc, v);

@@ -75,6 +75,8 @@ pub struct CamMem {
     pub rail_len: f32,
     /// The record the last stepped screen slot shows (record 0 at the start).
     pub screen_record: u32,
+    /// The screen slot stepped last (its offset in the island), whose shake offsets effects set.
+    pub screen_slot: u32,
 }
 
 impl std::fmt::Debug for CamMem {
@@ -92,6 +94,7 @@ impl Default for CamMem {
             rail_place: 0.0,
             rail_len: 0.0,
             screen_record: RECORDS,
+            screen_slot: SCREENS,
         };
         m.init();
         m

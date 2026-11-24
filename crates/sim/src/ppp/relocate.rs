@@ -67,6 +67,13 @@ pub fn oef2_particle(m: &mut Space, file: u32, n: u32) -> u32 {
     m.u32(table + 4 * n)
 }
 
+/// The getter for the directory's plain tables (any kind but 2, 3, 6 and 8): slot `n` of the table the
+/// directory's +kind·4 names (kind 9: the shapes a driver draws itself).
+pub fn oef2_entry(m: &Space, file: u32, kind: u32, n: u32) -> u32 {
+    let table = file.wrapping_add(m.u32(file + kind * 4));
+    m.u32(table + 4 * n)
+}
+
 /// Bind the particle group at `group` to the program table at `table` (0x28-byte entries).
 pub fn bind(m: &mut Space, group: u32, table: u32) {
     for f in [0x10, 0x14, 0x18, 0x1c] {

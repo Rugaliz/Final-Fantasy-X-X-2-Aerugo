@@ -11,6 +11,7 @@
 pub mod driver;
 pub mod programs;
 pub mod relocate;
+pub mod timeline;
 pub mod vfx;
 
 /// A byte region at an address.
@@ -419,6 +420,27 @@ pub struct ShapeDraw {
     pub path3: bool,
 }
 
+/// A sprite a driver keeps and draws itself through the engine's shape entries (effect 688's rising sprites):
+/// one frame of a shape, the entry keyed by the sprite's index in its pool and the shape, drawn with the
+/// magic's own flag up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpriteDraw {
+    pub index: u32,
+    pub shape: u32,
+    /// The frame drawn (an index into the shape's frame list).
+    pub frame: u16,
+    /// The draw parameters the driver fills: its flags word (the script task sets bit 23 every frame) and the
+    /// sprite's colour.
+    pub param_flags: u32,
+    pub colour: [u8; 4],
+    /// The draw matrix (turned and scaled, at the sprite's camera-space position) and the work matrix (the
+    /// same lifted on Y), when the sprite asks for one.
+    pub matrix: crate::chr::elements::Mat,
+    pub work_matrix: Option<crate::chr::elements::Mat>,
+    /// The render state a new entry is made with: the frame's blend, | 1 with a work matrix.
+    pub create: u32,
+}
+
 /// A frame-buffer distortion draw of a model (pppKeMdlDtt).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistortDraw {
@@ -485,6 +507,12 @@ pub enum RenderCall {
     Model(Box<ModelDraw>),
     Distort(Box<DistortDraw>),
     Shape(Box<ShapeDraw>),
+    Sprite(Box<SpriteDraw>),
+    /// A driver's sprite entry (keyed by the sprite's index and its shape) given back.
+    SpriteRelease {
+        index: u32,
+        shape: u32,
+    },
     Geometry(Box<GeometryDraw>),
     /// The render entry of (object, reference index) destroyed.
     Destroy {

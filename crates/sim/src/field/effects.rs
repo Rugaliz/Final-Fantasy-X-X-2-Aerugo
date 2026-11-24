@@ -27,6 +27,46 @@ pub struct Effects {
     /// The running effect's driver and the engine's vector-unit random generator.
     pub effect: Option<Box<crate::ppp::driver::Effect>>,
     pub vu: crate::ppp::VuRand,
+    /// The map display a timeline effect keeps when it starts and puts back when it is freed: the fog block's
+    /// colour, distances and background bytes, and the remaster's background colour.
+    pub display_kept: Option<KeptDisplay>,
+}
+
+/// The display state a timeline effect's set-up keeps and its free entry restores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeptDisplay {
+    pub fog_rgba: [u8; 4],
+    pub fog_limit: f32,
+    pub fog_near: f32,
+    pub fog_far: f32,
+    pub back: [u8; 4],
+    pub background: Option<[f32; 3]>,
+}
+
+impl KeptDisplay {
+    fn keep(g: &FieldState) -> KeptDisplay {
+        let f = &g.ps_fog;
+        KeptDisplay {
+            fog_rgba: f.rgba,
+            fog_limit: f.limit,
+            fog_near: f.near,
+            fog_far: f.far,
+            back: f.back,
+            background: g.background,
+        }
+    }
+
+    /// The timeline driver's free entry: the kept fog and background back, the motion blur off.
+    fn restore(&self, g: &mut FieldState) {
+        let f = &mut g.ps_fog;
+        f.rgba = self.fog_rgba;
+        f.limit = self.fog_limit;
+        f.near = self.fog_near;
+        f.far = self.fog_far;
+        f.back = self.back;
+        g.background = self.background;
+        g.screen.blur(0);
+    }
 }
 
 /// The effect `id` from the magic files, when its driver is ported.
@@ -46,25 +86,44 @@ fn with_driver<T>(
     let mut e = g.effects.effect.take()?;
     let mut paused = g.particle_pause != 0;
     let mut vu = g.effects.vu;
-    let mut h = crate::ppp::driver::Host {
-        ticking: true,
-        busy: false,
-        event_bits: g.engine.event_bits,
-        view: g.cam_view.unwrap_or(crate::chr::elements::IDENTITY),
-        screen: g.cam_screen.unwrap_or(crate::chr::elements::IDENTITY),
-        paused: &mut paused,
-        vu: &mut vu,
-        crt: &mut g.crt_rand,
-        event: u32::from(g.scene.unwrap_or(0)),
-        map_id: g.map_id,
+    let mut crt = g.crt_rand;
+    let out = {
+        let field: &FieldState = g;
+        let mut h = crate::ppp::driver::Host {
+            ticking: true,
+            busy: false,
+            event_bits: field.engine.event_bits,
+            view: field.cam_view.unwrap_or(crate::chr::elements::IDENTITY),
+            screen: field.cam_screen.unwrap_or(crate::chr::elements::IDENTITY),
+            paused: &mut paused,
+            vu: &mut vu,
+            crt: &mut crt,
+            event: u32::from(field.scene.unwrap_or(0)),
+            map_id: field.map_id,
+            bodies: field,
+        };
+        f(&mut e, &mut h)
     };
-    let out = f(&mut e, &mut h);
+    g.crt_rand = crt;
     if paused {
         g.particle_pause = 1;
     }
     g.effects.vu = vu;
     g.effects.effect = Some(e);
     Some(out)
+}
+
+/// The characters' bodies as the effect drivers see them: the worker playing an actor (the first whose +0x40
+/// is it) when it is bound to a body, and its bodies' element matrices.
+impl crate::ppp::driver::Bodies for FieldState {
+    fn actor_body(&self, actor: i32) -> Option<usize> {
+        let w = self.workers.list.iter().position(|wk| wk.i32(0x40) == actor)?;
+        has_body(self, w).then_some(w)
+    }
+
+    fn body_element_matrix(&self, worker: usize, element: i32) -> Option<crate::chr::elements::Mat> {
+        FieldState::body_element_matrix(self, worker, element)
+    }
 }
 
 /// Whether the calling worker is bound to a body (+0xaa 1, +0x9c set).
@@ -117,6 +176,9 @@ pub fn frame_after_scripts(g: &mut FieldState) {
             Some(s) => s.ready,
             None => true,
         };
+        if let Some(shake) = g.effects.effect.as_ref().and_then(|e| e.screen_shake) {
+            g.cam.set_screen_shake(shake);
+        }
         if ready && g.effects.state == 4 {
             g.effects.state = 5;
         }
@@ -124,6 +186,9 @@ pub fn frame_after_scripts(g: &mut FieldState) {
     if g.effects.state == 6 {
         if g.effects.effect.is_some() {
             effect_free(g);
+        }
+        if let Some(kept) = g.effects.display_kept.take() {
+            kept.restore(g);
         }
         g.effects.state = 0;
         g.effects.effect = None;
@@ -144,7 +209,12 @@ pub fn frame_draw(g: &mut FieldState) {
     if !matches!(g.effects.state, 4 | 5) {
         return;
     }
-    if with_driver(g, |e, h| e.draw(h)).is_some_and(|s| s.done) {
+    // A timeline effect sends its ready call from its draw entry.
+    let signals = with_driver(g, |e, h| e.draw(h));
+    if signals.is_some_and(|s| s.ready) && g.effects.state == 4 {
+        g.effects.state = 5;
+    }
+    if signals.is_some_and(|s| s.done) {
         g.effects.state = 6;
     }
     if let Some(e) = &g.effects.effect {
@@ -204,6 +274,8 @@ pub fn register(n: &mut Natives<FieldState>) {
             wait: Some(|g, _| match g.effects.state {
                 3 => {
                     g.effects.effect = load_effect(g, g.effects.id);
+                    let timeline = g.effects.effect.as_ref().is_some_and(|e| e.timeline.is_some());
+                    g.effects.display_kept = timeline.then(|| KeptDisplay::keep(g));
                     if g.effects.effect.is_none() {
                         log::error!(
                             "GAP: event effect {} has no ported driver (or no file): it signals at once and never ends",

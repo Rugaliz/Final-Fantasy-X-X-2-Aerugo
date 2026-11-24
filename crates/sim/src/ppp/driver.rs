@@ -26,6 +26,8 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     LoopingPart,
+    /// A timeline script that starts parts (see [`super::timeline`]).
+    Timeline(super::timeline::TimelineLayout),
 }
 
 /// The driver and data layout of magic file `magic`, when its shape is ported.
@@ -39,6 +41,41 @@ pub fn driver(magic: u32) -> Option<(Shape, Layout)> {
         711 => (
             Shape::LoopingPart,
             Layout { oef2: 0x1000_4020, table: 0x100b_c5c8, work: 0x100b_d140, work_size },
+        ),
+        638 => (
+            Shape::Timeline(super::timeline::TimelineLayout {
+                script: 0x1000_612c,
+                part_records: 0x1000_663c,
+                start_part_fn: 0x1000_3260,
+                part_start: super::timeline::PartStart::BY_REGISTER,
+                sprites: None,
+            }),
+            Layout { oef2: 0x1000_6d00, table: 0x1000_6148, work: 0x1007_d550, work_size: 0x4_0000 },
+        ),
+        688 => (
+            Shape::Timeline(super::timeline::TimelineLayout {
+                script: 0x1000_7620,
+                part_records: 0x1000_7648,
+                start_part_fn: 0x1000_3b50,
+                part_start: super::timeline::PartStart::BY_REGISTER,
+                sprites: Some(super::timeline::SpriteLayout {
+                    spawn_fn: 0x1000_3b60,
+                    actor: 0x14,
+                    elements: 0x1000_7664,
+                    shape_slot: 0,
+                }),
+            }),
+            Layout { oef2: 0x1000_7d20, table: 0x1000_7130, work: 0x1008_0630, work_size: 0x4_0000 },
+        ),
+        689 => (
+            Shape::Timeline(super::timeline::TimelineLayout {
+                script: 0x1000_6788,
+                part_records: 0x1000_6798,
+                start_part_fn: 0x1000_3230,
+                part_start: super::timeline::PartStart { fixed_part: Some(0), fade_out: Some(0xa4) },
+                sprites: None,
+            }),
+            Layout { oef2: 0x1000_6ea0, table: 0x1000_6170, work: 0x100c_f750, work_size: 0x4_0000 },
         ),
         _ => return None,
     })
@@ -63,6 +100,29 @@ pub struct Host<'a> {
     /// The current event and the remaster's map id (for the draw adjustments).
     pub event: u32,
     pub map_id: u32,
+    /// The characters' bodies (what drivers that place things on a character read).
+    pub bodies: &'a dyn Bodies,
+}
+
+/// What a driver reads of the characters' bodies.
+pub trait Bodies: std::fmt::Debug {
+    /// The worker whose character is `actor` (its +0x40), when it is bound to a body.
+    fn actor_body(&self, actor: i32) -> Option<usize>;
+    /// The world matrix of element `element` of worker `worker`'s body.
+    fn body_element_matrix(&self, worker: usize, element: i32) -> Option<Mat>;
+}
+
+/// No bodies (a driver run outside the field).
+#[derive(Debug)]
+pub struct NoBodies;
+
+impl Bodies for NoBodies {
+    fn actor_body(&self, _: i32) -> Option<usize> {
+        None
+    }
+    fn body_element_matrix(&self, _: usize, _: i32) -> Option<Mat> {
+        None
+    }
 }
 
 /// What a driver call asks of the event system.
@@ -107,6 +167,9 @@ pub struct Effect {
     pub view: Mat,
     /// The render requests of the last callback.
     pub render: Vec<RenderCall>,
+    /// A timeline effect's driver state, and the screen shake offsets its last run set.
+    pub timeline: Option<Box<super::timeline::Timeline>>,
+    pub screen_shake: Option<[u32; 2]>,
 }
 
 /// A program name with the static lifetime programs carry (each distinct name kept once).
@@ -140,6 +203,8 @@ impl PartialEq for Effect {
             && (self.frames, self.callback_frames, self.idle) == (o.frames, o.callback_frames, o.idle)
             && (self.world, self.frame, self.camera, self.view) == (o.world, o.frame, o.camera, o.view)
             && self.render == o.render
+            && self.timeline == o.timeline
+            && self.screen_shake == o.screen_shake
     }
 }
 
@@ -207,11 +272,30 @@ impl Effect {
             camera: IDENTITY,
             view: IDENTITY,
             render: Vec::new(),
+            timeline: match shape {
+                Shape::Timeline(t) => Some(Box::new(super::timeline::Timeline::new(t))),
+                Shape::LoopingPart => None,
+            },
+            screen_shake: None,
         })
     }
 
     fn run_with<T>(&mut self, h: &mut Host, own: bool, f: impl FnOnce(&mut Run, &mut Part) -> T) -> T {
         let mut part = std::mem::take(&mut self.part);
+        let out = self.run_part(h, own, &mut part, f);
+        self.part = part;
+        out
+    }
+
+    /// Run `f` on `part` in the particle runtime with this effect's space and matrices (`own`: the effect's
+    /// own flag up, as the driver sets it around a part's step).
+    pub(super) fn run_part<T>(
+        &mut self,
+        h: &mut Host,
+        own: bool,
+        part: &mut Part,
+        f: impl FnOnce(&mut Run, &mut Part) -> T,
+    ) -> T {
         let mut r = Run {
             m: &mut self.space,
             env: &mut self.env,
@@ -240,9 +324,8 @@ impl Effect {
             scene: Scene { event: h.event, own_magic: own, map_part: None, map_part_id: 0 },
             render: std::mem::take(&mut self.render),
         };
-        let out = f(&mut r, &mut part);
+        let out = f(&mut r, part);
         self.render = std::mem::take(&mut r.render);
-        self.part = part;
         out
     }
 
@@ -285,7 +368,12 @@ impl Effect {
 
     /// The run (after the scripts, while the loader runs the effect): on a ticking frame, once the effect
     /// system is free, the ready call; ready once it is answered.
-    pub fn run(&mut self, h: &Host) -> Signals {
+    pub fn run(&mut self, h: &mut Host) -> Signals {
+        if matches!(self.shape, Shape::Timeline(_)) {
+            let (s, out) = self.timeline_run(h);
+            self.screen_shake = out.shake;
+            return s;
+        }
         let mut s = Signals::default();
         if !h.ticking {
             return s;
@@ -308,6 +396,10 @@ impl Effect {
     /// event bit 0 turns the callback on (once); bit 1 turns it off, ends the timeline and reports the effect
     /// done.
     pub fn draw(&mut self, h: &mut Host) -> Signals {
+        if matches!(self.shape, Shape::Timeline(_)) {
+            self.render.clear();
+            return self.timeline_draw(h);
+        }
         let mut s = Signals::default();
         if !self.ready {
             return s;

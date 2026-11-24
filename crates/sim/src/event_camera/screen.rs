@@ -255,6 +255,13 @@ impl CamMem {
         if dx <= 0.0 { a - std::f32::consts::PI } else { a }
     }
 
+    /// The current screen slot's two shake offsets (what an effect's timeline sets each frame).
+    pub fn set_screen_shake(&mut self, offsets: [u32; 2]) {
+        let s = self.screen_slot;
+        self.set_u32(s + 0x30, offsets[0]);
+        self.set_u32(s + 0x34, offsets[1]);
+    }
+
     /// The frame's settling of a slot's rectangles and shakes (the part of the screen step on the island): each
     /// rectangle takes its target, its centre offset from the frame, follows the other as asked (1: the other's
     /// size; 2: the other's place, no offset; 3: centred), runs its four channels; the shakes step; then every
@@ -268,6 +275,7 @@ impl CamMem {
             return false;
         }
         self.screen_record = super::RECORDS + u32::from(self.u8(s + 0xc1)) * super::RECORD;
+        self.screen_slot = s;
         for k in 0..2u32 {
             let cur = s + 0x40 + k * 0x10;
             let other = s + 0x50 - k * 0x10;
