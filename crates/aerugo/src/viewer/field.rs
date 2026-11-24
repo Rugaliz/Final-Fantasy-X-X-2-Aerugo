@@ -1300,8 +1300,15 @@ impl FieldView {
                     .find_map(|p| vfs.read(p).ok().and_then(|d| aerugo_formats::ftc::Ftc::parse(&d).ok()))
                 });
                 if let Some(font) = font.as_ref() {
-                    let (canvas, drawn) =
-                        message_canvas(st, &s.prebg, font, px, lang, self.started.elapsed().as_secs_f32());
+                    let (canvas, drawn) = message_canvas(
+                        st,
+                        &s.event.vm.memory.global[0],
+                        &s.prebg,
+                        font,
+                        px,
+                        lang,
+                        self.started.elapsed().as_secs_f32(),
+                    );
                     s.ui.draw(vfs, renderer, &mut s.phyre.programs, &canvas, lang.code(), px, &mut frame);
                     drawn_windows = drawn;
                 }
@@ -1455,6 +1462,7 @@ fn caster_source(
 /// the other types are not ported yet.
 fn message_canvas(
     st: &aerugo_sim::field::FieldState,
+    image: &[u8],
     prebg: &[PreBgQuad],
     font: &aerugo_formats::ftc::Ftc,
     px: (u32, u32),
@@ -1486,14 +1494,17 @@ fn message_canvas(
         if t.hidden || !(f.on || t.on) {
             continue;
         }
-        let Some(msg) = w.message.and_then(|m| st.messages.get(m)) else { continue };
+        if w.message.and_then(|m| st.messages.get(m)).is_none() {
+            continue;
+        }
         let frame_type = usize::from(w.style.unwrap_or(0));
         if frame_type > 2 {
             continue;
         }
         drawn.push(i);
-        let end = t.end.unwrap_or(msg.bytes.len()).min(msg.bytes.len());
-        let page = msg.bytes.get(t.start.min(end)..end).unwrap_or_default();
+        // The current page with its macros as their texts (8b6660).
+        let page_bytes = aerugo_sim::field::msg_to::page_bytes(st, image, i);
+        let page = page_bytes.as_slice();
         let kind = msgwin::TextKind::from_flags(w.flags as u16);
         let (tw, th) = msgwin::measure(page, font, &metrics, kind, frame_type);
         let placement = msgwin::place(&metrics, frame_type, w.align, w.x, w.y, tw, th);

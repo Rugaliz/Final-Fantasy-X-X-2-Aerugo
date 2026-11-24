@@ -208,9 +208,9 @@ fn step_len(bytes: &[u8]) -> usize {
     }
 }
 
-/// The page from `start`: its end (the next byte below 3) and its count (8b7f40, 8b80b0); `name` gives the
-/// length of a {13:30+n} character name.
-pub fn page(bytes: &[u8], start: usize, name: &dyn Fn(u8) -> i32) -> (Option<usize>, i32) {
+/// The page from `start`: its end (the next byte below 3) and its count (8b7f40, 8b80b0); `macro_len` gives the
+/// length of a macro element's text (code, argument), `None` when Aerugo does not resolve it (reported).
+pub fn page(bytes: &[u8], start: usize, macro_len: &dyn Fn(u8, u8) -> Option<i32>) -> (Option<usize>, i32) {
     let mut at = start;
     let mut count = 0;
     loop {
@@ -230,11 +230,7 @@ pub fn page(bytes: &[u8], start: usize, name: &dyn Fn(u8) -> i32) -> (Option<usi
             }
             3 => {
                 let arg = bytes.get(at + 1).copied().unwrap_or(0);
-                if b == 0x13 && arg >= 0x30 {
-                    count += name(arg - 0x30);
-                } else {
-                    log::error!("GAP: message macro {{{b:02x}:{arg:02x}}} (its length) is not ported");
-                }
+                count += macro_len(b, arg).unwrap_or(0);
             }
             4 => count += 1,
             _ => {}
@@ -252,12 +248,106 @@ fn language_rate(language_type: Option<u32>, rate: i32) -> i32 {
     }
 }
 
-/// A character name's length in the save image (its slot, up to the NUL; page leads and the extension prefix
-/// start two-byte characters).
-fn name_len(image: &[u8], chr: u8) -> i32 {
-    let at = super::NAMES + usize::from(chr) * super::NAME_SLOT;
-    let slot = image.get(at..at + super::NAME_SLOT).unwrap_or_default();
-    slot.iter().take_while(|&&b| b != 0).filter(|&&b| !matches!(b, 0x04 | 0x2C..=0x2F)).count() as i32
+/// A macro's text length (8b80b0, kind 3): its bytes up to the NUL, page leads and the extension prefix not
+/// counted (they start two-byte characters).
+fn text_len(bytes: &[u8]) -> i32 {
+    bytes.iter().take_while(|&&b| b != 0).filter(|&&b| !matches!(b, 0x04 | 0x2C..=0x2F)).count() as i32
+}
+
+/// A text from `bytes` up to its NUL.
+fn to_nul(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().copied().take_while(|&b| b != 0).collect()
+}
+
+/// TOGetChangeMacroAddress (8b6660): the text macro element {code:arg} of window `w` stands for (without its
+/// NUL), or what Aerugo does not resolve yet.
+/// - {13:30+n}: 8ac850(n): n ≤ 0x13 the save's name n (TOGetSaveChrName), else MsGetComData (not ported).
+/// - {12:30+n} below 0x50: value slot n by its active type: 0xff nothing (the static empty text c5a040), 0 the
+///   text at the value's address, 1 the value as "%d", 2 the same with an 'F' before every group of three digits
+///   after the first (8b6210); the other types (0x13–0x23, '+'–'7') are not ported.
+/// - {16:30+n} / {17:30+n}: item n's name (kernel_item, field 0); {23:30+n}: key item n's name (790860, field
+///   variant · 4).
+/// - The rest ({12:50+}, {14}/{15}/{18}, the dictionary macros {19}–{22}): not ported.
+pub fn macro_text(g: &FieldState, image: &[u8], w: usize, code: u8, arg: u8) -> Result<Vec<u8>, String> {
+    let n = arg.wrapping_sub(0x30);
+    let variant = crate::items::text_variant(image);
+    let item_text = |table: &aerugo_formats::KernelTable, field: usize| {
+        crate::items::ItemTables::text_bytes(table, u16::from(n), field).map(to_nul)
+    };
+    match code {
+        0x13 if n <= 0x13 => {
+            let at = super::NAMES + usize::from(n) * super::NAME_SLOT;
+            Ok(to_nul(image.get(at..at + super::NAME_SLOT).unwrap_or_default()))
+        }
+        0x13 => Err(format!("name {{13:{arg:02x}}} is a battle command's (MsGetComData)")),
+        0x12 if arg < 0x50 => {
+            let slot = usize::from(n);
+            if slot >= 0x20 {
+                return Err(format!("value {{12:{arg:02x}}} is past the window's 32 slots"));
+            }
+            let win = &g.windows[w];
+            let ty = win.value_types.get(slot).copied().unwrap_or(0xff);
+            let value = win.values.get(slot).map_or(-1, |v| v.1);
+            match ty {
+                0xff => Ok(Vec::new()),
+                0 if (super::text_space::SAVE..super::text_space::SAVE + 0x0100_0000)
+                    .contains(&(value as u32)) =>
+                {
+                    let at = (value as u32 - super::text_space::SAVE) as usize;
+                    Ok(to_nul(image.get(at..).unwrap_or_default()))
+                }
+                0 => g.texts.bytes_at(value as u32).map(to_nul).ok_or_else(|| {
+                    format!("value {{12:{arg:02x}}}: text address {value:#x} is not in Aerugo's text space")
+                }),
+                1 | 2 => {
+                    let digits = value.to_string().into_bytes();
+                    let mut out = Vec::new();
+                    for (i, &d) in digits.iter().enumerate() {
+                        let left = digits.len() - i;
+                        if ty == 2 && i > 0 && left % 3 == 0 {
+                            out.push(b'F');
+                        }
+                        out.push(d);
+                    }
+                    Ok(out)
+                }
+                t => Err(format!("value {{12:{arg:02x}}} of type {t:#x} is not ported")),
+            }
+        }
+        0x16 | 0x17 => g
+            .items
+            .as_ref()
+            .and_then(|t| item_text(&t.items, 0))
+            .ok_or_else(|| format!("item name {{{code:02x}:{arg:02x}}}: no item table")),
+        0x23 => g
+            .items
+            .as_ref()
+            .and_then(|t| item_text(&t.key_items, if variant { 4 } else { 0 }))
+            .ok_or_else(|| format!("key item name {{23:{arg:02x}}}: no key item table")),
+        _ => Err(format!("macro {{{code:02x}:{arg:02x}}} is not ported")),
+    }
+}
+
+/// The current page of window `w` with every macro element replaced by its text (what the draw shows and the
+/// reveal counts); macros Aerugo does not resolve are left out.
+pub fn page_bytes(g: &FieldState, image: &[u8], w: usize) -> Vec<u8> {
+    let bytes = bytes_of(g, w);
+    let t = &g.windows[w].to.text;
+    let end = t.end.unwrap_or(bytes.len()).min(bytes.len());
+    let mut at = t.start.min(end);
+    let mut out = Vec::new();
+    while at < end {
+        let len = step_len(&bytes[at..]).max(1).min(end - at);
+        if kind(bytes[at]) == 3 {
+            if let Ok(text) = macro_text(g, image, w, bytes[at], bytes.get(at + 1).copied().unwrap_or(0)) {
+                out.extend(text);
+            }
+        } else {
+            out.extend_from_slice(&bytes[at..at + len]);
+        }
+        at += len;
+    }
+    out
 }
 
 fn bytes_of(g: &FieldState, w: usize) -> Vec<u8> {
@@ -271,7 +361,15 @@ fn new_page(g: &mut FieldState, w: usize, image: &[u8]) {
     if let Some(end) = t.end {
         t.start = end + 1;
     }
-    let (end, count) = page(&bytes, t.start, &|chr| name_len(image, chr));
+    let start = t.start;
+    let (end, count) = page(&bytes, start, &|code, arg| match macro_text(g, image, w, code, arg) {
+        Ok(text) => Some(text_len(&text)),
+        Err(e) => {
+            log::error!("GAP: message {e}");
+            None
+        }
+    });
+    let t = &mut g.windows[w].to.text;
     t.end = end;
     t.shown = 0;
     t.drawn_shown = 0;
@@ -322,6 +420,8 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     let win = &mut g.windows[w];
     let kind = u16::from(win.style.unwrap_or(0));
     let flags = win.flags | win.word28;
+    // 8b8210: the value slots' staged types become the active ones.
+    win.value_types = (0..0x20).map(|k| win.values.get(k).map_or(0xff, |v| v.0)).collect();
     win.to = To::default();
     let to = &mut win.to;
     to.frame.kind = kind;
@@ -675,9 +775,10 @@ pub fn draw_pass(g: &mut FieldState, image: &[u8]) {
         if !win.to.text.on || win.to.text.hidden || win.to.text.shown <= 0 {
             continue;
         }
-        let bytes = bytes_of(g, w);
+        // The page as drawn: its macros as their texts (TOSetDrawInfo reads them through 8b6660).
+        let bytes = page_bytes(g, image, w);
         let t = &mut g.windows[w].to.text;
-        let mut at = t.start;
+        let mut at = 0;
         let mut drawn = 0;
         while drawn < t.shown {
             let Some(&b) = bytes.get(at) else { break };

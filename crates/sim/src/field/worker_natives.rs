@@ -623,24 +623,29 @@ pub(super) fn register_shapes(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // 0059(x extent, z extent, height): a box's half extents and height (kinds 3, 6).
+    // 0059(x extent, z extent, height): a box's half extents and height (kinds 3, 6); 0058(x, z) pushes −1.0
+    // and runs 0059 (855f80).
+    fn box_extents(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
+        let z = c.stack.pop_float();
+        let x = c.stack.pop_float();
+        let w = wk(g, c);
+        if !matches!(w.kind, 3 | 6) {
+            return Value::Int(0);
+        }
+        w.set_pf(p::PITCH, x);
+        w.set_pf(p::ROLL, z);
+        w.set_pf(p::HEIGHT, h);
+        w.set_u16(workers::FLAGS2, w.flags2() | 1);
+        Value::Int(1)
+    }
     n.register(
         0x0059,
         Native::result(|g, c| {
             let h = c.stack.pop_float();
-            let z = c.stack.pop_float();
-            let x = c.stack.pop_float();
-            let w = wk(g, c);
-            if !matches!(w.kind, 3 | 6) {
-                return Value::Int(0);
-            }
-            w.set_pf(p::PITCH, x);
-            w.set_pf(p::ROLL, z);
-            w.set_pf(p::HEIGHT, h);
-            w.set_u16(workers::FLAGS2, w.flags2() | 1);
-            Value::Int(1)
+            box_extents(g, c, h)
         }),
     );
+    n.register(0x0058, Native::result(|g, c| box_extents(g, c, -1.0)));
     // 005a(yaw): a box's turn (kinds 3, 6).
     n.register(
         0x005A,

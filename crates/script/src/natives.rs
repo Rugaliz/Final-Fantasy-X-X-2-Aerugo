@@ -286,6 +286,10 @@ impl<G: World> Host for Bound<'_, G> {
     fn level_started(&mut self, w: usize, level: u8) {
         self.game.level_started(w, level)
     }
+
+    fn may_run(&mut self, w: usize) -> bool {
+        self.game.may_run(w)
+    }
 }
 
 /// What the machine asks of the game state beyond natives.
@@ -312,6 +316,10 @@ pub trait World {
     fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
     /// A request started on a worker's level, or the level started over.
     fn level_started(&mut self, _w: usize, _level: u8) {}
+    /// The engine's part of the worker run gate (atel_run_worker 8641e0) past the worker's on bit.
+    fn may_run(&mut self, _w: usize) -> bool {
+        true
+    }
 }
 
 impl World for () {}

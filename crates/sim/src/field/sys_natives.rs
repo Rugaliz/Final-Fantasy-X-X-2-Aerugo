@@ -295,41 +295,23 @@ pub fn register(n: &mut Natives<FieldState>) {
                 }
                 c.scratch[1] = 0;
                 g.sound.play_simple_pub(0x8000_0026u32 as i32, 0x3f, 0x7f);
-                g.engine.event_flags3 |= 4;
+                g.workers.sys.mode3 |= 4;
                 let variant = crate::items::text_variant(&c.memory.global[0]);
                 let wi = c.scratch[0] as usize;
                 let chr_name = if chr <= 0x13 {
-                    (super::NAMES + chr.max(0) as usize * super::NAME_SLOT) as i32
+                    (super::text_space::SAVE + (super::NAMES + chr.max(0) as usize * super::NAME_SLOT) as u32)
+                        as i32
                 } else {
                     super::text_space::EMPTY as i32
                 };
                 let cmd_name = g.items.clone().map_or(super::text_space::EMPTY, |t| {
                     g.texts.command_name(&t.commands, cmd as u32, variant)
                 }) as i32;
-                let text = g
-                    .items
-                    .clone()
-                    .and_then(|t| {
-                        crate::items::ItemTables::text_bytes(&t.messages, 0x401e, if variant { 4 } else { 0 })
-                            .map(<[u8]>::to_vec)
-                    })
-                    .unwrap_or_default();
-                if let Some(cs) = g.charset.clone() {
-                    g.messages.push(super::message_from_bytes(text, 0, &cs));
-                }
-                let m = g.messages.len().checked_sub(1);
                 let win = &mut g.windows[wi];
-                win.values.resize(win.values.len().max(0x20), (0, 0));
+                win.values.resize(win.values.len().max(0x20), (0xff, -1));
                 win.values[0] = (0, chr_name);
                 win.values[1] = (0, cmd_name);
-                win.x = 0x100;
-                win.y = 0xd0;
-                win.align = 4;
-                win.message = m;
-                win.word16 = 0;
-                win.flags = 0;
-                super::msg_open(g, &c.memory.global[0], wi, 0);
-                super::msg_wait_init(g, wi);
+                super::system_message(g, &c.memory.global[0], wi, 0x401e);
             }),
             wait: Some(|g, c| match c.scratch[1] {
                 0 => {
@@ -346,7 +328,8 @@ pub fn register(n: &mut Natives<FieldState>) {
                 _ => 5,
             }),
             result: Some(|g, c| {
-                g.engine.event_flags3 &= !4;
+                g.workers.sys.mode3 &= !4;
+                g.control_refresh();
                 crate::stats::set_command(
                     &mut c.memory.global[0],
                     c.scratch[2].max(0) as usize,
@@ -1748,7 +1731,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
                 && s < 0x20
             {
                 if w.values.len() < 0x20 {
-                    w.values.resize(0x20, (0, 0));
+                    w.values.resize(0x20, (0xff, -1));
                 }
                 w.values[s] = (ty as u8, value);
             }

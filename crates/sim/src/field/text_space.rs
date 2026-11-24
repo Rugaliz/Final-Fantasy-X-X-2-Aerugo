@@ -6,7 +6,9 @@
 //! - the macro dictionary (`menu/macrodic.dcp`: 16 table offsets, each table u16 offsets to its strings),
 //! - the event's text (u16 offsets every 8 bytes),
 //! - an empty text (the original's static one, when the event has no text),
-//! - the command table (`command.bin`: its names).
+//! - the command table (`command.bin`: its names),
+//! - the item, key item and equipment name tables (`item.bin`, `important.bin`, `w_name.bin`),
+//! - the save image (its names: save_ram + offset); the image is not kept here, so readers resolve it.
 
 use std::sync::Arc;
 
@@ -14,12 +16,19 @@ pub const MACRODIC: u32 = 0x4000_0000;
 pub const EVENT_TEXT: u32 = 0x5000_0000;
 pub const EMPTY: u32 = 0x5fff_0000;
 pub const COMMANDS: u32 = 0x6000_0000;
+pub const ITEMS: u32 = 0x6100_0000;
+pub const KEY_ITEMS: u32 = 0x6200_0000;
+pub const EQUIPMENT_NAMES: u32 = 0x6300_0000;
+pub const SAVE: u32 = 0x7000_0000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextSpace {
     pub macrodic: Option<Arc<[u8]>>,
     pub event: Option<Arc<[u8]>>,
     pub commands: Option<Arc<[u8]>>,
+    pub items: Option<Arc<[u8]>>,
+    pub key_items: Option<Arc<[u8]>>,
+    pub equipment_names: Option<Arc<[u8]>>,
 }
 
 fn u16_at(d: &[u8], at: usize) -> Option<u16> {
@@ -53,11 +62,29 @@ impl TextSpace {
 
     /// The address of command `cmd`'s name (its record's text field 0, or 4 with the text variant).
     pub fn command_name(&self, table: &aerugo_formats::KernelTable, cmd: u32, variant: bool) -> u32 {
-        let Some(r) = table.record(cmd & 0xfff) else { return EMPTY };
-        let Some(pool) = table.segments()[r.segment].text_pool else { return EMPTY };
-        let field = if variant { 4 } else { 0 };
-        let at = r.bytes.get(field..field + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
-        COMMANDS + (pool + usize::from(at)) as u32
+        record_text(COMMANDS, table, cmd, if variant { 4 } else { 0 })
+    }
+
+    /// 8ab280: item `id`'s name (kernel_item: field 0, 4 with the text variant).
+    pub fn item_name(&self, table: &aerugo_formats::KernelTable, id: u32, variant: bool) -> u32 {
+        record_text(ITEMS, table, id, if variant { 4 } else { 0 })
+    }
+
+    /// 790860: key item `id`'s name (kernel_rec(id & 0xfff, [11334c0]): field variant · 4).
+    pub fn key_item_name(&self, table: &aerugo_formats::KernelTable, id: u32, variant: bool) -> u32 {
+        record_text(KEY_ITEMS, table, id, if variant { 4 } else { 0 })
+    }
+
+    /// equip_name 7a0c50: name record `name` ([11363b4]), field owner · 4, or 0x1c + owner · 4 with the variant.
+    pub fn equipment_name(
+        &self,
+        table: &aerugo_formats::KernelTable,
+        name: u32,
+        owner: u8,
+        variant: bool,
+    ) -> u32 {
+        let field = usize::from(owner) * 4 + if variant { 0x1c } else { 0 };
+        record_text(EQUIPMENT_NAMES, table, name, field)
     }
 
     /// The bytes at an address, up to the end of its file (a text runs to its NUL).
@@ -68,13 +95,28 @@ impl TextSpace {
             (self.event.as_deref()?, addr - EVENT_TEXT)
         } else if addr == EMPTY {
             return Some(&[0]);
-        } else if (COMMANDS..COMMANDS + 0x0100_0000).contains(&addr) {
+        } else if (COMMANDS..ITEMS).contains(&addr) {
             (self.commands.as_deref()?, addr - COMMANDS)
+        } else if (ITEMS..KEY_ITEMS).contains(&addr) {
+            (self.items.as_deref()?, addr - ITEMS)
+        } else if (KEY_ITEMS..EQUIPMENT_NAMES).contains(&addr) {
+            (self.key_items.as_deref()?, addr - KEY_ITEMS)
+        } else if (EQUIPMENT_NAMES..EQUIPMENT_NAMES + 0x0100_0000).contains(&addr) {
+            (self.equipment_names.as_deref()?, addr - EQUIPMENT_NAMES)
         } else {
             return None;
         };
         file.get(at as usize..)
     }
+}
+
+/// A kernel record's text: the file's address base + its text pool + the u16 offset in field `field` (kernel_rec
+/// of `id & 0xfff`).
+fn record_text(base: u32, table: &aerugo_formats::KernelTable, id: u32, field: usize) -> u32 {
+    let Some(r) = table.record(id & 0xfff) else { return EMPTY };
+    let Some(pool) = table.segments()[r.segment].text_pool else { return EMPTY };
+    let at = r.bytes.get(field..field + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    base + (pool + usize::from(at)) as u32
 }
 
 #[cfg(test)]

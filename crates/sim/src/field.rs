@@ -9,7 +9,7 @@ use aerugo_formats::text::{self, Charset};
 use aerugo_script::natives::{Native, World, wrap_angle};
 
 use crate::control::PlayerControl;
-use crate::trigger::{self, Talk, Trigger};
+use crate::trigger::{self, Talk};
 use aerugo_script::vm::{NativeCall, Value, WAIT_DONE};
 use aerugo_script::{Natives, Phase, RequestMode, Vm};
 use aerugo_vfs::{Language, Vfs};
@@ -103,7 +103,6 @@ pub struct Actor {
     /// Signal bits scripts set and clear per worker: an engine signal of type n reaches the worker only while
     /// bit n is set.
     pub flags: u32,
-    pub trigger: Trigger,
     /// Collision radius set by a script (else the model's).
     pub radius: Option<f32>,
     /// The model's own collision radius (from its PS2 character data, once loaded).
@@ -205,7 +204,6 @@ impl Default for Actor {
             params: [0; 4],
             character: None,
             flags: 0,
-            trigger: Trigger::default(),
             radius: None,
             model_radius: None,
             move_heading: 0.0,
@@ -356,8 +354,12 @@ pub struct Window {
     pub style: Option<u8>,
     /// The message module's frame, text and choice records.
     pub to: msg_to::To,
-    /// The values the text's placeholders show (009e): per slot, a type byte and the value.
+    /// The values the text's placeholders show (1869ab0's 32 slots: 009e / 8b8960 the staged type +0, 8b8980 the
+    /// value +4); a slot not listed is (0xff, −1), as 8b81d0 resets them.
     pub values: Vec<(u8, i32)>,
+    /// The slots' active types (+1), copied from the staged ones when the window opens (8b8210); the {12:3n}
+    /// macros read these. A slot not listed is 0xff (none).
+    pub value_types: Vec<u8>,
     /// The window's colour word (00a2: four bytes) and its +0x28 word (0256 / 0257).
     pub color: u32,
     pub word28: u32,
@@ -705,8 +707,6 @@ pub struct FogOverride {
 pub struct EngineValues {
     /// The event flags byte (bit 5: 00f2).
     pub event_flags: u8,
-    /// The event system's byte +3 (bit 2: a learned-command message holds the player's control, 0216).
-    pub event_flags3: u8,
     /// Sound switches (0151 sets bit n).
     pub sound_switches: u32,
     /// Event bits (017a sets bit n; an event effect load clears them).
@@ -736,24 +736,6 @@ impl Default for FieldLights {
             FieldLight::from_script(0x12, 0x12, 0xD, 0x82, 0x11C),
             FieldLight::from_script(0x50, 0x5A, 0x69, 0, 0),
         ])
-    }
-}
-
-/// The script random number stream: a multiply / xor generator with a 16-bit rotate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Rng {
-    pub state: u32,
-}
-
-impl Rng {
-    const MUL: u32 = 0x0EBB_6BD7;
-    const XOR: u32 = 0x2BA9;
-
-    pub fn next_value(&mut self) -> u32 {
-        let s = Self::MUL.wrapping_mul(self.state) ^ Self::XOR;
-        let s = (((s as i32) >> 16) as u32).wrapping_add(s << 16);
-        self.state = s;
-        s & 0x7FFF_FFFF
     }
 }
 
@@ -997,7 +979,6 @@ pub struct FieldState {
     pub next_loading_screen: bool,
     /// A map change asked for the software reset (not ported: reported).
     pub soft_reset: bool,
-    pub rng: Rng,
     /// Character ids in the three party slots (from the save image, refreshed every tick).
     pub party: [u8; 3],
     /// Random values to hand out instead of the generator's (replaying a recording of the original).
@@ -1092,9 +1073,9 @@ pub struct FieldState {
 }
 
 impl FieldState {
-    /// The next script random number: a replayed one, else the generator's.
+    /// The next script random number (rng_next(2), 7988f0): a replayed one, else stream 2's.
     pub fn random(&mut self) -> u32 {
-        self.rng_replay.pop_front().unwrap_or_else(|| self.rng.next_value())
+        self.rng_replay.pop_front().unwrap_or_else(|| self.rng_streams.next(2))
     }
 }
 
@@ -1105,6 +1086,18 @@ impl World for FieldState {
 
     fn worker_will_run(&mut self, w: usize, _kind: u8, _level: u8) {
         self.worker_pre_run(w);
+    }
+
+    // 8641e0: a worker runs with +0x34 bit 2 or +0x36 bit 6 set, or while no battle is requested or running
+    // (780c90: [112a8e0] / [112a8e2]; the field frame does not run during Aerugo's battles, so the request);
+    // never with the system's +3 & 3 == 1, and with 2 only with +0x36 bit 15. (+0x34 bit 1 is the VM's on bit.)
+    fn may_run(&mut self, w: usize) -> bool {
+        let Some(wk) = self.workers.list.get(w) else { return true };
+        let (f, f2) = (wk.flags(), wk.flags2());
+        let mode = self.workers.sys.mode3 & 3;
+        (f & 4 != 0 || f2 & 0x40 != 0 || self.battle.is_none())
+            && mode != 1
+            && (mode != 2 || f2 & 0x8000 != 0)
     }
 
     fn level_started(&mut self, w: usize, level: u8) {
@@ -2402,6 +2395,16 @@ impl FieldState {
         self.user_control = false;
     }
 
+    /// 86a130: control off, then on again unless byte 1 bit 2 or byte 3 bits 0x84 block it, when byte 0 had 0x22
+    /// before.
+    pub fn control_refresh(&mut self) {
+        let kept = self.workers.sys.flags0;
+        self.control_off();
+        if self.workers.sys.flags1 & 4 == 0 && self.workers.sys.mode3 & 0x84 == 0 && kept & 0x22 != 0 {
+            self.control_on();
+        }
+    }
+
     /// Control checked again: off, then on when not blocked and the kept byte 0 had 0x22; bit 1 of byte 0
     /// restored from the kept byte.
     pub fn control_recheck(&mut self) {
@@ -2663,11 +2666,7 @@ impl Event {
         let actors = script
             .workers
             .iter()
-            .map(|w| Actor {
-                flags: trigger::default_signal_bits(w.kind),
-                trigger: Trigger::for_kind(w.kind),
-                ..Actor::default()
-            })
+            .map(|w| Actor { flags: trigger::default_signal_bits(w.kind), ..Actor::default() })
             .collect();
         let mut state = FieldState {
             water_level: WATER_LEVEL_AT_START,
@@ -2731,6 +2730,9 @@ impl Event {
             state.stat_tables = crate::stats::StatTables::load(vfs, lang);
             state.new_game_tables = crate::new_game::NewGameTables::load(vfs, lang);
             state.texts.commands = state.items.as_ref().map(|t| t.commands.data().into());
+            state.texts.items = state.items.as_ref().map(|t| t.items.data().into());
+            state.texts.key_items = state.items.as_ref().map(|t| t.key_items.data().into());
+            state.texts.equipment_names = state.items.as_ref().map(|t| t.equipment_names.data().into());
             state.encounters = vfs
                 .read("ffx_ps2/ffx/master/jppc/battle/kernel/btl.bin")
                 .ok()
@@ -3749,11 +3751,6 @@ fn open_number(g: &mut FieldState, w: usize, mode: i32) {
         .then(|| NumberEntry::new(i32::from(win.byte22), i32::from(win.byte23), win.word24 as i32, digits));
 }
 
-/// A message made at run time (not from the event's text).
-fn runtime_message(text: &str) -> Message {
-    Message { text: text.to_owned(), raw: text.to_owned(), choices: 0, word: 0, bytes: Vec::new() }
-}
-
 /// Treasure: give treasure `index` (the item, key item, equipment or gil) into the save image. Returns whether
 /// the equipment it held did not fit.
 fn give_treasure(g: &FieldState, image: &mut [u8], index: i32) -> (crate::items::Treasure, bool) {
@@ -4212,54 +4209,110 @@ fn register_queries(n: &mut Natives<FieldState>) {
     for id in [0x00DFu16, 0x00E0] {
         n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
     }
-    // Switches whose result is whether they were turned on.
-    for id in [0x00E9u16, 0x0177] {
-        n.register(id, Native::result(|_, c| Value::Int(i32::from(c.stack.pop_int() != 0))));
-    }
+    // 00e9(on): the system's byte 1 bit 4 (86aff0); 0177(on): the caller's +0x36 bit 6, and bit 15 when on
+    // (both run gates of 8641e0). The result is on ≠ 0.
+    n.register(
+        0x00E9,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            let s = &mut g.workers.sys;
+            s.flags1 = s.flags1 & !0x10 | u8::from(on) << 4;
+            Value::Int(i32::from(on))
+        }),
+    );
+    n.register(
+        0x0177,
+        Native::result(|g, c| {
+            let on = c.stack.pop_int() != 0;
+            if let Some(w) = g.workers.list.get_mut(c.worker) {
+                let f2 = w.flags2() & !0x40 | u16::from(on) << 6 | if on { 0x8000 } else { 0 };
+                w.set_u16(crate::workers::FLAGS2, f2);
+            }
+            Value::Int(i32::from(on))
+        }),
+    );
 }
 
 fn register_treasure(n: &mut Natives<FieldState>) {
-    // Open a chest (window, treasure): give it, then show "Obtained ..." in the window and wait for the player
-    // to close it. Scratch: window, step, equipment did not fit.
+    // 015b(window, treasure) (85a8a0): the treasure given (MsFieldItemGet), then the system message window with
+    // battle-end text 0x4016 equipment / 0x4017 key item / 0x4018 or 0x4019 one or more of an item / 0x401a gil
+    // (else 0x401d); value slot 0 (type 0) the name, slot 1 (type 1) the count or the gil. Wait (85af70): the
+    // message wait each frame; once it reports done, one frame (the menu 0x10001 asked for when the equipment did
+    // not fit), then done. The end (85b4c0): the system's +3 bit 2 off, control checked again; 1.
+    // Scratch: window, step, the equipment did not fit.
     n.register(
         0x015B,
         Native {
             init: Some(|g, c| {
+                use crate::items::Treasure;
+                g.sound.play_simple_pub(0x8000_0026u32 as i32, 0x3f, 0x7f);
+                g.workers.sys.mode3 |= 4;
                 let index = c.stack.pop_int();
                 let w = window(c);
-                let image = &mut c.memory.global[0];
-                let (got, full) = give_treasure(g, image, index);
+                let (got, full) = give_treasure(g, &mut c.memory.global[0], index);
+                let image = &c.memory.global[0];
                 let variant = crate::items::text_variant(image);
-                let text = g.items.as_ref().map(|t| t.pickup_message(&got, variant)).unwrap_or_default();
-                g.messages.push(runtime_message(&text));
-                g.windows[w].message = Some(g.messages.len() - 1);
-                g.windows[w].x = 0x100;
-                g.windows[w].y = 0xD0;
-                g.windows[w].style = Some(0);
-                msg_open(g, image, w, 0);
-                msg_wait_init(g, w);
+                let (text, name, number) = match (&got, g.items.clone()) {
+                    (Treasure::Item(id, n), Some(t)) if *id != 0 && *n > 0 => (
+                        if *n == 1 { 0x4018 } else { 0x4019 },
+                        Some(g.texts.item_name(&t.items, u32::from(*id), variant)),
+                        Some(i32::from(*n)),
+                    ),
+                    (Treasure::KeyItem(id), Some(t)) => {
+                        (0x4017, Some(g.texts.key_item_name(&t.key_items, u32::from(*id), variant)), None)
+                    }
+                    (Treasure::Equipment(e), Some(t)) => {
+                        let name = u32::from(u16::from_le_bytes([e[0], e[1]]));
+                        (0x4016, Some(g.texts.equipment_name(&t.equipment_names, name, e[4], variant)), None)
+                    }
+                    (Treasure::Gil(gil), _) if *gil != 0 => (0x401a, None, Some(*gil)),
+                    _ => (0x401d, None, None),
+                };
+                let win = &mut g.windows[w];
+                if win.values.len() < 0x20 {
+                    win.values.resize(0x20, (0xff, -1));
+                }
+                win.values[0].0 = 0;
+                win.values[1].0 = 1;
+                if let Some(v) = number {
+                    win.values[1].1 = v;
+                }
+                if let Some(v) = name {
+                    win.values[0].1 = v as i32;
+                }
+                system_message(g, image, w, text);
                 c.scratch[0] = w as i32;
                 c.scratch[1] = 0;
                 c.scratch[2] = i32::from(full);
             }),
-            wait: Some(|g, c| match c.scratch[1] {
-                // The message, then a tick (with the "full" sound when the equipment did not fit), then done.
-                0 => {
-                    if msg_wait(g, c.scratch[0] as usize) & WAIT_DONE != 0 {
-                        c.scratch[1] = 1;
+            wait: Some(|g, c| {
+                let r = msg_wait(g, c.scratch[0] as usize);
+                match c.scratch[1] {
+                    0 => {
+                        if r & WAIT_DONE != 0 {
+                            c.scratch[1] = 1;
+                        }
+                        0
                     }
-                    0
+                    1 => {
+                        if c.scratch[2] != 0 {
+                            g.menu = Some(MenuRequest { mode: 0x10001, open: false });
+                        }
+                        c.scratch[1] = 2;
+                        0
+                    }
+                    _ => WAIT_DONE,
                 }
-                1 => {
-                    c.scratch[1] = 2;
-                    0
-                }
-                _ => WAIT_DONE,
             }),
-            result: Some(|_, _| Value::Int(1)),
+            result: Some(|g, _| {
+                g.workers.sys.mode3 &= !4;
+                g.control_refresh();
+                Value::Int(1)
+            }),
         },
     );
-    // The same without a message (a tick's wait when the equipment did not fit).
+    // 01a7(treasure) (857b70): the same without a message. Wait (857ef0): done at once (and on this frame) when
+    // everything fit; else the menu 0x10001 is asked for, then done the frame after. The result is 1.
     n.register(
         0x01A7,
         Native {
@@ -4269,16 +4322,52 @@ fn register_treasure(n: &mut Natives<FieldState>) {
                 c.scratch[1] = 0;
                 c.scratch[2] = i32::from(full);
             }),
-            wait: Some(|_, c| {
-                if c.scratch[2] == 0 || c.scratch[1] == 1 {
-                    return WAIT_DONE;
+            wait: Some(|g, c| {
+                if c.scratch[2] == 0 {
+                    return WAIT_DONE | aerugo_script::vm::WAIT_CONTINUE;
                 }
-                c.scratch[1] = 1;
-                0
+                if c.scratch[1] == 0 {
+                    g.menu = Some(MenuRequest { mode: 0x10001, open: false });
+                    c.scratch[1] = 1;
+                    return 0;
+                }
+                WAIT_DONE
             }),
             result: Some(|_, _| Value::Int(1)),
         },
     );
+}
+
+/// The system message window of 015b and 0216 (85a8a0, 85b280), after their value slots: battle-end text `text`
+/// (TkBtlEndGetText: field variant · 4) placed by 0065 at (0x100, 0xd0) aligned 4, frame style 0 (+0x20), the
+/// text with +0x16 = 0 and flags +0x18 = 0, opened (006a mode 0); control checked again (86a130) and the message
+/// wait's mode bit (+0x1d |= 0x10).
+pub(crate) fn system_message(g: &mut FieldState, image: &[u8], w: usize, text: u32) {
+    let variant = crate::items::text_variant(image);
+    let bytes = g
+        .items
+        .clone()
+        .and_then(|t| {
+            crate::items::ItemTables::text_bytes(&t.messages, text as u16, if variant { 4 } else { 0 })
+                .map(<[u8]>::to_vec)
+        })
+        .unwrap_or_default();
+    if let Some(cs) = g.charset.clone() {
+        g.messages.push(message_from_bytes(bytes, 0, &cs));
+    }
+    let m = g.messages.len().checked_sub(1);
+    let (x, y) = window_place(g, 0x100, 0xd0);
+    let win = &mut g.windows[w];
+    win.x = x;
+    win.y = y;
+    win.align = 4;
+    win.style = Some(0);
+    win.message = m;
+    win.word16 = 0;
+    win.flags = 0;
+    msg_open(g, image, w, 0);
+    g.control_refresh();
+    msg_wait_init(g, w);
 }
 
 /// The message wait (0084): the window and a value; done once the window has closed (msg_wait); the result
@@ -4319,13 +4408,14 @@ fn choice_native() -> Native<FieldState> {
 
 /// Workers turned off (they stop running, but keep their requests) and on again.
 fn register_workers(n: &mut Natives<FieldState>) {
-    fn set(c: &mut NativeCall, on: bool) -> Value {
-        let w = c.stack.pop_int().max(0) as usize;
+    // 00a7 / 00a8(w): worker by index (86a830: negative or past the last → 0), +0x34 bit 1 cleared / set.
+    fn set(g: &FieldState, c: &mut NativeCall, on: bool) -> Value {
+        let w = target(g, c);
         c.effects.push(aerugo_script::vm::Effect::Enable(w, on));
         Value::Int(0)
     }
-    n.register(0x00A7, Native::result(|_, c| set(c, false)));
-    n.register(0x00A8, Native::result(|_, c| set(c, true)));
+    n.register(0x00A7, Native::result(|g, c| set(g, c, false)));
+    n.register(0x00A8, Native::result(|g, c| set(g, c, true)));
 }
 
 /// Player control on and off, and the player's talk reach.
@@ -4351,26 +4441,6 @@ fn register_control(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-}
-
-/// Trigger shapes: lines (kinds 2 and 5), boxes (3 and 6), and the touch and talk sizes of characters.
-fn register_triggers(n: &mut Natives<FieldState>) {
-    // A box's half width and depth, with (0x59) or without (0x58) a half height.
-    n.register(0x0058, Native::result(|g, c| box_size(g, c, -1.0)));
-}
-
-fn box_size(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
-    let hd = c.stack.pop_float();
-    let hw = c.stack.pop_float();
-    let kind = c.kind;
-    let t = &mut g.actor(c.worker).trigger;
-    if !matches!(kind, 3 | 6) {
-        return Value::Int(0);
-    }
-    t.b = [hw, 0.0, hd];
-    t.height = h;
-    t.dirty = true;
-    Value::Int(1)
 }
 
 /// Natives that set values for engine parts: save bytes, event and sound switches, the character ID effect
@@ -5096,13 +5166,13 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(g.actor(c.worker).params[i])
         }),
     );
-    // Random numbers from the script stream.
+    // Random numbers from stream 2: 00a9 the low 16 bits, 00a6(n) (bits · max(n, 1), unsigned) >> 16.
     n.register(0x00A9, Native::result(|g, _| Value::Int((g.random() & 0xFFFF) as i32)));
     n.register(
         0x00A6,
         Native::result(|g, c| {
             let n = c.stack.pop_int().max(1);
-            Value::Int((((g.random() & 0xFFFF) as i64 * i64::from(n)) >> 16) as i32)
+            Value::Int(((g.random() & 0xFFFF).wrapping_mul(n as u32) >> 16) as i32)
         }),
     );
     // Map change: target and entrance; the session carries it out between ticks.
@@ -5223,7 +5293,6 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(w as i32)
         }),
     );
-    register_triggers(n);
     register_control(n);
     register_workers(n);
     // Halt: the worker stops here for good (until a request takes it elsewhere).
@@ -5239,15 +5308,15 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(w)
         }),
     );
-    // Mark a worker for an extra pass this frame.
+    // 0117(w): a worker (by index: negative or past the last is worker 0) marked for an extra pass this frame
+    // (+0x36 & ~0x400 | 0x1200); returns w as popped.
     n.register(
         0x0117,
-        Native::result(|_, c| {
+        Native::result(|g, c| {
             let w = c.stack.pop_int();
-            if let Ok(w) = usize::try_from(w) {
-                c.effects.push(aerugo_script::vm::Effect::ExtraPass(w));
-            }
-            Value::Int(0)
+            let t = usize::try_from(w).ok().filter(|&i| i < g.workers.list.len()).unwrap_or(0);
+            c.effects.push(aerugo_script::vm::Effect::ExtraPass(t));
+            Value::Int(w)
         }),
     );
     // The camera natives on the camera system (they replace the ones above).
@@ -5309,16 +5378,6 @@ pub fn register(n: &mut Natives<FieldState>) {
 mod tests {
 
     use super::*;
-
-    #[test]
-    fn rng_is_deterministic_and_positive() {
-        let mut a = Rng { state: 1 };
-        let mut b = Rng { state: 1 };
-        let xs: Vec<u32> = (0..100).map(|_| a.next_value()).collect();
-        assert!(xs.iter().all(|&x| x <= 0x7FFF_FFFF));
-        assert_eq!(xs, (0..100).map(|_| b.next_value()).collect::<Vec<_>>());
-        assert!(xs.windows(2).any(|w| w[0] != w[1]));
-    }
 
     #[test]
     fn a_movie_plays_one_frame_a_tick_and_its_wait_ends_with_it() {

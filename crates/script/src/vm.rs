@@ -275,6 +275,10 @@ pub trait Host {
     fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
     /// A request started on level `level` of worker `w`, or the level started over.
     fn level_started(&mut self, _w: usize, _level: u8) {}
+    /// The engine's part of the run gate at the top of atel_run_worker (8641e0), past the worker's on bit.
+    fn may_run(&mut self, _w: usize) -> bool {
+        true
+    }
 }
 
 /// Engine signal defaults per worker kind and signal type: the level, and the entry (255 / -1: none).
@@ -704,7 +708,7 @@ impl Vm {
 
     /// Run worker `w` for this frame.
     pub fn run_worker(&mut self, w: usize, host: &mut dyn Host) {
-        if !self.workers[w].active || !self.workers[w].enabled {
+        if !self.workers[w].active || !self.workers[w].enabled || !host.may_run(w) {
             return;
         }
         self.tell_level_starts(host);
