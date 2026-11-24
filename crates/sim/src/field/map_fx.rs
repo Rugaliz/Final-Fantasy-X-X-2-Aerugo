@@ -335,7 +335,8 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x800B,
         Native::result(|g, c| {
-            let v = c.stack.pop_int() as u32;
+            // 91b130: a negative id counts as 0.
+            let v = c.stack.pop_int().max(0) as u32;
             let w = &mut g.workers.list[c.worker];
             if w.kind == 1 {
                 let mut freed = Vec::new();
