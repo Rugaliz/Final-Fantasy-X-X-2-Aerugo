@@ -566,10 +566,12 @@ impl Workers {
         let sys = self.sys.clone();
         let player_yaw = self.list.get(sys.player as usize).map_or(0.0, |p| p.pf(p::YAW));
         let (prev, cur) = (sys.player_prev, sys.player_pos);
+        // 866cc0 tests +0x35 bit 0 (the player was in the box itself last frame) before this frame's outcode
+        // updates it.
+        let was_in_box = self.list[w].u8(FLAGS + 1) & 1 != 0;
         let (inside, near, crossed, out_flags) =
             self.box_flags(w, [prev[0], prev[1], prev[2]], [cur[0], cur[1], cur[2]]);
-        let wk = &mut self.list[w];
-        if crossed && wk.u8(FLAGS + 1) & 1 == 0 {
+        if crossed && !was_in_box {
             env.signal(w, 4);
         }
         let wk = &mut self.list[w];

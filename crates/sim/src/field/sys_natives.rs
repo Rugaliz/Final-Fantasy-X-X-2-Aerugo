@@ -2548,7 +2548,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let v = c.stack.pop_float();
             let i = c.stack.pop_int();
-            g.values_5b98[usize::from(i != 0)] = v;
+            g.globals.reveal_speed[usize::from(i != 0)] = v;
             Value::Float(v)
         }),
     );

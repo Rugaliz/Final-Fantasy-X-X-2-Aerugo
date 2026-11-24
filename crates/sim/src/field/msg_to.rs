@@ -652,7 +652,7 @@ fn advance(t: &mut Text, speed: f32) {
 pub fn step(g: &mut FieldState, held: u32, image: &[u8]) {
     let stick = g.input.stick;
     g.menu_pad.frame(held, stick);
-    let speed = g.values_5b98[0];
+    let speed = g.globals.reveal_speed[0];
     for w in 0..g.windows.len() {
         if !g.windows[w].to.open {
             continue;

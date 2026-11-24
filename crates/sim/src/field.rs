@@ -302,6 +302,9 @@ pub struct Globals {
     /// the fog and background colours use both while the display flags' bit 2 is set.
     pub colour_mul: [f32; 4],
     pub colour_add: [f32; 4],
+    /// The text reveal speeds [1325b98] (0259; the message reveal reads entry 0): zero at boot (BSS), kept across
+    /// events.
+    pub reveal_speed: [f32; 2],
 }
 
 impl Default for Globals {
@@ -313,6 +316,7 @@ impl Default for Globals {
             save_read_1330230: 0,
             colour_mul: [0.0; 4],
             colour_add: [0.0; 4],
+            reveal_speed: [0.0; 2],
         }
     }
 }
@@ -828,6 +832,8 @@ pub struct FieldState {
     pub workers: crate::workers::Workers,
     /// Each worker's character record (the original's layout), once it binds a body.
     pub chrs: Vec<Option<crate::chr::Chr>>,
+    /// The event script header's area word (+0x1e) and, with its bit 15, its table (+0x28) — 870ef0.
+    pub area_table: Option<(u16, Vec<u16>)>,
     /// The event effect running in the sandbox (00db–00de).
     pub effects: effects::Effects,
     /// Each body's matrices from the last batch.
@@ -915,10 +921,6 @@ pub struct FieldState {
     pub achievements: Vec<i32>,
     /// The movie 01b0 asked the remaster to preload (number, mode & 0x80).
     pub movie_preload: Option<(i32, i32)>,
-    /// The two values 0259 sets; 4043's pair; 4039's bytes
-    /// ; the character light table 4023 allocates (0x2c bytes each: +0xc and +0x1c
-    /// 1.0, +0x28 the byte 402a sets).
-    pub values_5b98: [f32; 2],
     /// The message module's menu pad (pressed and repeating buttons).
     pub menu_pad: msg_to::MenuPad,
     /// The player control's heading state.
@@ -2395,6 +2397,19 @@ impl FieldState {
 
     /// 86a130: control off, then on again unless byte 1 bit 2 or byte 3 bits 0x84 block it, when byte 0 had 0x22
     /// before.
+    /// 870ef0: the event's area for index `n` — the header's area word, or with its bit 15 the n-th of its table
+    /// (past the table: the first); 0 without a script.
+    pub fn area_word(&self, n: u32) -> u16 {
+        match &self.area_table {
+            None => 0,
+            Some((w, _)) if w & 0x8000 == 0 => *w,
+            Some((w, t)) => {
+                let i = if (n as usize) < usize::from(w & 0x7fff) { n as usize } else { 0 };
+                t.get(i).copied().unwrap_or(0)
+            }
+        }
+    }
+
     pub fn control_refresh(&mut self) {
         let kept = self.workers.sys.flags0;
         self.control_off();
@@ -2675,6 +2690,24 @@ impl Event {
             kinds: script.workers.iter().map(|w| w.kind).collect(),
             cam_slots: vec![0; script.workers.len()],
             camera_worker: script.header_u16(0x18).unwrap_or(0xFFFF),
+            area_table: {
+                // The header's area word (+0x1e): with bit 15, a count of u16 areas at the u32 offset +0x28.
+                let w = script.header_u16(0x1e).unwrap_or(0);
+                let d = script.data();
+                let off =
+                    d.get(0x28..0x2c).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+                let table = if w & 0x8000 != 0 {
+                    (0..usize::from(w & 0x7fff))
+                        .map(|i| {
+                            d.get(off + i * 2..off + i * 2 + 2)
+                                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some((w, table))
+            },
             chr_worker_count: {
                 let h = |at| i32::from(script.header_u16(at).unwrap_or(0));
                 h(0x36) - h(0x1c) - h(0x16) - h(0x14)
@@ -4685,7 +4718,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let a = g.actor(c.worker);
             a.yaw = dir;
             a.move_heading = dir;
-            worker_natives::place_worker(g, c.worker, pos, false);
+            worker_natives::place_worker(g, &mut c.memory.global[0], c.worker, pos, false);
         }
         Value::Int(0)
     }
@@ -4784,7 +4817,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             if g.player == Some(c.worker) {
                 g.player_placed = true;
             }
-            worker_natives::place_worker(g, c.worker, [x, y, z], true);
+            worker_natives::place_worker(g, &mut c.memory.global[0], c.worker, [x, y, z], true);
             Value::Int(0)
         }),
     );

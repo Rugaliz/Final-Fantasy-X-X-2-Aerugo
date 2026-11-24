@@ -97,7 +97,13 @@ fn rot_target(g: &mut FieldState, c: &mut NativeCall, k: u32, facing: u32) -> Va
 
 /// Place a worker (the original's position set): its body goes there too, the player's tracked place moves, and
 /// unless placements keep the previous place (engine flag 0x10, `keep_prev` off) the previous place is the new one.
-pub(super) fn place_worker(g: &mut FieldState, w: usize, pos: [f32; 3], keep_prev_off: bool) {
+pub(super) fn place_worker(
+    g: &mut FieldState,
+    image: &mut [u8],
+    w: usize,
+    pos: [f32; 3],
+    keep_prev_off: bool,
+) {
     let Some(wk) = g.workers.list.get_mut(w) else { return };
     if wk.pos().is_none() {
         return;
@@ -108,9 +114,19 @@ pub(super) fn place_worker(g: &mut FieldState, w: usize, pos: [f32; 3], keep_pre
     let cam = wk.u32(workers::CAMERA);
     let keep = wk.flags() & 0x10 == 0 || keep_prev_off;
     if bound {
+        // 82b480 (position and previous position, moved flag 0x2000000, the triangle looked up again), then
+        // MsSetChrPosReset 824650: flag 0x10 unless flag 1 (835730) and Ch_ClothReset (no cloth in Aerugo).
         g.actor(w).pos = pos;
+        if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
+            ch.set_pos(pos);
+            let f = ch.u32(crate::chr::FLAGS);
+            if f & 1 == 0 {
+                ch.set_u32(crate::chr::FLAGS, f | 0x10);
+            }
+        }
     } else if bind == 2 {
-        let _ = cam;
+        // cam_set_vec(handle +0x3c, side 1, (pos, 1)).
+        g.cam.set_vec(cam, 1, [pos[0], pos[1], pos[2], 1.0]);
     }
     if g.workers.sys.player == w as i16 {
         let s = &mut g.workers.sys;
@@ -118,6 +134,20 @@ pub(super) fn place_worker(g: &mut FieldState, w: usize, pos: [f32; 3], keep_pre
         s.player_pos = [pos[0], pos[1], pos[2], 1.0];
         if keep {
             s.player_prev = s.player_pos;
+        }
+        // The ground flags of the player's body: save +0x10 = +0x828 bits 7–8 (0 without a body), save +0xe =
+        // the event's area for bits 11–12 (870ef0).
+        let flags = g.workers.list[w]
+            .chr_bound()
+            .then(|| g.chrs.get(w).and_then(Option::as_ref).map(|ch| ch.u32(0x828)))
+            .flatten();
+        let (ground, area) = flags.map_or((0, 0), |f| (f >> 7 & 3, f >> 11 & 3));
+        if let Some(b) = image.get_mut(0x10) {
+            *b = ground as u8;
+        }
+        let a = g.area_word(area);
+        if let Some(b) = image.get_mut(0xe..0x10) {
+            b.copy_from_slice(&a.to_le_bytes());
         }
     }
     let wk = &mut g.workers.list[w];
@@ -138,7 +168,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let z = c.stack.pop_float();
             let x = c.stack.pop_float();
-            place_worker(g, c.worker, [x, 0.0, z], false);
+            place_worker(g, &mut c.memory.global[0], c.worker, [x, 0.0, z], false);
             Value::Int(0)
         }),
     );
@@ -146,7 +176,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x0013,
         Native::result(|g, c| {
             let pos = pop3(c);
-            place_worker(g, c.worker, pos, false);
+            place_worker(g, &mut c.memory.global[0], c.worker, pos, false);
             Value::Int(0)
         }),
     );
