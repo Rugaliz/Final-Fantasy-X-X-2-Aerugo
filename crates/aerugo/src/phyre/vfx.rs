@@ -274,7 +274,29 @@ impl VfxRenderer {
                     }
                 })
             };
-            for seg in &mesh.segments {
+            // The remaster's depth correction of quads drawn with a work matrix: its effect projection is
+            // the view projection times the engine's view space.
+            let corrected = mesh.z_correction.map(|z| {
+                let view_projection = (projection * view).to_cols_array();
+                let p = aerugo_sim::chr::elements::mul(&view_projection, &z.view_space);
+                let p_inverse = aerugo_sim::chr::elements::vu0_inverse(&p);
+                mesh.segments
+                    .iter()
+                    .map(|seg| {
+                        let mut seg = seg.clone();
+                        for q in &seg.z_quads.clone() {
+                            let corners = aerugo_sim::ppp::vfx::z_correct(q, &p, &p_inverse, z.hold_at_w);
+                            for (j, c) in corners.iter().enumerate() {
+                                if let Some(at) = seg.positions.get_mut(usize::from(q.first) + j) {
+                                    *at = *c;
+                                }
+                            }
+                        }
+                        seg
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for seg in corrected.as_ref().unwrap_or(&mesh.segments) {
                 if seg.indices.is_empty() {
                     continue;
                 }

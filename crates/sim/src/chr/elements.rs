@@ -603,6 +603,49 @@ pub fn neck_init(ch: &mut super::Chr, parents: &[Option<usize>], joints: &[Joint
     ch.set_f32(0x41c, deg(super::wrap(f32::from_bits(0x3fc9_0fd8))));
 }
 
+/// The engine's 4×4 inverse (sceVu0InversMatrix4x4, behind the identity when a column is all zero): the
+/// cofactors over the determinant (none when it is 0: all zero). The original runs on the x87; the products
+/// and the cofactors are kept in single precision here as the decompile names them, the sums in double.
+pub fn vu0_inverse(m: &Mat) -> Mat {
+    if (0..4).any(|c| m[c * 4..c * 4 + 4].iter().all(|&v| v == 0.0)) {
+        return IDENTITY;
+    }
+    let r = |x: f64| x as f32;
+    let (m0, m1, m2, m3) = (d(m[0]), d(m[1]), d(m[2]), d(m[3]));
+    let (m4, m5, m6, m7) = (d(m[4]), d(m[5]), d(m[6]), d(m[7]));
+    let (m8, m9, m10, m11) = (d(m[8]), d(m[9]), d(m[10]), d(m[11]));
+    let (m12, m13, m14, m15) = (d(m[12]), d(m[13]), d(m[14]), d(m[15]));
+    let p = |a: f64, b: f64| d(r(a * b));
+    // The first eight cofactors' pair products.
+    let (f5, f11, f1, f6) = (p(m10, m15), p(m14, m11), p(m6, m15), p(m7, m14));
+    let (f9, f4, f2, f7) = (p(m6, m11), p(m7, m10), p(m2, m15), p(m3, m14));
+    let (f10, f12, f3, f8) = (p(m2, m11), p(m3, m10), p(m2, m7), p(m6, m3));
+    let mut c = [0.0f32; 16];
+    c[0] = r((m13 * f9 + m9 * f6 + f5 * m5) - (f11 * m5 + f1 * m9 + f4 * m13));
+    c[1] = r((m13 * f12 + m1 * f11 + f2 * m9) - (m13 * f10 + m1 * f5 + f7 * m9));
+    c[2] = r((m5 * f7 + m1 * f1 + f3 * m13) - (m5 * f2 + f6 * m1 + f8 * m13));
+    c[3] = r((m9 * f8 + m1 * f4 + m5 * f10) - (m9 * f3 + m1 * f9 + m5 * f12));
+    c[4] = r((m12 * f4 + m8 * f1 + m4 * f11) - (m12 * f9 + m8 * f6 + m4 * f5));
+    c[5] = r((m12 * f10 + m8 * f7 + m0 * f5) - (m12 * f12 + m8 * f2 + m0 * f11));
+    c[6] = r((m12 * f8 + m0 * f6 + m4 * f2) - (m12 * f3 + m0 * f1 + m4 * f7));
+    c[7] = r((m0 * f9 + m4 * f12 + m8 * f3) - (m0 * f4 + m4 * f10 + m8 * f8));
+    // The other eight's pair products (the original reuses four of its inputs' slots for them).
+    let (g7, g4, g6, g5) = (p(m13, m8), p(m9, m12), p(m4, m13), p(m5, m12));
+    let (g3, g2, h13, g8) = (p(m4, m9), p(m8, m5), p(m0, m13), p(m1, m12));
+    let (h9, g1, h5, h1) = (p(m0, m9), p(m1, m8), p(m0, m5), p(m1, m4));
+    c[8] = r((g5 * m11 + g7 * m7 + m15 * g3) - (g6 * m11 + g4 * m7 + g2 * m15));
+    c[9] = r((g1 * m15 + h13 * m11 + g4 * m3) - (h9 * m15 + m3 * g7 + g8 * m11));
+    c[10] = r((h5 * m15 + g8 * m7 + m3 * g6) - (h1 * m15 + h13 * m7 + g5 * m3));
+    c[11] = r((h1 * m11 + h9 * m7 + m3 * g2) - (h5 * m11 + g1 * m7 + m3 * g3));
+    c[12] = r((m6 * g4 + g6 * m10 + g2 * m14) - (g5 * m10 + m6 * g7 + g3 * m14));
+    c[13] = r((g8 * m10 + h9 * m14 + m2 * g7) - (m2 * g4 + h13 * m10 + g1 * m14));
+    c[14] = r((m2 * g5 + h1 * m14 + m6 * h13) - (m2 * g6 + h5 * m14 + m6 * g8));
+    c[15] = r((g1 * m6 + m2 * g3 + m10 * h5) - (m2 * g2 + h1 * m10 + h9 * m6));
+    let det = r(m12 * d(c[3]) + m8 * d(c[2]) + m0 * d(c[0]) + m4 * d(c[1]));
+    let k = if det == 0.0 { 0.0 } else { r(1.0 / d(det)) };
+    std::array::from_fn(|i| c[i] * k)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

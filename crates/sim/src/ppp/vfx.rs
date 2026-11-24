@@ -54,6 +54,27 @@ pub struct Segment {
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u16>,
     pub texture: Option<Texture>,
+    /// Quads whose depth the renderer corrects (shape pieces drawn with a work matrix).
+    pub z_quads: Vec<ZQuad>,
+}
+
+/// A quad that takes the remaster's depth correction (VertexGroupApplyZMatZClip): its four corners through
+/// the draw matrix and through the work matrix (one corner a column each), and where its vertices start in the
+/// segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZQuad {
+    pub first: u16,
+    pub drawn: Mat,
+    pub work: Mat,
+}
+
+/// What the renderer needs to correct a mesh's quads: the engine's view space as the remaster's
+/// projection takes it (the camera's view inverted with x and y negated), and whether a corrected depth is
+/// held at w (not on maps 0x21e8 and 0x4a6, nor for magic 0x2b9).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZCorrection {
+    pub view_space: Mat,
+    pub hold_at_w: bool,
 }
 
 /// One render entry's geometry for this frame.
@@ -70,13 +91,16 @@ pub struct Mesh {
     pub segments: Vec<Segment>,
     /// Every colour component at most 0.5.
     pub dim: bool,
+    /// Present when segments have quads to correct.
+    pub z_correction: Option<ZCorrection>,
 }
 
 /// What the builder reads from the engine.
 #[derive(Debug, Clone, Copy)]
 pub struct Scene {
-    /// The PS2 screen matrix and the inverse of the camera's view.
+    /// The PS2 screen matrix, the camera's view and its inverse.
     pub screen: Mat,
+    pub view: Mat,
     pub inverse_view: Mat,
     pub magic: u32,
     pub map_id: u32,
@@ -336,6 +360,7 @@ pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
         semi: d.semi,
         segments,
         dim,
+        z_correction: None,
     }
 }
 
@@ -462,15 +487,14 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
     if s.map_id == 0x76f && matches!(s.map_part, Some(3..=5)) && matrix[14] < 300.0 {
         matrix[14] = -10000.0;
     }
-    if d.work_matrix.is_some() {
+    if d.work_matrix.is_some() && d.flags & SHAPE_DEPTH_FADE != 0 {
         static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
             log::error!(
-                "GAP: a shape drawn with a work matrix (VertexGroupApplyZMatZClip: the HD projection's z \
-                 correction) is not ported"
+                "GAP: a depth-faded shape with a work matrix: its fade reads the corrected corner, which only \
+                 the renderer has; faded by the uncorrected one"
             );
         }
-        return Vec::new();
     }
     let colour = shape_colour(m, d.shape, d.colour, s.magic);
     let draw_colour: [f32; 4] = std::array::from_fn(|i| f32::from(colour[i]) * 0.007_812_5);
@@ -504,6 +528,18 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
             quad[j * 4 + 3] = 1.0;
         }
         let placed = mul(&matrix, &quad);
+        let work = d.work_matrix.map(|w| mul(&w, &quad));
+        if let Some(work) = work
+            && z_clipped(&placed, &work, &s.screen, corners)
+        {
+            // The clipped quad's indices are zeroed (its vertices are left as they were).
+            let seg = &mut segments[g];
+            seg.positions.extend([[0.0; 3]; 4]);
+            seg.colours.extend([[0.0; 4]; 4]);
+            seg.uvs.extend([[0.0; 2]; 4]);
+            seg.indices.extend([0; 6]);
+            continue;
+        }
         let mut piece_colour: [f32; 4] =
             std::array::from_fn(|i| f32::from(m.u8(header + i as u32)) * 0.003_906_25);
         if d.flags & SHAPE_DEPTH_FADE != 0 {
@@ -532,6 +568,9 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
         let v1 = v0 - h;
         let seg = &mut segments[g];
         let base = seg.positions.len() as u16;
+        if let Some(work) = work {
+            seg.z_quads.push(ZQuad { first: base, drawn: placed, work });
+        }
         for j in 0..4 {
             seg.positions.push([placed[j * 4], placed[j * 4 + 1], placed[j * 4 + 2]]);
             seg.colours.push(vertex_colour);
@@ -544,6 +583,10 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
     world[7] = 0.0;
     world[11] = 0.0;
     world[15] = 1.0;
+    let z_correction = d.work_matrix.map(|_| ZCorrection {
+        view_space: correction_view_space(&s.view),
+        hold_at_w: !(s.map_id == 0x21e8 || s.map_id == 0x4a6 || s.magic == 0x2b9),
+    });
     segments
         .into_iter()
         .zip(&entry.groups)
@@ -557,6 +600,104 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
             semi: false,
             segments: vec![seg],
             dim,
+            z_correction,
         })
         .collect()
+}
+
+/// The view space the remaster's effect projection is built on (UpdatePhyreViewProjectionMatrix): the
+/// camera's view inverted, x and y of each column negated, the w row (0, 0, 0, 1).
+pub fn correction_view_space(view: &Mat) -> Mat {
+    let mut n = crate::chr::elements::vu0_inverse(view);
+    for c in 0..4 {
+        n[c * 4] = -n[c * 4];
+        n[c * 4 + 1] = -n[c * 4 + 1];
+    }
+    n[3] = 0.0;
+    n[7] = 0.0;
+    n[11] = 0.0;
+    n[15] = 1.0;
+    n
+}
+
+/// A sum of products the way the original's x87 code keeps it: each partial sum stored to single precision.
+fn single_sum(start: f32, terms: [(f32, f32); 4]) -> f32 {
+    terms.iter().fold(start, |a, &(x, y)| (f64::from(a) + f64::from(x) * f64::from(y)) as f32)
+}
+
+/// A quotient, 0 for a zero divisor.
+fn ratio_or_zero(z: f32, w: f32) -> f32 {
+    if w == 0.0 { 0.0 } else { (f64::from(z) / f64::from(w)) as f32 }
+}
+
+/// VertexGroupApplyZMatZClip's clip test: the quad is dropped when its depths through the PS2 screen matrix
+/// all fall outside [0, 2²³]. Rectangle pieces test the work matrix's first corner (over its last corner's w)
+/// and the drawn last corner; four-corner pieces first test the work matrix's first two corners (a w that
+/// runs on across corners), then its third and the drawn last corner. (For that last one the original adds
+/// a stack word it never wrote; 0 here.)
+fn z_clipped(drawn: &Mat, work: &Mat, screen: &Mat, corners: bool) -> bool {
+    let s = screen;
+    let depth = |m: &Mat, c: usize, start: f32| {
+        single_sum(
+            start,
+            [(s[2], m[c * 4]), (s[6], m[c * 4 + 1]), (s[10], m[c * 4 + 2]), (s[14], m[c * 4 + 3])],
+        )
+    };
+    let w_of = |m: &Mat, c: usize, start: f32| {
+        single_sum(
+            start,
+            [(s[3], m[c * 4]), (s[7], m[c * 4 + 1]), (s[11], m[c * 4 + 2]), (s[15], m[c * 4 + 3])],
+        )
+    };
+    let inside = |v: f32| (0.0..=8_388_608.0).contains(&v);
+    let (third, last) = if corners {
+        let mut w = 0.0;
+        let mut d = [0.0f32; 3];
+        for (c, out) in d.iter_mut().enumerate() {
+            let z = depth(work, c, 0.0);
+            w = w_of(work, c, w);
+            *out = ratio_or_zero(z, w);
+        }
+        if inside(d[0]) || inside(d[1]) {
+            return false;
+        }
+        (d[2], ratio_or_zero(depth(drawn, 3, 0.0), w_of(drawn, 3, 0.0)))
+    } else {
+        (
+            ratio_or_zero(depth(work, 0, 0.0), w_of(work, 3, 0.0)),
+            ratio_or_zero(depth(drawn, 3, 0.0), w_of(drawn, 3, 0.0)),
+        )
+    };
+    !inside(third) && !inside(last)
+}
+
+/// The rest of VertexGroupApplyZMatZClip, which needs the renderer's projection `projection` (its view
+/// projection times [`ZCorrection::view_space`]) and its inverse: both corner sets through it; each drawn
+/// corner's depth becomes the work corner's depth scaled by the drawn w over the work w; a depth whose sign
+/// differs from w's goes to 0, one past w is held at w (with `hold_at_w`); back through the inverse, divided by
+/// w. The four corrected corners.
+pub fn z_correct(q: &ZQuad, projection: &Mat, inverse: &Mat, hold_at_w: bool) -> [[f32; 3]; 4] {
+    let mut v = mul(projection, &q.drawn);
+    let l = mul(projection, &q.work);
+    for c in 0..4 {
+        let k = ratio_or_zero(v[c * 4 + 3], l[c * 4 + 3]);
+        v[c * 4 + 2] = k * l[c * 4 + 2];
+    }
+    for c in 0..4 {
+        let (z, w) = (v[c * 4 + 2], v[c * 4 + 3]);
+        let product = w * z;
+        if product.is_nan() || product > 0.0 {
+            if hold_at_w && w.abs() < z.abs() {
+                v[c * 4 + 2] = w;
+            }
+        } else {
+            v[c * 4 + 2] = 0.0;
+        }
+    }
+    let v = mul(inverse, &v);
+    std::array::from_fn(|c| {
+        let w = v[c * 4 + 3];
+        let k = if w == 0.0 { 0.0 } else { (1.0 / f64::from(w)) as f32 };
+        [k * v[c * 4], v[c * 4 + 1] * k, v[c * 4 + 2] * k]
+    })
 }

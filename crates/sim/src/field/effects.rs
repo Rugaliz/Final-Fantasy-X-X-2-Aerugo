@@ -325,6 +325,7 @@ pub fn vfx_scene(g: &FieldState, magic: u32, map_part: Option<u32>) -> crate::pp
     let view = g.cam_view.unwrap_or(crate::chr::elements::IDENTITY);
     crate::ppp::vfx::Scene {
         screen: g.cam_screen.unwrap_or(crate::chr::elements::IDENTITY),
+        view,
         inverse_view: crate::ppp::driver::rigid_inverse(&view),
         magic,
         map_id: g.map_id,
