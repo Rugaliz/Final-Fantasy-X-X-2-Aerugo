@@ -327,6 +327,9 @@ pub struct Attachment {
     pub mount: i32,
     /// Hidden (024b).
     pub hidden: bool,
+    /// Parts hidden by number (Ch_ModelSetHide), and every part's alpha when one was set for all.
+    pub parts_hidden: Vec<bool>,
+    pub parts_alpha: Option<f32>,
 }
 
 /// One of the eight message windows: the event side's record (msg_window) and the message module's part.
@@ -3047,9 +3050,10 @@ fn pop3(c: &mut NativeCall<'_>) -> [f32; 3] {
     [x, y, z]
 }
 
-fn target(c: &mut NativeCall<'_>) -> usize {
+/// A worker by index as atel_worker_by_index takes it: negative or past the last is worker 0.
+fn target(g: &FieldState, c: &mut NativeCall<'_>) -> usize {
     let i = c.stack.pop_int();
-    if i < 0 { c.worker } else { i as usize }
+    usize::try_from(i).ok().filter(|&i| i < g.workers.list.len()).unwrap_or(0)
 }
 
 fn window(c: &mut NativeCall<'_>) -> usize {
@@ -3059,9 +3063,6 @@ fn window(c: &mut NativeCall<'_>) -> usize {
 /// Natives that set a value for later (an actor's, a worker's or the field's) and give back what the original
 /// returns; the values are kept by (native, worker) for the parts of the engine not ported yet.
 fn register_settings(n: &mut Natives<FieldState>) {
-    fn keep(g: &mut FieldState, id: u16, w: usize, values: Vec<Value>) {
-        g.settings.insert((id, w), values);
-    }
     // The entrance and the area id in the save image.
     n.register(
         0x0010,
@@ -3087,25 +3088,30 @@ fn register_settings(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // Two field switches; returns the first.
+    // 0114(a, b): system byte 2 bit 2 = a != 0, bit 1 = b != 0; returns a != 0.
     n.register(
         0x0114,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            keep(g, 0x0114, 0, vec![Value::Int(a), Value::Int(b)]);
+            let s = &mut g.workers.sys;
+            s.flags2 = s.flags2 & 0xf9 | u8::from(a != 0) << 2 | u8::from(b != 0) << 1;
             Value::Int(i32::from(a != 0))
         }),
     );
-    // An actor's value (as on|0x80000000, or 0), returned.
+    // 0148(v, worker): the worker's +0xbc = v | 0x80000000 (0 stays 0) and +0xb4 = −10000.0.
     n.register(
         0x0148,
         Native::result(|g, c| {
-            let chr = c.stack.pop_int();
+            let i = c.stack.pop_int();
             let v = c.stack.pop_int() as u32;
-            let stored = if v != 0 { v | 0x8000_0000 } else { 0 } as i32;
-            keep(g, 0x0148, chr.max(0) as usize, vec![Value::Int(stored)]);
-            Value::Int(stored)
+            let w = usize::try_from(i).ok().filter(|&w| w < g.workers.list.len()).unwrap_or(0);
+            let stored = if v != 0 { v | 0x8000_0000 } else { 0 };
+            if let Some(wk) = g.workers.list.get_mut(w) {
+                wk.set_u32(0xbc, stored);
+                wk.set_f32(0xb4, -10000.0);
+            }
+            Value::Int(stored as i32)
         }),
     );
     // A window's style byte; returns the window.
@@ -3191,6 +3197,9 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             let gr = c.stack.pop_float();
             let r = c.stack.pop_float();
             let w = c.worker;
+            if g.chrs.get(w).is_none_or(Option::is_none) {
+                return Value::Int(0);
+            }
             let a = g.actor(w);
             for (k, v) in [r, gr, b].into_iter().enumerate() {
                 a.color[k].set(v, frames);
@@ -3204,7 +3213,9 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
             let frames = c.stack.pop_int();
             let alpha = c.stack.pop_float();
             let w = c.worker;
-            g.actor(w).color[3].set(alpha, frames);
+            if g.chrs.get(w).is_some_and(Option::is_some) {
+                g.actor(w).color[3].set(alpha, frames);
+            }
             Value::Int(0)
         }),
     );
@@ -3391,21 +3402,25 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             })
         }),
     );
-    // A worker's position into three float variables (worker, x, y, z descriptors); a line's midpoint for
-    // line workers (kinds 2 and 5).
+    // 00a3(worker, x, y, z): a worker's position into three float variables (86a2f0): lines (kinds 2, 5) their two
+    // points' midpoint (pos +0 and +0x30); kind 4 workers have no position (the original reads through a null
+    // pointer: reported).
     n.register(
         0x00A3,
         Native::result(|g, c| {
             let z = c.stack.pop_int();
             let y = c.stack.pop_int();
             let x = c.stack.pop_int();
-            let w = target(c);
-            let kind = g.kinds.get(w).copied().unwrap_or(0);
-            let a = g.actors.get(w).cloned().unwrap_or_default();
-            let p = if matches!(kind, 2 | 5) {
-                std::array::from_fn(|k| (a.pos[k] + a.trigger.b[k]) * 0.5)
+            let w = target(g, c);
+            let Some(wk) = g.workers.list.get(w) else { return Value::Int(0) };
+            if wk.kind == 4 {
+                log::error!("GAP: 00a3 on a kind-4 worker (no position record)");
+                return Value::Int(0);
+            }
+            let p = if matches!(wk.kind, 2 | 5) {
+                std::array::from_fn(|k| (wk.pf(0x30 + k as u32 * 4) + wk.pf(k as u32 * 4)) * 0.5)
             } else {
-                a.pos
+                [wk.pf(0), wk.pf(4), wk.pf(8)]
             };
             let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
             for (desc, v) in [(x, p[0]), (y, p[1]), (z, p[2])] {
@@ -4671,29 +4686,40 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Collision radius (0 or below: back to the default); the result is the previous one.
+    // 5039(v): the body's collision radius base +0x4e4 = v (0 or below: the model block's +0x1c); the old one
+    // back (82b880); without a body 0.
     n.register(
         0x5039,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
-            let a = g.actor(c.worker);
-            let old = a.collision_radius();
-            a.radius = (v > 0.0).then_some(v);
+            let w = c.worker;
+            let model = g.actors.get(w).and_then(|a| a.model);
+            let base = model.and_then(|m| g.model_radii.get(&m).copied().flatten());
+            let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) else { return Value::Float(0.0) };
+            let old = ch.f32(0x4e4);
+            let v = if v.is_nan() || v > 0.0 { v } else { base.unwrap_or(old) };
+            ch.set_f32(0x4e4, v);
+            let a = g.actor(w);
+            a.radius = Some(v);
             Value::Float(old)
         }),
     );
-    // Place the worker. 0x126 is a warp: the player placed with it did not walk, so triggers see no movement
-    // that tick; a 0x13 placement counts as a move.
-    fn place(g: &mut FieldState, c: &mut NativeCall<'_>, warp: bool) -> Value {
-        let p = pop3(c);
-        if warp && g.player == Some(c.worker) {
-            g.player_placed = true;
-        }
-        let a = g.actor(c.worker);
-        a.pos = p;
-        Value::Int(0)
-    }
-    n.register(0x0126, Native::result(|g, c| place(g, c, true)));
+    // 0126(x, y, z): the worker placed as 0013 does, with the set's flag 1 (870b20); on event 0x9f a z between
+    // −35.6 and −35.5 also raises the music flag [1325b40].
+    n.register(
+        0x0126,
+        Native::result(|g, c| {
+            let [x, y, z] = pop3(c);
+            if g.scene == Some(0x9f) && -35.6 < z && z < -35.5 {
+                g.sound.music_0x25 = true;
+            }
+            if g.player == Some(c.worker) {
+                g.player_placed = true;
+            }
+            worker_natives::place_worker(g, c.worker, [x, y, z], true);
+            Value::Int(0)
+        }),
+    );
     // 5008 / 500d(v): the body's hide bit (+0x180 bit 0 = v; showing it marks +0x820 bit 2). In a battle on map
     // 0x21e8 only body 0x108a stays shown (the battle side is not ported: reported).
     for id in [0x5008u16, 0x500D] {
@@ -4854,7 +4880,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x5047,
         Native::result(|g, c| {
             let m = c.stack.pop_int();
-            let w = target(c);
+            let w = target(g, c);
             g.set_motion(w, m);
             Value::Int(0)
         }),

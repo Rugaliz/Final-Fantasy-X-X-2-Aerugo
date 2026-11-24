@@ -947,8 +947,17 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             if chr_of(g, c.worker).is_none() || model == 0 {
                 return Value::Int(0);
             }
-            // (The attached body's own part settings for models 3, 7, 0x10a0 and 0x1075 are not tracked yet.)
+            // The body (872190): its resident motions read (836870(model, 0)); model 3 hides part 1 and shows part
+            // 2, model 7 shows part 1, models 0x10a0 and 0x1075 set every part's alpha to 1.0.
             let mut ch = g.allocate_body(model as u16);
+            g.read_motion_file((0, 0, model as u16));
+            let (mut parts_hidden, mut parts_alpha) = (Vec::new(), None);
+            match model {
+                3 => parts_hidden = vec![false, true, false],
+                7 => parts_hidden = vec![false, false],
+                0x10a0 | 0x1075 => parts_alpha = Some(1.0),
+                _ => {}
+            }
             ch.set_u8(0x184, 0xf);
             let wk = &g.workers.list[c.worker];
             let (bind_id, flags) = (wk.u16(workers::BIND_ID), wk.u32(0xb08 + k as u32 * 4));
@@ -964,6 +973,12 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             ch.set_i32(0x1b8, parent_tag);
             ch.set_i32(0x1a0, mount);
             ch.set_u8(crate::chr::HEIGHT_MODE, 0);
+            // 82aa70(body, 0): off the walk mesh (bit 0x80), ground normal (0, −1, 0), no walk-mesh shade.
+            ch.set_f32(0x7c, 0.0);
+            ch.set_f32(0x80, -1.0);
+            ch.set_f32(0x84, 0.0);
+            let f = ch.u32(crate::chr::FLAGS);
+            ch.set_u32(crate::chr::FLAGS, (f | 0x80) & !0x40000);
             ch.set_u8(0x183, 0);
             let f = ch.u32(crate::chr::FLAGS);
             ch.set_u32(crate::chr::FLAGS, f & !(1 << 11) | (flags & 1) << 11);
@@ -972,8 +987,14 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             if g.attachments.len() <= c.worker {
                 g.attachments.resize(c.worker + 1, [None, None]);
             }
-            g.attachments[c.worker][k] =
-                Some(super::Attachment { model: model as u16, chr: ch, mount, hidden: false });
+            g.attachments[c.worker][k] = Some(super::Attachment {
+                model: model as u16,
+                chr: ch,
+                mount,
+                hidden: false,
+                parts_hidden,
+                parts_alpha,
+            });
             let wk = &mut g.workers.list[c.worker];
             wk.set_u32(0xaf4 + k as u32 * 4, 1);
             wk.set_i32(0xafc + k as u32 * 4, mount);
