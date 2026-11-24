@@ -234,7 +234,7 @@ pub struct Receivers {
     /// the manager never writes it (its allocation is not cleared) and the material samples the cleared dummy
     /// map through it, which reads zero wherever it points.
     pub light_view_projection: [Mat4; 2],
-    /// mainChrYPos: the mean height of the registered main characters' first instance (0 with none).
+    /// MainChrYPos: the mean height of the registered main characters' first instance (0 with none).
     pub main_chr_y: f32,
 }
 
@@ -682,7 +682,7 @@ impl Casters {
             .collect()
     }
 
-    /// mainChrYPos: the main character's first instance's height when it is registered and seen, else the
+    /// MainChrYPos: the main character's first instance's height when it is registered and seen, else the
     /// mean over the seen characters whose name starts with 'c', else over those starting with 'n', else 0.
     pub fn main_chr_y(&self) -> f32 {
         let y = |c: &Cell| c.instances.first().map_or(0.0, |i| i.world.w_axis.y);

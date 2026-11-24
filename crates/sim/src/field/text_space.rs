@@ -65,17 +65,17 @@ impl TextSpace {
         record_text(COMMANDS, table, cmd, if variant { 4 } else { 0 })
     }
 
-    /// 8ab280: item `id`'s name (kernel_item: field 0, 4 with the text variant).
+    /// Item `id`'s name (kernel_item: field 0, 4 with the text variant).
     pub fn item_name(&self, table: &aerugo_formats::KernelTable, id: u32, variant: bool) -> u32 {
         record_text(ITEMS, table, id, if variant { 4 } else { 0 })
     }
 
-    /// 790860: key item `id`'s name (kernel_rec(id & 0xfff, [11334c0]): field variant · 4).
+    /// Key item `id`'s name (kernel_rec(id & 0xfff): field variant · 4).
     pub fn key_item_name(&self, table: &aerugo_formats::KernelTable, id: u32, variant: bool) -> u32 {
         record_text(KEY_ITEMS, table, id, if variant { 4 } else { 0 })
     }
 
-    /// equip_name 7a0c50: name record `name` ([11363b4]), field owner · 4, or 0x1c + owner · 4 with the variant.
+    /// equip_name name record `name`, field owner · 4, or 0x1c + owner · 4 with the variant.
     pub fn equipment_name(
         &self,
         table: &aerugo_formats::KernelTable,

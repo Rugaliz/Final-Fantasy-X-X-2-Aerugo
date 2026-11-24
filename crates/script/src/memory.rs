@@ -195,7 +195,7 @@ mod tests {
         m.store_int(p, v.ty, 300, true);
         assert_eq!(m.load_int(p, v.ty), 127);
         let f = var(VarType::F32, 6, 8, 4);
-        let p = m.place(&f, 9, 0, [0; 3], 16); // index clamps to 3
+        let p = m.place(&f, 9, 0, [0; 3], 16); // Index clamps to 3
         assert_eq!(p, Place::Script(16 + 8 + 12));
         m.store_float(p, f.ty, 1.5, false);
         assert_eq!(m.load_float(p, f.ty), 1.5);

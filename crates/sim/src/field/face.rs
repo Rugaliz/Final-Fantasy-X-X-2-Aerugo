@@ -369,7 +369,7 @@ pub struct FaceSprite {
     pub name: String,
     /// Sub-texture ids by frame (indexing [`CharFace::textures`]).
     pub ids: Vec<u32>,
-    /// mUStart, mVStart, mUEnd, mVEnd.
+    /// MUStart, mVStart, mUEnd, mVEnd.
     pub uv: [f32; 4],
 }
 

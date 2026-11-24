@@ -249,7 +249,7 @@ impl App {
             frame.textures.clear();
             let presented = presented?;
             if !presented && self.platform.drawable_size().0 == 0 {
-                std::thread::sleep(Duration::from_millis(16)); // minimized
+                std::thread::sleep(Duration::from_millis(16)); // Minimized
             }
             self.apply_settings();
         }
@@ -674,11 +674,11 @@ mod tests {
     fn overrides_are_not_persisted_unless_changed() {
         let file = Settings::default();
         let mut launch = file.clone();
-        launch.graphics.frame_limit = 144; // from --fps-limit
-        launch.window.fullscreen = true; // from --fullscreen
+        launch.graphics.frame_limit = 144; // From --fps-limit
+        launch.window.fullscreen = true; // From --fullscreen
         let mut current = launch.clone();
-        current.ui.scale = 1.5; // edited in the UI
-        current.window.fullscreen = false; // toggled back in the UI
+        current.ui.scale = 1.5; // Edited in the UI
+        current.window.fullscreen = false; // Toggled back in the UI
         let saved = without_untouched_overrides(&current, &launch, &file);
         assert_eq!(saved.graphics.frame_limit, 0);
         assert!(!saved.window.fullscreen);

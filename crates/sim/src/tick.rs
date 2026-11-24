@@ -49,7 +49,7 @@ impl FixedTimestep {
         }
         let dropped_time = self.accumulator >= self.period;
         if dropped_time {
-            // keep the fractional part so interpolation stays continuous
+            // Keep the fractional part so interpolation stays continuous
             self.accumulator =
                 Duration::from_nanos((self.accumulator.as_nanos() % self.period.as_nanos()) as u64);
         }

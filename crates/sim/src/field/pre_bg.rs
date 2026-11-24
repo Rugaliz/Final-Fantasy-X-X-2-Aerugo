@@ -662,7 +662,7 @@ fn roll(s: &mut Scene, sine: &[f32]) {
 const LOCALIZED: [(u32, [i32; 9]); 2] =
     [(0xcbc, [0, 0xd, 7, 0xb, 9, 5, 0xd, 3, 0xd]), (0x199f, [2, 0, 6, 8, 7, 5, 2, 2, 8])];
 
-/// getLocMenuPageLayer: the layer of map `map` for language type `lang`, −1 when it has none.
+/// GetLocMenuPageLayer: the layer of map `map` for language type `lang`, −1 when it has none.
 fn localized_layer(lang: Option<u32>, map: u32) -> i32 {
     let Some(lang) = lang else { return -1 };
     let Some((_, t)) = LOCALIZED.iter().find(|(m, _)| *m == map) else { return -1 };
@@ -939,7 +939,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                 let u16_at =
                     |s: &[u8], a: usize| s.get(a..a + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
                 if g.map_id == 0x159c && u16_at(save, 0xbec) == 0x7e4 && page == 2 {
-                    g.page_flag_bf68 = true;
+                    g.bg_alternate = true;
                 }
                 g.page_switch = (1, page as i8, -1);
                 if save.len() >= 0xcc {

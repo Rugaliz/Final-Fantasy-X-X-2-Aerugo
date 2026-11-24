@@ -33,7 +33,7 @@ fn global(vm: &Vm, off: usize) -> i32 {
 
 #[test]
 fn arithmetic_comparisons_and_variables() {
-    // global[0] = (7 - 2) * 3 / 2 (int path); global[4] = 5 > 3; global[8] = 1.5 * 2.0 stored as int.
+    // Global[0] = (7 - 2) * 3 / 2 (int path); global[4] = 5 > 3; global[8] = 1.5 * 2.0 stored as int.
     let w = WorkerSrc {
         entries: vec![vec![
             imm(7),
@@ -69,7 +69,7 @@ fn arithmetic_comparisons_and_variables() {
 
 #[test]
 fn branches_loop_until_done() {
-    // count = 0; L0: count += 1; if count < 10 goto L0
+    // Count = 0; L0: count += 1; if count < 10 goto L0
     let w = WorkerSrc {
         entries: vec![vec![
             imm(0),
@@ -81,7 +81,7 @@ fn branches_loop_until_done() {
             Op(PUSHV, Some(0)),
             imm(10),
             op(0x0B),
-            Op(0x56, Some(0)), // pop into A, jump if non-zero
+            Op(0x56, Some(0)), // Pop into A, jump if non-zero
             op(END),
         ]],
         labels: vec![(0, 2)],

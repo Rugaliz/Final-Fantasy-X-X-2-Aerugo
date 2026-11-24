@@ -472,7 +472,7 @@ mod tests {
         d.extend([3, 2, 1, 0, 0, 0]);
         d.extend([1, 8, 0, 0, 0]);
         d.extend([5, 9, 0, 0, 0, 1, 0, 0, 0]);
-        d.extend([2, 5]); // cut off
+        d.extend([2, 5]); // Cut off
         let recs = parse(&d).unwrap();
         assert_eq!(recs.len(), 7);
         let runs = event_runs(&recs);
@@ -494,8 +494,8 @@ mod tests {
         assert_eq!(parse(&encode(&recs)).unwrap(), recs);
         // Version 2: depth before each instruction; a call taking 2 and pushing a result leaves depth 2 -> 1.
         let mut d = MAGIC_V2.to_vec();
-        d.extend([2, 0, 0, 0, 2, 0, 0, 0, 0, 0xB5, 0x01, 0x10]); // depth 2, call 0x1001
-        d.extend([2, 0, 0, 0, 1, 3, 0, 0, 0, 0xA0, 0, 0]); // depth 1 after
+        d.extend([2, 0, 0, 0, 2, 0, 0, 0, 0, 0xB5, 0x01, 0x10]); // Depth 2, call 0x1001
+        d.extend([2, 0, 0, 0, 1, 3, 0, 0, 0, 0xA0, 0, 0]); // Depth 1 after
         let recs = parse(&d).unwrap();
         let m = measured_arity(&recs);
         assert_eq!(m[&0x1001].keys().copied().collect::<Vec<_>>(), vec![2]);

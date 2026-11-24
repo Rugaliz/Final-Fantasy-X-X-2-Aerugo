@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn the_table_maps_property_sets_to_effect_files() {
         let t = parse_table(
-            "// comment VSP_ZMAT\nVfxDefaultShader.fx.phyre:VSP_ALPHA_MODULATE|VSP_ENABLE_TEXTURE\n\
+            "// Comment VSP_ZMAT\nVfxDefaultShader.fx.phyre:VSP_ALPHA_MODULATE|VSP_ENABLE_TEXTURE\n\
              VfxShapeShader.fx.phyre:VSP_ZMAT|VSP_ALPHA_MODULATE|VSP_ENABLE_TEXTURE\n",
         );
         assert_eq!(shader_for(&t, ENABLE_TEXTURE), Some("VfxDefaultShader.fx.phyre"));

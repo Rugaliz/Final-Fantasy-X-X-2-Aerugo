@@ -27,7 +27,7 @@ pub struct WindowSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphicsSettings {
-    /// fifo, fifo-relaxed, mailbox or immediate.
+    /// Fifo, fifo-relaxed, mailbox or immediate.
     pub present_mode: String,
     /// Frame rate cap in Hz; 0 = uncapped.
     pub frame_limit: u32,

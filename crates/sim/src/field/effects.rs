@@ -17,10 +17,10 @@ pub struct Effects {
     /// The loader's state (see the module notes) and the effect loaded.
     pub state: u8,
     pub id: i32,
-    /// The event system's effect flags: `hold` (an effect holds the event), `flag_b70`, `request` (the
+    /// The event system's effect flags: `hold` (an effect holds the event), `effect_flag`, `request` (the
     /// loader's request: 1 load, 4 freed).
     pub hold: u32,
-    pub flag_b70: u32,
+    pub effect_flag: u32,
     pub request: u32,
     /// The bodies' effects held off (0244) / let on (0245): bit 0x800 of the effect system's flags.
     pub et_flags: u32,
@@ -44,7 +44,7 @@ fn with_driver<T>(
     f: impl FnOnce(&mut crate::ppp::driver::Effect, &mut crate::ppp::driver::Host) -> T,
 ) -> Option<T> {
     let mut e = g.effects.effect.take()?;
-    let mut paused = g.map_effect_230fd34 != 0;
+    let mut paused = g.particle_pause != 0;
     let mut vu = g.effects.vu;
     let mut h = crate::ppp::driver::Host {
         ticking: true,
@@ -60,7 +60,7 @@ fn with_driver<T>(
     };
     let out = f(&mut e, &mut h);
     if paused {
-        g.map_effect_230fd34 = 1;
+        g.particle_pause = 1;
     }
     g.effects.vu = vu;
     g.effects.effect = Some(e);
@@ -178,7 +178,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native {
             init: Some(|g, c| {
                 c.scratch[0] = c.stack.pop_int();
-                g.effects.flag_b70 = 0;
+                g.effects.effect_flag = 0;
                 g.effects.hold = 1;
             }),
             wait: Some(|g, c| {

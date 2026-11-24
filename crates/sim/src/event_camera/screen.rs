@@ -241,8 +241,8 @@ impl CamMem {
         }
     }
 
-    /// 7bcf20: the heading of the current record ([2311430], the last screen slot stepped) on x/z from its eye
-    /// (side 1's output, +0x66c) to its focus (side 0's, +0x50), as 7c4990 makes it: atan(dz / dx), less π for
+    /// The heading of the current record (the last screen slot stepped) on x/z from its eye
+    /// (side 1's output, +0x66c) to its focus (side 0's, +0x50), as the camera's polar angle makes it: atan(dz / dx), less π for
     /// dx ≤ 0, ±π/2 (by dz's sign) for dx = 0.
     pub fn heading(&self) -> f32 {
         let r = self.screen_record;

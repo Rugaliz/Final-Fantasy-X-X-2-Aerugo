@@ -552,7 +552,7 @@ impl FieldView {
                         ui.label("File ffx_");
                         ui.add(egui::DragValue::new(slot).range(0..=999));
                         if ui.button("Save").clicked() {
-                            // The remaster's own file (header 8b3e60, checksum 648f20); the counter goes up per save.
+                            // The remaster's own file (its header and checksum); the counter goes up per save.
                             ev.state.globals.save_counter = ev.state.globals.save_counter.saturating_add(1);
                             let counter = ev.state.globals.save_counter;
                             let lang = ev.state.language_type.unwrap_or(0) as u8;
@@ -1519,7 +1519,7 @@ fn message_canvas(
             continue;
         }
         drawn.push(i);
-        // The current page with its macros as their texts (8b6660).
+        // The current page with its macros as their texts.
         let page_bytes = aerugo_sim::field::msg_to::page_bytes(st, image, i);
         let page = page_bytes.as_slice();
         let kind = msgwin::TextKind::from_flags(w.flags as u16);

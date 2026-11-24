@@ -109,7 +109,7 @@ mod tests {
     fn lowpass_rejects_content_above_the_cutoff() {
         // Downsampling 2:1: a tone at 0.8 of the source Nyquist must be strongly attenuated.
         let t = SincTable::new(0.5);
-        let f = 0.4; // cycles per source sample (0.8 × Nyquist)
+        let f = 0.4; // Cycles per source sample (0.8 × Nyquist)
         let src = |i: i64| (2.0 * std::f64::consts::PI * f * i as f64).sin() as f32;
         let peak = (100..400).map(|n| t.interpolate(n as f64 * 2.0 + 0.25, src).abs()).fold(0.0, f32::max);
         assert!(peak < 0.05, "leak {peak}");

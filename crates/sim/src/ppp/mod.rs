@@ -393,7 +393,7 @@ pub struct ModelDraw {
     /// The update: semi-transparent (flag 4) or solid; `finish` the extra pass pppDrawMdlSemi3 asks for.
     pub semi: bool,
     pub finish: bool,
-    /// pppDrawMdl's fade parameters (the key's two words and the work's value).
+    /// PppDrawMdl's fade parameters (the key's two words and the work's value).
     pub fade: Option<(u32, u32, f32)>,
 }
 

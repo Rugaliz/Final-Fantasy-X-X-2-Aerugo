@@ -38,7 +38,7 @@ pub struct Block {
     pub scale: f32,
 }
 
-/// The values a block has without an info block (825ee0's defaults).
+/// The values a block has without an info block (the model block set-up's defaults).
 impl Default for Block {
     fn default() -> Self {
         Block { h24: 1.0, h28: 0.0, h2c: 8.0, scale: 1.0 }
@@ -48,17 +48,17 @@ impl Default for Block {
 /// Character engine switches natives set (two flags, a map mode byte).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Globals {
-    pub flag_b1: u8,
-    pub flag_b2: u8,
-    pub byte_778: u8,
+    pub switch_400e: u8,
+    pub switch_400f: u8,
+    pub mode_403a: u8,
     /// Body 0x66 plays motion 0x21092 (the remaster checks it).
     pub motion_21092: u8,
     /// The second water height (403c; the bodies' step takes the higher of it and the water level), the map
     /// alpha mode (4034) and two more switches (4045, 4046).
     pub water2: f32,
     pub map_alpha: u8,
-    pub byte_7c5: u8,
-    pub byte_8fd: u8,
+    pub switch_4045: u8,
+    pub switch_4046: u8,
 }
 
 /// One character record.

@@ -319,7 +319,7 @@ mod tests {
         let mut block = [0u8; 16];
         block[0] = 255; // a0
         block[1] = 0; // a1
-        block[2] = 0b0000_1000; // pixel 0 -> index 0 (255), pixel 1 -> index 1 (0)
+        block[2] = 0b0000_1000; // Pixel 0 -> index 0 (255), pixel 1 -> index 1 (0)
         let px = decode_rgba8(PixelFormat::Bc3, 4, 4, &block).unwrap();
         assert_eq!(px[3], 255);
         assert_eq!(px[7], 0);

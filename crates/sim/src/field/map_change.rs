@@ -52,7 +52,7 @@ fn set_byte(save: &mut [u8], at: usize, v: u8) {
     }
 }
 
-/// The save's map and entrance for the change (the original's 88ea60).
+/// The save's map and entrance for the change (the save's place words shifted, as the original's map change does).
 fn shift_save(g: &mut FieldState, save: &mut [u8], target: i32, entrance: i8) {
     if target == RESET_TARGET {
         log::error!("GAP: map change to the software reset target {RESET_TARGET} (soft reset not ported)");
@@ -80,7 +80,7 @@ fn shift_save(g: &mut FieldState, save: &mut [u8], target: i32, entrance: i8) {
     g.map_change = Some(MapChange { frames: 0, extra: 0 });
 }
 
-/// A map change request (the original's 86ff40): `with_fade` for 0011 / 00ab.
+/// A map change request: `with_fade` for 0011 / 00ab.
 pub fn request(g: &mut FieldState, c: &mut NativeCall, target: i32, entrance: i8, with_fade: bool) {
     // The original's other gate is its debug switch, off in a release build.
     if g.workers.sys.flags0 & 0x80 == 0 {
@@ -89,7 +89,7 @@ pub fn request(g: &mut FieldState, c: &mut NativeCall, target: i32, entrance: i8
     g.control_off();
     let save = &mut c.memory.global[0];
     shift_save(g, save, target, entrance);
-    // A battle asked for but not started is dropped (781530; its keep switch is a debug setting).
+    // A battle asked for but not started is dropped (its keep switch is a debug setting).
     if matches!(g.battle, Some((_, false))) {
         g.battle = None;
     }

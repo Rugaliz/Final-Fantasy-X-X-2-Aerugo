@@ -1,7 +1,7 @@
 //! Saves. The game state scripts read and write by offset is the **save image** (global block 0 of the script
 //! machine). Aerugo keeps it in its own container with the place to resume and a checksum, and reads and writes
 //! the remaster's own save files (`FINAL FANTASY X/ffx_NNN`: a 0x40-byte header, then the image), as
-//! TkMenuPreSave → 8b3e60 / 648f20 write them and 647d70 checks them.
+//! TkMenuPreSave writes them and the load checks them.
 
 use aerugo_formats::Game;
 
@@ -29,7 +29,7 @@ pub enum SaveError {
     SteamChecksum(u16, u32, u16),
 }
 
-/// The remaster's save checksum (8b1450): CRC-16, polynomial 0x1021 MSB first, start 0xffff, inverted at the end;
+/// The remaster's save checksum: CRC-16, polynomial 0x1021 MSB first, start 0xffff, inverted at the end;
 /// the table is built for entries 0..=0xfe only (entry 0xff stays 0, as the original's loop bound leaves it).
 pub fn steam_crc(data: &[u8]) -> u16 {
     let mut t = [0u16; 256];
@@ -48,7 +48,7 @@ pub fn steam_crc(data: &[u8]) -> u16 {
 }
 
 /// The checksum word in the image (+0x64b4, a u32 holding the CRC) and the span the CRC covers (the image up to
-/// and including that word, which counts as 0): 648f20 / 647d70.
+/// and including that word, which counts as 0), as the save writes and the load checks it.
 const STEAM_CRC_AT: usize = 0x64B4;
 const STEAM_CRC_LEN: usize = 0x64B8;
 
@@ -58,8 +58,8 @@ fn steam_image_crc(image: &[u8]) -> u16 {
     steam_crc(&img)
 }
 
-/// The header of a remaster save (8b3e60) for `image` (already with its +0x2a set): the save counter (the
-/// session's, capped at 0x80000000), the menu's party list (8a8f40: the three active slots, then the 17 reserve
+/// The header of a remaster save for `image` (already with its +0x2a set): the save counter (the
+/// session's, capped at 0x80000000), the menu's party list (the three active slots, then the 17 reserve
 /// slots, neither 0xff nor 7, then characters 0–6 that joined (+0x55f8 + c·0x94 bit 4) not listed yet; only the
 /// first before story 0x10; 0xff after it up to the seventh), +4 = 1, the language type, +5..+7 = the active
 /// slots (from story 0x10; 6 shows as 7 before story 300), the u32 at +0xbc, the play time word +0x3d48, the
@@ -238,7 +238,7 @@ impl SaveGame {
     }
 
     /// The save image of a Steam release save file (FFX): a 0x40-byte header, then the image. The checksum is
-    /// checked as 647d70 does (the header word and the image's +0x64b4 equal, and the CRC of the image up to it).
+    /// checked as the load does (the header word and the image's +0x64b4 equal, and the CRC of the image up to it).
     pub fn import_steam(game: Game, d: &[u8]) -> Result<SaveGame, SaveError> {
         let need = STEAM_HEADER_SIZE + FFX_IMAGE_SIZE;
         if d.len() < need {
@@ -262,7 +262,7 @@ impl SaveGame {
 }
 
 impl SaveGame {
-    /// The remaster's save file for this save (8b3e60 then 648f20): the image's +0x2a set (88ea50: the load
+    /// The remaster's save file for this save: the image's +0x2a set (the load
     /// resumes at the saved place), its checksum word, and the header before it.
     pub fn export_steam(&self, counter: u32, language_type: u8) -> Vec<u8> {
         let mut image = self.image.clone();

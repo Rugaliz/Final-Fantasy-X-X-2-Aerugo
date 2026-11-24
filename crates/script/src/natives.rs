@@ -316,7 +316,7 @@ pub trait World {
     fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
     /// A request started on a worker's level, or the level started over.
     fn level_started(&mut self, _w: usize, _level: u8) {}
-    /// The engine's part of the worker run gate (atel_run_worker 8641e0) past the worker's on bit.
+    /// The engine's part of the worker run gate (atel_run_worker) past the worker's on bit.
     fn may_run(&mut self, _w: usize) -> bool {
         true
     }
@@ -337,7 +337,7 @@ pub fn heading(x1: f32, z1: f32, x2: f32, z2: f32) -> f32 {
     }
 }
 
-/// angle_wrap (88bc20): ±2π (floats) until within [−π, π]; NaN comes back as it is. An infinite angle never gets
+/// angle_wrap: ±2π (floats) until within [−π, π]; NaN comes back as it is. An infinite angle never gets
 /// there (the original loops for ever): reported and returned.
 pub fn wrap_angle(mut a: f32) -> f32 {
     if a.is_infinite() {
@@ -353,7 +353,7 @@ pub fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-/// TkMtRsin (88c690): the quarter-wave table read by quadrant; a turn is 0x8000, the result in 1/32768.
+/// TkMtRsin: the quarter-wave table read by quadrant; a turn is 0x8000, the result in 1/32768.
 fn rsin(a: i32) -> i32 {
     let t = &crate::rsin::RSIN;
     let u = (a & 0x7FFF) as usize;
@@ -366,7 +366,7 @@ fn ftol(v: f32) -> i32 {
     if (-2147483648.0..2147483648.0).contains(&v) { v as i32 } else { i32::MIN }
 }
 
-/// 88c040 / 88bfe0: angle_wrap(v), plus 2π when below 0, times `n` over 2π (in extended), truncated.
+/// angle_wrap(v), plus 2π when below 0, times `n` over 2π (in extended), truncated.
 fn turn_units(v: f32, n: f64) -> i32 {
     let mut w = wrap_angle(v);
     if w < 0.0 {
@@ -430,7 +430,7 @@ fn register_common<G>(n: &mut Natives<G>) {
     n.register(0x100A, Native::result(|_, c| Value::Int(c.stack.pop_int())));
     n.register(0x100B, Native::result(|_, c| Value::Int(c.stack.pop_int().wrapping_shl(15))));
     n.register(0x100C, Native::result(|_, c| Value::Int(ftol(c.stack.pop_float() * 32768.0))));
-    // 100d / 100e (88c040 / 88bfe0): the wrapped angle (2π added when below 0) as 1/32768 or 1/4096 of a turn.
+    // 100d / 100e: the wrapped angle (2π added when below 0) as 1/32768 or 1/4096 of a turn.
     n.register(0x100D, Native::result(|_, c| Value::Int(turn_units(c.stack.pop_float(), 32768.0) & 0x7FFF)));
     n.register(0x100E, Native::result(|_, c| Value::Int(turn_units(c.stack.pop_float(), 4096.0) & 0xFFF)));
     n.register(
@@ -450,7 +450,7 @@ fn register_common<G>(n: &mut Natives<G>) {
         }),
     );
     n.register(0x1013, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
-    // 1014(a, b, step) (88b570): a turned toward b by at most step: d = wrap(b − a); when |d| reaches step,
+    // 1014(a, b, step): a turned toward b by at most step: d = wrap(b − a); when |d| reaches step,
     // a ± step (+ for d ≥ 0), else b; wrapped.
     n.register(
         0x1014,

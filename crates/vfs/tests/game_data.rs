@@ -36,7 +36,7 @@ fn sampled_entries_decompress_to_their_declared_size() {
         let step = (entries.len() / 200).max(1);
         for e in entries.iter().step_by(step).chain(entries.last()) {
             if e.size > 64 << 20 {
-                continue; // skip very large videos here
+                continue; // Skip very large videos here
             }
             let data = archive.read(e).unwrap_or_else(|err| panic!("{err}"));
             assert_eq!(data.len() as u64, e.size, "{}", e.path);

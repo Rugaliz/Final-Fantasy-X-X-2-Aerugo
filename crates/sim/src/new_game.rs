@@ -199,7 +199,7 @@ fn init_save_work(save: &mut [u8]) {
     save[0x1ec..0x1ec + 0x1000].fill(0);
 }
 
-/// eiAbmDataInit on the save's sphere grid (+0x21ec): the layout of the type the settings pick (node kinds),
+/// EiAbmDataInit on the save's sphere grid (+0x21ec): the layout of the type the settings pick (node kinds),
 /// each character's starting nodes and start positions.
 fn sphere_grid_init(t: &NewGameTables, save: &mut [u8]) {
     const GRID: usize = 0x21ec;

@@ -286,38 +286,38 @@ pub struct System {
     pub flags210: u32,
     /// Every joined member is free (the party code's global flag) and the flag 00ca(0xf) sets.
     pub full_member: u8,
-    pub party_ac8: u8,
+    pub party_flag_00ca: u8,
     /// The value 0212 sets (+0x208).
     pub value208: f32,
     /// The switch mask 0220 sets bits of.
-    pub mask_b90: u32,
+    pub mask_0220: u32,
     /// The value 025d keeps.
-    pub value_ac4: i32,
+    pub value_025d: i32,
     /// The mask 018a/018b set bits of, and the three values 014a keeps.
-    pub mask_b74: u32,
-    pub values_b48: [i32; 3],
+    pub mask_018a: u32,
+    pub battle_return_params: [i32; 3],
     /// The worker each body slot names (0158).
     pub body_slots: [i32; 16],
     /// Frames run since the setup ended (+500).
     pub frames: i32,
     /// c009's value and c051's switch.
-    pub byte_11f: u8,
-    pub switch_832: u8,
+    pub value_c009: u8,
+    pub switch_c051: u8,
     /// The event effect mask (00db clears it, 017b clears a bit).
-    pub mask_b70: u32,
+    pub effect_mask: u32,
     /// A byte the battle code sets (7035 reads it).
-    pub battle_9f1: u8,
+    pub battle_byte_7035: u8,
     /// The event effect flag (00db raises it, the effect's end lowers it) and a byte 01bf sets.
-    pub effect_b58: i32,
-    pub byte_b81: u8,
+    pub effect_up: i32,
+    pub byte_01bf: u8,
     /// The system block's +0x1a (0158/0159 do nothing while it is set).
-    pub word_1a: i16,
+    pub slot_lock: i16,
     /// The four values 01c0 sets and the four 022e sets.
-    pub values_ce0: [i32; 4],
-    pub values_cf0: [i32; 4],
+    pub values_01c0: [i32; 4],
+    pub values_022e: [i32; 4],
 }
 
-/// The block as the original's setup (86ee10) leaves it, turned on (871190): byte 0 0x80 | 1, byte 1 0x98, byte 2
+/// The block as the original's setup leaves it, turned on: byte 0 0x80 | 1, byte 1 0x98, byte 2
 /// 0xc8, byte 3 0x30, the +0x210 word 0x49.
 impl Default for System {
     fn default() -> Self {
@@ -337,23 +337,23 @@ impl Default for System {
             flags0: 0x81,
             flags210: 0x49,
             full_member: 0,
-            party_ac8: 0,
+            party_flag_00ca: 0,
             value208: 0.0,
-            mask_b90: 0,
-            value_ac4: 0,
-            mask_b74: 0,
-            values_b48: [0; 3],
+            mask_0220: 0,
+            value_025d: 0,
+            mask_018a: 0,
+            battle_return_params: [0; 3],
             body_slots: [0; 16],
             frames: 0,
-            byte_11f: 0,
-            switch_832: 0,
-            mask_b70: 0,
-            battle_9f1: 0,
-            effect_b58: 0,
-            byte_b81: 0,
-            word_1a: 0,
-            values_ce0: [0; 4],
-            values_cf0: [0; 4],
+            value_c009: 0,
+            switch_c051: 0,
+            effect_mask: 0,
+            battle_byte_7035: 0,
+            effect_up: 0,
+            byte_01bf: 0,
+            slot_lock: 0,
+            values_01c0: [0; 4],
+            values_022e: [0; 4],
         }
     }
 }

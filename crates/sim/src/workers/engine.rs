@@ -76,7 +76,7 @@ impl Workers {
         }
     }
 
-    /// Kind 5 (868020): AtelDecodeCommand for the worker named at +0x28 of the position block, then for each
+    /// Kind 5: AtelDecodeCommand for the worker named at +0x28 of the position block, then for each
     /// entry of the command list (+0x2e4: 8 × 8 bytes, i16 worker (−1 none), i16 on, …) — nothing ported sets
     /// that list, so it is reported if it is ever there.
     fn decode_commands(&mut self, w: usize, env: &mut dyn Env) {
@@ -90,11 +90,11 @@ impl Workers {
         }
     }
 
-    /// AtelDecodeCommand (8680a0) for the main target: the step of `target` (0xffff: the player, the system's
+    /// AtelDecodeCommand for the main target: the step of `target` (0xffff: the player, the system's
     /// +0x228 → +0x218; else the worker by index, its position block +0x10 → +0) across the line from the worker's
-    /// position to its second point (+0x30); a crossing (889bb0) within the height (+0x1c ≤ 0: any; else the
-    /// heights at the crossing (889e90) at most that far apart) sets the side in the second flags (bit 1 for a
-    /// positive side, else bits 1–2 cleared) and raises signal 4 (8764f0(0xffff, w, 4)). Tested only when the
+    /// position to its second point (+0x30); a crossing within the height (+0x1c ≤ 0: any; else the
+    /// heights at the crossing at most that far apart) sets the side in the second flags (bit 1 for a
+    /// positive side, else bits 1–2 cleared) and raises signal 4 (an engine signal from no worker). Tested only when the
     /// target moved on x or z, or the second flags' bit 0 asks for it (cleared then).
     fn decode_command(&mut self, w: usize, target: u16, env: &mut dyn Env) {
         let (prev, cur) = if target == 0xffff {
@@ -566,7 +566,7 @@ impl Workers {
         let sys = self.sys.clone();
         let player_yaw = self.list.get(sys.player as usize).map_or(0.0, |p| p.pf(p::YAW));
         let (prev, cur) = (sys.player_prev, sys.player_pos);
-        // 866cc0 tests +0x35 bit 0 (the player was in the box itself last frame) before this frame's outcode
+        // The box test reads +0x35 bit 0 (the player was in the box itself last frame) before this frame's outcode
         // updates it.
         let was_in_box = self.list[w].u8(FLAGS + 1) & 1 != 0;
         let (inside, near, crossed, out_flags) =

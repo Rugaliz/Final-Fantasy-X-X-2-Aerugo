@@ -281,7 +281,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x8066,
         Native::result(|g, c| {
-            g.map_effect_230fd34 = c.stack.pop_int();
+            g.particle_pause = c.stack.pop_int();
             Value::Int(1)
         }),
     );
@@ -335,7 +335,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x800B,
         Native::result(|g, c| {
-            // 91b130: a negative id counts as 0.
+            // A negative id counts as 0.
             let v = c.stack.pop_int().max(0) as u32;
             let w = &mut g.workers.list[c.worker];
             if w.kind == 1 {
@@ -404,7 +404,7 @@ pub fn register(n: &mut Natives<FieldState>) {
     n.register(
         0x805C,
         Native::result(|g, c| {
-            g.map_switch_5eb8 = u8::from(c.stack.pop_int() != 0);
+            g.map_display_switch = u8::from(c.stack.pop_int() != 0);
             Value::Int(1)
         }),
     );
@@ -468,7 +468,7 @@ pub fn frame_draw(g: &mut FieldState) {
     let mut h = MapHost {
         view: g.cam_view.unwrap_or(IDENTITY),
         screen: g.cam_screen.unwrap_or(IDENTITY),
-        paused: g.map_effect_230fd34 != 0,
+        paused: g.particle_pause != 0,
         vu: &mut g.effects.vu,
         crt: &mut g.crt_rand,
         event: u32::from(g.scene.unwrap_or(0)),
@@ -541,7 +541,7 @@ pub struct MapHost<'a> {
     pub map_id: u32,
 }
 
-/// The screen-quadrant code of a projected point (x beyond ±0.8888889: 1 / 2; y beyond ±0.5: 4 / 8).
+/// The screen-quadrant code of a projected point (x beyond ±0.1 / 2; y beyond ±0.5: 4 / 8).
 fn quadrant(x: f32, y: f32) -> u32 {
     let mut c = if x < -0.888_888_9 {
         1

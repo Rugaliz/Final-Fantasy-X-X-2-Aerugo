@@ -31,7 +31,7 @@ pub struct ShapeSlot {
     /// Scale ×1/256 on x and y.
     pub scale: [u16; 2],
     pub frame: u16,
-    /// r, g, b, alpha.
+    /// R, g, b, alpha.
     pub color: [u8; 4],
     /// Where the shape data is.
     pub data: Option<Place>,

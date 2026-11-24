@@ -256,7 +256,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         }),
     );
     // 0265: a switch only the debug menu toggles.
-    n.register(0x0265, Native::result(|g, _| Value::Int(g.debug_cccacc)));
+    n.register(0x0265, Native::result(|g, _| Value::Int(g.debug_menu_switch)));
     // 01d9: character 6's name becomes save text 0x2c (field 0, 4 with the text variant); returns 1.
     n.register(
         0x01D9,
@@ -728,8 +728,8 @@ pub(super) fn register_chr(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 5051 / 5075(worker): the body's motion clock +0x740 (839860; 0 without a body). Aerugo's motion player keeps
-    // that clock (chr_motion_start sets it to the range start, 8392d0 advances and loops it).
+    // 5051 / 5075(worker): the body's motion clock +0x740 (0 without a body). Aerugo's motion player keeps
+    // that clock (chr_motion_start sets it to the range start, the motion update advances and loops it).
     fn motion_clock(g: &mut FieldState, w: usize) -> i32 {
         if chr_of(g, w).is_none() {
             return 0;
@@ -940,7 +940,7 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             if chr_of(g, c.worker).is_none() || model == 0 {
                 return Value::Int(0);
             }
-            // The body (872190): its resident motions read (836870(model, 0)); model 3 hides part 1 and shows part
+            // The body: its resident motions read (836870(model, 0)); model 3 hides part 1 and shows part
             // 2, model 7 shows part 1, models 0x10a0 and 0x1075 set every part's alpha to 1.0.
             let mut ch = g.allocate_body(model as u16);
             g.read_motion_file((0, 0, model as u16));
@@ -966,7 +966,7 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             ch.set_i32(0x1b8, parent_tag);
             ch.set_i32(0x1a0, mount);
             ch.set_u8(crate::chr::HEIGHT_MODE, 0);
-            // 82aa70(body, 0): off the walk mesh (bit 0x80), ground normal (0, −1, 0), no walk-mesh shade.
+            // The body off the walk mesh (bit 0x80), ground normal (0, −1, 0), no walk-mesh shade.
             ch.set_f32(0x7c, 0.0);
             ch.set_f32(0x80, -1.0);
             ch.set_f32(0x84, 0.0);
@@ -1395,7 +1395,7 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
         0x5084,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
-            // 835020: 0 stands for 6.0.
+            // 0 stands for 6.0.
             if let Some(ch) = chr_of(g, c.worker) {
                 ch.set_f32(0x420, if v == 0.0 { 6.0 } else { v });
             }
@@ -1435,13 +1435,13 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 0158(slot) (85cfa0): while the system's +0x1a word is 0: the body's +0x184 (bound to a body, 835b50), the
-    // worker's +0xaf, and slots below 16 name the worker (885fd0); returns the slot.
+    // 0158(slot): while the system's +0x1a word is 0: the body's +0x184 (bound to a body), the
+    // worker's +0xaf, and slots below 16 name the worker; returns the slot.
     n.register(
         0x0158,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            if g.workers.sys.word_1a != 0 {
+            if g.workers.sys.slot_lock != 0 {
                 return Value::Int(v);
             }
             let bound = g.workers.list[c.worker].u8(workers::BIND) == 1;
@@ -1497,21 +1497,21 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
     n.register(
         0x400E,
         Native::result(|g, c| {
-            g.chr_globals.flag_b1 = (c.stack.pop_int() & 1) as u8;
+            g.chr_globals.switch_400e = (c.stack.pop_int() & 1) as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x400F,
         Native::result(|g, c| {
-            g.chr_globals.flag_b2 = (c.stack.pop_int() & 1) as u8;
+            g.chr_globals.switch_400f = (c.stack.pop_int() & 1) as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x403A,
         Native::result(|g, c| {
-            g.chr_globals.byte_778 = c.stack.pop_int() as u8;
+            g.chr_globals.mode_403a = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
@@ -1532,14 +1532,14 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
     n.register(
         0x4045,
         Native::result(|g, c| {
-            g.chr_globals.byte_7c5 = c.stack.pop_int() as u8;
+            g.chr_globals.switch_4045 = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x4046,
         Native::result(|g, c| {
-            g.chr_globals.byte_8fd = c.stack.pop_int() as u8;
+            g.chr_globals.switch_4046 = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
@@ -1807,7 +1807,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             if b < 8 {
-                g.workers.sys.mask_b90 |= 1u32 << (b as u32 & 31);
+                g.workers.sys.mask_0220 |= 1u32 << (b as u32 & 31);
             }
             Value::Int(b)
         }),
@@ -1830,12 +1830,12 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(on))
         }),
     );
-    // 025d(v): [1325ac4] = v; the result is v (left in EAX, 859c20).
+    // 025d(v): = v; the result is v (left in EAX).
     n.register(
         0x025D,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.workers.sys.value_ac4 = v;
+            g.workers.sys.value_025d = v;
             Value::Int(v)
         }),
     );
@@ -1951,7 +1951,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x018A,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
-            g.workers.sys.mask_b74 |= 1u32 << (b as u32 & 31);
+            g.workers.sys.mask_018a |= 1u32 << (b as u32 & 31);
             Value::Int(b)
         }),
     );
@@ -1959,7 +1959,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x018B,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
-            g.workers.sys.mask_b74 &= !(1u32 << (b as u32 & 31));
+            g.workers.sys.mask_018a &= !(1u32 << (b as u32 & 31));
             Value::Int(b)
         }),
     );
@@ -2039,7 +2039,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let v3 = c.stack.pop_int();
             let v2 = c.stack.pop_int();
             let v1 = c.stack.pop_int();
-            g.workers.sys.values_b48 = [v1, v2, v3];
+            g.workers.sys.battle_return_params = [v1, v2, v3];
             Value::Int(v1)
         }),
     );
@@ -2179,14 +2179,14 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x0195,
         Native {
             init: None,
-            wait: Some(|g, _| if g.workers.sys.effect_b58 != 0 { 0 } else { 5 }),
+            wait: Some(|g, _| if g.workers.sys.effect_up != 0 { 0 } else { 5 }),
             result: None,
         },
     );
     n.register(
         0x01BF,
         Native::result(|g, _| {
-            g.workers.sys.byte_b81 = 1;
+            g.workers.sys.byte_01bf = 1;
             Value::Int(1)
         }),
     );
@@ -2276,8 +2276,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B2,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            let old = g.byte_181e as i8;
-            g.byte_181e = u8::from(on);
+            let old = g.switch_00b2 as i8;
+            g.switch_00b2 = u8::from(on);
             Value::Int(i32::from(old))
         }),
     );
@@ -2285,7 +2285,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B3,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.values_194c[0] = v;
+            g.values_00b3[0] = v;
             Value::Int(v)
         }),
     );
@@ -2293,7 +2293,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B4,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.values_194c[1] = v;
+            g.values_00b3[1] = v;
             Value::Int(v)
         }),
     );
@@ -2349,7 +2349,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let slot = c.stack.pop_int().clamp(0, 3) as usize;
-            g.workers.sys.values_ce0[slot] = v;
+            g.workers.sys.values_01c0[slot] = v;
             Value::Int(v)
         }),
     );
@@ -2423,7 +2423,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let i = c.stack.pop_int();
-            if g.workers.sys.word_1a != 0 {
+            if g.workers.sys.slot_lock != 0 {
                 return Value::Int(v);
             }
             let w = index(g, i);
@@ -2497,7 +2497,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let cc = c.stack.pop_int();
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.workers.sys.values_cf0 = [a, b, cc, d];
+            g.workers.sys.values_022e = [a, b, cc, d];
             Value::Int(1)
         }),
     );
@@ -2568,7 +2568,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.values_08c4 = [a, b];
+            g.debug_values_c007 = [a, b];
             Value::Int(0)
         }),
     );
@@ -2579,7 +2579,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let cc = c.stack.pop_int();
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.bytes_0771 = [a as u8, b as u8, cc as u8, d as u8];
+            g.bytes_4039 = [a as u8, b as u8, cc as u8, d as u8];
             Value::Float(0.0)
         }),
     );
@@ -2592,14 +2592,14 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let mut rec = [0u8; 0x2c];
             rec[0xc..0x10].copy_from_slice(&1.0f32.to_le_bytes());
             rec[0x1c..0x20].copy_from_slice(&1.0f32.to_le_bytes());
-            g.lights_08cc = vec![rec; usize::try_from(n).unwrap_or(0)];
+            g.chr_lights = vec![rec; usize::try_from(n).unwrap_or(0)];
             Value::Int(0)
         }),
     );
     n.register(
         0x4024,
         Native::result(|g, _| {
-            g.lights_08cc.clear();
+            g.chr_lights.clear();
             Value::Int(0)
         }),
     );
@@ -2608,8 +2608,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let i = c.stack.pop_int();
-            if i <= g.lights_08cc.len() as i32
-                && let Some(r) = usize::try_from(i).ok().and_then(|i| g.lights_08cc.get_mut(i))
+            if i <= g.chr_lights.len() as i32
+                && let Some(r) = usize::try_from(i).ok().and_then(|i| g.chr_lights.get_mut(i))
             {
                 r[0x28] = v as u8;
             }
@@ -2630,8 +2630,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let y = c.stack.pop_float();
             let x = c.stack.pop_float();
             let i = c.stack.pop_int();
-            if i <= g.lights_08cc.len() as i32
-                && let Some(rec) = usize::try_from(i).ok().and_then(|i| g.lights_08cc.get_mut(i))
+            if i <= g.chr_lights.len() as i32
+                && let Some(rec) = usize::try_from(i).ok().and_then(|i| g.chr_lights.get_mut(i))
             {
                 let put = |rec: &mut [u8; 0x2c], at: usize, v: f32| {
                     rec[at..at + 4].copy_from_slice(&v.to_le_bytes())
@@ -2680,7 +2680,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.values_085c = [a, b];
+            g.pad_analog = [a, b];
             Value::Int(a)
         }),
     );
@@ -2766,7 +2766,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x806B,
         Native::result(|g, c| {
             if c.stack.pop_int() != 0 {
-                g.map_switch_5eb8 = 2;
+                g.map_display_switch = 2;
             }
             Value::Int(1)
         }),
@@ -2823,7 +2823,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
     n.register(
         0x5032,
         Native::result(|g, c| {
-            // 837180: 837d00(body, (i8) +0x185, 0).
+            // The idle motion for the body's mode (+0x185, signed).
             if let Some(mode) = g.chrs.get(c.worker).and_then(Option::as_ref).map(|ch| ch.u8(0x185)) {
                 g.mode_motion(c.worker, mode, 0);
             }
@@ -3436,7 +3436,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         }),
     );
     // 01fb: the menu value the menus keep.
-    n.register(0x01FB, Native::result(|g, _| Value::Int(g.value_a228)));
+    n.register(0x01FB, Native::result(|g, _| Value::Int(g.menu_value_01fb)));
     // 01f2: a mask of the characters 8–15 whose party record +0x2c bit 0 is set.
     n.register(
         0x01F2,
@@ -3511,8 +3511,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x01E2,
         Native::result(|g, _| {
             g.map_display |= 0x0100_0000;
-            g.distortion.value_ded28 = 0;
-            g.distortion.value_ea8 = 0;
+            g.distortion.value_01e2 = 0;
+            g.distortion.timer_01e2 = 0;
             distortion_switch(&mut g.distortion, true);
             Value::Int(0)
         }),
@@ -3521,7 +3521,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x01E3,
         Native::result(|g, _| {
             g.map_display &= !0x0100_0000;
-            g.distortion.value_ded28 = 0;
+            g.distortion.value_01e2 = 0;
             distortion_switch(&mut g.distortion, false);
             Value::Int(0)
         }),
@@ -3536,7 +3536,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let y = c.stack.pop_float();
             let x = c.stack.pop_float();
             g.distortion.point = [x, y, z];
-            g.distortion.count_ea0 = n;
+            g.distortion.count_01e4 = n;
             Value::Int(0)
         }),
     );
@@ -3556,8 +3556,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let b = c.stack.pop_float();
             let a = c.stack.pop_float();
             let n = c.stack.pop_int();
-            g.distortion.value_e7c = a;
-            g.distortion.value_e9c = b;
+            g.distortion.value_01e6_a = a;
+            g.distortion.value_01e6_b = b;
             g.distortion.flags |= if n != 0 { 3 } else { 1 };
             Value::Int(n)
         }),
@@ -3582,7 +3582,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         }),
     );
     // 7035: a byte the battle code leaves (none set in the field: 0).
-    n.register(0x7035, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.battle_9f1))));
+    n.register(0x7035, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.battle_byte_7035))));
     // c02c(v) / c053(a, b, c, d): take their arguments and do nothing.
     n.register(
         0xC02C,
@@ -3627,7 +3627,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0xC009,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.workers.sys.byte_11f = v as u8;
+            g.workers.sys.value_c009 = v as u8;
             Value::Int(v)
         }),
     );
@@ -3635,11 +3635,11 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0xC051,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            g.workers.sys.switch_832 = u8::from(on);
+            g.workers.sys.switch_c051 = u8::from(on);
             Value::Int(i32::from(on))
         }),
     );
-    n.register(0xC052, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.switch_832))));
+    n.register(0xC052, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.switch_c051))));
     // c030: the event system's frame count (frames run since its setup ended); c013: settings bit 3 is set.
     n.register(0xC030, Native::result(|g, _| Value::Int(g.workers.sys.frames)));
     n.register(0xC013, Native::result(|_, c| Value::Int(save_i32(c, 0x3d0c) >> 3 & 1)));
@@ -3683,7 +3683,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x017B,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
-            g.workers.sys.mask_b70 &= !(1u32 << (b as u32 & 31));
+            g.workers.sys.effect_mask &= !(1u32 << (b as u32 & 31));
             Value::Int(b)
         }),
     );
@@ -3772,7 +3772,7 @@ fn register_party(n: &mut Natives<FieldState>) {
                     return Value::Int(6);
                 }
             } else if chr == 0xf {
-                g.workers.sys.party_ac8 = 3;
+                g.workers.sys.party_flag_00ca = 3;
             }
             Value::Int(chr)
         }),

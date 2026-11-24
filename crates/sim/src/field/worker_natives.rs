@@ -25,7 +25,7 @@ fn pos_of(g: &FieldState, w: usize) -> [f32; 3] {
     g.workers.list.get(w).map_or([0.0; 3], Worker::position)
 }
 
-/// 8703b0(w, 0): a worker bound to a body (+0xaa = 1, +0x9c set) clears the body's flag 0x400 (+0x194, 82aae0).
+/// The auto-face switch off: a worker bound to a body (+0xaa = 1, +0x9c set) clears the body's flag 0x400 (+0x194).
 fn body_flag_400_off(g: &mut FieldState, w: usize) {
     let bound = g.workers.list.get(w).is_some_and(Worker::chr_bound);
     if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut).filter(|_| bound) {
@@ -114,8 +114,8 @@ pub(super) fn place_worker(
     let cam = wk.u32(workers::CAMERA);
     let keep = wk.flags() & 0x10 == 0 || keep_prev_off;
     if bound {
-        // 82b480 (position and previous position, moved flag 0x2000000, the triangle looked up again), then
-        // MsSetChrPosReset 824650: flag 0x10 unless flag 1 (835730) and Ch_ClothReset (no cloth in Aerugo).
+        // The body's position set (position and previous position, moved flag 0x2000000, the triangle looked up again), then
+        // MsSetChrPosReset flag 0x10 unless flag 1 and Ch_ClothReset (no cloth in Aerugo).
         g.actor(w).pos = pos;
         if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut) {
             ch.set_pos(pos);
@@ -136,7 +136,7 @@ pub(super) fn place_worker(
             s.player_prev = s.player_pos;
         }
         // The ground flags of the player's body: save +0x10 = +0x828 bits 7–8 (0 without a body), save +0xe =
-        // the event's area for bits 11–12 (870ef0).
+        // the event's area for bits 11–12.
         let flags = g.workers.list[w]
             .chr_bound()
             .then(|| g.chrs.get(w).and_then(Option::as_ref).map(|ch| ch.u32(0x828)))
@@ -199,7 +199,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(0.0)
         }),
     );
-    // 0018(mask, mode, id): start the running level's move (8703b0(w, 0) first).
+    // 0018(mask, mode, id): start the running level's move (the body's auto-face switch off first).
     n.register(
         0x0018,
         Native::result(|g, c| {
@@ -246,7 +246,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 0019(mask, mode, id): start the running level's turn (8703b0(w, 0) first).
+    // 0019(mask, mode, id): start the running level's turn (the body's auto-face switch off first).
     n.register(
         0x0019,
         Native::result(|g, c| {
@@ -664,7 +664,7 @@ pub(super) fn register_shapes(n: &mut Natives<FieldState>) {
         }),
     );
     // 0059(x extent, z extent, height): a box's half extents and height (kinds 3, 6); 0058(x, z) pushes −1.0
-    // and runs 0059 (855f80).
+    // and runs 0059.
     fn box_extents(g: &mut FieldState, c: &mut NativeCall, h: f32) -> Value {
         let z = c.stack.pop_float();
         let x = c.stack.pop_float();
@@ -954,7 +954,7 @@ fn set_facing(g: &mut FieldState, c: &mut NativeCall) -> Value {
     w.set_pf(p::DIR_YAW, v);
     w.set_pf(p::YAW, v);
     let (bound, bind) = (w.chr_bound(), w.bind());
-    // 8703b0(w, 0), then the bound body's facing and heading.
+    // The body's auto-face switch off, then the bound body's facing and heading.
     body_flag_400_off(g, c.worker);
     if bound {
         let a = g.actor(c.worker);

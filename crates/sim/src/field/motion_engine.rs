@@ -850,7 +850,7 @@ impl Player {
         total
     }
 
-    /// The pose with each channel's dirty mark, for the model joints (through the relation, as pose()).
+    /// The pose with each channel's dirty mark, for the model joints (through the relation, as pose).
     pub fn pose_dirty(&self) -> Vec<Option<([f32; 9], [bool; 9])>> {
         let joints = self.channels.len() / 9;
         let mut out = vec![None; joints];

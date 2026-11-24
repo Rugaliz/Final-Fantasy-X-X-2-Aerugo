@@ -117,7 +117,7 @@ pub struct To {
     pub choice: Choice,
 }
 
-/// The menu pad's repeat (8b7cd0): per button the time held and whether it fired, at 30 frames a second.
+/// The menu pad's repeat: per button the time held and whether it fired, at 30 frames a second.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MenuPad {
     pub last_held: u32,
@@ -130,10 +130,10 @@ pub struct MenuPad {
 
 const FRAME_TIME: f32 = 1.0 / 30.0;
 
-/// The save image's settings word (785290).
+/// The save image's settings word.
 const SETTINGS: usize = 0x3d0c;
 
-/// Left plus right insets by frame type (table c59ed8).
+/// Left plus right insets by frame type (the frame types' inset table).
 const FRAME_INSETS: [i16; 9] = [40, 64, 32, 0, 32, 32, 32, 32, 32];
 
 impl MenuPad {
@@ -181,7 +181,7 @@ impl MenuPad {
     }
 }
 
-/// Element kinds of the text stream (8df610): 1 end or page break, 2 a code with an argument byte, 3 a macro, 4
+/// Element kinds of the text stream: 1 end or page break, 2 a code with an argument byte, 3 a macro, 4
 /// anything else (a glyph).
 fn kind(b: u8) -> u8 {
     match b {
@@ -192,7 +192,7 @@ fn kind(b: u8) -> u8 {
     }
 }
 
-/// Bytes an element takes (8dfd80).
+/// Bytes an element takes.
 fn step_len(bytes: &[u8]) -> usize {
     match bytes.first() {
         None | Some(0) => 0,
@@ -208,7 +208,7 @@ fn step_len(bytes: &[u8]) -> usize {
     }
 }
 
-/// The page from `start`: its end (the next byte below 3) and its count (8b7f40, 8b80b0); `macro_len` gives the
+/// The page from `start`: its end (the next byte below 3) and its count; `macro_len` gives the
 /// length of a macro element's text (code, argument), `None` when Aerugo does not resolve it (reported).
 pub fn page(bytes: &[u8], start: usize, macro_len: &dyn Fn(u8, u8) -> Option<i32>) -> (Option<usize>, i32) {
     let mut at = start;
@@ -239,7 +239,7 @@ pub fn page(bytes: &[u8], start: usize, macro_len: &dyn Fn(u8, u8) -> Option<i32
     }
 }
 
-/// The rate per character for the language type (8de8c0): 30 or 25; other types leave it (0).
+/// The rate per character for the language type: 30 or 25; other types leave it (0).
 fn language_rate(language_type: Option<u32>, rate: i32) -> i32 {
     match language_type {
         Some(0 | 1 | 0x10..=0x12) => 0x1e,
@@ -248,7 +248,7 @@ fn language_rate(language_type: Option<u32>, rate: i32) -> i32 {
     }
 }
 
-/// A macro's text length (8b80b0, kind 3): its bytes up to the NUL, page leads and the extension prefix not
+/// A macro's text length (kind 3): its bytes up to the NUL, page leads and the extension prefix not
 /// counted (they start two-byte characters).
 fn text_len(bytes: &[u8]) -> i32 {
     bytes.iter().take_while(|&&b| b != 0).filter(|&&b| !matches!(b, 0x04 | 0x2C..=0x2F)).count() as i32
@@ -259,13 +259,13 @@ fn to_nul(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().copied().take_while(|&b| b != 0).collect()
 }
 
-/// TOGetChangeMacroAddress (8b6660): the text macro element {code:arg} of window `w` stands for (without its
+/// TOGetChangeMacroAddress: the text macro element {code:arg} of window `w` stands for (without its
 /// NUL), or what Aerugo does not resolve yet.
-/// - {13:30+n}: 8ac850(n): n ≤ 0x13 the save's name n (TOGetSaveChrName), else MsGetComData (not ported).
-/// - {12:30+n} below 0x50: value slot n by its active type: 0xff nothing (the static empty text c5a040), 0 the
+/// - {13:30+n}: n ≤ 0x13 the save's name n (TOGetSaveChrName), else MsGetComData (not ported).
+/// - {12:30+n} below 0x50: value slot n by its active type: 0xff nothing (the static empty text), 0 the
 ///   text at the value's address, 1 the value as "%d", 2 the same with an 'F' before every group of three digits
-///   after the first (8b6210); the other types (0x13–0x23, '+'–'7') are not ported.
-/// - {16:30+n} / {17:30+n}: item n's name (kernel_item, field 0); {23:30+n}: key item n's name (790860, field
+///   after the first; the other types (0x13–0x23, '+'–'7') are not ported.
+/// - {16:30+n} / {17:30+n}: item n's name (kernel_item, field 0); {23:30+n}: key item n's name (field
 ///   variant · 4).
 /// - The rest ({12:50+}, {14}/{15}/{18}, the dictionary macros {19}–{22}): not ported.
 pub fn macro_text(g: &FieldState, image: &[u8], w: usize, code: u8, arg: u8) -> Result<Vec<u8>, String> {
@@ -354,7 +354,7 @@ fn bytes_of(g: &FieldState, w: usize) -> Vec<u8> {
     g.windows[w].message.and_then(|m| g.messages.get(m)).map(|m| m.bytes.clone()).unwrap_or_default()
 }
 
-/// A new page (8de370): the page after the current one (or the first), shown from its start.
+/// A new page: the page after the current one (or the first), shown from its start.
 fn new_page(g: &mut FieldState, w: usize, image: &[u8]) {
     let bytes = bytes_of(g, w);
     let t = &mut g.windows[w].to.text;
@@ -380,7 +380,7 @@ fn new_page(g: &mut FieldState, w: usize, image: &[u8]) {
     t.phase = 1;
     t.state = 1;
     t.step = t.resume;
-    // A choice text's records (8b9a60): one per {10:xx} marker on the page (not {10:ff}, not the name markers
+    // A choice text's records: one per {10:xx} marker on the page (not {10:ff}, not the name markers
     // 0x50–0x5f); the first is 0.
     if t.choices {
         let (start, end) = (t.start, t.end.unwrap_or(bytes.len()).min(bytes.len()));
@@ -405,7 +405,7 @@ fn last_page(bytes: &[u8], t: &Text) -> bool {
     t.end.is_none_or(|e| bytes.get(e).is_none_or(|&b| b == 0))
 }
 
-/// The text's next page when there is one (8b8ca0).
+/// The text's next page when there is one.
 fn next_page(g: &mut FieldState, w: usize, image: &[u8]) {
     let bytes = bytes_of(g, w);
     if !last_page(&bytes, &g.windows[w].to.text) {
@@ -413,19 +413,19 @@ fn next_page(g: &mut FieldState, w: usize, image: &[u8]) {
     }
 }
 
-/// Open the window's message module part (8ada30 … 8ade10 of native 006a): `mode` is the atel record's mode
+/// Open the window's message module part (the message module's part of native 006a): `mode` is the atel record's mode
 /// byte, `choices` its choice count.
 pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     let language_type = g.language_type;
     let win = &mut g.windows[w];
     let kind = u16::from(win.style.unwrap_or(0));
     let flags = win.flags | win.word28;
-    // 8b8210: the value slots' staged types become the active ones.
+    // The value slots' staged types become the active ones.
     win.value_types = (0..0x20).map(|k| win.values.get(k).map_or(0xff, |v| v.0)).collect();
     win.to = To::default();
     let to = &mut win.to;
     to.frame.kind = kind;
-    // Text flags (8b8bb0): the text type, 0x4000, the size type (0x2000; with 0x8000 3, else 1; type 3: 3 with
+    // Text flags: the text type, 0x4000, the size type (0x2000; with 0x8000 3, else 1; type 3: 3 with
     // 0x8000, else 1), 0x1000 (or the settings' bit 8 clear), 0x400 pages go on by themselves.
     let settings =
         image.get(SETTINGS..SETTINGS + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -437,7 +437,7 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     }
     to.text.flag_c = flags & 0x1000 != 0 || settings & 0x100 == 0;
     to.text.auto_next = flags & 0x400 != 0;
-    // Choices without the number entry (8b0020).
+    // Choices without the number entry.
     if win.mode & 2 != 0 && win.mode & 0x40 == 0 {
         to.text.choices = true;
         to.choice.highlighted = win.first_choice as i8;
@@ -449,7 +449,7 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
         x.to.active = false;
     }
     g.windows[w].to.active = true;
-    // The frame opens (906c80): its init handler, then the open step.
+    // The frame opens: its init handler, then the open step.
     // The frame's width only decides on which step frame type 0 is fully open or closed: the 7th and the 6th for
     // every width a window can have (its insets alone are 40, the screen 512); the frame is measured here as its
     // insets.
@@ -471,7 +471,7 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     }
     f.state = 1;
     f.step = FrameStep::Open;
-    // The text opens (8b8560): init, then its first page.
+    // The text opens: init, then its first page.
     let t = &mut g.windows[w].to.text;
     t.on = true;
     t.phase = 0;
@@ -486,7 +486,7 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     new_page(g, w, image);
 }
 
-/// msg_close (8640f0): unless closed or closing, the event side's state 3 and the frame and text close.
+/// msg_close: unless closed or closing, the event side's state 3 and the frame and text close.
 pub fn close(g: &mut FieldState, w: usize) {
     let win = &mut g.windows[w];
     if matches!(win.atel_state, 0 | 3) {
@@ -505,7 +505,7 @@ pub fn close(g: &mut FieldState, w: usize) {
     }
 }
 
-/// The press check before the block's workers (867950): a confirm (or the second button) while a window waits on
+/// The press check before the block's workers: a confirm (or the second button) while a window waits on
 /// it sets the advance bit (system byte 0 bit 2); the bit lasts one frame.
 pub fn press(g: &mut FieldState, pressed: u32) {
     let s = &mut g.workers.sys;
@@ -515,7 +515,7 @@ pub fn press(g: &mut FieldState, pressed: u32) {
     }
 }
 
-/// 86c8b0: a window opening or shown that waits for a press (1), or that takes choices (2).
+/// A window opening or shown that waits for a press (1), or that takes choices (2).
 pub fn waiting(g: &FieldState) -> u8 {
     for w in &g.windows {
         if matches!(w.atel_state, 1 | 2) {
@@ -634,7 +634,7 @@ fn text_handler(state: i16) -> TextStep {
     }
 }
 
-/// The reveal's step (8df570).
+/// The reveal's step.
 fn advance(t: &mut Text, speed: f32) {
     if t.wait != 0 {
         t.wait -= 1;
@@ -647,7 +647,7 @@ fn advance(t: &mut Text, speed: f32) {
     }
 }
 
-/// The message module's frame (8ab910): the menu pad, then each open window's frame and text steps and the active
+/// The message module's frame: the menu pad, then each open window's frame and text steps and the active
 /// window's input.
 pub fn step(g: &mut FieldState, held: u32, image: &[u8]) {
     let stick = g.input.stick;
@@ -715,8 +715,8 @@ fn text_step(g: &mut FieldState, w: usize, speed: f32, image: &[u8]) {
     }
 }
 
-/// The active window's input (8b6b70: once its page is shown): plain text goes to the next page on confirm
-/// (8b64a0); choices move, cancel and pick (8b64e0).
+/// The active window's input (once its page is shown): plain text goes to the next page on confirm
+///; choices move, cancel and pick.
 fn input(g: &mut FieldState, w: usize, image: &[u8]) {
     if g.windows[w].to.text.phase != 2 {
         return;
@@ -729,7 +729,7 @@ fn input(g: &mut FieldState, w: usize, image: &[u8]) {
         return;
     }
     if let Some(e) = g.windows[w].number.as_mut() {
-        // The number entry (8b62b0).
+        // The number entry.
         e.step(repeat, pressed);
         g.windows[w].to.choice.state = e.state;
         return;
@@ -761,7 +761,7 @@ fn input(g: &mut FieldState, w: usize, image: &[u8]) {
     }
 }
 
-/// The draw pass's effects on the reveal (TODrawMessageWindow → 8dea40 / 8dee00 → TOSetDrawInfo): the page's
+/// The draw pass's effects on the reveal (TODrawMessageWindow → the text draw → TOSetDrawInfo): the page's
 /// elements up to the shown count; at speed 0 each drawn glyph shows the next.
 pub fn draw_pass(g: &mut FieldState, image: &[u8]) {
     let settings =
@@ -775,7 +775,7 @@ pub fn draw_pass(g: &mut FieldState, image: &[u8]) {
         if !win.to.text.on || win.to.text.hidden || win.to.text.shown <= 0 {
             continue;
         }
-        // The page as drawn: its macros as their texts (TOSetDrawInfo reads them through 8b6660).
+        // The page as drawn: its macros as their texts (TOSetDrawInfo reads them through TOGetChangeMacroAddress).
         let bytes = page_bytes(g, image, w);
         let t = &mut g.windows[w].to.text;
         let mut at = 0;
@@ -814,7 +814,7 @@ pub fn draw_pass(g: &mut FieldState, image: &[u8]) {
 }
 
 impl Window {
-    /// The text state the waits read (8b7ca0).
+    /// The text state the waits read.
     pub fn text_state(&self) -> u16 {
         self.to.text.state
     }

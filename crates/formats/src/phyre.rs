@@ -1176,16 +1176,16 @@ mod tests {
 
     #[test]
     fn selectors() {
-        // list [1, 3]
+        // List [1, 3]
         let mut r = Reader::new(&[2, 1, 3], 0);
         assert_eq!(select(&mut r, 2, 5).unwrap(), vec![1, 3]);
-        // complement of [1, 3] in 5
+        // Complement of [1, 3] in 5
         let mut r = Reader::new(&[2, 1, 3], 0);
         assert_eq!(select(&mut r, 3, 5).unwrap(), vec![0, 2, 4]);
-        // bitmask 0b1001_0001 over 9 objects, then bit 8
+        // Bitmask 0b1001_0001 over 9 objects, then bit 8
         let mut r = Reader::new(&[0x91, 0x01], 0);
         assert_eq!(select(&mut r, 4, 9).unwrap(), vec![0, 4, 7, 8]);
-        // start 2, stride 3, count 3
+        // Start 2, stride 3, count 3
         let mut r = Reader::new(&[2, 3, 3], 0);
         assert_eq!(select(&mut r, 6, 12).unwrap(), vec![2, 5, 8]);
         assert!(select(&mut Reader::new(&[], 0), 7, 3).is_err());
@@ -1193,17 +1193,17 @@ mod tests {
 
     #[test]
     fn array_and_pointer_records() {
-        // mode 0 over 2 objects, member offset 24, (count, offset) pairs.
+        // Mode 0 over 2 objects, member offset 24, (count, offset) pairs.
         let d = [0x00, 49, 3, 0, 5, 16];
         let recs = unpack_arrays(&mut Reader::new(&d, 0), 2, 2).unwrap();
         assert_eq!(recs.iter().map(|r| (r.1, r.2, r.3)).collect::<Vec<_>>(), vec![(0, 3, 0), (1, 5, 16)]);
-        // mode 0 over 1 object: shared target list (flag 0x20), no offset (0x40), no element (8): user 0 ->
+        // Mode 0 over 1 object: shared target list (flag 0x20), no offset (0x40), no element (8): user 0 ->
         // target object 7.
         let d = [0x68, 4, 9, 0, 7];
         let recs = unpack_pointers(&mut Reader::new(&d, 0), 1, 1).unwrap();
         let r = recs[0];
         assert_eq!((r.target_list, r.target_object, r.user), (9, 7, None));
-        // user fixup 2 (stored as 3).
+        // User fixup 2 (stored as 3).
         let d = [0x68, 4, 9, 3];
         let r = unpack_pointers(&mut Reader::new(&d, 0), 1, 1).unwrap()[0];
         assert_eq!(r.user, Some(2));

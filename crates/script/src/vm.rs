@@ -275,7 +275,7 @@ pub trait Host {
     fn worker_will_run(&mut self, _w: usize, _kind: u8, _level: u8) {}
     /// A request started on level `level` of worker `w`, or the level started over.
     fn level_started(&mut self, _w: usize, _level: u8) {}
-    /// The engine's part of the run gate at the top of atel_run_worker (8641e0), past the worker's on bit.
+    /// The engine's part of the run gate at the top of atel_run_worker, past the worker's on bit.
     fn may_run(&mut self, _w: usize) -> bool {
         true
     }

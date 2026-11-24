@@ -92,7 +92,7 @@ impl UiTextures {
     }
 }
 
-/// egui output for one frame.
+/// Egui output for one frame.
 #[derive(Debug)]
 pub struct EguiFrame<'a> {
     pub textures: &'a egui::TexturesDelta,
@@ -113,7 +113,7 @@ struct FrameSlot {
     cmd: vk::CommandBuffer,
     image_available: vk::Semaphore,
     in_flight: vk::Fence,
-    /// egui textures to free once this slot's previous submission has finished.
+    /// Egui textures to free once this slot's previous submission has finished.
     pending_frees: Vec<egui::TextureId>,
 }
 
@@ -829,7 +829,7 @@ fn record_game(
 impl Drop for Renderer {
     fn drop(&mut self) {
         self.ctx.wait_idle();
-        // egui's renderer frees its GPU memory through the shared allocator; drop it before the context.
+        // Egui's renderer frees its GPU memory through the shared allocator; drop it before the context.
         self.egui = None;
         self.drop_viewport();
         // Textures free their scene descriptor sets, so they go before the scene's pool.

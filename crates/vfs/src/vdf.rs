@@ -102,7 +102,7 @@ impl Lexer<'_> {
                     return Ok(Some(Token::Close));
                 }
                 '[' => {
-                    // conditional tag such as [$WIN32]: ignore
+                    // Conditional tag such as [$WIN32]: ignore
                     for c in self.chars.by_ref() {
                         if c == ']' {
                             break;
@@ -190,7 +190,7 @@ mod tests {
             "228980"    "123"
         }
     }
-    // second library
+    // Second library
     "1"
     {
         "path"      "D:\\SteamLibrary"

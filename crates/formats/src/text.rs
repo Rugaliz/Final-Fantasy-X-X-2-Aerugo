@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn single_byte_characters_and_controls() {
         let cs = latin();
-        // "Ab" , line break, colour code with argument, "1", end, then garbage that must be ignored.
+        // "Ab", line break, colour code with argument, "1", end, then garbage that must be ignored.
         let bytes = [0x30 + 12, 0x30 + 15, 0x03, 0x0A, 0x41, 0x31, 0x00, 0x99];
         let t = decode(&bytes, &cs);
         assert_eq!(

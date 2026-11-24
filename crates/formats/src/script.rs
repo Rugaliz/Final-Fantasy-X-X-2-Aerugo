@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(Script::parse(b"").unwrap_err(), ScriptError::NotAScript);
         assert!(Script::parse(&[0xFF; 64]).is_err());
         let mut s = sample();
-        s[0x40 + 0x2C] = 0xFF; // code end past the file
+        s[0x40 + 0x2C] = 0xFF; // Code end past the file
         assert!(Script::parse(&s).is_err());
     }
 

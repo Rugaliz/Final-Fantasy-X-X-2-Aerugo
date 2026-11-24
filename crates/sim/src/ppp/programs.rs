@@ -353,7 +353,7 @@ mat_fn!(matrix_yzx, *b"xzy");
 mat_fn!(matrix_zxy, *b"yxz");
 mat_fn!(matrix_zyx, *b"xyz");
 
-/// pppMatrixLoc: the unit matrix with the translation A.
+/// PppMatrixLoc: the unit matrix with the translation A.
 fn matrix_loc(r: &mut Run, o: u32, _key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
     let wa = at(o, wa);
@@ -364,7 +364,7 @@ fn matrix_loc(r: &mut Run, o: u32, _key: u32, rf: u32) {
     put_mat(r, o + 0x10, &m);
 }
 
-/// pppMatrixScl: the unit matrix with the scale B on its diagonal and the translation A.
+/// PppMatrixScl: the unit matrix with the scale B on its diagonal and the translation A.
 fn matrix_scl(r: &mut Run, o: u32, _key: u32, rf: u32) {
     let (wa, wb) = works(r, rf);
     let (wa, wb) = (at(o, wa), at(o, wb));
@@ -378,7 +378,7 @@ fn matrix_scl(r: &mut Run, o: u32, _key: u32, rf: u32) {
     put_mat(r, o + 0x10, &m);
 }
 
-/// pppParMatrix: with a target in the key, the object's translation through its parent's matrix (object
+/// PppParMatrix: with a target in the key, the object's translation through its parent's matrix (object
 /// +4): each row's three products summed and stored, then the translation added.
 fn par_matrix(r: &mut Run, o: u32, key: u32, _rf: u32) {
     if r.m.u32(key + 4) == 0xffff_ffff {
@@ -414,7 +414,7 @@ fn scale_rows(m: &mut Mat, k: [f32; 3]) {
     }
 }
 
-/// pppKeParMatR: the parent's (object +4) turn without its scale, then the object's translation through the
+/// PppKeParMatR: the parent's (object +4) turn without its scale, then the object's translation through the
 /// parent's whole matrix.
 fn ke_par_mat_r(r: &mut Run, o: u32, _key: u32, _rf: u32) {
     use crate::chr::elements::{apply4, mul, normalize};
@@ -431,7 +431,7 @@ fn ke_par_mat_r(r: &mut Run, o: u32, _key: u32, _rf: u32) {
     put_vec4(r, o + 0x40, v);
 }
 
-/// pppKeOfsMatXYZ: the XYZ turn of B scaled by C, about the offset A +0x10 + A +0x20: the translation is A plus
+/// PppKeOfsMatXYZ: the XYZ turn of B scaled by C, about the offset A +0x10 + A +0x20: the translation is A plus
 /// the offset less the turned offset.
 fn ke_ofs_mat_xyz(r: &mut Run, o: u32, _key: u32, rf: u32) {
     use crate::chr::elements::apply4;
@@ -454,7 +454,7 @@ fn ke_ofs_mat_xyz(r: &mut Run, o: u32, _key: u32, rf: u32) {
     put_mat(r, o + 0x10, &m);
 }
 
-/// pppKeMatSN: the XYZ turn of the change of the angles B since the last frame (kept at A +0x80) into the
+/// PppKeMatSN: the XYZ turn of the change of the angles B since the last frame (kept at A +0x80) into the
 /// matrix at A +0x40, its first two translation words then zero.
 fn ke_mat_sn(r: &mut Run, o: u32, _key: u32, rf: u32) {
     let (wa, wb) = works(r, rf);
@@ -476,7 +476,7 @@ fn ke_mat_sn_init(r: &mut Run, o: u32, rf: u32) {
     set(r, at(o, wa) + 0x80, &[0; 3]);
 }
 
-/// pppKeMatPht: the XYZ-ordered (X · Y · Z) turn of B scaled by C with the translation A, kept in work D; the
+/// PppKeMatPht: the XYZ-ordered (X · Y · Z) turn of B scaled by C with the translation A, kept in work D; the
 /// object's matrix is C on the diagonal with D's translation.
 fn ke_mat_pht(r: &mut Run, o: u32, _key: u32, rf: u32) {
     let pair = r.m.u32(rf + 0xc);
@@ -511,7 +511,7 @@ fn child(r: &mut Run, o: u32, index: u32) -> u32 {
     c
 }
 
-/// pppPointAp: every key +0xc frames (countdown byte at B +1), a child in slot key +4 at A's position (into the
+/// PppPointAp: every key +0xc frames (countdown byte at B +1), a child in slot key +4 at A's position (into the
 /// child's work at key +8); no child for −1.
 fn point_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, wb) = works(r, rf);
@@ -565,7 +565,7 @@ fn vertex_child(r: &mut Run, o: u32, key: u32, vtx: u32) {
     }
 }
 
-/// pppVertexAp: every key +7 frames (countdown u16 at A +2), key +6 children at vertices of mesh key +4 (the
+/// PppVertexAp: every key +7 frames (countdown u16 at A +2), key +6 children at vertices of mesh key +4 (the
 /// group's mesh list: its packet record's vertices, or the object's own at +0x90, and its index list): in
 /// order from the cursor at A (mode key +8 = 0), or at random (mode 1).
 fn vertex_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -640,7 +640,7 @@ fn vertex_at(r: &Run, verts: u32, idx: u32) -> [f32; 3] {
     [0, 2, 4].map(|k| f32::from(r.m.u16(verts + idx * 6 + k) as i16))
 }
 
-/// pppVertexApLc: pppVertexAp with the children at the vertex's own coordinates.
+/// PppVertexApLc: pppVertexAp with the children at the vertex's own coordinates.
 fn vertex_ap_lc(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
     let wa = at(o, wa);
@@ -701,7 +701,7 @@ fn vertex_ap_lc(r: &mut Run, o: u32, key: u32, rf: u32) {
     r.m.set_u16(wa + 2, v);
 }
 
-/// pppVertexApAt: pppVertexAp's timing; each child (slot key +0xc) gets a vertex number in its u16 work at
+/// PppVertexApAt: pppVertexAp's timing; each child (slot key +0xc) gets a vertex number in its u16 work at
 /// key +0x10: the cursor (mode 0) or a random one (mode 1).
 fn vertex_ap_at(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
@@ -747,7 +747,7 @@ fn vertex_ap_at(r: &mut Run, o: u32, key: u32, rf: u32) {
     r.m.set_u16(wa + 2, v);
 }
 
-/// pppVertexAttend: B = the vertex (number in A's u16) of mesh key +0xc through the parent's matrix.
+/// PppVertexAttend: B = the vertex (number in A's u16) of mesh key +0xc through the parent's matrix.
 fn vertex_attend(r: &mut Run, o: u32, key: u32, rf: u32) {
     use crate::chr::elements::apply4;
     let m_ = r.m.u16(key + 0xc) as i16;
@@ -766,7 +766,7 @@ fn vertex_attend(r: &mut Run, o: u32, key: u32, rf: u32) {
     }
 }
 
-/// pppPointRAp: every key +0x1c frames (countdown byte at B +1), a child (slot key +0xc) on a sphere of radius
+/// PppPointRAp: every key +0x1c frames (countdown byte at B +1), a child (slot key +0xc) on a sphere of radius
 /// key +4 about A: latitude ±90° and longitude from two draws; its position into its work at key +0x10, its
 /// velocity (the direction · key +8) at key +0x18.
 fn point_r_ap(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -963,7 +963,7 @@ fn born_face(r: &mut Run, o: u32, key: u32, v: u32) -> bool {
     true
 }
 
-/// pppKeBornRnd5 / pppKeBornRnd6: every key interval frames (countdown byte at A +2) a walk; the countdown
+/// PppKeBornRnd5 / pppKeBornRnd6: every key interval frames (countdown byte at A +2) a walk; the countdown
 /// runs down only after a walk that made all its children.
 fn born_timed(r: &mut Run, o: u32, key: u32, rf: u32, six: bool) {
     let (wait, s1, s2, mesh_at, rnd_at, cnt_at, cb): (u32, u32, u32, u32, u32, u32, BornFn) =
@@ -1005,7 +1005,7 @@ fn born6(r: &mut Run, o: u32, k: u32, rf: u32) {
     born_timed(r, o, k, rf, true)
 }
 
-/// pppKeBornRnd2 / pppKeBornRnd3: a walk on frames where the integer draw's second byte has none of the key's
+/// PppKeBornRnd2 / pppKeBornRnd3: a walk on frames where the integer draw's second byte has none of the key's
 /// mask bits (mask 0xff: never).
 fn born_chance(r: &mut Run, o: u32, key: u32, rf: u32, three: bool) {
     let (mask_at, s1, s2, rnd_at, cnt_at, cb): (u32, u32, u32, u32, u32, BornFn) =
@@ -1063,7 +1063,7 @@ fn key_target(r: &Run, slot: u32, w: u32) -> u32 {
     first.wrapping_add(w).wrapping_add(0xa0)
 }
 
-/// pppKeGrvTgt: on the key's time, B = (radius key +4, strength key +8, the address of A): a gravity target.
+/// PppKeGrvTgt: on the key's time, B = (radius key +4, strength key +8, the address of A): a gravity target.
 fn ke_grv_tgt(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.m.u32(o + 0xc) != r.m.u32(key) {
         return;
@@ -1081,7 +1081,7 @@ fn ke_grv_tgt_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u32(at(o, wb) + 8, 0);
 }
 
-/// pppKeGrvEff: on the key's time C = the gravity target the key names (slot key +4, work key +8); from then on
+/// PppKeGrvEff: on the key's time C = the gravity target the key names (slot key +4, work key +8); from then on
 /// (not on the first frame) the velocity B is pulled toward the target's position within its radius:
 /// (1 − distance / radius) · strength along the unit direction.
 fn ke_grv_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -1114,7 +1114,7 @@ fn ke_grv_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
     }
 }
 
-/// pppKeHmgEff: on the key's time C = (the turn rate key +4, the target the key names: slot +8, work +0xc);
+/// PppKeHmgEff: on the key's time C = (the turn rate key +4, the target the key names: slot +8, work +0xc);
 /// from then on the velocity B turns toward the target: its direction blended with the target's by the
 /// rate (nudged on a random axis when they are opposite), at B's speed.
 fn ke_hmg_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -1157,7 +1157,7 @@ fn ke_hmg_eff(r: &mut Run, o: u32, key: u32, rf: u32) {
     set3(r, b, &[m[0] * speed, m[1] * speed, m[2] * speed]);
 }
 
-/// pppKeMvYpEff: A's angles from the velocity B (when it is not zero): about Z from (−vy, vx), about X from the
+/// PppKeMvYpEff: A's angles from the velocity B (when it is not zero): about Z from (−vy, vx), about X from the
 /// horizontal length and −vz.
 fn ke_mv_yp_eff(r: &mut Run, o: u32, _key: u32, rf: u32) {
     if r.paused {
@@ -1179,7 +1179,7 @@ fn ke_mv_yp_eff(r: &mut Run, o: u32, _key: u32, rf: u32) {
     }
 }
 
-/// pppKeDrct: on the key's time A = the key's three integers (+0x10).
+/// PppKeDrct: on the key's time A = the key's three integers (+0x10).
 fn ke_drct(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.m.u32(o + 0xc) != r.m.u32(key) {
         return;
@@ -1199,7 +1199,7 @@ fn ke_drct_init(r: &mut Run, o: u32, rf: u32) {
 
 fn nothing(_: &mut Run, _: u32, _: u32) {}
 
-/// pppKeLnsLpSft: A (two floats) += the key's (+4, +8) on its time (not used on the first frame); then B +0x9c
+/// PppKeLnsLpSft: A (two floats) += the key's (+4, +8) on its time (not used on the first frame); then B +0x9c
 /// += A.x and B +0xa8 += A.y.
 fn ke_lns_lp_sft(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.paused {
@@ -1227,7 +1227,7 @@ fn zero_a2(r: &mut Run, o: u32, rf: u32) {
     set(r, at(o, wa), &[0; 2]);
 }
 
-/// pppNeiLightEikyo: A (six floats) += the key's (+4) on its time; then two ramps: A1 += A0, A2 += A1;
+/// PppNeiLightEikyo: A (six floats) += the key's (+4) on its time; then two ramps: A1 += A0, A2 += A1;
 /// A4 += A3, A5 += A4.
 fn nei_light_eikyo(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
@@ -1257,7 +1257,7 @@ fn zero_a6(r: &mut Run, o: u32, rf: u32) {
     set(r, at(o, wa), &[0; 6]);
 }
 
-/// pppNeiPointLight: on the key's time A +0xc / +0x10 = the addresses of B and C, A (three floats) += the
+/// PppNeiPointLight: on the key's time A +0xc / +0x10 = the addresses of B and C, A (three floats) += the
 /// key's (+4); then the ramp A1 += A0, A2 += A1.
 fn nei_point_light(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, wb, wc) = works3(r, rf);
@@ -1284,7 +1284,7 @@ fn zero_a3(r: &mut Run, o: u32, rf: u32) {
     set(r, at(o, wa), &[0; 3]);
 }
 
-/// pppKeAcmCic / pppKeAcmCicEx: unless the key's byte +4 is 2, the scene's accumulation set to (0, 1).
+/// PppKeAcmCic / pppKeAcmCicEx: unless the key's byte +4 is 2, the scene's accumulation set to (0, 1).
 fn ke_acm_cic(r: &mut Run, _o: u32, key: u32, _rf: u32) {
     if r.m.u8(key + 4) != 2 {
         r.render.push(super::RenderCall::Accumulation(0, 1));
@@ -1345,7 +1345,7 @@ fn model_centre(r: &Run, model: u32) -> [f32; 4] {
     acc
 }
 
-/// pppKeOfsPt: on the key's time A += the key's floats (+0x10) and A +0x20 = its integers (+0x20); at age 0 first
+/// PppKeOfsPt: on the key's time A += the key's floats (+0x10) and A +0x20 = its integers (+0x20); at age 0 first
 /// A +0x10 = the centre of packet record key +0x2c's model (none for 0xffff).
 fn ke_ofs_pt(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.paused || r.m.u32(o + 0xc) != r.m.u32(key) {
@@ -1382,7 +1382,7 @@ fn ke_ofs_pt_init(r: &mut Run, o: u32, rf: u32) {
 // The draw stage (each object's second entry, run in the update): the object's draw matrix at +0x50 (16 floats)
 // and its kind at +0x9c (0: through the view; 1: facing the camera).
 
-/// pppDrawMatrix: the view matrix times the object's.
+/// PppDrawMatrix: the view matrix times the object's.
 fn draw_matrix(r: &mut Run, o: u32, _key: u32, _rf: u32) {
     r.m.set_u8(o + 0x9c, 0);
     let m = crate::chr::elements::mul(&r.view, &get_mat(r, o + 0x10));
@@ -1404,14 +1404,14 @@ fn front(r: &mut Run, o: u32) -> Mat {
     m
 }
 
-/// pppDrawMatrixFront.
+/// PppDrawMatrixFront.
 fn draw_matrix_front(r: &mut Run, o: u32, _key: u32, _rf: u32) {
     r.m.set_u8(o + 0x9c, 1);
     let m = front(r, o);
     put_mat(r, o + 0x50, &m);
 }
 
-/// pppKeDMatFr: the facing matrix (the kind byte left as it is), also copied into work B.
+/// PppKeDMatFr: the facing matrix (the kind byte left as it is), also copied into work B.
 fn ke_d_mat_fr(r: &mut Run, o: u32, _key: u32, rf: u32) {
     let m = front(r, o);
     put_mat(r, o + 0x50, &m);
@@ -1515,7 +1515,7 @@ fn emit_model(r: &mut Run, o: u32, a: ModelArgs) {
     r.render.push(super::RenderCall::Model(Box::new(draw)));
 }
 
-/// pppDrawMdl3: key +4 the model, +8 its switches (4: semi-transparent with the plain blend; 2: semi-transparent,
+/// PppDrawMdl3: key +4 the model, +8 its switches (4: semi-transparent with the plain blend; 2: semi-transparent,
 /// the plain blend when the model is untextured; 1: flag 0x80), +9 / +0xb flags 0x200 / 0x100, +0xa facing the
 /// camera, +0xc the third work as the entry's matrix; the blend is the model's (+0x16) otherwise. Remaster
 /// adjustments for some magic files while their own effect runs: 0x296 is drawn solid, 0x241 semi-transparent
@@ -1607,7 +1607,7 @@ fn draw_mdl3(r: &mut Run, o: u32, key: u32, rf: u32) {
     emit_model(r, o, args);
 }
 
-/// pppDrawMdlSemi3: key +4 the model, +8 the blend (0: the render state 2), +0xa its switches (2:
+/// PppDrawMdlSemi3: key +4 the model, +8 the blend (0: the render state 2), +0xa its switches (2:
 /// semi-transparent; 1: flag 0x80), +0xb / +0xd flags 0x200 / 0x100, +0xc facing the camera, +0xe the third
 /// work as the entry's matrix; an extra pass after each update.
 fn draw_mdl_semi3(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -1674,7 +1674,7 @@ fn ramp3(r: &mut Run, o: u32, key: u32, v: u32, k: u32, accel: Option<f32>) {
     }
 }
 
-/// pppKeMdlTfd3: the third work ramps (key +8); then (model key +4) the fading draw: the fade from the key's
+/// PppKeMdlTfd3: the third work ramps (key +8); then (model key +4) the fading draw: the fade from the key's
 /// words +0x14 / +0x18 and the ramp's value, texture word key byte +0x1c · 4, switches the bytes +0x1d..+0x21
 /// together (2 semi-transparent, 1 flag 0x80, 4 / 8 flags 0x200 / 0x100, 0x10 facing the camera, 0x20 the
 /// fourth work as the entry's matrix), colour from the first work.
@@ -1693,7 +1693,7 @@ fn ke_mdl_tfd3(r: &mut Run, o: u32, key: u32, rf: u32) {
     draw_mdl(r, o, n, at(o, wa), word, (0, 0), sw, at(o, wd), fade);
 }
 
-/// pppDrawMdl (the model draw other programs call): switches `sw` as pppKeMdlTfd3 gives them; the blend is the
+/// PppDrawMdl (the model draw other programs call): switches `sw` as pppKeMdlTfd3 gives them; the blend is the
 /// model's; a new entry's render state also gets 0x80.
 #[allow(clippy::too_many_arguments)]
 fn draw_mdl(
@@ -1746,7 +1746,7 @@ fn draw_mdl(
     emit_model(r, o, args);
 }
 
-/// pppKeMdlDtt (not on event 0x13e): the first work ramps (key +8; for key modes (+0x14) 4 and up its third
+/// PppKeMdlDtt (not on event 0x13e): the first work ramps (key +8; for key modes (+0x14) 4 and up its third
 /// float is a pointer, and the ramp has no acceleration while that is set); then (model key +4) a distortion
 /// draw when the part's alpha times the second work's is not 0.
 fn ke_mdl_dtt(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -1800,7 +1800,7 @@ fn ke_mdl_tfd3_init(r: &mut Run, o: u32, rf: u32) {
     set(r, at(o, wc), &[0; 3]);
 }
 
-/// pppKeZCrct: into the first work, the object's matrix with its rows scaled by the key's (+0x20) and its
+/// PppKeZCrct: into the first work, the object's matrix with its rows scaled by the key's (+0x20) and its
 /// position, by the key's mode (+0x30): 0 the position offset by the key's (+0x10), then through the camera;
 /// 1 through the camera, then offset; 2 through the frame matrix, the position replaced by the part's scale
 /// plus the scale times the key's offset (w the part's), then through the world matrix; others unchanged.
@@ -1845,7 +1845,7 @@ fn ke_z_crct(r: &mut Run, o: u32, key: u32, rf: u32) {
     put_mat(r, at(o, wa), &m);
 }
 
-/// pppVtMime: the first work ramps (key +0xc); then, with two meshes (key +4 / +8, records of the group's +0x14
+/// PppVtMime: the first work ramps (key +0xc); then, with two meshes (key +4 / +8, records of the group's +0x14
 /// list: +0 the vertex count, +0x14 the vertices, three i16 each), each vertex blended (first + (second − first)
 /// · the ramp's value, truncated) into a buffer of the pool (made once, at the work's +0xc) that becomes the
 /// object's vertex buffer.
@@ -1941,14 +1941,14 @@ fn loop_back(r: &mut Run, o: u32, rf: u32, float: bool) {
     }
 }
 
-/// pppAngleLoop: integers.
+/// PppAngleLoop: integers.
 fn angle_loop(r: &mut Run, o: u32, key: u32, rf: u32) {
     loop_add(r, o, key, rf, false)
 }
 fn angle_loop_back(r: &mut Run, o: u32, rf: u32) {
     loop_back(r, o, rf, false)
 }
-/// pppPointLoop / pppScaleLoop: floats.
+/// PppPointLoop / pppScaleLoop: floats.
 fn float_loop(r: &mut Run, o: u32, key: u32, rf: u32) {
     loop_add(r, o, key, rf, true)
 }
@@ -1960,7 +1960,7 @@ fn loop_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u32(at(o, wa) + 0x10, 0);
 }
 
-/// pppDrawMdlLoop: a model whose texture scrolls: the third work keeps the first key (+0), u and v (+4, +0x10;
+/// PppDrawMdlLoop: a model whose texture scrolls: the third work keeps the first key (+0), u and v (+4, +0x10;
 /// from the key's +8 / +0x14 at the start) with their speeds and accelerations (+8 / +0xc, +0x14 / +0x18,
 /// added from the key's +0xc / +0x10 / +0x18 / +0x1c on its time); each frame the speeds take their
 /// accelerations and u, v their speeds, kept in [0, 32768); the draw takes them · 65536. Key +0x20 the blend
@@ -2049,7 +2049,7 @@ fn draw_mdl_loop_restart(r: &mut Run, o: u32, rf: u32) {
     set(r, c + 0x14, &[0; 2]);
 }
 
-/// pppKeZCrctShp: into the first work, the object's rows scaled by the part's scale and its position (times
+/// PppKeZCrctShp: into the first work, the object's rows scaled by the part's scale and its position (times
 /// the key's scale +0x20, w its own) by the key's mode (+0x30): 0 offset by the key's (+0x10), then through the
 /// camera (turn and position, w taken as 1); 1 through the camera, then offset; 2 the part's scale plus the
 /// scale times the key's offset (w the part's).
@@ -2197,7 +2197,7 @@ fn draw_shape_one(r: &mut Run, o: u32, key: u32, rf: u32, path3: bool) {
     shape_step(r, a, key, shape, rec);
 }
 
-/// pppDrawShape / pppDrawShapeX (part-level entries): unless the definition skips its draws (+0xc bit 0), each
+/// PppDrawShape / pppDrawShapeX (part-level entries): unless the definition skips its draws (+0xc bit 0), each
 /// object of the slot with its key moved on to the next when that one's time has come, then drawn.
 fn draw_shape_group(r: &mut Run, s: u32, def: u32, rf: u32, k: u32, path3: bool) {
     if r.m.u32(def + 0xc) & 1 != 0 {
@@ -2337,7 +2337,7 @@ fn ke_th(r: &mut Run, a: u32, pos: u32) {
 
 const IDENTITY_M: Mat = crate::chr::elements::IDENTITY;
 
-/// pppKeLnsLp: on the key's time +0xa8 += key +8, +0x8e = key byte +0xc, +0x9c += key +4, +0x8f = key byte
+/// PppKeLnsLp: on the key's time +0xa8 += key +8, +0x8e = key byte +0xc, +0x9c += key +4, +0x8f = key byte
 /// +0xd; facing: +0x90 = the object's z axis (w kept); +0x80 = the object's position; then the light state.
 fn ke_lns_lp(r: &mut Run, o: u32, key: u32, rf: u32) {
     let (wa, _) = works(r, rf);
@@ -2376,7 +2376,7 @@ fn ke_lns_lp_restart(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u32(a + 0xa8, 0);
 }
 
-/// pppKeLnsFls: on the key's time the first work takes the light (+0 the address of the second work) and the
+/// PppKeLnsFls: on the key's time the first work takes the light (+0 the address of the second work) and the
 /// shape (+4 the list entry of key +4, its timer +8 set to the first frame's duration and its frame +0xa to 0 when
 /// it changes; none for 0xffff); then a flare: the shape frame along the light, scaled (key +0xc, by the
 /// distance on the screen over key u16 +0x10: modes key +0x12 / +0x13 for x / y: 1 the fade, 2 one plus the
@@ -2536,7 +2536,7 @@ fn tail_ring(r: &mut Run, o: u32, ring: u32, index: u32, len: u8) {
     }
 }
 
-/// pppKeShpTail2 (update): the first work's byte +0 is the ring's length, +1 its index, the ring from +0x10.
+/// PppKeShpTail2 (update): the first work's byte +0 is the ring's length, +1 its index, the ring from +0x10.
 fn ke_shp_tail2(r: &mut Run, o: u32, _key: u32, rf: u32) {
     if r.paused {
         return;
@@ -2547,7 +2547,7 @@ fn ke_shp_tail2(r: &mut Run, o: u32, _key: u32, rf: u32) {
     tail_ring(r, o, a + 0x10, a + 1, len);
 }
 
-/// pppKeShpTail2 (draw): the trail (its geometry built by the renderer from the ring), then the shape's frame
+/// PppKeShpTail2 (draw): the trail (its geometry built by the renderer from the ring), then the shape's frame
 /// step (timer u16 +2 by key i16 +8, frame u16 +4).
 fn ke_shp_tail2_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
     let n = r.m.u32(key + 4);
@@ -2587,7 +2587,7 @@ fn ke_shp_tail2_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u16(a, 0x1f);
 }
 
-/// pppKeShpTail3 (update): the ring of 0x1c positions from +0x30 (index byte +0x1f8) and two colours of four
+/// PppKeShpTail3 (update): the ring of 0x1c positions from +0x30 (index byte +0x1f8) and two colours of four
 /// i16 (+0 and +8) with their rates (+0x10, +0x20) and accelerations (+0x18, +0x28), on the key's time each
 /// taking the key's (+0x20.., +0x28.., +0x30.., +0x40.., +0x38.., +0x48..).
 fn ke_shp_tail3(r: &mut Run, o: u32, key: u32, rf: u32) {
@@ -2623,7 +2623,7 @@ fn ke_shp_tail3(r: &mut Run, o: u32, key: u32, rf: u32) {
     }
 }
 
-/// pppKeShpTail3 (draw, unpaused only): the trail (built by the renderer), then the time +0x1f0 += key +8.
+/// PppKeShpTail3 (draw, unpaused only): the trail (built by the renderer), then the time +0x1f0 += key +8.
 fn ke_shp_tail3_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.paused {
         return;
@@ -2783,7 +2783,7 @@ fn field_keeps_entries(map: u32) -> bool {
     matches!(map, 0x76f | 0x18e7 | 0x5c8 | 0x1f7 | 0x4c4 | 0x1b8a | 0x324 | 0x1e8a | 0x1139)
 }
 
-/// pppDrawShapeField: a field of sprites (key +8 of them, 0xa0 bytes each in the pool at the first work's +0x40,
+/// PppDrawShapeField: a field of sprites (key +8 of them, 0xa0 bytes each in the pool at the first work's +0x40,
 /// with a 0xc-byte buffer at +0x44 and a colour history of the life's frames at +0x50, made on the first
 /// draw): the second work's colour into the history while the object is young; near the definition's end the
 /// object's age held while sprites live; unless paused (and the part not draining) the spawn; the draw; the
@@ -2903,7 +2903,7 @@ fn sea_map(map: u32) -> bool {
     )
 }
 
-/// pppDrawMdlSea (on the sea maps): the third work (+0x40 a wave phase vector, +0x50.. u and v with speeds and
+/// PppDrawMdlSea (on the sea maps): the third work (+0x40 a wave phase vector, +0x50.. u and v with speeds and
 /// accelerations, +0x68 the model's resting vertices, +0x6c a byte per vertex, +0x70 the key, +0x74 / +0x75 /
 /// +0x76 the texture animation's wait, frame and count, +0x77 waves on), made on the first draw; unless paused,
 /// the scroll ramps (key +8..+0x1c), and with waves each flagged vertex of the model moved from rest by the sine

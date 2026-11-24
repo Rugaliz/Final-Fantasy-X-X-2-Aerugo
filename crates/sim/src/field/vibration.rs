@@ -89,7 +89,7 @@ impl Vibration {
         }
     }
 
-    /// A segment from the data at `at` : level, hold, and the next level.
+    /// A segment from the data at `at`: level, hold, and the next level.
     fn segment(&self, s: &mut Stream, at: usize) {
         let d = self.data.as_deref().unwrap_or(&[]);
         let b = |i: usize| d.get(at + i).copied().unwrap_or(0);

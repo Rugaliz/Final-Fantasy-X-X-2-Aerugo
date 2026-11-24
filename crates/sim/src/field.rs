@@ -295,17 +295,17 @@ pub struct Globals {
     pub first_c6: u8,
     /// A value a menu sets (−1 at start; 01fa reads it).
     pub menu_value_fa: i32,
-    /// The save read's argument 01c5 keeps ([1330230]).
-    pub save_read_1330230: i32,
+    /// The save read's argument 01c5 keeps.
+    pub save_read_arg: i32,
     /// The scene's colour transform: multipliers and offsets (zero at start; an event effect's end, or a
     /// battle's start, sets the multipliers to 1). The map effects take their colour from the multipliers, and
     /// the fog and background colours use both while the display flags' bit 2 is set.
     pub colour_mul: [f32; 4],
     pub colour_add: [f32; 4],
-    /// The save menu's counter [186627c] (8b4e70 resets it to 0; each save adds one and writes it into the file's
+    /// The save menu's counter (the save menu's set-up resets it to 0; each save adds one and writes it into the file's
     /// header, capped at 0x80000000).
     pub save_counter: u32,
-    /// The text reveal speeds [1325b98] (0259; the message reveal reads entry 0): zero at boot (BSS), kept across
+    /// The text reveal speeds (0259; the message reveal reads entry 0): zero at boot (BSS), kept across
     /// events.
     pub reveal_speed: [f32; 2],
 }
@@ -316,7 +316,7 @@ impl Default for Globals {
             turn_limit_deg: 179.0,
             first_c6: 1,
             menu_value_fa: -1,
-            save_read_1330230: 0,
+            save_read_arg: 0,
             colour_mul: [0.0; 4],
             colour_add: [0.0; 4],
             reveal_speed: [0.0; 2],
@@ -362,10 +362,10 @@ pub struct Window {
     pub style: Option<u8>,
     /// The message module's frame, text and choice records.
     pub to: msg_to::To,
-    /// The values the text's placeholders show (1869ab0's 32 slots: 009e / 8b8960 the staged type +0, 8b8980 the
-    /// value +4); a slot not listed is (0xff, −1), as 8b81d0 resets them.
+    /// The values the text's placeholders show (32 slots per window: 009e sets the staged type +0 and the
+    /// value +4); a slot not listed is (0xff, −1), as the message module's reset leaves them.
     pub values: Vec<(u8, i32)>,
-    /// The slots' active types (+1), copied from the staged ones when the window opens (8b8210); the {12:3n}
+    /// The slots' active types (+1), copied from the staged ones when the window opens; the {12:3n}
     /// macros read these. A slot not listed is 0xff (none).
     pub value_types: Vec<u8>,
     /// The window's colour word (00a2: four bytes) and its +0x28 word (0256 / 0257).
@@ -836,7 +836,7 @@ pub struct FieldState {
     pub workers: crate::workers::Workers,
     /// Each worker's character record (the original's layout), once it binds a body.
     pub chrs: Vec<Option<crate::chr::Chr>>,
-    /// The event script header's area word (+0x1e) and, with its bit 15, its table (+0x28) — 870ef0.
+    /// The event script header's area word (+0x1e) and, with its bit 15, its table (+0x28): the encounter area of the player's ground.
     pub area_table: Option<(u16, Vec<u16>)>,
     /// The event effect running in the sandbox (00db–00de).
     pub effects: effects::Effects,
@@ -873,7 +873,7 @@ pub struct FieldState {
     /// the session to set; without it the save image's word now stands for it.
     pub primers_loaded: Option<i32>,
     /// A switch only the debug menu toggles (0265).
-    pub debug_cccacc: i32,
+    pub debug_menu_switch: i32,
     pub input: Input,
     /// Worker the player controls.
     pub player: Option<usize>,
@@ -888,8 +888,8 @@ pub struct FieldState {
     /// The map effects' particle runtime (from the map package's table).
     pub map_runtime: Option<Box<map_fx::MapRuntime>>,
     /// A map display switch (805c), and the particle runtime's pause (8066 sets it; an effect may too).
-    pub map_switch_5eb8: u8,
-    pub map_effect_230fd34: i32,
+    pub map_display_switch: u8,
+    pub particle_pause: i32,
     /// The PS2 map's pre-rendered background layers.
     pub pre_bg: pre_bg::PreBg,
     /// The remaster's map id (the hash of the map path) and language type (jp 0, us 1, fr 2, es 3, de 4, it 5,
@@ -907,7 +907,7 @@ pub struct FieldState {
     pub map_package: Option<std::sync::Arc<[u8]>>,
     pub page_switch: (u8, i8, i8),
     /// Set by 8006 on map 0x159c at story 0x7e4 with page 2 (the remaster reads it).
-    pub page_flag_bf68: bool,
+    pub bg_alternate: bool,
     /// The map display switches (map load sets 0x11, 0x4000 with a background stream; 8001 bit 0x10)
     /// and the remaster's render switch 8001 passes.
     pub map_display: u32,
@@ -952,19 +952,19 @@ pub struct FieldState {
     /// The pad's held word last frame and the buttons let go this frame (the pad history's +8, kept).
     pub pad_prev_held: u32,
     /// A menu value (01fb reads it; the menus set it).
-    pub value_a228: i32,
+    pub menu_value_01fb: i32,
     pub pad_released: u32,
     /// The pad block's analog bytes and second word (0121 / 0122 / 0251).
     pub pad: pad::PadBlock,
     /// c007's pair and the debug switch bytes 707d / 707e set and read.
-    pub values_085c: [i32; 2],
+    pub pad_analog: [i32; 2],
     pub debug_flags: Vec<u8>,
-    pub values_08c4: [i32; 2],
-    pub bytes_0771: [u8; 4],
-    pub lights_08cc: Vec<[u8; 0x2c]>,
+    pub debug_values_c007: [i32; 2],
+    pub bytes_4039: [u8; 4],
+    pub chr_lights: Vec<[u8; 0x2c]>,
     /// A switch byte 00b2 sets and the three values 00b3/00b4 set.
-    pub byte_181e: u8,
-    pub values_194c: [i32; 3],
+    pub switch_00b2: u8,
+    pub values_00b3: [i32; 3],
     /// The PS2 map's display objects and keyframe tracks, and the keyframe slots playing them.
     pub map_objects: Option<std::sync::Arc<map_objects::MapObjects>>,
     pub keyframes: map_objects::Keyframes,
@@ -1076,7 +1076,7 @@ pub struct FieldState {
 }
 
 impl FieldState {
-    /// The next script random number (rng_next(2), 7988f0): a replayed one, else stream 2's.
+    /// The next script random number (rng_next(2)): a replayed one, else stream 2's.
     pub fn random(&mut self) -> u32 {
         self.rng_replay.pop_front().unwrap_or_else(|| self.rng_streams.next(2))
     }
@@ -1091,8 +1091,8 @@ impl World for FieldState {
         self.worker_pre_run(w);
     }
 
-    // 8641e0: a worker runs with +0x34 bit 2 or +0x36 bit 6 set, or while no battle is requested or running
-    // (780c90: [112a8e0] / [112a8e2]; the field frame does not run during Aerugo's battles, so the request);
+    // A worker runs with +0x34 bit 2 or +0x36 bit 6 set, or while no battle is requested or running
+    // (; the field frame does not run during Aerugo's battles, so the request);
     // never with the system's +3 & 3 == 1, and with 2 only with +0x36 bit 15. (+0x34 bit 1 is the VM's on bit.)
     fn may_run(&mut self, w: usize) -> bool {
         let Some(wk) = self.workers.list.get(w) else { return true };
@@ -1236,7 +1236,7 @@ impl FieldState {
             ch.set_f32(0x50, rise);
             ch.set_f32(0x54, vz);
         }
-        // The body step and the collision push (83d3b0) over the worker bodies.
+        // The body step and the collision push over the worker bodies.
         let walk_mesh = self.walk_mesh.take();
         self.bump_signals = body_pass(&mut self.chrs, walk_mesh.as_ref(), event, &players, &remap);
         self.walk_mesh = walk_mesh;
@@ -1265,7 +1265,7 @@ impl FieldState {
             let push = self.control.tick(self.input.stick, self.input.walk, in_water);
             player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
             // The heading: the player control's camera heading kept while the stick holds its direction.
-            // The camera heading of the current camera record (7bcf20).
+            // The camera heading of the current camera record.
             let cam = self.cam.heading();
             let vector = self.control.vector;
             let heading = self.sg.frame(cam, self.user_control, self.control.pushing(), vector, self.map_id);
@@ -1517,7 +1517,7 @@ impl FieldState {
     }
 
     /// A new body record for model `m` (Ch_Allocate's setter chain): its collision radius base (+0x4e4) is the
-    /// model block's +0x1c, the character data's info block +4 (82b880 with −1).
+    /// model block's +0x1c, the character data's info block +4 (the collision radius set to its default).
     pub(crate) fn allocate_body(&mut self, m: u16) -> crate::chr::Chr {
         self.model_data(m);
         let block = self.model_blocks.get(&m).copied().flatten();
@@ -1967,7 +1967,7 @@ pub fn chr_motion_scale(d: &[u8]) -> Option<f32> {
 
 /// A character's collision radius from its `.chr` data: header version (u32 at 4) 10 or later has an info block
 /// (offset at 0x58) whose second float is the radius; older data takes 1.
-/// A model's block values (825ee0): with a version above 9 from the info block (file +0x58): +0x24 ← info +0x18,
+/// A model's block values: with a version above 9 from the info block (file +0x58): +0x24 ← info +0x18,
 /// +0x28 ← +0x14, +0x2c ← +8, the scale +0x34 ← +0x1c; else 1, 0, 8 and 1.
 pub fn chr_block(d: &[u8]) -> Option<crate::chr::Block> {
     let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -2309,15 +2309,15 @@ fn degree_rad(d: f32) -> f32 {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Distortion {
     pub flags: u32,
-    pub value_e7c: f32,
+    pub value_01e6_a: f32,
     /// +8..+0x14 (the reset clears them).
-    pub values_e80: [u32; 4],
+    pub reset_words: [u32; 4],
     pub point: [f32; 3],
-    pub value_e9c: f32,
-    pub count_ea0: i32,
+    pub value_01e6_b: f32,
+    pub count_01e4: i32,
     pub rgb: [u8; 3],
-    pub value_ea8: u32,
-    pub value_ded28: u32,
+    pub timer_01e2: u32,
+    pub value_01e2: u32,
     pub on: bool,
     pub fresh: bool,
     pub start: f32,
@@ -2326,11 +2326,11 @@ pub struct Distortion {
 impl Distortion {
     /// The parameters' defaults (the flags stay).
     pub fn reset(&mut self) {
-        self.value_e7c = 0.0;
-        self.values_e80 = [0; 4];
+        self.value_01e6_a = 0.0;
+        self.reset_words = [0; 4];
         self.point = [f32::from_bits(0x3cf5_c28f), f32::from_bits(0x3ca3_d70a), f32::from_bits(0x3ba3_d70a)];
-        self.value_e9c = f32::from_bits(0x4280_0000);
-        self.count_ea0 = 0x60;
+        self.value_01e6_b = f32::from_bits(0x4280_0000);
+        self.count_01e4 = 0x60;
         self.rgb = [0x80; 3];
     }
 }
@@ -2399,9 +2399,9 @@ impl FieldState {
         self.user_control = false;
     }
 
-    /// 86a130: control off, then on again unless byte 1 bit 2 or byte 3 bits 0x84 block it, when byte 0 had 0x22
+    /// Control off, then on again unless byte 1 bit 2 or byte 3 bits 0x84 block it, when byte 0 had 0x22
     /// before.
-    /// 870ef0: the event's area for index `n` — the header's area word, or with its bit 15 the n-th of its table
+    /// the event's area for index `n` — the header's area word, or with its bit 15 the n-th of its table
     /// (past the table: the first); 0 without a script.
     pub fn area_word(&self, n: u32) -> u16 {
         match &self.area_table {
@@ -2464,7 +2464,7 @@ impl FieldState {
 }
 
 /// The remaster's map id: a hash of the map package path between `jppc` and `bin/` (`/map/bjyt/bjyt00/`).
-/// The body step and the collision push (83d3b0) over the bodies in use and shown: up to two passes, each
+/// The body step and the collision push over the bodies in use and shown: up to two passes, each
 /// stepping every body (the ground step for bodies on the walk mesh, else the whole velocity; the velocity is then
 /// cleared) and pushing overlapping pairs apart (their push goes into the velocity the next pass applies); then the
 /// bodies a walker touched for the first time get the bump signal. Returns the bumped bodies' workers.
@@ -2566,13 +2566,13 @@ fn body_pass(
     }
 }
 
-/// The distance on the ground plane (83e3e0).
+/// The distance on the ground plane.
 fn xz_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     let (dx, dz) = (b[0] - a[0], b[2] - a[2]);
     (f64::from(dx * dx + dz * dz)).sqrt() as f32
 }
 
-/// chr_push_apart (83ecd0): the overlap `r − d` shared out by the push weights (+0x500; both negative: by how far
+/// chr_push_apart: the overlap `r − d` shared out by the push weights (+0x500; both negative: by how far
 /// each moved this frame) along the unit direction from b to a, into the velocities; a body given a push gets
 /// flag 0x20. Returns whether there was a push.
 fn push_apart(a: &mut crate::chr::Chr, b: &mut crate::chr::Chr, r: f32, d: f32) -> i32 {
@@ -3194,7 +3194,7 @@ fn register_engine_settings(n: &mut Natives<FieldState>) {
         }),
     );
     // 500e(v): the body's +0x194 bit 0x80 = v & 1 (set: it leaves the walk mesh, its ground normal (0, −1, 0)), and
-    // the walk-mesh shade bit 0x40000 the opposite (82aa70). 5060(v): the shade bit = v & 1 (8340f0).
+    // the walk-mesh shade bit 0x40000 the opposite. 5060(v): the shade bit = v & 1.
     n.register(
         0x500E,
         Native::result(|g, c| {
@@ -3402,8 +3402,8 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
     );
     // The memory card check and the title (memochek, test20): save data present, the answers the recordings show
     // (01c6 1, 0243 3, 01c5 0, 0253 1), so a new game goes on to the title.
-    // 01c5(a, mode): the Al Bhed dictionary read from the save (85b1a0 / 85b590 / 85d8f0): +0x210 bit 4 off,
-    // [1330230] = a; the read's state starts at 2, so the result is 0 with mode 1, else 2; bit 4 on again. The
+    // 01c5(a, mode): the Al Bhed dictionary read from the save: +0x210 bit 4 off,
+    // = a; the read's state starts at 2, so the result is 0 with mode 1, else 2; bit 4 on again. The
     // remaster's save screen path of worker 0x5045 is not ported (reported).
     n.register(
         0x01C5,
@@ -3412,7 +3412,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
                 let mode = c.stack.pop_int();
                 let a = c.stack.pop_int();
                 g.workers.sys.flags210 &= !0x10;
-                g.globals.save_read_1330230 = a;
+                g.globals.save_read_arg = a;
                 c.scratch[1] = mode as i8 as i32;
                 if g.workers.list.get(c.worker).is_some_and(|w| w.u16(crate::workers::BIND_ID) == 0x5045) {
                     log::error!("GAP: 01c5 on worker 0x5045 (the remaster's save screen) is not ported");
@@ -3426,7 +3426,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
         },
     );
     // 00fb(window): the highlighted choice of a window whose text has choices and whose choice record runs
-    // (8b8010), else −1.
+    //, else −1.
     n.register(
         0x00FB,
         Native::result(|g, c| {
@@ -3439,7 +3439,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             })
         }),
     );
-    // 00a3(worker, x, y, z): a worker's position into three float variables (86a2f0): lines (kinds 2, 5) their two
+    // 00a3(worker, x, y, z): a worker's position into three float variables: lines (kinds 2, 5) their two
     // points' midpoint (pos +0 and +0x30); kind 4 workers have no position (the original reads through a null
     // pointer: reported).
     n.register(
@@ -3466,7 +3466,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 5073(v): the body's collision height test (+0x194 bit 30 = v & 1, 82b420); without a body the value stays
+    // 5073(v): the body's collision height test (+0x194 bit 30 = v & 1); without a body the value stays
     // on the stack.
     n.register(
         0x5073,
@@ -3685,8 +3685,8 @@ fn window_place(g: &FieldState, x: i32, y: i32) -> (i32, i32) {
     }
 }
 
-/// Native 006a's open (858b50) on the window record: state 1; with mode bit 1 the choice counts of +0x16 clamp
-/// the record's choice bytes (871210: no digits → +0x22 = 0 and mode bit 6 off; no choices → mode bit 1 off and
+/// Native 006a's open on the window record: state 1; with mode bit 1 the choice counts of +0x16 clamp
+/// the record's choice bytes (no digits → +0x22 = 0 and mode bit 6 off; no choices → mode bit 1 off and
 /// +0x1e/+0x1f = 0); the mode is kept (+0x1d); the number entry (mode bit 6); the message module opens it.
 pub(crate) fn msg_open(g: &mut FieldState, image: &[u8], w: usize, mode: u32) {
     let mut mode = mode;
@@ -3728,12 +3728,12 @@ pub(crate) fn msg_open(g: &mut FieldState, image: &[u8], w: usize, mode: u32) {
     msg_to::open(g, w, image);
 }
 
-/// 0084's init (85abd0): the window (0–7), the message wait's mode bit 4.
+/// 0084's init: the window (0–7), the message wait's mode bit 4.
 pub(crate) fn msg_wait_init(g: &mut FieldState, w: usize) {
     g.windows[w].mode |= 0x10;
 }
 
-/// 0084's wait (85ae90): closed (or closed state) → done; shown with its text all shown and the advance bit →
+/// 0084's wait: closed (or closed state) → done; shown with its text all shown and the advance bit →
 /// close it (the bit goes off) and wait on.
 pub(crate) fn msg_wait(g: &mut FieldState, w: usize) -> u32 {
     match g.windows[w].atel_state {
@@ -3747,7 +3747,7 @@ pub(crate) fn msg_wait(g: &mut FieldState, w: usize) -> u32 {
     }
 }
 
-/// 007d's wait (859c50): once shown with its text all shown and its choice taken, the pick is kept and the window
+/// 007d's wait: once shown with its text all shown and its choice taken, the pick is kept and the window
 /// closes; done when closed. Scratch 1: the pick (−1 none).
 fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
     let w = c.scratch[0] as usize;
@@ -3953,7 +3953,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 013b / 0267(window, message, first, cancel, x, y, alignment): a choice window in one call (8607a0): 0065
+    // 013b / 0267(window, message, first, cancel, x, y, alignment): a choice window in one call: 0065
     // placement, frame type 0 (0066), the message (0064), text flags 0 (009d), first and cancel (0069), opened
     // with mode 2 (006a), then the choice wait (007d).
     for id in [0x013B, 0x0267] {
@@ -4244,8 +4244,8 @@ fn register_queries(n: &mut Natives<FieldState>) {
     for id in [0x00DFu16, 0x00E0] {
         n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
     }
-    // 00e9(on): the system's byte 1 bit 4 (86aff0); 0177(on): the caller's +0x36 bit 6, and bit 15 when on
-    // (both run gates of 8641e0). The result is on ≠ 0.
+    // 00e9(on): the system's byte 1 bit 4; 0177(on): the caller's +0x36 bit 6, and bit 15 when on
+    // (both run gates of atel_run_worker). The result is on ≠ 0.
     n.register(
         0x00E9,
         Native::result(|g, c| {
@@ -4269,11 +4269,11 @@ fn register_queries(n: &mut Natives<FieldState>) {
 }
 
 fn register_treasure(n: &mut Natives<FieldState>) {
-    // 015b(window, treasure) (85a8a0): the treasure given (MsFieldItemGet), then the system message window with
+    // 015b(window, treasure): the treasure given (MsFieldItemGet), then the system message window with
     // battle-end text 0x4016 equipment / 0x4017 key item / 0x4018 or 0x4019 one or more of an item / 0x401a gil
-    // (else 0x401d); value slot 0 (type 0) the name, slot 1 (type 1) the count or the gil. Wait (85af70): the
+    // (else 0x401d); value slot 0 (type 0) the name, slot 1 (type 1) the count or the gil. Wait: the
     // message wait each frame; once it reports done, one frame (the menu 0x10001 asked for when the equipment did
-    // not fit), then done. The end (85b4c0): the system's +3 bit 2 off, control checked again; 1.
+    // not fit), then done. The end: the system's +3 bit 2 off, control checked again; 1.
     // Scratch: window, step, the equipment did not fit.
     n.register(
         0x015B,
@@ -4346,7 +4346,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
             }),
         },
     );
-    // 01a7(treasure) (857b70): the same without a message. Wait (857ef0): done at once (and on this frame) when
+    // 01a7(treasure): the same without a message. Wait: done at once (and on this frame) when
     // everything fit; else the menu 0x10001 is asked for, then done the frame after. The result is 1.
     n.register(
         0x01A7,
@@ -4373,9 +4373,9 @@ fn register_treasure(n: &mut Natives<FieldState>) {
     );
 }
 
-/// The system message window of 015b and 0216 (85a8a0, 85b280), after their value slots: battle-end text `text`
+/// The system message window of 015b and 0216, after their value slots: battle-end text `text`
 /// (TkBtlEndGetText: field variant · 4) placed by 0065 at (0x100, 0xd0) aligned 4, frame style 0 (+0x20), the
-/// text with +0x16 = 0 and flags +0x18 = 0, opened (006a mode 0); control checked again (86a130) and the message
+/// text with +0x16 = 0 and flags +0x18 = 0, opened (006a mode 0); control checked again and the message
 /// wait's mode bit (+0x1d |= 0x10).
 pub(crate) fn system_message(g: &mut FieldState, image: &[u8], w: usize, text: u32) {
     let variant = crate::items::text_variant(image);
@@ -4443,7 +4443,7 @@ fn choice_native() -> Native<FieldState> {
 
 /// Workers turned off (they stop running, but keep their requests) and on again.
 fn register_workers(n: &mut Natives<FieldState>) {
-    // 00a7 / 00a8(w): worker by index (86a830: negative or past the last → 0), +0x34 bit 1 cleared / set.
+    // 00a7 / 00a8(w): worker by index (negative or past the last → 0), +0x34 bit 1 cleared / set.
     fn set(g: &FieldState, c: &mut NativeCall, on: bool) -> Value {
         let w = target(g, c);
         c.effects.push(aerugo_script::vm::Effect::Enable(w, on));
@@ -4792,7 +4792,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         }),
     );
     // 5039(v): the body's collision radius base +0x4e4 = v (0 or below: the model block's +0x1c); the old one
-    // back (82b880); without a body 0.
+    // back; without a body 0.
     n.register(
         0x5039,
         Native::result(|g, c| {
@@ -4809,8 +4809,8 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(old)
         }),
     );
-    // 0126(x, y, z): the worker placed as 0013 does, with the set's flag 1 (870b20); on event 0x9f a z between
-    // −35.6 and −35.5 also raises the music flag [1325b40].
+    // 0126(x, y, z): the worker placed as 0013 does, with the set's flag 1; on event 0x9f a z between
+    // −35.6 and −35.5 also raises the music flag.
     n.register(
         0x0126,
         Native::result(|g, c| {
@@ -4951,9 +4951,9 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The waits for a motion (5003 a788a0, 501e a793c0): while the body plays a motion a script set (+0x736),
-    // then done on this frame (5); without a body they never end. (501e also counts frames in [22fb4d8] while
-    // [12fb80c] == 1, a counter nothing in the field reads.)
+    // The waits for a motion (5003, 501e): while the body plays a motion a script set (+0x736),
+    // then done on this frame (5); without a body they never end. (501e also counts frames in while
+    // == 1, a counter nothing in the field reads.)
     for id in [0x5003u16, 0x501E] {
         n.register(
             id,
@@ -5045,7 +5045,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The character engine's mode (5013(m): 82b1e0 / 82b3a0, body +0x185 and +0x186 = m; 0 on the ground, 2 in
+    // The character engine's mode (5013(m): body +0x185 and +0x186 = m; 0 on the ground, 2 in
     // water; without a body nothing) and the water level (4001).
     n.register(
         0x5013,
@@ -5066,7 +5066,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Stopping the motion (5005 / 5020: chr_motion_stop 82b080: body +0x730 = 1, +0x736 = 0, +0x728 = 0; without a
+    // Stopping the motion (5005 / 5020: chr_motion_stop body +0x730 = 1, +0x736 = 0, +0x728 = 0; without a
     // body nothing): the character engine picks its own again.
     for id in [0x5005u16, 0x5020] {
         n.register(
@@ -5254,7 +5254,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         );
     }
     // Messages: text, position, open, wait for the player, close.
-    // 0064(window, message): the text ([1325ac0] keeps the message), +0x16 its choice and digit word (86bf10).
+    // 0064(window, message): the text (keeps the message), +0x16 its choice and digit word.
     n.register(
         0x0064,
         Native::result(|g, c| {
