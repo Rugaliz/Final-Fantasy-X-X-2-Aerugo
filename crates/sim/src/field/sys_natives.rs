@@ -1385,8 +1385,9 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
         0x5084,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
+            // 835020: 0 stands for 6.0.
             if let Some(ch) = chr_of(g, c.worker) {
-                ch.set_f32(0x420, v);
+                ch.set_f32(0x420, if v == 0.0 { 6.0 } else { v });
             }
             Value::Int(0)
         }),
@@ -1424,8 +1425,8 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 0158(slot): the worker's body slot (its body's +0x184, the worker's +0xaf), and slots below 16 name the
-    // worker; returns the slot.
+    // 0158(slot) (85cfa0): while the system's +0x1a word is 0: the body's +0x184 (bound to a body, 835b50), the
+    // worker's +0xaf, and slots below 16 name the worker (885fd0); returns the slot.
     n.register(
         0x0158,
         Native::result(|g, c| {
@@ -1433,7 +1434,8 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
             if g.workers.sys.word_1a != 0 {
                 return Value::Int(v);
             }
-            if let Some(ch) = chr_of(g, c.worker) {
+            let bound = g.workers.list[c.worker].u8(workers::BIND) == 1;
+            if bound && let Some(ch) = chr_of(g, c.worker) {
                 ch.set_u8(0x184, v as u8);
             }
             let w = wk(g, c);
@@ -1818,12 +1820,13 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(on))
         }),
     );
-    // 025d(v): a value the system keeps.
+    // 025d(v): [1325ac4] = v; the result is v (left in EAX, 859c20).
     n.register(
         0x025D,
         Native::result(|g, c| {
-            g.workers.sys.value_ac4 = c.stack.pop_int();
-            Value::Int(0)
+            let v = c.stack.pop_int();
+            g.workers.sys.value_ac4 = v;
+            Value::Int(v)
         }),
     );
     n.register(0x025C, Native::result(|_, _| Value::Int(0)));
@@ -2810,8 +2813,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
     n.register(
         0x5032,
         Native::result(|g, c| {
-            if g.chrs.get(c.worker).is_some_and(Option::is_some) {
-                let mode = g.actors.get(c.worker).map_or(0, |a| a.chr_mode);
+            // 837180: 837d00(body, (i8) +0x185, 0).
+            if let Some(mode) = g.chrs.get(c.worker).and_then(Option::as_ref).map(|ch| ch.u8(0x185)) {
                 g.mode_motion(c.worker, mode, 0);
             }
             Value::Int(0)
@@ -2884,7 +2887,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x4040,
         Native::result(|g, c| {
             let d = c.stack.pop_float();
-            let cam = g.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
+            let cam = g.cam.heading();
             g.sg.turn_to(cam, d);
             Value::Int(0)
         }),
@@ -2903,7 +2906,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
     n.register(
         0x403F,
         Native::result(|g, _| {
-            g.sg.camera = g.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
+            g.sg.camera = g.cam.heading();
             g.sg.offset = 0.0;
             Value::Int(0)
         }),

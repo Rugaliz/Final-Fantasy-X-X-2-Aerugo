@@ -622,9 +622,6 @@ pub struct Input {
     pub held: u32,
     /// Cancel held: the player walks instead of running.
     pub walk: bool,
-    /// Heading of the camera the player sees (towards where it looks on the ground plane, as `atan2(dz, dx)`);
-    /// the stick is relative to it. None: the camera looks along +Z.
-    pub camera_heading: Option<f32>,
 }
 
 /// A value moving linearly to a target over a number of ticks (the original's interpolated character values).
@@ -1262,7 +1259,8 @@ impl FieldState {
             let push = self.control.tick(self.input.stick, self.input.walk, in_water);
             player_speed = push.filter(|_| self.user_control).map_or(0.0, |p| p.speed);
             // The heading: the player control's camera heading kept while the stick holds its direction.
-            let cam = self.input.camera_heading.unwrap_or(std::f32::consts::FRAC_PI_2);
+            // The camera heading of the current camera record (7bcf20).
+            let cam = self.cam.heading();
             let vector = self.control.vector;
             let heading = self.sg.frame(cam, self.user_control, self.control.pushing(), vector, self.map_id);
             if let (Some(push), Some(h)) = (push.filter(|_| self.user_control), heading) {

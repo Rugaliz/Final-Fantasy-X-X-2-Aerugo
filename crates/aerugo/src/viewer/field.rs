@@ -76,8 +76,6 @@ pub struct FieldView {
     alt: bool,
     cancel: bool,
     last_stick: [f32; 2],
-    /// Heading of the camera drawn last (the stick is relative to it).
-    camera_heading: Option<f32>,
     /// Draw between the last two ticks (smooth above 30 Hz); the share of the next tick elapsed.
     interpolate: bool,
     alpha: f32,
@@ -275,7 +273,6 @@ impl FieldView {
             alt: false,
             cancel: false,
             last_stick: [0.0, 0.0],
-            camera_heading: None,
             interpolate: true,
             alpha: 1.0,
             prev_view: None,
@@ -726,7 +723,6 @@ impl FieldView {
                 alt: std::mem::take(&mut self.alt),
                 stick_pressed,
                 walk,
-                camera_heading: self.camera_heading,
                 pad: 0,
                 held: if self.pause_menu { 0 } else { held },
             };
@@ -1085,16 +1081,6 @@ impl FieldView {
                 CameraMode::Follow
             };
         }
-        self.camera_heading = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
-            (CameraMode::Script, Some(eye), Some(focus), _) => {
-                Some((focus[2] - eye[2]).atan2(focus[0] - eye[0]))
-            }
-            (CameraMode::Map, _, _, Some((_, h))) => Some(h),
-            _ => {
-                let d = self.orbit.target - self.orbit.eye();
-                Some((-d.z).atan2(d.x))
-            }
-        };
         let map_camera = map_camera.map(|(vp, _)| vp);
         let view_proj = match (self.camera_mode, cam_eye, cam_focus, map_camera) {
             (CameraMode::Script, Some(eye), Some(focus), _) => {

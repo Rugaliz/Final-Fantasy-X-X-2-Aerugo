@@ -241,6 +241,20 @@ impl CamMem {
         }
     }
 
+    /// 7bcf20: the heading of the current record ([2311430], the last screen slot stepped) on x/z from its eye
+    /// (side 1's output, +0x66c) to its focus (side 0's, +0x50), as 7c4990 makes it: atan(dz / dx), less π for
+    /// dx ≤ 0, ±π/2 (by dz's sign) for dx = 0.
+    pub fn heading(&self) -> f32 {
+        let r = self.screen_record;
+        let dx = self.f32(r + 0x50) - self.f32(r + 0x66c);
+        let dz = self.f32(r + 0x58) - self.f32(r + 0x674);
+        if dx == 0.0 {
+            return if dz < 0.0 { -1.570_796_4 } else { 1.570_796_4 };
+        }
+        let a = f64::from(dz / dx).atan() as f32;
+        if dx <= 0.0 { a - std::f32::consts::PI } else { a }
+    }
+
     /// The frame's settling of a slot's rectangles and shakes (the part of the screen step on the island): each
     /// rectangle takes its target, its centre offset from the frame, follows the other as asked (1: the other's
     /// size; 2: the other's place, no offset; 3: centred), runs its four channels; the shakes step; then every
