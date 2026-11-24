@@ -724,6 +724,11 @@ impl Player {
 
     /// One frame: the sequence, the pose at the clock, then the clock moves on. `alt_clock` is the frame-time
     /// scale (0x100 normal) when the alternative clock (native 4022) is on.
+    /// The motion clock (the body's +0x740: 1/256 frames, from the range start).
+    pub fn clock(&self) -> i32 {
+        self.clock
+    }
+
     pub fn frame(&mut self, alt_clock: Option<i32>) {
         self.dirty.iter_mut().for_each(|d| *d = false);
         if self.pc.is_none() {

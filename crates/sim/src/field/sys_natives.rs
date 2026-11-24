@@ -728,14 +728,24 @@ pub(super) fn register_chr(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 5051 / 5075(worker): the body's +0x740 value (0 without a body).
-    n.register(0x5051, Native::result(|g, c| Value::Int(chr_of(g, c.worker).map_or(0, |ch| ch.i32(0x740)))));
+    // 5051 / 5075(worker): the body's motion clock +0x740 (839860; 0 without a body). Aerugo's motion player keeps
+    // that clock (chr_motion_start sets it to the range start, 8392d0 advances and loops it).
+    fn motion_clock(g: &mut FieldState, w: usize) -> i32 {
+        if chr_of(g, w).is_none() {
+            return 0;
+        }
+        g.actors.get(w).and_then(|a| a.player.as_ref()).map_or_else(
+            || g.chrs.get(w).and_then(Option::as_ref).map_or(0, |ch| ch.i32(0x740)),
+            super::motion_engine::Player::clock,
+        )
+    }
+    n.register(0x5051, Native::result(|g, c| Value::Int(motion_clock(g, c.worker))));
     n.register(
         0x5075,
         Native::result(|g, c| {
             let i = c.stack.pop_int();
             let w = index(g, i);
-            Value::Int(chr_of(g, w).map_or(0, |ch| ch.i32(0x740)))
+            Value::Int(motion_clock(g, w))
         }),
     );
     // 5050(worker, v): the body's +0x737 byte.
