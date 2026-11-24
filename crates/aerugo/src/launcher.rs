@@ -10,6 +10,8 @@ use aerugo_vfs::{ArchiveId, ArchiveStatus, GameId, Install};
 pub enum InstallSource {
     CommandLine,
     Environment,
+    /// The folder the executable sits in (it was placed in the game folder).
+    ExecutableFolder,
     Settings,
     Steam,
     Manual,
@@ -20,6 +22,7 @@ impl InstallSource {
         match self {
             InstallSource::CommandLine => "from --game-dir",
             InstallSource::Environment => "from AERUGO_GAME_DIR",
+            InstallSource::ExecutableFolder => "the folder Aerugo is in",
             InstallSource::Settings => "from settings",
             InstallSource::Steam => "found in a Steam library",
             InstallSource::Manual => "chosen manually",
@@ -89,6 +92,9 @@ pub fn choose_install(
     if let Some(dir) = std::env::var_os(aerugo_vfs::GAME_DIR_ENV) {
         return Some((Install::inspect(PathBuf::from(dir)), InstallSource::Environment));
     }
+    if let Some(install) = executable_folder_install() {
+        return Some((install, InstallSource::ExecutableFolder));
+    }
     if let Some(dir) = settings_dir {
         let install = Install::inspect(dir);
         if install.is_usable() {
@@ -99,6 +105,14 @@ pub fn choose_install(
     let found = steam();
     let best = found.iter().position(Install::is_usable).or(if found.is_empty() { None } else { Some(0) });
     best.map(|i| (found.into_iter().nth(i).expect("index in range"), InstallSource::Steam))
+}
+
+/// The game install Aerugo's own folder is, when the executable was placed in the game folder.
+fn executable_folder_install() -> Option<Install> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.canonicalize().unwrap_or(exe).parent()?.to_path_buf();
+    let install = Install::inspect(dir);
+    install.is_usable().then_some(install)
 }
 
 /// Things the launcher asks the app to do.
