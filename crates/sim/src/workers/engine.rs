@@ -70,8 +70,61 @@ impl Workers {
             }
             2 if player != -1 => self.test_line(w, env),
             3 if player != -1 => self.test_box(w, env),
+            5 => self.decode_commands(w, env),
             6 => self.test_zone(w, env),
             _ => {}
+        }
+    }
+
+    /// Kind 5 (868020): AtelDecodeCommand for the worker named at +0x28 of the position block, then for each
+    /// entry of the command list (+0x2e4: 8 × 8 bytes, i16 worker (−1 none), i16 on, …) — nothing ported sets
+    /// that list, so it is reported if it is ever there.
+    fn decode_commands(&mut self, w: usize, env: &mut dyn Env) {
+        let wk = &self.list[w];
+        let target = wk.u16(wk.pb() + p::TARGET);
+        self.decode_command(w, target, env);
+        if self.list[w].u32(0x2e4) != 0 {
+            log::error!(
+                "GAP: worker {w}'s kind-5 command list (+0x2e4, AtelDecodeCommand per entry) is not ported"
+            );
+        }
+    }
+
+    /// AtelDecodeCommand (8680a0) for the main target: the step of `target` (0xffff: the player, the system's
+    /// +0x228 → +0x218; else the worker by index, its position block +0x10 → +0) across the line from the worker's
+    /// position to its second point (+0x30); a crossing (889bb0) within the height (+0x1c ≤ 0: any; else the
+    /// heights at the crossing (889e90) at most that far apart) sets the side in the second flags (bit 1 for a
+    /// positive side, else bits 1–2 cleared) and raises signal 4 (8764f0(0xffff, w, 4)). Tested only when the
+    /// target moved on x or z, or the second flags' bit 0 asks for it (cleared then).
+    fn decode_command(&mut self, w: usize, target: u16, env: &mut dyn Env) {
+        let (prev, cur) = if target == 0xffff {
+            let s = &self.sys;
+            (
+                [s.player_prev[0], s.player_prev[1], s.player_prev[2]],
+                [s.player_pos[0], s.player_pos[1], s.player_pos[2]],
+            )
+        } else {
+            let i = if usize::from(target) < self.list.len() { usize::from(target) } else { 0 };
+            let t = &self.list[i];
+            ([t.pf(p::PREV), t.pf(p::PREV + 4), t.pf(p::PREV + 8)], t.position())
+        };
+        let wk = &mut self.list[w];
+        let a = wk.position();
+        let b = [wk.pf(p::PITCH), wk.pf(p::YAW), wk.pf(p::ROLL)];
+        let height = wk.pf(p::HEIGHT);
+        if cur[0] == prev[0] && cur[2] == prev[2] && wk.flags2() & 1 == 0 {
+            return;
+        }
+        wk.set_u16(FLAGS2, wk.flags2() & 0xfffe);
+        let side = math::crossing(prev, cur, a, b);
+        if side == 0 {
+            return;
+        }
+        let gap = math::crossing_height(prev, cur, a, b);
+        if height <= 0.0 || gap <= height {
+            let f2 = wk.flags2();
+            wk.set_u16(FLAGS2, if side < 1 { f2 & 0xfff9 } else { f2 & 0xfffb | 2 });
+            env.signal(w, 4);
         }
     }
 

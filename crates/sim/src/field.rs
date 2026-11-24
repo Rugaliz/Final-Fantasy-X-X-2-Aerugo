@@ -4891,13 +4891,17 @@ pub fn register(n: &mut Natives<FieldState>) {
     for id in [0xB002, 0xB005, 0xB006, 0xB007, 0xB008, 0xB00D, 0xB00E, 0xB00F] {
         n.register(id, Native::result(|_, _| Value::Int(0)));
     }
-    // How many more times the motion plays (0: once; 0xFF: for ever), and its speed (0x100 normal).
+    // How many more times the motion plays (0: once; 0xFF: for ever): 5022(n) → 837570 (body +0x737 = n; without
+    // a body nothing). Its speed (0x100 normal): 5021.
     n.register(
         0x5022,
         Native::result(|g, c| {
             let n = c.stack.pop_int();
-            if let Some(p) = &mut g.actor(c.worker).player {
-                p.plays = n as i8;
+            if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut) {
+                ch.set_u8(0x737, n as u8);
+                if let Some(p) = &mut g.actor(c.worker).player {
+                    p.plays = n as i8;
+                }
             }
             Value::Int(0)
         }),
@@ -4912,16 +4916,19 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The waits for a motion (0x5003, 0x501E): while the character's motion plays.
+    // The waits for a motion (5003 a788a0, 501e a793c0): while the body plays a motion a script set (+0x736),
+    // then done on this frame (5); without a body they never end. (501e also counts frames in [22fb4d8] while
+    // [12fb80c] == 1, a counter nothing in the field reads.)
     for id in [0x5003u16, 0x501E] {
         n.register(
             id,
             Native {
                 init: None,
                 wait: Some(|g, c| {
-                    let playing =
-                        g.actors.get(c.worker).and_then(|a| a.player.as_ref()).is_some_and(|p| p.playing);
-                    if playing { 0 } else { WAIT_DONE }
+                    let Some(ch) = g.chrs.get(c.worker).and_then(Option::as_ref) else { return 0 };
+                    let playing = ch.u8(0x736) != 0
+                        && g.actors.get(c.worker).and_then(|a| a.player.as_ref()).is_some_and(|p| p.playing);
+                    if playing { 0 } else { WAIT_DONE | aerugo_script::vm::WAIT_CONTINUE }
                 }),
                 result: None,
             },
@@ -5003,12 +5010,17 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // The character engine's mode (5013: 0 on the ground, 2 in water) and the water level (4001).
+    // The character engine's mode (5013(m): 82b1e0 / 82b3a0, body +0x185 and +0x186 = m; 0 on the ground, 2 in
+    // water; without a body nothing) and the water level (4001).
     n.register(
         0x5013,
         Native::result(|g, c| {
             let m = c.stack.pop_int();
-            g.actor(c.worker).chr_mode = m as u8;
+            if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut) {
+                ch.set_u8(0x185, m as u8);
+                ch.set_u8(0x186, m as u8);
+                g.actor(c.worker).chr_mode = m as u8;
+            }
             Value::Int(0)
         }),
     );
@@ -5019,13 +5031,19 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // Stopping the motion: the character engine picks its own again.
+    // Stopping the motion (5005 / 5020: chr_motion_stop 82b080: body +0x730 = 1, +0x736 = 0, +0x728 = 0; without a
+    // body nothing): the character engine picks its own again.
     for id in [0x5005u16, 0x5020] {
         n.register(
             id,
             Native::result(|g, c| {
-                if let Some(p) = &mut g.actor(c.worker).player {
-                    p.stop();
+                if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut) {
+                    ch.set_u32(0x730, 1);
+                    ch.set_u8(0x736, 0);
+                    ch.set_u16(0x728, 0);
+                    if let Some(p) = &mut g.actor(c.worker).player {
+                        p.stop();
+                    }
                 }
                 Value::Int(0)
             }),
