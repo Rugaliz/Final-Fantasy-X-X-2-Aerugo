@@ -25,6 +25,14 @@ fn pos_of(g: &FieldState, w: usize) -> [f32; 3] {
     g.workers.list.get(w).map_or([0.0; 3], Worker::position)
 }
 
+/// 8703b0(w, 0): a worker bound to a body (+0xaa = 1, +0x9c set) clears the body's flag 0x400 (+0x194, 82aae0).
+fn body_flag_400_off(g: &mut FieldState, w: usize) {
+    let bound = g.workers.list.get(w).is_some_and(Worker::chr_bound);
+    if let Some(ch) = g.chrs.get_mut(w).and_then(Option::as_mut).filter(|_| bound) {
+        ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x400);
+    }
+}
+
 fn pop3(c: &mut NativeCall) -> [f32; 3] {
     let z = c.stack.pop_float();
     let y = c.stack.pop_float();
@@ -161,13 +169,14 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Float(0.0)
         }),
     );
-    // 0018(mask, mode, id): start the running level's move.
+    // 0018(mask, mode, id): start the running level's move (8703b0(w, 0) first).
     n.register(
         0x0018,
         Native::result(|g, c| {
             let id = c.stack.pop_int();
             let mut mode = c.stack.pop_int() as u32;
             let mask = c.stack.pop_int() as u32;
+            body_flag_400_off(g, c.worker);
             let w = wk(g, c);
             let m = w.cur_move();
             match mode & 0xffff_007f {
@@ -207,13 +216,14 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(0)
         }),
     );
-    // 0019(mask, mode, id): start the running level's turn.
+    // 0019(mask, mode, id): start the running level's turn (8703b0(w, 0) first).
     n.register(
         0x0019,
         Native::result(|g, c| {
             let id = c.stack.pop_int();
             let mode = c.stack.pop_int() as u32;
             let mask = c.stack.pop_int() as u32;
+            body_flag_400_off(g, c.worker);
             let w = wk(g, c);
             let r = w.rot_of(i32::from(c.level));
             let m = mode & 0xffff_001f;
@@ -914,10 +924,8 @@ fn set_facing(g: &mut FieldState, c: &mut NativeCall) -> Value {
     w.set_pf(p::DIR_YAW, v);
     w.set_pf(p::YAW, v);
     let (bound, bind) = (w.chr_bound(), w.bind());
-    // 8703b0(w, 0): a bound body's flag 0x400 (+0x194) is cleared; then its facing and heading.
-    if let Some(ch) = g.chrs.get_mut(c.worker).and_then(Option::as_mut).filter(|_| bound) {
-        ch.set_u32(crate::chr::FLAGS, ch.u32(crate::chr::FLAGS) & !0x400);
-    }
+    // 8703b0(w, 0), then the bound body's facing and heading.
+    body_flag_400_off(g, c.worker);
     if bound {
         let a = g.actor(c.worker);
         a.yaw = v;

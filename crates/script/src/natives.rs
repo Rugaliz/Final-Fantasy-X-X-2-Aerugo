@@ -333,13 +333,16 @@ pub fn heading(x1: f32, z1: f32, x2: f32, z2: f32) -> f32 {
     } else if dz == 0.0 {
         if dx < 0.0 { PI } else { -0.0 }
     } else {
-        dz.atan2(dx)
+        f64::from(dz).atan2(f64::from(dx)) as f32
     }
 }
 
+/// angle_wrap (88bc20): ±2π (floats) until within [−π, π]; NaN comes back as it is. An infinite angle never gets
+/// there (the original loops for ever): reported and returned.
 pub fn wrap_angle(mut a: f32) -> f32 {
-    if !a.is_finite() {
-        return 0.0;
+    if a.is_infinite() {
+        log::error!("GAP: angle_wrap of an infinite angle (the original never returns)");
+        return a;
     }
     while a < -PI {
         a += TAU;
@@ -350,9 +353,27 @@ pub fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-/// Fixed-point sine: a full turn is 0x8000, the result is in 1/4096.
-fn fixed_sin(a: i32) -> i32 {
-    ((a & 0x7FFF) as f32 / 32768.0 * TAU).sin().mul_add(4096.0, 0.0) as i32
+/// TkMtRsin (88c690): the quarter-wave table read by quadrant; a turn is 0x8000, the result in 1/32768.
+fn rsin(a: i32) -> i32 {
+    let t = &crate::rsin::RSIN;
+    let u = (a & 0x7FFF) as usize;
+    let q = |v: usize| i32::from(if v < 0x2000 { t[v] } else { t[0x3FFF - v] });
+    if u < 0x4000 { q(u) } else { -q(u - 0x4000) }
+}
+
+/// The x87 truncation of a float (ftol: out of range gives 0x80000000).
+fn ftol(v: f32) -> i32 {
+    if (-2147483648.0..2147483648.0).contains(&v) { v as i32 } else { i32::MIN }
+}
+
+/// 88c040 / 88bfe0: angle_wrap(v), plus 2π when below 0, times `n` over 2π (in extended), truncated.
+fn turn_units(v: f32, n: f64) -> i32 {
+    let mut w = wrap_angle(v);
+    if w < 0.0 {
+        w = (f64::from(w) + f64::from(TAU)) as f32;
+    }
+    let x = f64::from(w) * n / f64::from(TAU);
+    if (-2147483648.0..2147483648.0).contains(&x) { x as i32 } else { i32::MIN }
 }
 
 fn pop_f<const N: usize>(c: &mut NativeCall<'_>) -> [f32; N] {
@@ -381,35 +402,37 @@ fn register_common<G>(n: &mut Natives<G>) {
     // Halt: never finishes.
     n.register(0x005F, Native { init: None, wait: Some(|_, _| 0), result: None });
 
-    // Math.
-    n.register(0x1001, Native::result(|_, c| Value::Float(c.stack.pop_float().sin())));
-    n.register(0x1002, Native::result(|_, c| Value::Float(c.stack.pop_float().cos())));
-    n.register(0x1003, Native::result(|_, c| Value::Float(c.stack.pop_float().tan())));
-    n.register(0x1004, Native::result(|_, c| Value::Float(c.stack.pop_float().atan())));
+    // Math (8779xx–878060): the x87 works in extended precision and the result is stored as a float, so the
+    // transcendental ones go through f64 with one rounding.
+    fn ext(f: fn(f64) -> f64, x: f32) -> f32 {
+        f(f64::from(x)) as f32
+    }
+    n.register(0x1001, Native::result(|_, c| Value::Float(ext(f64::sin, c.stack.pop_float()))));
+    n.register(0x1002, Native::result(|_, c| Value::Float(ext(f64::cos, c.stack.pop_float()))));
+    n.register(0x1003, Native::result(|_, c| Value::Float(ext(f64::tan, c.stack.pop_float()))));
+    n.register(0x1004, Native::result(|_, c| Value::Float(ext(f64::atan, c.stack.pop_float()))));
     n.register(
         0x1005,
         Native::result(|_, c| {
             let [y, x] = pop_f::<2>(c);
-            Value::Float(y.atan2(x))
+            Value::Float(f64::from(y).atan2(f64::from(x)) as f32)
         }),
     );
-    n.register(0x1006, Native::result(|_, c| Value::Float(c.stack.pop_float().sqrt())));
-    n.register(0x1007, Native::result(|_, c| Value::Float(1.0 / c.stack.pop_float().sqrt())));
-    n.register(0x1008, Native::result(|_, c| Value::Int(fixed_sin(c.stack.pop_int()))));
-    n.register(0x1009, Native::result(|_, c| Value::Int(fixed_sin(c.stack.pop_int() + 0x2000))));
+    n.register(0x1006, Native::result(|_, c| Value::Float(ext(f64::sqrt, c.stack.pop_float()))));
+    // 1007: 1 / the float of the square root.
+    n.register(
+        0x1007,
+        Native::result(|_, c| Value::Float((1.0 / f64::from(ext(f64::sqrt, c.stack.pop_float()))) as f32)),
+    );
+    // 1008 / 1009: TkMtRsin of the angle (a turn is 0x8000) / of a quarter turn on: sine / cosine in 1/32768.
+    n.register(0x1008, Native::result(|_, c| Value::Int(rsin(c.stack.pop_int()))));
+    n.register(0x1009, Native::result(|_, c| Value::Int(rsin(c.stack.pop_int().wrapping_add(0x2000)))));
     n.register(0x100A, Native::result(|_, c| Value::Int(c.stack.pop_int())));
     n.register(0x100B, Native::result(|_, c| Value::Int(c.stack.pop_int().wrapping_shl(15))));
-    n.register(0x100C, Native::result(|_, c| Value::Int((c.stack.pop_float() * 32768.0) as i32)));
-    n.register(
-        0x100D,
-        Native::result(|_, c| {
-            Value::Int(((wrap_angle(c.stack.pop_float()) / TAU * 32768.0) as i32) & 0x7FFF)
-        }),
-    );
-    n.register(
-        0x100E,
-        Native::result(|_, c| Value::Int(((wrap_angle(c.stack.pop_float()) / TAU * 4096.0) as i32) & 0xFFF)),
-    );
+    n.register(0x100C, Native::result(|_, c| Value::Int(ftol(c.stack.pop_float() * 32768.0))));
+    // 100d / 100e (88c040 / 88bfe0): the wrapped angle (2π added when below 0) as 1/32768 or 1/4096 of a turn.
+    n.register(0x100D, Native::result(|_, c| Value::Int(turn_units(c.stack.pop_float(), 32768.0) & 0x7FFF)));
+    n.register(0x100E, Native::result(|_, c| Value::Int(turn_units(c.stack.pop_float(), 4096.0) & 0xFFF)));
     n.register(
         0x100F,
         Native::result(|_, c| Value::Float(wrap_angle((c.stack.pop_int() & 0x7FFF) as f32 * TAU / 32768.0))),
@@ -427,30 +450,34 @@ fn register_common<G>(n: &mut Natives<G>) {
         }),
     );
     n.register(0x1013, Native::result(|_, c| Value::Float(wrap_angle(c.stack.pop_float()))));
-    // Turn angle `a` towards `b` by at most `step`.
+    // 1014(a, b, step) (88b570): a turned toward b by at most step: d = wrap(b − a); when |d| reaches step,
+    // a ± step (+ for d ≥ 0), else b; wrapped.
     n.register(
         0x1014,
         Native::result(|_, c| {
             let [a, b, step] = pop_f::<3>(c);
             let d = wrap_angle(b - a);
-            let r = if d.abs() > step { a + step.copysign(d) } else { b };
+            let s = if d.abs() < step { d.abs() } else { step };
+            let r = if step == s { if d >= 0.0 { a + s } else { a - s } } else { b };
             Value::Float(wrap_angle(r))
         }),
     );
     n.register(0x1019, Native::result(|_, c| Value::Float(c.stack.pop_float().abs())));
+    // 101a / 101b: the distance on x/z / in 3D; the differences are floats, their squares summed in extended.
     n.register(
         0x101A,
         Native::result(|_, c| {
             let [x1, z1, x2, z2] = pop_f::<4>(c);
-            Value::Float((x2 - x1).hypot(z2 - z1))
+            let (dx, dz) = (f64::from(x1 - x2), f64::from(z1 - z2));
+            Value::Float((dx * dx + dz * dz).sqrt() as f32)
         }),
     );
     n.register(
         0x101B,
         Native::result(|_, c| {
             let [x1, y1, z1, x2, y2, z2] = pop_f::<6>(c);
-            let (dx, dy, dz) = (x2 - x1, y2 - y1, z2 - z1);
-            Value::Float((dx * dx + dy * dy + dz * dz).sqrt())
+            let (dx, dy, dz) = (f64::from(x1 - x2), f64::from(y1 - y2), f64::from(z1 - z2));
+            Value::Float((dx * dx + dy * dy + dz * dz).sqrt() as f32)
         }),
     );
 
@@ -472,7 +499,8 @@ mod tests {
     #[test]
     fn angles() {
         assert!((wrap_angle(3.0 * PI) - PI).abs() < 1e-5);
-        assert_eq!(fixed_sin(0x2000), 4096);
-        assert_eq!(fixed_sin(0), 0);
+        assert_eq!(rsin(0x2000), 32768);
+        assert_eq!(rsin(0), 0);
+        assert_eq!(rsin(0x6000), -32768);
     }
 }

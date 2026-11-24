@@ -6,6 +6,7 @@ pub mod asm;
 pub mod memory;
 pub mod natives;
 pub mod recording;
+mod rsin;
 pub mod vm;
 
 pub use memory::Memory;
