@@ -267,8 +267,13 @@ fn to_nul(bytes: &[u8]) -> Vec<u8> {
 ///   after the first; the other types (0x13–0x23, '+'–'7') are not ported.
 /// - {16:30+n} / {17:30+n}: item n's name (kernel_item, field 0); {23:30+n}: key item n's name (field
 ///   variant · 4).
-/// - The rest ({12:50+}, {14}/{15}/{18}, the dictionary macros {19}–{22}): not ported.
+/// - {19:30+n}–{22:30+n}: the macro dictionary's tables 6–15 (the code − 0x13, the first dictionary: the
+///   original's dictionary choice is always 0), entry n·2 plus the text's dictionary variant.
+/// - The rest ({12:50+}, {14}/{15}/{18}): not ported.
 pub fn macro_text(g: &FieldState, image: &[u8], w: usize, code: u8, arg: u8) -> Result<Vec<u8>, String> {
+    // The text's dictionary variant (the text object's +0x20): setting a window's text clears it and nothing
+    // else writes it.
+    const DICTIONARY_VARIANT: i32 = 0;
     let n = arg.wrapping_sub(0x30);
     let variant = crate::items::text_variant(image);
     let item_text = |table: &aerugo_formats::KernelTable, field: usize| {
@@ -324,6 +329,14 @@ pub fn macro_text(g: &FieldState, image: &[u8], w: usize, code: u8, arg: u8) -> 
             .as_ref()
             .and_then(|t| item_text(&t.key_items, if variant { 4 } else { 0 }))
             .ok_or_else(|| format!("key item name {{23:{arg:02x}}}: no key item table")),
+        0x19..=0x22 => g
+            .texts
+            .macro_text(i32::from(code), DICTIONARY_VARIANT + i32::from(n) * 2)
+            .and_then(|at| g.texts.bytes_at(at))
+            .map(to_nul)
+            .ok_or_else(|| {
+                format!("dictionary macro {{{code:02x}:{arg:02x}}}: no such dictionary table or entry")
+            }),
         _ => Err(format!("macro {{{code:02x}:{arg:02x}}} is not ported")),
     }
 }
