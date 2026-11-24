@@ -159,13 +159,16 @@ impl Viewer {
         let mut v = Viewer::open(install, text_language, sdl, japanese_voices, original_music, "field");
         v.tab = Tab::Field;
         v.field = FieldView::game(text_language);
+        v.field.original_saves = field::original_save_dir(install.map(|i| i.root.as_path()));
         v.game = true;
         v
     }
 
     /// On the game screen, continue from a save file of the original release instead of the title.
     pub fn continue_from_steam(&mut self, data: &[u8]) -> Result<(), String> {
+        let original = self.field.original_saves.clone();
         self.field = FieldView::game_from_steam(self.field.language(), data)?;
+        self.field.original_saves = original;
         Ok(())
     }
 

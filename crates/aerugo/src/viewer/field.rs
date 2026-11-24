@@ -94,6 +94,10 @@ pub struct FieldView {
     /// A save to put in place once its event is open.
     pending_restore: Option<SaveGame>,
     slot: u32,
+    /// The original game's save folder (its `FINAL FANTASY X` folder), when it was found.
+    pub original_saves: Option<std::path::PathBuf>,
+    /// The save sphere also writes into the original game's folder.
+    save_to_original: bool,
     import_path: String,
     /// The movie the scripts play, drawn over the field.
     movie: MoviePlayer,
@@ -286,7 +290,9 @@ impl FieldView {
             follow_jumps: true,
             pending_open: None,
             pending_restore: None,
-            slot: 1,
+            slot: 0,
+            original_saves: None,
+            save_to_original: false,
             import_path: String::new(),
             movie: MoviePlayer::new(),
             game: false,
@@ -452,13 +458,23 @@ impl FieldView {
     /// The title's Load Game screen (game screen): the saved games; loading one goes on from where it was saved,
     /// Back returns to the title.
     fn load_menu(&mut self, ui: &mut egui::Ui) {
+        // Aerugo's saves (the remaster's file format, ffx_NNN, and older slotN.aesv files), then the original game's.
         let dir = aerugo_platform::user_dir(false).join("saves");
-        let slots: Vec<(u32, SaveGame)> = (1..=9)
-            .filter_map(|n| {
-                let b = std::fs::read(dir.join(format!("slot{n}.aesv"))).ok()?;
-                Some((n, SaveGame::from_bytes(&b).ok()?))
-            })
-            .collect();
+        let mut slots: Vec<(String, SaveGame)> = Vec::new();
+        for n in 1..=9 {
+            if let Some(s) = std::fs::read(dir.join(format!("slot{n}.aesv")))
+                .ok()
+                .and_then(|b| SaveGame::from_bytes(&b).ok())
+            {
+                slots.push((format!("Aerugo slot {n}"), s));
+            }
+        }
+        for (label, folder) in [("Aerugo", Some(dir.clone())), ("Original", self.original_saves.clone())] {
+            let Some(folder) = folder else { continue };
+            for (name, save) in steam_saves(&folder) {
+                slots.push((format!("{label} {name}"), save));
+            }
+        }
         let mut chosen = None;
         let mut back = false;
         egui::Area::new(egui::Id::new("game-load"))
@@ -477,14 +493,11 @@ impl FieldView {
                         );
                     }
                     for (n, save) in &slots {
-                        let place = save.event.as_deref().and_then(|e| e.rsplit('/').nth(1)).unwrap_or("?");
-                        let time = save.ticks / 30;
-                        let label = format!(
-                            "Slot {n} · {place} · {}:{:02}:{:02}",
-                            time / 3600,
-                            time / 60 % 60,
-                            time % 60
-                        );
+                        let event = save.event.clone().or_else(|| {
+                            ffx_event_path(i32::from(u16::from_le_bytes([save.image[0], save.image[1]])))
+                        });
+                        let place = event.as_deref().and_then(|e| e.rsplit('/').nth(1)).unwrap_or("?");
+                        let label = format!("{n} · {place}");
                         if ui.button(egui::RichText::new(label).size(18.0)).clicked() {
                             chosen = Some(save.clone());
                         }
@@ -498,7 +511,12 @@ impl FieldView {
                 });
             });
         if let Some(save) = chosen {
-            if let Some(ev) = save.event.clone() {
+            // A remaster save resumes at the event its image names (+0), as game_from_steam does.
+            let event = save
+                .event
+                .clone()
+                .or_else(|| ffx_event_path(i32::from(u16::from_le_bytes([save.image[0], save.image[1]]))));
+            if let Some(ev) = event {
                 self.pending_open = Some(ev);
             }
             self.pending_restore = Some(save);
@@ -516,6 +534,8 @@ impl FieldView {
         use aerugo_sim::field::menu_mode;
         use aerugo_sim::items;
         let slot = &mut self.slot;
+        let save_to_original = &mut self.save_to_original;
+        let original = self.original_saves.clone();
         let Some(s) = &mut self.session else { return };
         let mut close = false;
         egui::Window::new("Menu").collapsible(false).resizable(true).show(ui.ctx(), |ui| {
@@ -527,17 +547,28 @@ impl FieldView {
             match menu_mode::kind(mode) {
                 menu_mode::SAVE => {
                     ui.label("Save sphere");
+                    ui.checkbox(save_to_original, "Also write into the original game's save folder");
                     ui.horizontal(|ui| {
-                        ui.label("Slot");
-                        ui.add(egui::DragValue::new(slot).range(1..=9));
+                        ui.label("File ffx_");
+                        ui.add(egui::DragValue::new(slot).range(0..=999));
                         if ui.button("Save").clicked() {
-                            let dir = aerugo_platform::user_dir(false).join("saves");
-                            let path = dir.join(format!("slot{slot}.aesv"));
-                            let msg = match write_atomically(&path, &ev.save().to_bytes()) {
-                                Ok(()) => format!("saved to {}", path.display()),
-                                Err(e) => format!("save failed: {e}"),
-                            };
-                            s.notes.push(msg);
+                            // The remaster's own file (header 8b3e60, checksum 648f20); the counter goes up per save.
+                            ev.state.globals.save_counter = ev.state.globals.save_counter.saturating_add(1);
+                            let counter = ev.state.globals.save_counter;
+                            let lang = ev.state.language_type.unwrap_or(0) as u8;
+                            let bytes = ev.save().export_steam(counter, lang);
+                            let mut dirs = vec![aerugo_platform::user_dir(false).join("saves")];
+                            if *save_to_original && let Some(o) = original.clone() {
+                                dirs.push(o);
+                            }
+                            for dir in dirs {
+                                let path = dir.join(format!("ffx_{slot:03}"));
+                                let msg = match write_atomically(&path, &bytes) {
+                                    Ok(()) => format!("saved to {}", path.display()),
+                                    Err(e) => format!("save failed: {e}"),
+                                };
+                                s.notes.push(msg);
+                            }
                         }
                     });
                 }
@@ -1508,6 +1539,46 @@ fn message_canvas(
         msgwin::draw(&mut canvas, font, &metrics, &draw, lang == Language::Japanese);
     }
     (canvas, drawn)
+}
+
+/// The remaster's save files in a folder (`ffx_NNN`, the checksum checked), in file order.
+fn steam_saves(dir: &std::path::Path) -> Vec<(String, SaveGame)> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.len() == 7 && n.starts_with("ffx_") && n[4..].bytes().all(|b| b.is_ascii_digit()))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|n| {
+            let d = std::fs::read(dir.join(&n)).ok()?;
+            match SaveGame::import_steam(Game::Ffx, &d) {
+                Ok(s) => Some((n, s)),
+                Err(e) => {
+                    log::warn!("{}: {e}", dir.join(&n).display());
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// The original game's FFX save folder: Documents/SQUARE ENIX/FINAL FANTASY X&X-2 HD Remaster/FINAL FANTASY X, on
+/// Windows in the user's documents, under Proton in the game's compatdata prefix (app 359870) next to the library
+/// the game is installed in.
+pub fn original_save_dir(game_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let rel = ["SQUARE ENIX", "FINAL FANTASY X&X-2 HD Remaster", "FINAL FANTASY X"];
+    let mut candidates = Vec::new();
+    if cfg!(windows)
+        && let Some(d) = aerugo_platform::documents_dir()
+    {
+        candidates.push(d);
+    }
+    if let Some(steamapps) = game_dir.and_then(|g| g.parent()).and_then(std::path::Path::parent) {
+        candidates.push(steamapps.join("compatdata/359870/pfx/drive_c/users/steamuser/Documents"));
+    }
+    candidates.into_iter().map(|d| rel.iter().fold(d, |p, r| p.join(r))).find(|p| p.is_dir())
 }
 
 fn game_frame() -> egui::Frame {

@@ -302,6 +302,9 @@ pub struct Globals {
     /// the fog and background colours use both while the display flags' bit 2 is set.
     pub colour_mul: [f32; 4],
     pub colour_add: [f32; 4],
+    /// The save menu's counter [186627c] (8b4e70 resets it to 0; each save adds one and writes it into the file's
+    /// header, capped at 0x80000000).
+    pub save_counter: u32,
     /// The text reveal speeds [1325b98] (0259; the message reveal reads entry 0): zero at boot (BSS), kept across
     /// events.
     pub reveal_speed: [f32; 2],
@@ -317,6 +320,7 @@ impl Default for Globals {
             colour_mul: [0.0; 4],
             colour_add: [0.0; 4],
             reveal_speed: [0.0; 2],
+            save_counter: 0,
         }
     }
 }
@@ -452,8 +456,8 @@ impl NumberEntry {
 }
 
 /// Character names in the save image: one 0x14-byte slot per character, NUL-terminated.
-pub(crate) const NAMES: usize = 0x634C;
-pub(crate) const NAME_SLOT: usize = 0x14;
+pub const NAMES: usize = 0x634C;
+pub const NAME_SLOT: usize = 0x14;
 
 /// One event message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

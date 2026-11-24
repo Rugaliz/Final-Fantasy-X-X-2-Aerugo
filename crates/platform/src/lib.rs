@@ -66,6 +66,11 @@ impl Platform {
 }
 
 /// Folder for settings and saves. With `portable`, a folder next to the executable.
+/// The user's documents folder (where Windows games keep their saves).
+pub fn documents_dir() -> Option<PathBuf> {
+    dirs::document_dir()
+}
+
 pub fn user_dir(portable: bool) -> PathBuf {
     if portable {
         let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from));
