@@ -679,11 +679,17 @@ impl FieldRenderer {
         }
         // The effects after the scene's transparent draws.
         let mut transient = Vec::new();
+        // The map's own effect textures (its `fp` folder), which the remaster loads with the map.
+        let map_effect_textures = objects
+            .map
+            .and_then(|m| m.split_once("/mdl/").map(|(root, _)| format!("{root}/fp/tex/d3d11")))
+            .unwrap_or_default();
         ops.extend(self.vfx.draws(
             vfs,
             renderer,
             &mut self.programs,
             objects.vfx,
+            &map_effect_textures,
             scene,
             viewport,
             &mut transient,

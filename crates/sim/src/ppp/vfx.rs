@@ -338,3 +338,225 @@ pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
         dim,
     }
 }
+
+/// A shape entry as the remaster makes it on a shape's first draw (createVFXRenderDataBufferShp): the shader
+/// properties of each blend group it draws with, and its texture. An entry whose frames mix blends is split
+/// into six groups (modulate, additive, subtract, the second and third subtracts, no blending), each piece
+/// drawn in its blend's group; otherwise every piece goes to one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeEntry {
+    pub groups: Vec<u32>,
+    pub texture: Option<Texture>,
+}
+
+/// What a shape draw hands the remaster's shape entry: its key, the shape and the frame drawn, the draw
+/// parameters (their flags half-word, colour, draw and work matrices) and the render state a new entry is
+/// made with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapeInput {
+    pub key: (u32, u32),
+    pub shape: u32,
+    pub frame: u32,
+    pub flags: u16,
+    pub colour: [u8; 4],
+    pub matrix: Mat,
+    pub work_matrix: Option<Mat>,
+    pub create: u32,
+}
+
+/// The draw-parameter flag that fades a shape by its depth.
+const SHAPE_DEPTH_FADE: u16 = 0x400;
+
+/// A frame's piece record (the frame's sprites: +0 flags (bit 3: pieces by four corners), i16 +2 piece count,
+/// +4 the offset of the 8-byte piece headers (colour bytes, blend at +4), +0x10 the texture words, pieces from
+/// +0x20).
+fn shape_frame_pieces(m: &Space, shape: u32, frame: u32) -> u32 {
+    shape.wrapping_add(m.u16(shape + 0x10 + frame * 8) as i16 as i32 as u32)
+}
+
+/// A piece's blend group (0 modulate, 1 additive, 2 subtract, 3 the second subtract, 4 the third, 5 none).
+fn blend_group(blend: u8) -> usize {
+    match blend {
+        0x48 => 1,
+        0x42 => 2,
+        0x46 => 3,
+        0x41 => 4,
+        0x88 => 5,
+        _ => 0,
+    }
+}
+
+/// The shader property bits of each blend group (textured).
+const GROUP_PROPERTIES: [u32; 6] = [8, 10, 0x18, 0x28, 0x108, 0x208];
+
+/// The entry the remaster makes for `shape` on its first draw with render state `create`: the texture is the
+/// last one its frames change to (the remaster keeps a single texture per shape; magic 0x241's page 0x3cc0 is
+/// read as page 0x34c0 format 0x13, map 0x1ed9's page 0x3720 as 0x3721); the groups split when any piece's
+/// blend differs from the first frame's first piece (never for magic 7). Magic 0x1e3 in event 0x71 adds the
+/// depth-test-off bit.
+pub fn shape_entry(m: &Space, shape: u32, mut create: u32, s: &Scene) -> ShapeEntry {
+    if s.magic == 0x1e3 && s.event == 0x71 {
+        create |= 0x800;
+    }
+    let frames = (m.u16(shape + 6) as i16).max(0) as u32;
+    let mut texture = None;
+    let mut last = (0, 0);
+    for f in 0..frames {
+        let p = shape_frame_pieces(m, shape, f);
+        let mut t = Texture::from_words(m.u32(p + 0x10), m.u32(p + 0x14));
+        if s.magic == 0x241 && t.page == 0x3cc0 {
+            t.page = 0x34c0;
+            t.format = 0x13;
+        } else if s.map_id == 0x1ed9 && t.page == 0x3720 {
+            t.page = 0x3721;
+        }
+        if (t.page, t.format) != last {
+            if t.page >= 0x3f00 {
+                log::error!(
+                    "GAP: shape {shape:#x} names texture page {:#x}: the remaster's named texture lookup is not ported",
+                    t.page
+                );
+            }
+            texture = Some(t);
+            last = (t.page, t.format);
+        }
+    }
+    let blend_of = |p: u32, k: u32| m.u8(p.wrapping_add(m.u32(p + 4)) + k * 8 + 4);
+    let first = blend_group(blend_of(shape_frame_pieces(m, shape, 0), 0));
+    let mixed = s.magic != 7
+        && (0..frames).any(|f| {
+            let p = shape_frame_pieces(m, shape, f);
+            (0..(m.u16(p + 2) as i16).max(0) as u32).any(|k| blend_group(blend_of(p, k)) != first)
+        });
+    let groups =
+        if mixed { GROUP_PROPERTIES.iter().map(|g| create & !0x332 | g).collect() } else { vec![create | 8] };
+    ShapeEntry { groups, texture }
+}
+
+/// The remaster's colour adjustments for some magics' shapes (by the texture page of the shape's first
+/// frame): the colour's red, green and blue become 0x80.
+fn shape_colour(m: &Space, shape: u32, mut c: [u8; 4], magic: u32) -> [u8; 4] {
+    let page = m.u32(shape_frame_pieces(m, shape, 0) + 0x10) & 0x3fff;
+    let neutral = if magic == 0x12e {
+        page == 0x3960
+    } else {
+        (matches!(magic, 0x274 | 0x99 | 0x9a) && page == 0x3400)
+            || (matches!(magic, 0x259 | 0x98 | 0x215) && page == 0x39a0)
+            || (matches!(magic, 0x123 | 0x154) && page == 0x3800)
+    };
+    if neutral {
+        c[0] = 0x80;
+        c[1] = 0x80;
+        c[2] = 0x80;
+    }
+    c
+}
+
+/// One frame of a shape entry (updateVFXRenderDataShp and the shape filler): each piece of the frame a quad —
+/// its rectangle (or its four corners) in sixteenths, at z 0, through the draw matrix; texture coordinates in
+/// 4096ths (v flipped); its colour bytes / 256 times the draw colour / 128, faded by the depth with the fade
+/// flag — in the group of its blend; the entry's world is the inverse view, and the whole draw is dim when no
+/// colour component passes 0.5. Meshes for the groups that got pieces.
+pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Mesh> {
+    let mut matrix = d.matrix;
+    if s.map_id == 0x76f && matches!(s.map_part, Some(3..=5)) && matrix[14] < 300.0 {
+        matrix[14] = -10000.0;
+    }
+    if d.work_matrix.is_some() {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::error!(
+                "GAP: a shape drawn with a work matrix (VertexGroupApplyZMatZClip: the HD projection's z \
+                 correction) is not ported"
+            );
+        }
+        return Vec::new();
+    }
+    let colour = shape_colour(m, d.shape, d.colour, s.magic);
+    let draw_colour: [f32; 4] = std::array::from_fn(|i| f32::from(colour[i]) * 0.007_812_5);
+    let fade_matrix = mul(&s.screen, &matrix);
+    let frame = shape_frame_pieces(m, d.shape, d.frame);
+    let corners = m.u8(frame) & 8 != 0;
+    let count = (m.u16(frame + 2) as i16).max(0) as u32;
+    let headers = frame.wrapping_add(m.u32(frame + 4));
+    let split = entry.groups.len() > 1;
+    let mut segments: Vec<Segment> =
+        vec![Segment { texture: entry.texture, ..Segment::default() }; entry.groups.len()];
+    let mut dim = true;
+    let sixteenth = |at: u32| (m.u16(at) as i16 as i32) as f32 * 0.0625;
+    let unit = |at: u32| (m.u16(at) as i16 as i32) as f32 * 0.000_244_140_62;
+    let (stride, uv_at) = if corners { (0x18, 0x10) } else { (0x10, 8) };
+    for k in 0..count {
+        let piece = frame + 0x20 + k * stride;
+        let header = headers + k * 8;
+        let g = if split { blend_group(m.u8(header + 4)) } else { 0 };
+        let points: [[f32; 2]; 4] = if corners {
+            std::array::from_fn(|j| [sixteenth(piece + 4 * j as u32), sixteenth(piece + 2 + 4 * j as u32)])
+        } else {
+            let (x0, y0, x1, y1) =
+                (sixteenth(piece), sixteenth(piece + 2), sixteenth(piece + 4), sixteenth(piece + 6));
+            [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]
+        };
+        let mut quad = [0.0f32; 16];
+        for (j, p) in points.iter().enumerate() {
+            quad[j * 4] = p[0];
+            quad[j * 4 + 1] = p[1];
+            quad[j * 4 + 3] = 1.0;
+        }
+        let placed = mul(&matrix, &quad);
+        let mut piece_colour: [f32; 4] =
+            std::array::from_fn(|i| f32::from(m.u8(header + i as u32)) * 0.003_906_25);
+        if d.flags & SHAPE_DEPTH_FADE != 0 {
+            let q = apply4(&fade_matrix, [placed[0], placed[1], 0.0, 1.0]);
+            let w = q[3] * 8.0 - 32.0;
+            // (A NaN depth fails the original's `0 <= w` test too, fading to nothing.)
+            let fade = if w.is_nan() || w < 0.0 {
+                0.0
+            } else if w <= 128.0 {
+                w * 0.007_812_5
+            } else {
+                1.0
+            };
+            for c in &mut piece_colour {
+                *c *= fade;
+            }
+        }
+        let vertex_colour: [f32; 4] = std::array::from_fn(|i| draw_colour[i] * piece_colour[i]);
+        if vertex_colour.iter().any(|&c| 0.5 < c) {
+            dim = false;
+        }
+        let (u0, v_top) = (unit(piece + uv_at), unit(piece + uv_at + 2));
+        let (w, h) = (unit(piece + uv_at + 4), unit(piece + uv_at + 6));
+        let v0 = 1.0 - v_top;
+        let u1 = w + u0;
+        let v1 = v0 - h;
+        let seg = &mut segments[g];
+        let base = seg.positions.len() as u16;
+        for j in 0..4 {
+            seg.positions.push([placed[j * 4], placed[j * 4 + 1], placed[j * 4 + 2]]);
+            seg.colours.push(vertex_colour);
+        }
+        seg.uvs.extend([[u0, v0], [u1, v0], [u0, v1], [u1, v1]]);
+        seg.indices.extend([base, base + 2, base + 1, base + 2, base + 3, base + 1]);
+    }
+    let mut world = s.inverse_view;
+    world[3] = 0.0;
+    world[7] = 0.0;
+    world[11] = 0.0;
+    world[15] = 1.0;
+    segments
+        .into_iter()
+        .zip(&entry.groups)
+        .filter(|(seg, _)| !seg.indices.is_empty())
+        .map(|(seg, &properties)| Mesh {
+            ref_index: d.key.1,
+            object: d.key.0,
+            properties,
+            world,
+            z_matrix: None,
+            semi: false,
+            segments: vec![seg],
+            dim,
+        })
+        .collect()
+}

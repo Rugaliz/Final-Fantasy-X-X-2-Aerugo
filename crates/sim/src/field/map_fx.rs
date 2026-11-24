@@ -484,6 +484,7 @@ pub fn frame_draw(g: &mut FieldState) {
             g.vfx.push((crate::ppp::vfx::model(&rt.space, d, &scene), String::new()));
         }
     }
+    rt.shape_entries.draws(&mut g.vfx, &rt.space, &rt.render, &scene, "");
     g.map_runtime = Some(rt);
 }
 
@@ -513,6 +514,8 @@ pub struct MapRuntime {
     /// The engine matrices of the last effect run (the lens and thunder programs read the screen and the
     /// camera position).
     pub render: Vec<RenderCall>,
+    /// The shape entries the map effects' draws have made.
+    pub shape_entries: super::effects::ShapeEntries,
 }
 
 impl PartialEq for MapRuntime {
@@ -651,7 +654,15 @@ impl MapRuntime {
             .collect();
         let n = u32::from(space.u16(h + 4));
         let wood = (0..n).any(|i| space.u8(h + 0x20 + i * 0x50 + 0x4a) == 2);
-        Some(MapRuntime { space, env, table, missing, wood, render: Vec::new() })
+        Some(MapRuntime {
+            space,
+            env,
+            table,
+            missing,
+            wood,
+            render: Vec::new(),
+            shape_entries: Default::default(),
+        })
     }
 
     /// One frame of the map effects (the draw phase, while they are on): for each record not hidden (800d),

@@ -229,7 +229,9 @@ impl VfxRenderer {
     }
 
     /// The draws of the frame's effect geometry (`meshes`: each with its texture folder), seen with `scene`'s
-    /// camera; vertex data goes into `transient`.
+    /// camera; vertex data goes into `transient`. A texture is looked for in the mesh's folder, then in the
+    /// map's effect folder (`map_dir`): the remaster finds it by page, format and size among every effect
+    /// texture loaded (the magic's and the map's).
     #[allow(clippy::too_many_arguments)]
     pub fn draws(
         &mut self,
@@ -237,6 +239,7 @@ impl VfxRenderer {
         renderer: &mut Renderer,
         programs: &mut Programs,
         meshes: &[(Mesh, String)],
+        map_dir: &str,
         scene: &SceneConstants,
         viewport: [f32; 6],
         transient: &mut Vec<u8>,
@@ -276,8 +279,19 @@ impl VfxRenderer {
                     continue;
                 }
                 let texture = match seg.texture {
-                    Some(t) if !t.is_frame_buffer() && !dir.is_empty() => {
-                        match self.texture(vfs, renderer, &format!("{dir}/{}", t.file_name())) {
+                    Some(t) if !t.is_frame_buffer() => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            log::error!(
+                                "GAP: effect textures are found by folder (the effect's, then the map's); the                                  remaster's loaded-texture lookup (its per-map and per-magic substitutions and                                  its choice among same-page textures) is not ported"
+                            );
+                        });
+                        let name = t.file_name();
+                        let found = [dir.as_str(), map_dir]
+                            .into_iter()
+                            .filter(|d| !d.is_empty())
+                            .find_map(|d| self.texture(vfs, renderer, &format!("{d}/{name}")));
+                        match found {
                             Some(h) => Some(h),
                             None => continue,
                         }

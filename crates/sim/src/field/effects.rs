@@ -27,9 +27,99 @@ pub struct Effects {
     /// The running effect's driver and the engine's vector-unit random generator.
     pub effect: Option<Box<crate::ppp::driver::Effect>>,
     pub vu: crate::ppp::VuRand,
+    /// The shape entries the effect's draws have made (kept until destroyed or the effect is freed).
+    pub shape_entries: ShapeEntries,
     /// The map display a timeline effect keeps when it starts and puts back when it is freed: the fog block's
     /// colour, distances and background bytes, and the remaster's background colour.
     pub display_kept: Option<KeptDisplay>,
+}
+
+/// Which shape entry a draw updates: a program's (its object and reference index) or a driver's own sprite's
+/// (its index in the pool and its shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShapeKey {
+    Program { object: u32, ref_index: u32 },
+    Sprite { index: u32, shape: u32 },
+}
+
+/// The remaster's shape entries: made on a shape's first draw (with that draw's render state and texture) and
+/// updated by every later one, until destroyed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShapeEntries(pub std::collections::BTreeMap<ShapeKey, crate::ppp::vfx::ShapeEntry>);
+
+impl ShapeEntries {
+    /// The frame's shape and sprite draws (and entry releases) of `calls` into meshes for the renderer, with
+    /// textures from `dir`. A draw with no entry yet makes one unless it makes none this frame (then nothing is
+    /// drawn).
+    pub fn draws(
+        &mut self,
+        vfx: &mut Vec<(crate::ppp::vfx::Mesh, String)>,
+        space: &crate::ppp::Space,
+        calls: &[crate::ppp::RenderCall],
+        scene: &crate::ppp::vfx::Scene,
+        dir: &str,
+    ) {
+        use crate::ppp::RenderCall;
+        use crate::ppp::vfx::{ShapeInput, shape, shape_entry};
+        for c in calls {
+            let (key, input) = match c {
+                RenderCall::Shape(d) => {
+                    if d.path3 {
+                        static ONCE: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::error!(
+                                "GAP: the third shape path (pppDrawShape's own update) is not ported"
+                            );
+                        }
+                        continue;
+                    }
+                    let key = ShapeKey::Program { object: d.object, ref_index: d.ref_index };
+                    let input = ShapeInput {
+                        key: (d.object, d.ref_index),
+                        shape: d.shape,
+                        frame: d.frame,
+                        flags: d.flags,
+                        colour: d.colour,
+                        matrix: d.matrix,
+                        work_matrix: d.work_matrix,
+                        create: d.create.unwrap_or(0),
+                    };
+                    if d.create.is_none() && !self.0.contains_key(&key) {
+                        continue;
+                    }
+                    (key, input)
+                }
+                RenderCall::Sprite(d) => (
+                    ShapeKey::Sprite { index: d.index, shape: d.shape },
+                    ShapeInput {
+                        key: (d.shape, d.index),
+                        shape: d.shape,
+                        frame: u32::from(d.frame),
+                        flags: (d.param_flags >> 16) as u16,
+                        colour: d.colour,
+                        matrix: d.matrix,
+                        work_matrix: d.work_matrix,
+                        create: d.create,
+                    },
+                ),
+                RenderCall::Destroy { object, ref_index } => {
+                    self.0.remove(&ShapeKey::Program { object: *object, ref_index: *ref_index });
+                    continue;
+                }
+                RenderCall::SpriteRelease { index, shape } => {
+                    self.0.remove(&ShapeKey::Sprite { index: *index, shape: *shape });
+                    continue;
+                }
+                _ => continue,
+            };
+            let entry =
+                self.0.entry(key).or_insert_with(|| shape_entry(space, input.shape, input.create, scene));
+            for mesh in shape(space, &input, entry, scene) {
+                vfx.push((mesh, dir.to_owned()));
+            }
+        }
+    }
 }
 
 /// The display state a timeline effect's set-up keeps and its free entry restores.
@@ -190,6 +280,7 @@ pub fn frame_after_scripts(g: &mut FieldState) {
         if let Some(kept) = g.effects.display_kept.take() {
             kept.restore(g);
         }
+        g.effects.shape_entries.0.clear();
         g.effects.state = 0;
         g.effects.effect = None;
     }
@@ -225,6 +316,7 @@ pub fn frame_draw(g: &mut FieldState) {
                 g.vfx.push((crate::ppp::vfx::model(&e.space, d, &scene), dir.clone()));
             }
         }
+        g.effects.shape_entries.draws(&mut g.vfx, &e.space, &e.render, &scene, &dir);
     }
 }
 
