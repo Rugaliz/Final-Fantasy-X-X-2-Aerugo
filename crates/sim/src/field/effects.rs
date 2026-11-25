@@ -63,17 +63,9 @@ impl ShapeEntries {
         use crate::ppp::vfx::{ShapeInput, shape, shape_entry};
         for c in calls {
             let (key, input) = match c {
+                // Both shape programs' draws (pppDrawShape's own set-up included) end in the same entry
+                // update.
                 RenderCall::Shape(d) => {
-                    if d.path3 {
-                        static ONCE: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            log::error!(
-                                "GAP: the third shape path (pppDrawShape's own update) is not ported"
-                            );
-                        }
-                        continue;
-                    }
                     let key = ShapeKey::Program { object: d.object, ref_index: d.ref_index };
                     let input = ShapeInput {
                         key: (d.object, d.ref_index),
