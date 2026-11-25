@@ -2554,8 +2554,8 @@ fn ke_shp_tail2_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
     if n == 0xffff {
         return;
     }
-    let len = u32::from(r.m.u8(at(o, works(r, rf).0)));
-    geometry(r, "pppKeShpTail2", o, key, rf, (0x24, 0x10 + 0x10 * len, 8), Vec::new());
+    let draw = tail2_instances(r, o, key, rf);
+    r.render.push(super::RenderCall::ShapeField(Box::new(draw)));
     let (wa, _) = works(r, rf);
     let a = at(o, wa);
     let shape = r.m.u32(r.env.lists[1].wrapping_add(4 * n));
@@ -2578,6 +2578,154 @@ fn ke_shp_tail2_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
             }
         }
     }
+}
+
+/// The length of a vector's x, y, z (the sum kept in extended precision, the root rounded to single).
+fn length3(v: [f32; 4]) -> f32 {
+    let d = f64::from;
+    ((d(v[0]) * d(v[0]) + d(v[1]) * d(v[1])) + d(v[2]) * d(v[2])).sqrt() as f32
+}
+
+/// The same with the sum stored in single precision before the root (as the tail's walk does).
+fn stored_length3(v: [f32; 4]) -> f32 {
+    let d = f64::from;
+    f64::from(((d(v[0]) * d(v[0]) + d(v[1]) * d(v[1])) + d(v[2]) * d(v[2])) as f32).sqrt() as f32
+}
+
+/// `m · p` as the tail's helper sums it: the x, y, z terms (z first) stored, then the w term added.
+fn tail_transform(m: &crate::chr::elements::Mat, p: [f32; 4]) -> [f32; 4] {
+    let d = f64::from;
+    std::array::from_fn(|c| {
+        let xyz = ((d(p[2]) * d(m[8 + c]) + d(p[1]) * d(m[4 + c])) + d(p[0]) * d(m[c])) as f32;
+        (d(p[3]) * d(m[12 + c]) + d(xyz)) as f32
+    })
+}
+
+/// PppKeShpTail2's draw: copies of the shape's current frame along the object's position history. The key
+/// gives the count (+0x20), the start and end colours (+0x14 / +0x18 bytes, times the part's colour, the
+/// alpha also times the colour work's alpha / 16384), the start and end scales (+0xc / +0x10) and the
+/// spacing (+0x1c), which shrinks with the scale; with key +0x22 the first copy sits at the newest position.
+/// Each copy walks the history by arc length, its colour and scale stepping evenly from start to end; its
+/// matrix is the object's draw matrix with its first two axes scaled by the part's scale and the copy's, at
+/// the camera's transform of its point. All of them go to the object's one shape entry.
+fn tail2_instances(r: &mut Run, o: u32, key: u32, rf: u32) -> super::ShapeFieldDraw {
+    use crate::chr::elements::IDENTITY;
+    let (wa, wb) = works(r, rf);
+    let (a, colour_work) = (at(o, wa), at(o, wb));
+    let n = r.m.u32(key + 4);
+    let entry = r.env.lists[1].wrapping_add(4 * n);
+    let shape = r.m.u32(entry);
+    let frame_index = r.m.u16(a + 4);
+    let frame = shape.wrapping_add(r.m.u16(shape + 0x10 + u32::from(frame_index) * 8) as i16 as i32 as u32);
+    let create = blend_state(r.m.u8(frame.wrapping_add(r.m.u32(frame + 4)) + 4));
+    let mut draw = super::ShapeFieldDraw {
+        object: o,
+        ref_index: r.ref_index,
+        shape,
+        flags: 0x80,
+        create,
+        sprites: Vec::new(),
+    };
+    let mut count = u32::from(r.m.u16(key + 0x20));
+    let steps = (count as i32 - 1) as f32;
+    let alpha = f32::from(r.m.u16(colour_work + 6) as i16) * 6.103_515_6e-5;
+    let tinted = |r: &Run, at: u32, c: usize| {
+        ((u32::from(r.m.u8(at)) * u32::from(r.part_colour[c])) as i32 >> 12) as f32
+    };
+    let mut colour: [f32; 4] = std::array::from_fn(|c| tinted(r, key + 0x14 + c as u32, c));
+    let mut end: [f32; 4] = std::array::from_fn(|c| tinted(r, key + 0x18 + c as u32, c));
+    colour[3] *= alpha;
+    end[3] *= alpha;
+    let colour_step: [f32; 4] = if steps == 0.0 {
+        [0.0; 4]
+    } else {
+        let k = 1.0 / steps;
+        sub4(colour, end).map(|c| k * c)
+    };
+    // The object's draw matrix with its first two axes scaled by the part's scale.
+    let mut base = get_mat(r, o + 0x10);
+    for i in 0..3 {
+        base[i] *= r.part_scale[0];
+        base[4 + i] *= r.part_scale[1];
+    }
+    let mut scale = r.m.f32(key + 0xc);
+    let scale_step = if steps == 0.0 {
+        0.0
+    } else {
+        ((f64::from(scale) - f64::from(r.m.f32(key + 0x10))) / f64::from(steps)) as f32
+    };
+    let mut spacing = r.m.f32(key + 0x1c);
+    let spacing_step = if scale == 0.0 {
+        0.0
+    } else {
+        (f64::from(scale_step) / f64::from(scale) * f64::from(spacing)) as f32
+    };
+    if spacing == 0.0 {
+        count = 0;
+    }
+    // The history: the ring of positions from +0x10, its newest at the index byte +1.
+    let (head, last) = (u32::from(r.m.u8(a + 1)), u32::from(r.m.u8(a)).wrapping_sub(1));
+    let ring = |r: &Run, i: u32| vec4(r, a + 0x10 + 0x10 * i);
+    let next_index = |i: u32| if i == last { 0 } else { i + 1 };
+    let mut point = ring(r, head);
+    let mut previous = point;
+    let mut index = next_index(head);
+    let mut current = ring(r, index);
+    let mut direction = sub4(current, previous);
+    let mut along = spacing;
+    let mut segment = length3(direction);
+    let mut ahead = segment;
+    let place_copy = |draw: &mut super::ShapeFieldDraw, colour: [f32; 4], scale: f32, point: [f32; 4]| {
+        let packed = colour.map(|c| c.round_ties_even() as i32 as u8);
+        let mut matrix = IDENTITY;
+        for i in 0..3 {
+            matrix[i] = scale * base[i];
+            matrix[4 + i] = base[4 + i] * scale;
+        }
+        matrix[12..16].copy_from_slice(&tail_transform(&r.camera, point));
+        draw.sprites.push(super::FieldSprite {
+            frame: frame_index,
+            colour: packed,
+            matrix,
+            work_matrix: None,
+        });
+    };
+    if r.m.u8(key + 0x22) != 0 {
+        place_copy(&mut draw, colour, scale, point);
+    }
+    loop {
+        count = count.wrapping_sub(1);
+        if count == 0 {
+            break;
+        }
+        colour = sub4(colour, colour_step);
+        scale -= scale_step;
+        spacing -= spacing_step;
+        // The spacing has run out (a NaN spacing goes on, as the x87 comparison lets it).
+        if spacing <= 0.0 {
+            break;
+        }
+        // (The x87 comparison also walks on when either is NaN.)
+        while ahead < spacing || ahead.is_nan() || spacing.is_nan() {
+            index = next_index(index);
+            if index == head {
+                return draw;
+            }
+            previous = current;
+            current = ring(r, index);
+            direction = sub4(current, previous);
+            along -= segment;
+            segment = stored_length3(direction);
+            ahead += segment;
+        }
+        let t = along / segment;
+        let offset = direction.map(|c| c * t);
+        point = std::array::from_fn(|i| previous[i] + offset[i]);
+        along += spacing;
+        ahead -= spacing;
+        place_copy(&mut draw, colour, scale, point);
+    }
+    draw
 }
 
 fn ke_shp_tail2_init(r: &mut Run, o: u32, rf: u32) {
