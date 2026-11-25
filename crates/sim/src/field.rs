@@ -951,20 +951,24 @@ pub struct FieldState {
     pub mime_params: Vec<Option<f32>>,
     /// The pad's held word last frame and the buttons let go this frame (the pad history's +8, kept).
     pub pad_prev_held: u32,
-    /// A menu value (01fb reads it; the menus set it).
-    pub menu_value_01fb: i32,
+    /// What the save and load screens (0) or the battle code leave when they close (01fb reads it).
+    pub menu_exit_value: i32,
     pub pad_released: u32,
     /// The pad block's analog bytes and second word (0121 / 0122 / 0251).
     pub pad: pad::PadBlock,
-    /// c007's pair and the debug switch bytes 707d / 707e set and read.
+    /// The pad's analog pair and the debug switch bytes 707d / 707e set and read.
     pub pad_analog: [i32; 2],
     pub debug_flags: Vec<u8>,
-    pub debug_values_c007: [i32; 2],
-    pub bytes_4039: [u8; 4],
+    /// The debug map jump's target (c007: map and entrance; map 0x17 by default).
+    pub debug_jump_target: [i32; 2],
+    /// The PS2 frame's second clear (4039: mode, then red, green, blue): with a mode, the fixed buffer is
+    /// cleared too, with mode 2 in this colour.
+    pub fixed_buffer_clear: [u8; 4],
     pub chr_lights: Vec<[u8; 0x2c]>,
-    /// A switch byte 00b2 sets and the three values 00b3/00b4 set.
-    pub switch_00b2: u8,
-    pub values_00b3: [i32; 3],
+    /// The PS2 display's two-circuit blend (00b2 turns it on; 00b3 / 00b4 set its x / y offset; the third is
+    /// its alpha): while on, the GS display registers merge the frame with itself, offset.
+    pub display_blend_on: u8,
+    pub display_blend: [i32; 3],
     /// The PS2 map's display objects and keyframe tracks, and the keyframe slots playing them.
     pub map_objects: Option<std::sync::Arc<map_objects::MapObjects>>,
     pub keyframes: map_objects::Keyframes,
@@ -2322,20 +2326,28 @@ fn degree_rad(d: f32) -> f32 {
     ((f64::from(d) * f64::from(crate::chr::BODY_PI)) / 180.0) as f32
 }
 
-/// The screen distortion: the PS2 block natives set (flags, +4, +0x18..+0x28, the colour bytes +0x2c, a value
-/// and a timer) and the remaster's Distortion switch (+0x7c on, +0x7e fresh, +0x78 its start value).
+/// The screen wave (the map's distortion block, which the remaster's wave step reads, and its Distortion
+/// switch: +0x7c on, +0x7e fresh, +0x78 its start value).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Distortion {
+    /// Bit 0: the wave starts at the surface height's screen line; bit 1 (01e6 with its first argument).
     pub flags: u32,
-    pub value_01e6_a: f32,
-    /// +8..+0x14 (the reset clears them).
-    pub reset_words: [u32; 4],
-    pub point: [f32; 3],
-    pub value_01e6_b: f32,
-    pub count_01e4: i32,
+    /// The height of the surface the wave hangs from (01e6).
+    pub surface_height: f32,
+    /// The wave's running phases (the step adds the phase speed × 1.5 and × 1; the reset clears them).
+    pub phases: [u32; 4],
+    /// The phase speed, the step along the screen (× 64) and the amplitude (01e4).
+    pub wave: [f32; 3],
+    /// 01e6's second value (64 by default): nothing reads it.
+    pub unread_value: f32,
+    /// The wave's strength (01e4; the remaster's distortion takes it / 128).
+    pub strength: i32,
+    /// The colour the wave tints towards.
     pub rgb: [u8; 3],
-    pub timer_01e2: u32,
-    pub value_01e2: u32,
+    /// Frames the wave has run (01e2 restarts the count).
+    pub frames: u32,
+    /// The value 01e2 clears, which the wave step is handed and ignores.
+    pub unread_argument: u32,
     pub on: bool,
     pub fresh: bool,
     pub start: f32,
@@ -2344,11 +2356,11 @@ pub struct Distortion {
 impl Distortion {
     /// The parameters' defaults (the flags stay).
     pub fn reset(&mut self) {
-        self.value_01e6_a = 0.0;
-        self.reset_words = [0; 4];
-        self.point = [f32::from_bits(0x3cf5_c28f), f32::from_bits(0x3ca3_d70a), f32::from_bits(0x3ba3_d70a)];
-        self.value_01e6_b = f32::from_bits(0x4280_0000);
-        self.count_01e4 = 0x60;
+        self.surface_height = 0.0;
+        self.phases = [0; 4];
+        self.wave = [f32::from_bits(0x3cf5_c28f), f32::from_bits(0x3ca3_d70a), f32::from_bits(0x3ba3_d70a)];
+        self.unread_value = f32::from_bits(0x4280_0000);
+        self.strength = 0x60;
         self.rgb = [0x80; 3];
     }
 }

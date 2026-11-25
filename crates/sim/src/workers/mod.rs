@@ -284,37 +284,47 @@ pub struct System {
     pub flags1: u8,
     pub mode1a: u16,
     pub flags210: u32,
-    /// Every joined member is free (the party code's global flag) and the flag 00ca(0xf) sets.
+    /// Every joined member is free (the party code's global flag).
     pub full_member: u8,
-    pub party_flag_00ca: u8,
+    /// The names still to enter after character 0xf joins (00ca sets 3; the name entry asks for characters
+    /// 0xf–0x11 one after another, counting down).
+    pub sister_names_left: u8,
     /// The value 0212 sets (+0x208).
     pub value208: f32,
-    /// The switch mask 0220 sets bits of.
-    pub mask_0220: u32,
-    /// The value 025d keeps.
-    pub value_025d: i32,
-    /// The mask 018a/018b set bits of, and the three values 014a keeps.
-    pub mask_018a: u32,
+    /// Party characters (bit per character below 8; 0220 sets and clears them) left out of the points an event
+    /// adds once to each party character's save tally when it starts (AtelGetNowEventJumpId).
+    pub members_without_event_credit: u32,
+    /// The Al Bhed letters known (025d sets the mask the game calls g_albhed; the text shows those letters
+    /// translated).
+    pub al_bhed_letters: i32,
+    /// Main-menu commands held off (018a sets a bit, 018b clears it); the main command window offers command
+    /// 0x40 only while bit 6 is clear. And the three values 014a keeps.
+    pub menu_commands_off: u32,
     pub battle_return_params: [i32; 3],
     /// The worker each body slot names (0158).
     pub body_slots: [i32; 16],
     /// Frames run since the setup ended (+500).
     pub frames: i32,
-    /// c009's value and c051's switch.
-    pub value_c009: u8,
-    pub switch_c051: u8,
+    /// The development environment (c009: 0 map, 1 event, 2 operation check, 3 sound, 4 motion; the debug
+    /// screen shows it and the event files' path follows it) and the development switch (c051: while on, the
+    /// main menu cannot open and the development host's queries answer instead of the PC's stubs).
+    pub development_environment: u8,
+    pub development_mode: u8,
     /// The event effect mask (00db clears it, 017b clears a bit).
     pub effect_mask: u32,
-    /// A byte the battle code sets (7035 reads it).
-    pub battle_byte_7035: u8,
-    /// The event effect flag (00db raises it, the effect's end lowers it) and a byte 01bf sets.
+    /// The battle voice's standby state (MsVoiceStanby keeps it; 7035 reads it).
+    pub voice_standby: u8,
+    /// The event effect flag (00db raises it, the effect's end lowers it).
     pub effect_up: i32,
-    pub byte_01bf: u8,
+    /// After a battle, character 3's body keeps its model parts as they are (01bf; otherwise part 1 is hidden
+    /// and part 2 shown).
+    pub keep_parts_after_battle: u8,
     /// The system block's +0x1a (0158/0159 do nothing while it is set).
     pub slot_lock: i16,
-    /// The four values 01c0 sets and the four 022e sets.
-    pub values_01c0: [i32; 4],
-    pub values_022e: [i32; 4],
+    /// The four effect parameters 01c0 sets (only the debug screen shows them, as EffPm 0–3) and the four sounds
+    /// 022e names (−1 none) whose volume the event drops under water (AtelEventExecBGVolumeInWater).
+    pub effect_params: [i32; 4],
+    pub underwater_sounds: [i32; 4],
 }
 
 /// The block as the original's setup leaves it, turned on: byte 0 0x80 | 1, byte 1 0x98, byte 2
@@ -337,23 +347,23 @@ impl Default for System {
             flags0: 0x81,
             flags210: 0x49,
             full_member: 0,
-            party_flag_00ca: 0,
+            sister_names_left: 0,
             value208: 0.0,
-            mask_0220: 0,
-            value_025d: 0,
-            mask_018a: 0,
+            members_without_event_credit: 0,
+            al_bhed_letters: 0,
+            menu_commands_off: 0,
             battle_return_params: [0; 3],
             body_slots: [0; 16],
             frames: 0,
-            value_c009: 0,
-            switch_c051: 0,
+            development_environment: 0,
+            development_mode: 0,
             effect_mask: 0,
-            battle_byte_7035: 0,
+            voice_standby: 0,
             effect_up: 0,
-            byte_01bf: 0,
+            keep_parts_after_battle: 0,
             slot_lock: 0,
-            values_01c0: [0; 4],
-            values_022e: [0; 4],
+            effect_params: [0; 4],
+            underwater_sounds: [0; 4],
         }
     }
 }

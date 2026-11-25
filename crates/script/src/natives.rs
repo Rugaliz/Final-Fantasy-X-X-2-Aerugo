@@ -402,7 +402,7 @@ fn register_common<G>(n: &mut Natives<G>) {
     // Halt: never finishes.
     n.register(0x005F, Native { init: None, wait: Some(|_, _| 0), result: None });
 
-    // Math (8779xx–878060): the x87 works in extended precision and the result is stored as a float, so the
+    // Math natives: the x87 works in extended precision and the result is stored as a float, so the
     // transcendental ones go through f64 with one rounding.
     fn ext(f: fn(f64) -> f64, x: f32) -> f32 {
         f(f64::from(x)) as f32

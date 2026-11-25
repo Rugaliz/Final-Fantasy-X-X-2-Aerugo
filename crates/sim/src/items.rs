@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::auto_abilities as ability;
 use aerugo_formats::KernelTable;
 use aerugo_formats::text::{self, Charset, Token};
 use aerugo_vfs::{Language, Vfs};
@@ -473,8 +474,8 @@ pub fn give(save: &mut [u8], got: &Treasure) -> bool {
     }
 }
 
-/// The name an equipment record gets from its abilities (weapons when byte 5 is 0, else armour), slot count
-/// and flags: the first rule that matches.
+/// The name an equipment record gets from its auto-abilities (weapons when byte 5 is 0, else armour), slot
+/// count and flags: the first rule that matches. The names are records of the equipment name table.
 pub fn equipment_name_id(e: &[u8; EQUIPMENT_SIZE]) -> u16 {
     let abilities: [u16; 4] = std::array::from_fn(|i| u16::from_le_bytes([e[0xE + i * 2], e[0xF + i * 2]]));
     let has = |a: u16| abilities.contains(&a);
@@ -495,10 +496,29 @@ fn weapon_name(
     count: &dyn Fn(&[u16]) -> usize,
     either: &dyn Fn(u16, u16) -> bool,
 ) -> u16 {
-    let elemental_strikes = count(&[0x8062, 0x8063, 0x8064, 0x8065]);
-    let elemental_wards = count(&[0x8066, 0x8067, 0x8068, 0x8069]);
-    let touches = count(&[0x801E, 0x8022, 0x8026, 0x802A]);
-    let strikes = count(&[0x802E, 0x8036, 0x803A, 0x803E, 0x8042, 0x8046, 0x804A]);
+    let strength_ups = count(&[
+        ability::STRENGTH_3_PERCENT,
+        ability::STRENGTH_5_PERCENT,
+        ability::STRENGTH_10_PERCENT,
+        ability::STRENGTH_20_PERCENT,
+    ]);
+    let magic_ups = count(&[
+        ability::MAGIC_3_PERCENT,
+        ability::MAGIC_5_PERCENT,
+        ability::MAGIC_10_PERCENT,
+        ability::MAGIC_20_PERCENT,
+    ]);
+    let elemental_strikes =
+        count(&[ability::FIRESTRIKE, ability::ICESTRIKE, ability::LIGHTNINGSTRIKE, ability::WATERSTRIKE]);
+    let status_strikes = count(&[
+        ability::DEATHSTRIKE,
+        ability::STONESTRIKE,
+        ability::POISONSTRIKE,
+        ability::SLEEPSTRIKE,
+        ability::SILENCESTRIKE,
+        ability::DARKSTRIKE,
+        ability::SLOWSTRIKE,
+    ]);
     if flags & 4 != 0 {
         return 0x5000;
     }
@@ -506,85 +526,85 @@ fn weapon_name(
         return 0x5001;
     }
     let rules: &[(bool, u16)] = &[
-        (has(0x807A), 0x5002),
-        (touches > 3, 0x5003),
-        (has(0x8019), 0x5004),
-        (has(0x800F) && has(0x8013) && has(0x8011), 0x5005),
-        (has(0x800F) && has(0x8011), 0x5006),
-        (has(0x800E) && has(0x8012), 0x5007),
-        (has(0x800F), 0x5008),
-        (has(0x800E), 0x5009),
-        (has(0x8013), 0x500A),
-        (has(0x8012), 0x500B),
-        (has(0x8011), 0x500C),
-        (has(0x8010), 0x500D),
-        (has(0x800D), 0x500F),
-        (strikes > 3, 0x5010),
-        (elemental_strikes > 3, 0x5013),
-        (elemental_wards > 3, 0x5014),
-        (elemental_wards > 2 && has(0x8006), 0x5015),
-        (has(0x800C), 0x5016),
-        (has(0x801A), 0x5017),
-        (touches > 2, 0x5018),
-        (strikes > 2, 0x5019),
-        (either(0x8003, 0x8004) && has(0x8005), 0x501A),
-        (either(0x8003, 0x8004), 0x501B),
-        (has(0x8005), 0x5020),
-        (has(0x8006), 0x5021),
-        (has(0x8007), 0x5022),
-        (has(0x8001), 0x5023),
-        (has(0x8002), 0x5024),
-        (has(0x802E), 0x5025),
-        (has(0x804A), 0x5026),
-        (has(0x8036), 0x5027),
-        (has(0x803A), 0x5028),
-        (has(0x803E), 0x5029),
-        (has(0x8042), 0x502A),
-        (has(0x8046), 0x502B),
-        (elemental_strikes > 2, 0x502C),
-        (elemental_wards > 2, 0x502D),
-        (touches > 1, 0x502E),
+        (has(ability::CAPTURE), 0x5002),
+        (elemental_strikes > 3, 0x5003),
+        (has(ability::BREAK_DAMAGE_LIMIT), 0x5004),
+        (has(ability::TRIPLE_OVERDRIVE) && has(ability::TRIPLE_AP) && has(ability::OVERDRIVE_TO_AP), 0x5005),
+        (has(ability::TRIPLE_OVERDRIVE) && has(ability::OVERDRIVE_TO_AP), 0x5006),
+        (has(ability::DOUBLE_OVERDRIVE) && has(ability::DOUBLE_AP), 0x5007),
+        (has(ability::TRIPLE_OVERDRIVE), 0x5008),
+        (has(ability::DOUBLE_OVERDRIVE), 0x5009),
+        (has(ability::TRIPLE_AP), 0x500A),
+        (has(ability::DOUBLE_AP), 0x500B),
+        (has(ability::OVERDRIVE_TO_AP), 0x500C),
+        (has(ability::SOS_OVERDRIVE), 0x500D),
+        (has(ability::ONE_MP_COST), 0x500F),
+        (status_strikes > 3, 0x5010),
+        (strength_ups > 3, 0x5013),
+        (magic_ups > 3, 0x5014),
+        (magic_ups > 2 && has(ability::MAGIC_BOOSTER), 0x5015),
+        (has(ability::HALF_MP_COST), 0x5016),
+        (has(ability::GILLIONAIRE), 0x5017),
+        (elemental_strikes > 2, 0x5018),
+        (status_strikes > 2, 0x5019),
+        (either(ability::COUNTERATTACK, ability::EVADE_AND_COUNTER) && has(ability::MAGIC_COUNTER), 0x501A),
+        (either(ability::COUNTERATTACK, ability::EVADE_AND_COUNTER), 0x501B),
+        (has(ability::MAGIC_COUNTER), 0x5020),
+        (has(ability::MAGIC_BOOSTER), 0x5021),
+        (has(ability::ALCHEMY), 0x5022),
+        (has(ability::FIRST_STRIKE), 0x5023),
+        (has(ability::INITIATIVE), 0x5024),
+        (has(ability::DEATHSTRIKE), 0x5025),
+        (has(ability::SLOWSTRIKE), 0x5026),
+        (has(ability::STONESTRIKE), 0x5027),
+        (has(ability::POISONSTRIKE), 0x5028),
+        (has(ability::SLEEPSTRIKE), 0x5029),
+        (has(ability::SILENCESTRIKE), 0x502A),
+        (has(ability::DARKSTRIKE), 0x502B),
+        (strength_ups > 2, 0x502C),
+        (magic_ups > 2, 0x502D),
+        (elemental_strikes > 1, 0x502E),
     ];
     if let Some(&(_, name)) = rules.iter().find(|r| r.0) {
         return name;
     }
-    let pairs = [
-        (0x802E, 0x802F),
-        (0x8036, 0x8037),
-        (0x803A, 0x803B),
-        (0x803E, 0x803F),
-        (0x8042, 0x8043),
-        (0x8046, 0x8047),
-        (0x804A, 0x804B),
+    let status_attacks = [
+        (ability::DEATHSTRIKE, ability::DEATHTOUCH),
+        (ability::STONESTRIKE, ability::STONETOUCH),
+        (ability::POISONSTRIKE, ability::POISONTOUCH),
+        (ability::SLEEPSTRIKE, ability::SLEEPTOUCH),
+        (ability::SILENCESTRIKE, ability::SILENCETOUCH),
+        (ability::DARKSTRIKE, ability::DARKTOUCH),
+        (ability::SLOWSTRIKE, ability::SLOWTOUCH),
     ];
     let rules: &[(bool, u16)] = &[
-        (pairs.iter().filter(|&&(a, b)| either(a, b)).count() > 1, 0x502F),
-        (has(0x802F), 0x5030),
-        (has(0x804B), 0x5031),
-        (has(0x8037), 0x5032),
-        (has(0x803B), 0x5033),
-        (has(0x803F), 0x5034),
-        (has(0x8043), 0x5035),
-        (has(0x8047), 0x5036),
-        (has(0x8000), 0x5037),
-        (has(0x801E), 0x5038),
-        (has(0x8022), 0x5039),
-        (has(0x8026), 0x503A),
-        (has(0x802A), 0x503B),
-        (has(0x807C), 0x501C),
-        (has(0x807D), 0x501D),
-        (has(0x807E), 0x501E),
-        (has(0x807F), 0x501F),
+        (status_attacks.iter().filter(|&&(a, b)| either(a, b)).count() > 1, 0x502F),
+        (has(ability::DEATHTOUCH), 0x5030),
+        (has(ability::SLOWTOUCH), 0x5031),
+        (has(ability::STONETOUCH), 0x5032),
+        (has(ability::POISONTOUCH), 0x5033),
+        (has(ability::SLEEPTOUCH), 0x5034),
+        (has(ability::SILENCETOUCH), 0x5035),
+        (has(ability::DARKTOUCH), 0x5036),
+        (has(ability::SENSOR), 0x5037),
+        (has(ability::FIRESTRIKE), 0x5038),
+        (has(ability::ICESTRIKE), 0x5039),
+        (has(ability::LIGHTNINGSTRIKE), 0x503A),
+        (has(ability::WATERSTRIKE), 0x503B),
+        (has(ability::DISTILL_POWER), 0x501C),
+        (has(ability::DISTILL_MANA), 0x501D),
+        (has(ability::DISTILL_SPEED), 0x501E),
+        (has(ability::DISTILL_ABILITY), 0x501F),
         (slots > 3, 0x503C),
-        (elemental_wards > 0 && elemental_strikes > 0, 0x503D),
+        (magic_ups > 0 && strength_ups > 0, 0x503D),
         (slots > 1, 0x503E),
-        (either(0x8068, 0x8069), 0x503F),
-        (either(0x8064, 0x8065), 0x5040),
-        (has(0x8067), 0x5041),
-        (has(0x8066), 0x5042),
-        (has(0x8063), 0x5043),
-        (has(0x8062), 0x5044),
-        (has(0x800B), 0x5045),
+        (either(ability::MAGIC_10_PERCENT, ability::MAGIC_20_PERCENT), 0x503F),
+        (either(ability::STRENGTH_10_PERCENT, ability::STRENGTH_20_PERCENT), 0x5040),
+        (has(ability::MAGIC_5_PERCENT), 0x5041),
+        (has(ability::MAGIC_3_PERCENT), 0x5042),
+        (has(ability::STRENGTH_5_PERCENT), 0x5043),
+        (has(ability::STRENGTH_3_PERCENT), 0x5044),
+        (has(ability::PIERCING), 0x5045),
     ];
     rules.iter().find(|r| r.0).map_or(0x5046, |r| r.1)
 }
@@ -595,104 +615,151 @@ fn armor_name(
     count: &dyn Fn(&[u16]) -> usize,
     either: &dyn Fn(u16, u16) -> bool,
 ) -> u16 {
-    let guards = count(&[0x8008, 0x8009, 0x800A]);
-    let wards_a = count(&[0x8021, 0x8025, 0x8029, 0x802D]);
-    let wards_b = count(&[0x8020, 0x8024, 0x8028, 0x802C]);
-    let status = count(&[0x8054, 0x8055, 0x8057, 0x8058]);
-    let protects =
-        count(&[0x8030, 0x8034, 0x8038, 0x803C, 0x8040, 0x8044, 0x8048, 0x804C, 0x804E, 0x8050, 0x8052]);
-    let eat_a = count(&[0x806A, 0x806B, 0x806C, 0x806D]);
-    let eat_b = count(&[0x806E, 0x806F, 0x8070, 0x8071]);
-    let eat_c = count(&[0x8072, 0x8073, 0x8074, 0x8075]);
-    let eat_d = count(&[0x8076, 0x8077, 0x8078, 0x8079]);
-    let stat_ups = count(&[0x805E, 0x805F, 0x8060, 0x8061]);
-    let all_ups = stat_ups + count(&[0x8059, 0x805A, 0x805B, 0x805C, 0x805D]);
-    let with_8056 = usize::from(has(0x8056)) + status;
-    let pairs = [(0x8021, 0x8020), (0x8025, 0x8024), (0x8029, 0x8028), (0x802D, 0x802C)];
+    let auto_items = count(&[ability::AUTO_POTION, ability::AUTO_MED, ability::AUTO_PHOENIX]);
+    let elemental_eaters =
+        count(&[ability::FIRE_EATER, ability::ICE_EATER, ability::LIGHTNING_EATER, ability::WATER_EATER]);
+    let elemental_proofs =
+        count(&[ability::FIREPROOF, ability::ICEPROOF, ability::LIGHTNINGPROOF, ability::WATERPROOF]);
+    let auto_statuses_but_haste =
+        count(&[ability::AUTO_SHELL, ability::AUTO_PROTECT, ability::AUTO_REGEN, ability::AUTO_REFLECT]);
+    let status_proofs = count(&[
+        ability::DEATHPROOF,
+        ability::ZOMBIEPROOF,
+        ability::STONEPROOF,
+        ability::POISONPROOF,
+        ability::SLEEPPROOF,
+        ability::SILENCEPROOF,
+        ability::DARKPROOF,
+        ability::SLOWPROOF,
+        ability::CONFUSEPROOF,
+        ability::BERSERKPROOF,
+        ability::CURSEPROOF,
+    ]);
+    let defense_ups = count(&[
+        ability::DEFENSE_3_PERCENT,
+        ability::DEFENSE_5_PERCENT,
+        ability::DEFENSE_10_PERCENT,
+        ability::DEFENSE_20_PERCENT,
+    ]);
+    let magic_def_ups = count(&[
+        ability::MAGIC_DEF_3_PERCENT,
+        ability::MAGIC_DEF_5_PERCENT,
+        ability::MAGIC_DEF_10_PERCENT,
+        ability::MAGIC_DEF_20_PERCENT,
+    ]);
+    let hp_ups = count(&[
+        ability::HP_5_PERCENT,
+        ability::HP_10_PERCENT,
+        ability::HP_20_PERCENT,
+        ability::HP_30_PERCENT,
+    ]);
+    let mp_ups = count(&[
+        ability::MP_5_PERCENT,
+        ability::MP_10_PERCENT,
+        ability::MP_20_PERCENT,
+        ability::MP_30_PERCENT,
+    ]);
+    let sos_nul_elements =
+        count(&[ability::SOS_NULTIDE, ability::SOS_NULFROST, ability::SOS_NULSHOCK, ability::SOS_NULBLAZE]);
+    let sos_abilities = sos_nul_elements
+        + count(&[
+            ability::SOS_SHELL,
+            ability::SOS_PROTECT,
+            ability::SOS_HASTE,
+            ability::SOS_REGEN,
+            ability::SOS_REFLECT,
+        ]);
+    let auto_statuses = usize::from(has(ability::AUTO_HASTE)) + auto_statuses_but_haste;
+    let elemental_absorbs = [
+        (ability::FIRE_EATER, ability::FIREPROOF),
+        (ability::ICE_EATER, ability::ICEPROOF),
+        (ability::LIGHTNING_EATER, ability::LIGHTNINGPROOF),
+        (ability::WATER_EATER, ability::WATERPROOF),
+    ];
     let rules: &[(bool, u16)] = &[
-        (has(0x8017) && has(0x8018), 0x504A),
-        (has(0x8080), 0x509E),
-        (has(0x8017), 0x504B),
-        (has(0x8018), 0x504C),
-        (wards_a > 3, 0x504D),
-        (wards_b > 3, 0x504E),
-        (status > 3, 0x504F),
-        (guards > 2, 0x5050),
-        (has(0x8008) && has(0x8009), 0x5051),
-        (protects > 3, 0x5052),
-        (eat_a > 3, 0x5053),
-        (eat_b > 3, 0x5054),
-        (eat_c > 3, 0x5055),
-        (eat_d > 3, 0x5056),
-        (has(0x8016), 0x5057),
-        (has(0x8015), 0x5058),
-        (has(0x801B) && has(0x801C), 0x5059),
-        (with_8056 > 2, 0x505A),
-        (wards_a > 2, 0x505B),
-        (has(0x801B), 0x505C),
-        (has(0x801C), 0x505D),
-        (has(0x800A), 0x505E),
-        (has(0x8009), 0x505F),
-        (stat_ups > 3, 0x5060),
-        (all_ups > 3, 0x5061),
-        (protects > 2, 0x5062),
-        (has(0x801D), 0x5063),
-        (has(0x8008), 0x5064),
-        (wards_b > 2, 0x5065),
-        (all_ups > 2, 0x5066),
-        (with_8056 > 1, 0x5067),
-        (all_ups > 1, 0x5068),
-        (either(0x8057, 0x805C), 0x5069),
-        (either(0x8056, 0x805B), 0x506A),
-        (either(0x8058, 0x805D), 0x506B),
-        (either(0x8054, 0x8059), 0x506C),
-        (either(0x8055, 0x805A), 0x506D),
-        (has(0x8007), 0x506E),
-        (eat_a > 2, 0x506F),
-        (eat_b > 2, 0x5070),
-        (eat_c > 2, 0x5071),
-        (eat_d > 2, 0x5072),
-        (pairs.iter().filter(|&&(a, b)| either(a, b)).count() > 1, 0x5073),
-        (protects > 1, 0x5074),
-        (has(0x8021), 0x5075),
-        (has(0x8025), 0x5076),
-        (has(0x8029), 0x5077),
-        (has(0x802D), 0x5078),
-        (either(0x8052, 0x8053), 0x5079),
-        (either(0x804E, 0x804F), 0x507A),
-        (either(0x8050, 0x8051), 0x507B),
-        (either(0x804C, 0x804D), 0x507C),
-        (either(0x8030, 0x8031), 0x507D),
-        (either(0x8034, 0x8035), 0x507E),
-        (either(0x8038, 0x8039), 0x507F),
-        (either(0x803C, 0x803D), 0x5080),
-        (either(0x8040, 0x8041), 0x5081),
-        (either(0x8044, 0x8045), 0x5082),
-        (either(0x8048, 0x8049), 0x5083),
-        (either(0x8020, 0x801F), 0x5084),
-        (either(0x8024, 0x8023), 0x5085),
-        (either(0x8028, 0x8027), 0x5086),
-        (either(0x802C, 0x802B), 0x5087),
-        (has(0x805E), 0x5088),
-        (has(0x8061), 0x5089),
-        (has(0x8060), 0x508A),
-        (has(0x805F), 0x508B),
-        (eat_c + eat_d > 3, 0x508C),
+        (has(ability::BREAK_HP_LIMIT) && has(ability::BREAK_MP_LIMIT), 0x504A),
+        (has(ability::RIBBON), 0x509E),
+        (has(ability::BREAK_HP_LIMIT), 0x504B),
+        (has(ability::BREAK_MP_LIMIT), 0x504C),
+        (elemental_eaters > 3, 0x504D),
+        (elemental_proofs > 3, 0x504E),
+        (auto_statuses_but_haste > 3, 0x504F),
+        (auto_items > 2, 0x5050),
+        (has(ability::AUTO_POTION) && has(ability::AUTO_MED), 0x5051),
+        (status_proofs > 3, 0x5052),
+        (defense_ups > 3, 0x5053),
+        (magic_def_ups > 3, 0x5054),
+        (hp_ups > 3, 0x5055),
+        (mp_ups > 3, 0x5056),
+        (has(ability::MASTER_THIEF), 0x5057),
+        (has(ability::PICKPOCKET), 0x5058),
+        (has(ability::HP_STROLL) && has(ability::MP_STROLL), 0x5059),
+        (auto_statuses > 2, 0x505A),
+        (elemental_eaters > 2, 0x505B),
+        (has(ability::HP_STROLL), 0x505C),
+        (has(ability::MP_STROLL), 0x505D),
+        (has(ability::AUTO_PHOENIX), 0x505E),
+        (has(ability::AUTO_MED), 0x505F),
+        (sos_nul_elements > 3, 0x5060),
+        (sos_abilities > 3, 0x5061),
+        (status_proofs > 2, 0x5062),
+        (has(ability::NO_ENCOUNTERS), 0x5063),
+        (has(ability::AUTO_POTION), 0x5064),
+        (elemental_proofs > 2, 0x5065),
+        (sos_abilities > 2, 0x5066),
+        (auto_statuses > 1, 0x5067),
+        (sos_abilities > 1, 0x5068),
+        (either(ability::AUTO_REGEN, ability::SOS_REGEN), 0x5069),
+        (either(ability::AUTO_HASTE, ability::SOS_HASTE), 0x506A),
+        (either(ability::AUTO_REFLECT, ability::SOS_REFLECT), 0x506B),
+        (either(ability::AUTO_SHELL, ability::SOS_SHELL), 0x506C),
+        (either(ability::AUTO_PROTECT, ability::SOS_PROTECT), 0x506D),
+        (has(ability::ALCHEMY), 0x506E),
+        (defense_ups > 2, 0x506F),
+        (magic_def_ups > 2, 0x5070),
+        (hp_ups > 2, 0x5071),
+        (mp_ups > 2, 0x5072),
+        (elemental_absorbs.iter().filter(|&&(a, b)| either(a, b)).count() > 1, 0x5073),
+        (status_proofs > 1, 0x5074),
+        (has(ability::FIRE_EATER), 0x5075),
+        (has(ability::ICE_EATER), 0x5076),
+        (has(ability::LIGHTNING_EATER), 0x5077),
+        (has(ability::WATER_EATER), 0x5078),
+        (either(ability::CURSEPROOF, ability::CURSE_WARD), 0x5079),
+        (either(ability::CONFUSEPROOF, ability::CONFUSE_WARD), 0x507A),
+        (either(ability::BERSERKPROOF, ability::BERSERK_WARD), 0x507B),
+        (either(ability::SLOWPROOF, ability::SLOW_WARD), 0x507C),
+        (either(ability::DEATHPROOF, ability::DEATH_WARD), 0x507D),
+        (either(ability::ZOMBIEPROOF, ability::ZOMBIE_WARD), 0x507E),
+        (either(ability::STONEPROOF, ability::STONE_WARD), 0x507F),
+        (either(ability::POISONPROOF, ability::POISON_WARD), 0x5080),
+        (either(ability::SLEEPPROOF, ability::SLEEP_WARD), 0x5081),
+        (either(ability::SILENCEPROOF, ability::SILENCE_WARD), 0x5082),
+        (either(ability::DARKPROOF, ability::DARK_WARD), 0x5083),
+        (either(ability::FIREPROOF, ability::FIRE_WARD), 0x5084),
+        (either(ability::ICEPROOF, ability::ICE_WARD), 0x5085),
+        (either(ability::LIGHTNINGPROOF, ability::LIGHTNING_WARD), 0x5086),
+        (either(ability::WATERPROOF, ability::WATER_WARD), 0x5087),
+        (has(ability::SOS_NULTIDE), 0x5088),
+        (has(ability::SOS_NULBLAZE), 0x5089),
+        (has(ability::SOS_NULSHOCK), 0x508A),
+        (has(ability::SOS_NULFROST), 0x508B),
+        (hp_ups + mp_ups > 3, 0x508C),
         (slots > 3, 0x508D),
-        (eat_a > 0 && eat_b > 0, 0x508E),
-        (eat_a > 1, 0x508F),
-        (eat_b > 1, 0x5090),
-        (eat_c > 1, 0x5091),
-        (eat_d > 1, 0x5092),
-        (either(0x806C, 0x806D), 0x5093),
-        (either(0x8070, 0x8071), 0x5094),
-        (either(0x8078, 0x8079), 0x5095),
-        (either(0x8074, 0x8075), 0x5096),
+        (defense_ups > 0 && magic_def_ups > 0, 0x508E),
+        (defense_ups > 1, 0x508F),
+        (magic_def_ups > 1, 0x5090),
+        (hp_ups > 1, 0x5091),
+        (mp_ups > 1, 0x5092),
+        (either(ability::DEFENSE_10_PERCENT, ability::DEFENSE_20_PERCENT), 0x5093),
+        (either(ability::MAGIC_DEF_10_PERCENT, ability::MAGIC_DEF_20_PERCENT), 0x5094),
+        (either(ability::MP_20_PERCENT, ability::MP_30_PERCENT), 0x5095),
+        (either(ability::HP_20_PERCENT, ability::HP_30_PERCENT), 0x5096),
         (slots > 2, 0x5097),
-        (either(0x806A, 0x806B), 0x5098),
-        (either(0x806E, 0x806F), 0x5099),
-        (either(0x8076, 0x8077), 0x509A),
-        (either(0x8072, 0x8073), 0x509B),
+        (either(ability::DEFENSE_3_PERCENT, ability::DEFENSE_5_PERCENT), 0x5098),
+        (either(ability::MAGIC_DEF_3_PERCENT, ability::MAGIC_DEF_5_PERCENT), 0x5099),
+        (either(ability::MP_5_PERCENT, ability::MP_10_PERCENT), 0x509A),
+        (either(ability::HP_5_PERCENT, ability::HP_10_PERCENT), 0x509B),
     ];
     rules.iter().find(|r| r.0).map_or(0x509C + u16::from(slots < 2), |r| r.1)
 }
@@ -764,7 +831,7 @@ mod tests {
         assert_eq!(equipment_name_id(&e), 0x508D);
         // A weapon with Firestrike in it.
         e[5] = 0;
-        e[0xE..0x10].copy_from_slice(&0x801Eu16.to_le_bytes());
+        e[0xE..0x10].copy_from_slice(&ability::FIRESTRIKE.to_le_bytes());
         assert_eq!(equipment_name_id(&e), 0x5038);
     }
 

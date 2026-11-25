@@ -1493,32 +1493,32 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
     );
     // 5068: wait for every character read (reads complete at once here).
     n.register(0x5068, Native { init: None, wait: Some(|_, _| 1), result: None });
-    // 400e(v) / 400f(v): the character engine's two flags (bit 0); 403a(v): its mode byte.
+    // 400e(v) / 400f(v): two switches nothing reads (bit 0); 403a(v): drawing into the fixed buffer.
     n.register(
         0x400E,
         Native::result(|g, c| {
-            g.chr_globals.switch_400e = (c.stack.pop_int() & 1) as u8;
+            g.chr_globals.unread_switches[0] = (c.stack.pop_int() & 1) as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x400F,
         Native::result(|g, c| {
-            g.chr_globals.switch_400f = (c.stack.pop_int() & 1) as u8;
+            g.chr_globals.unread_switches[1] = (c.stack.pop_int() & 1) as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x403A,
         Native::result(|g, c| {
-            g.chr_globals.mode_403a = c.stack.pop_int() as u8;
+            g.chr_globals.draw_to_fixed_buffer = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x403C,
         Native::result(|g, c| {
-            g.chr_globals.water2 = c.stack.pop_float();
+            g.chr_globals.second_water_height = c.stack.pop_float();
             Value::Int(0)
         }),
     );
@@ -1532,14 +1532,14 @@ pub(super) fn register_chr2(n: &mut Natives<FieldState>) {
     n.register(
         0x4045,
         Native::result(|g, c| {
-            g.chr_globals.switch_4045 = c.stack.pop_int() as u8;
+            g.chr_globals.swim_dive = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
     n.register(
         0x4046,
         Native::result(|g, c| {
-            g.chr_globals.switch_4046 = c.stack.pop_int() as u8;
+            g.chr_globals.unread_switches[2] = c.stack.pop_int() as u8;
             Value::Int(0)
         }),
     );
@@ -1807,7 +1807,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             if b < 8 {
-                g.workers.sys.mask_0220 |= 1u32 << (b as u32 & 31);
+                g.workers.sys.members_without_event_credit |= 1u32 << (b as u32 & 31);
             }
             Value::Int(b)
         }),
@@ -1835,7 +1835,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x025D,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.workers.sys.value_025d = v;
+            g.workers.sys.al_bhed_letters = v;
             Value::Int(v)
         }),
     );
@@ -1951,7 +1951,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x018A,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
-            g.workers.sys.mask_018a |= 1u32 << (b as u32 & 31);
+            g.workers.sys.menu_commands_off |= 1u32 << (b as u32 & 31);
             Value::Int(b)
         }),
     );
@@ -1959,7 +1959,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x018B,
         Native::result(|g, c| {
             let b = c.stack.pop_int();
-            g.workers.sys.mask_018a &= !(1u32 << (b as u32 & 31));
+            g.workers.sys.menu_commands_off &= !(1u32 << (b as u32 & 31));
             Value::Int(b)
         }),
     );
@@ -2186,7 +2186,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
     n.register(
         0x01BF,
         Native::result(|g, _| {
-            g.workers.sys.byte_01bf = 1;
+            g.workers.sys.keep_parts_after_battle = 1;
             Value::Int(1)
         }),
     );
@@ -2276,8 +2276,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B2,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            let old = g.switch_00b2 as i8;
-            g.switch_00b2 = u8::from(on);
+            let old = g.display_blend_on as i8;
+            g.display_blend_on = u8::from(on);
             Value::Int(i32::from(old))
         }),
     );
@@ -2285,7 +2285,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B3,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.values_00b3[0] = v;
+            g.display_blend[0] = v;
             Value::Int(v)
         }),
     );
@@ -2293,7 +2293,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x00B4,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.values_00b3[1] = v;
+            g.display_blend[1] = v;
             Value::Int(v)
         }),
     );
@@ -2349,7 +2349,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let slot = c.stack.pop_int().clamp(0, 3) as usize;
-            g.workers.sys.values_01c0[slot] = v;
+            g.workers.sys.effect_params[slot] = v;
             Value::Int(v)
         }),
     );
@@ -2497,7 +2497,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let cc = c.stack.pop_int();
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.workers.sys.values_022e = [a, b, cc, d];
+            g.workers.sys.underwater_sounds = [a, b, cc, d];
             Value::Int(1)
         }),
     );
@@ -2568,7 +2568,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.debug_values_c007 = [a, b];
+            g.debug_jump_target = [a, b];
             Value::Int(0)
         }),
     );
@@ -2579,7 +2579,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let cc = c.stack.pop_int();
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.bytes_4039 = [a as u8, b as u8, cc as u8, d as u8];
+            g.fixed_buffer_clear = [a as u8, b as u8, cc as u8, d as u8];
             Value::Float(0.0)
         }),
     );
@@ -3436,7 +3436,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         }),
     );
     // 01fb: the menu value the menus keep.
-    n.register(0x01FB, Native::result(|g, _| Value::Int(g.menu_value_01fb)));
+    n.register(0x01FB, Native::result(|g, _| Value::Int(g.menu_exit_value)));
     // 01f2: a mask of the characters 8–15 whose party record +0x2c bit 0 is set.
     n.register(
         0x01F2,
@@ -3511,8 +3511,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x01E2,
         Native::result(|g, _| {
             g.map_display |= 0x0100_0000;
-            g.distortion.value_01e2 = 0;
-            g.distortion.timer_01e2 = 0;
+            g.distortion.unread_argument = 0;
+            g.distortion.frames = 0;
             distortion_switch(&mut g.distortion, true);
             Value::Int(0)
         }),
@@ -3521,7 +3521,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0x01E3,
         Native::result(|g, _| {
             g.map_display &= !0x0100_0000;
-            g.distortion.value_01e2 = 0;
+            g.distortion.unread_argument = 0;
             distortion_switch(&mut g.distortion, false);
             Value::Int(0)
         }),
@@ -3535,8 +3535,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let z = c.stack.pop_float();
             let y = c.stack.pop_float();
             let x = c.stack.pop_float();
-            g.distortion.point = [x, y, z];
-            g.distortion.count_01e4 = n;
+            g.distortion.wave = [x, y, z];
+            g.distortion.strength = n;
             Value::Int(0)
         }),
     );
@@ -3556,8 +3556,8 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             let b = c.stack.pop_float();
             let a = c.stack.pop_float();
             let n = c.stack.pop_int();
-            g.distortion.value_01e6_a = a;
-            g.distortion.value_01e6_b = b;
+            g.distortion.surface_height = a;
+            g.distortion.unread_value = b;
             g.distortion.flags |= if n != 0 { 3 } else { 1 };
             Value::Int(n)
         }),
@@ -3582,7 +3582,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         }),
     );
     // 7035: a byte the battle code leaves (none set in the field: 0).
-    n.register(0x7035, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.battle_byte_7035))));
+    n.register(0x7035, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.voice_standby))));
     // c02c(v) / c053(a, b, c, d): take their arguments and do nothing.
     n.register(
         0xC02C,
@@ -3627,7 +3627,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0xC009,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
-            g.workers.sys.value_c009 = v as u8;
+            g.workers.sys.development_environment = v as u8;
             Value::Int(v)
         }),
     );
@@ -3635,11 +3635,11 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         0xC051,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            g.workers.sys.switch_c051 = u8::from(on);
+            g.workers.sys.development_mode = u8::from(on);
             Value::Int(i32::from(on))
         }),
     );
-    n.register(0xC052, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.switch_c051))));
+    n.register(0xC052, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.development_mode))));
     // c030: the event system's frame count (frames run since its setup ended); c013: settings bit 3 is set.
     n.register(0xC030, Native::result(|g, _| Value::Int(g.workers.sys.frames)));
     n.register(0xC013, Native::result(|_, c| Value::Int(save_i32(c, 0x3d0c) >> 3 & 1)));
@@ -3772,7 +3772,7 @@ fn register_party(n: &mut Natives<FieldState>) {
                     return Value::Int(6);
                 }
             } else if chr == 0xf {
-                g.workers.sys.party_flag_00ca = 3;
+                g.workers.sys.sister_names_left = 3;
             }
             Value::Int(chr)
         }),

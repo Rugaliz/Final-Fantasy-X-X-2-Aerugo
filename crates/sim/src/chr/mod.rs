@@ -45,20 +45,24 @@ impl Default for Block {
     }
 }
 
-/// Character engine switches natives set (two flags, a map mode byte).
+/// The character engine's switches the scripts set.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Globals {
-    pub switch_400e: u8,
-    pub switch_400f: u8,
-    pub mode_403a: u8,
+    /// The switches 400e, 400f and 4046 set, in that order: nothing in the game reads them (only the engine's
+    /// start-up clears them).
+    pub unread_switches: [u8; 3],
+    /// The PS2 frame draws into the fixed buffer (frame and depth base 0xd0) rather than the one its display
+    /// mode picks (403a).
+    pub draw_to_fixed_buffer: u8,
     /// Body 0x66 plays motion 0x21092 (the remaster checks it).
     pub motion_21092: u8,
-    /// The second water height (403c; the bodies' step takes the higher of it and the water level), the map
-    /// alpha mode (4034) and two more switches (4045, 4046).
-    pub water2: f32,
+    /// The second water height (403c; the bodies' step takes the higher of it and the water level) and the map
+    /// alpha mode (4034).
+    pub second_water_height: f32,
     pub map_alpha: u8,
-    pub switch_4045: u8,
-    pub switch_4046: u8,
+    /// Diving (4045): a swimming player body sinks while the pad's 0x40 button is held (its water depth offset
+    /// +0x504 grows by 0.2 a frame up to 2).
+    pub swim_dive: u8,
 }
 
 /// One character record.

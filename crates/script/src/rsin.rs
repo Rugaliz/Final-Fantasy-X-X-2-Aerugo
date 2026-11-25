@@ -1,4 +1,4 @@
-//! TkMtRsin's table (88c690), traced offline from the game executable and carried as a constant (Aerugo never
+//! TkMtRsin's quarter-wave table, traced offline from the game executable and carried as a constant (Aerugo never
 //! reads the executable). Written by the private repo's re/tools/gen_traced_tables.py: the first quarter of a sine
 //! wave in 0x2000 steps, in 1/32768 (the last entry 32768).
 

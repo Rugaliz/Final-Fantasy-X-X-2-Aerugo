@@ -60,7 +60,7 @@ fn shift_save(g: &mut FieldState, save: &mut [u8], target: i32, entrance: i8) {
         return;
     }
     if target == 0x17 {
-        log::error!("GAP: map change to map 0x17: its scene release (645310) is not ported");
+        log::error!("GAP: map change to map 0x17: the remaster's scene release for it is not ported");
     }
     let (map, entrance) = if target < 0 {
         let back = u16_at(save, 0xb8);

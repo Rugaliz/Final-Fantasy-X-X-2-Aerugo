@@ -54,9 +54,9 @@ pub struct SoundState {
     /// The stream mode (1 keeps the stream on 00d7) and the stream request word.
     pub stream_mode: i32,
     pub stream_request: i32,
-    /// The byte 018f keeps, the sound mode and the pad's Dolby byte
-    /// (+0x9d).
-    pub byte_018f: u8,
+    /// The voice volume (018f; voices start at it, and the debug screen shows it as V.Vol), the sound mode and
+    /// the pad's Dolby byte (+0x9d).
+    pub voice_volume: u8,
     pub sound_mode: Option<i32>,
     pub dolby: u8,
     /// The sound data group 013d sent last.
@@ -90,7 +90,7 @@ impl Default for SoundState {
             pos_fade_rate: 0.0,
             stream_mode: 0,
             stream_request: 0,
-            byte_018f: 0,
+            voice_volume: 0,
             sound_mode: None,
             dolby: 0,
             spk_group: None,
@@ -473,7 +473,7 @@ pub fn register(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
-            g.sound.byte_018f = b as u8;
+            g.sound.voice_volume = b as u8;
             let settings = c.memory.global[0]
                 .get(0x3d0c..0x3d10)
                 .map_or(0, |x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
