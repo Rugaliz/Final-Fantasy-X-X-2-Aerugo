@@ -480,12 +480,9 @@ pub fn frame_draw(g: &mut FieldState) {
     rt.frame(&mut g.map_effects, &mut h);
     let magic = h.magic;
     let scene = super::effects::vfx_scene(g, magic, Some(0));
-    for c in &rt.render {
-        if let RenderCall::Model(d) = c {
-            g.vfx.push((crate::ppp::vfx::model(&rt.space, d, &scene), String::new()));
-        }
-    }
-    rt.shape_entries.draws(&mut g.vfx, &rt.space, &rt.render, &scene, "");
+    let mut alpha_scale = g.vfx_alpha_scale;
+    rt.shape_entries.draws(&mut g.vfx, &rt.space, &rt.render, &scene, "", &mut alpha_scale);
+    g.vfx_alpha_scale = alpha_scale;
     g.map_runtime = Some(rt);
 }
 

@@ -10,7 +10,7 @@
 //! indices): 1, 3, 5, 7, whose normals are (0, 0, 1) unless the draw is lit (flag 0x40: its normals and lighting
 //! come with the draw request, not ported yet).
 
-use super::{ModelDraw, Space};
+use super::{ModelDraw, ShapeFieldDraw, Space};
 use crate::chr::elements::{Mat, apply4, mul};
 
 /// A PS2 texture as the remaster names its HD replacement: `<page>_<format>_0_0_<width>_<height>`.
@@ -165,6 +165,24 @@ fn properties(d: &ModelDraw, textured: bool, first_page: u32, s: &Scene) -> u32 
     p
 }
 
+/// The alpha scale a model's update sets (the engine keeps it for the frame's later shape fields): 512 for magic
+/// 0x66 / 0x67 on page 0x3400, else 256. (Magics 0x203 and 0x29b also take 512 on page 0 with blend 0x48 for
+/// reference 0xb, by a renderer setting not traced yet: reported.)
+pub fn model_alpha_scale(m: &Space, d: &ModelDraw, s: &Scene) -> f32 {
+    let first = d.model.wrapping_add(m.u32(d.model + 4));
+    let first_page = m.u32(first + 8) & 0x3fff;
+    if matches!(s.magic, 0x203 | 0x29b) && first_page == 0 && d.blend == 0x48 && d.ref_index == 0xb {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::error!(
+                "GAP: magic {:#x}'s alpha scale depends on a renderer setting not traced yet",
+                s.magic
+            );
+        }
+    }
+    if (s.magic == 0x66 || s.magic == 0x67) && first_page == 0x3400 { 512.0 } else { 256.0 }
+}
+
 /// The geometry of a model draw.
 pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
     let model = d.model;
@@ -180,13 +198,12 @@ pub fn model(m: &Space, d: &ModelDraw, s: &Scene) -> Mesh {
         c[1] = 0x30;
         c[2] = 0x30;
     }
-    let alpha_scale =
-        if (s.magic == 0x66 || s.magic == 0x67) && first_page == 0x3400 { 512.0 } else { 256.0 };
+    let alpha_scale = model_alpha_scale(m, d, s);
     let k = [
         f32::from(c[0]) * f32::from_bits(0x3800_0000),
         f32::from(c[1]) * f32::from_bits(0x3800_0000),
         f32::from(c[2]) * f32::from_bits(0x3800_0000),
-        f32::from(c[3]) * (0.0078125 / alpha_scale) as f32,
+        f32::from(c[3]) * (0.0078125 / alpha_scale),
     ];
     if d.flags & 0x40 != 0 {
         static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -477,11 +494,145 @@ fn shape_colour(m: &Space, shape: u32, mut c: [u8; 4], magic: u32) -> [u8; 4] {
     c
 }
 
+/// One piece of a shape frame: its corners (sixteenths), its texture rectangle (u, v, width, height in
+/// 4096ths, as stored), and its header's colour bytes and blend.
+struct Piece {
+    corners: [[f32; 2]; 4],
+    texels: [i16; 4],
+    colour: [u8; 4],
+    blend: u8,
+}
+
+impl Piece {
+    /// The corners as the columns of a matrix (z 0, w 1), the form the draw matrix takes them in.
+    fn corner_matrix(&self) -> Mat {
+        let mut quad = [0.0f32; 16];
+        for (j, p) in self.corners.iter().enumerate() {
+            quad[j * 4] = p[0];
+            quad[j * 4 + 1] = p[1];
+            quad[j * 4 + 3] = 1.0;
+        }
+        quad
+    }
+
+    /// The four corners' texture coordinates (v flipped): (u, v), (u + w, v), (u, v − h), (u + w, v − h).
+    fn uvs(&self, [u, v, w, h]: [f32; 4]) -> [[f32; 2]; 4] {
+        let v0 = 1.0 - v;
+        let u1 = w + u;
+        let v1 = v0 - h;
+        [[u, v0], [u1, v0], [u, v1], [u1, v1]]
+    }
+
+    fn texel_units(&self) -> [f32; 4] {
+        self.texels.map(|t| f32::from(t) * 0.000_244_140_62)
+    }
+}
+
+/// The pieces of a frame record: rectangles (x0, y0, x1, y1, then the texture rectangle; 0x10 bytes each), or
+/// with the record's flag bit 3 four corners each (then the texture rectangle; 0x18 bytes).
+fn frame_pieces(m: &Space, frame: u32) -> Vec<Piece> {
+    let corners = m.u8(frame) & 8 != 0;
+    let count = (m.u16(frame + 2) as i16).max(0) as u32;
+    let headers = frame.wrapping_add(m.u32(frame + 4));
+    let sixteenth = |at: u32| f32::from(m.u16(at) as i16) * 0.0625;
+    let (stride, texels_at) = if corners { (0x18, 0x10) } else { (0x10, 8) };
+    (0..count)
+        .map(|k| {
+            let piece = frame + 0x20 + k * stride;
+            let header = headers + k * 8;
+            let corners = if corners {
+                std::array::from_fn(|j| {
+                    [sixteenth(piece + 4 * j as u32), sixteenth(piece + 2 + 4 * j as u32)]
+                })
+            } else {
+                let (x0, y0, x1, y1) =
+                    (sixteenth(piece), sixteenth(piece + 2), sixteenth(piece + 4), sixteenth(piece + 6));
+                [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]
+            };
+            Piece {
+                corners,
+                texels: std::array::from_fn(|j| m.u16(piece + texels_at + 2 * j as u32) as i16),
+                colour: std::array::from_fn(|j| m.u8(header + j as u32)),
+                blend: m.u8(header + 4),
+            }
+        })
+        .collect()
+}
+
+/// The depth fade (draw flag 0x400) of a point through `fade_matrix` (the screen matrix times the draw
+/// matrix): its w · 8 − 32, nothing below 0 (or NaN), 1/128 steps up to 128, full beyond.
+fn depth_fade(fade_matrix: &Mat, x: f32, y: f32) -> f32 {
+    let w = apply4(fade_matrix, [x, y, 0.0, 1.0])[3] * 8.0 - 32.0;
+    if w.is_nan() || w < 0.0 {
+        0.0
+    } else if w <= 128.0 {
+        w * 0.007_812_5
+    } else {
+        1.0
+    }
+}
+
+/// A piece's quad into `seg`: its corners through the draw matrix (and the work matrix, when there is one, for
+/// the depth correction; a quad the correction's clip test drops has its indices zeroed), its colour and
+/// texture coordinates.
+fn push_quad(seg: &mut Segment, placed: &Mat, work: Option<Mat>, colour: [f32; 4], uvs: [[f32; 2]; 4]) {
+    let base = seg.positions.len() as u16;
+    if let Some(work) = work {
+        seg.z_quads.push(ZQuad { first: base, drawn: *placed, work });
+    }
+    for j in 0..4 {
+        seg.positions.push([placed[j * 4], placed[j * 4 + 1], placed[j * 4 + 2]]);
+        seg.colours.push(colour);
+    }
+    seg.uvs.extend(uvs);
+    seg.indices.extend([base, base + 2, base + 1, base + 2, base + 3, base + 1]);
+}
+
+/// A quad left out: vertices kept (as zero here) and its indices zeroed.
+fn push_dropped_quad(seg: &mut Segment) {
+    seg.positions.extend([[0.0; 3]; 4]);
+    seg.colours.extend([[0.0; 4]; 4]);
+    seg.uvs.extend([[0.0; 2]; 4]);
+    seg.indices.extend([0; 6]);
+}
+
+/// The world a shape entry is drawn with: the inverse view, its w column (0, 0, 0, 1).
+fn shape_world(s: &Scene) -> Mat {
+    let mut world = s.inverse_view;
+    world[3] = 0.0;
+    world[7] = 0.0;
+    world[11] = 0.0;
+    world[15] = 1.0;
+    world
+}
+
+/// The depth correction a work matrix asks for.
+fn z_correction_for(work_matrix: Option<Mat>, s: &Scene) -> Option<ZCorrection> {
+    work_matrix.map(|_| ZCorrection {
+        view_space: correction_view_space(&s.view),
+        hold_at_w: !(s.map_id == 0x21e8 || s.map_id == 0x4a6 || s.magic == 0x2b9),
+    })
+}
+
+/// The work matrix's quad (for the clip test and the correction), or none; `None` overall when the clip
+/// test drops the quad.
+fn work_quad(
+    placed: &Mat,
+    work_matrix: Option<Mat>,
+    quad: &Mat,
+    screen: &Mat,
+    corners: bool,
+) -> Option<Option<Mat>> {
+    match work_matrix.map(|w| mul(&w, quad)) {
+        Some(work) if z_clipped(placed, &work, screen, corners) => None,
+        work => Some(work),
+    }
+}
+
 /// One frame of a shape entry (updateVFXRenderDataShp and the shape filler): each piece of the frame a quad —
-/// its rectangle (or its four corners) in sixteenths, at z 0, through the draw matrix; texture coordinates in
-/// 4096ths (v flipped); its colour bytes / 256 times the draw colour / 128, faded by the depth with the fade
-/// flag — in the group of its blend; the entry's world is the inverse view, and the whole draw is dim when no
-/// colour component passes 0.5. Meshes for the groups that got pieces.
+/// its corners through the draw matrix; its colour bytes / 256 times the draw colour / 128, faded by the
+/// depth with the fade flag — in the group of its blend; the entry's world is the inverse view, and the whole
+/// draw is dim when no colour component passes 0.5. Meshes for the groups that got pieces.
 pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Mesh> {
     let mut matrix = d.matrix;
     if s.map_id == 0x76f && matches!(s.map_part, Some(3..=5)) && matrix[14] < 300.0 {
@@ -501,92 +652,31 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
     let fade_matrix = mul(&s.screen, &matrix);
     let frame = shape_frame_pieces(m, d.shape, d.frame);
     let corners = m.u8(frame) & 8 != 0;
-    let count = (m.u16(frame + 2) as i16).max(0) as u32;
-    let headers = frame.wrapping_add(m.u32(frame + 4));
     let split = entry.groups.len() > 1;
-    let mut segments: Vec<Segment> =
-        vec![Segment { texture: entry.texture, ..Segment::default() }; entry.groups.len()];
+    let mut segments = vec![Segment { texture: entry.texture, ..Segment::default() }; entry.groups.len()];
     let mut dim = true;
-    let sixteenth = |at: u32| (m.u16(at) as i16 as i32) as f32 * 0.0625;
-    let unit = |at: u32| (m.u16(at) as i16 as i32) as f32 * 0.000_244_140_62;
-    let (stride, uv_at) = if corners { (0x18, 0x10) } else { (0x10, 8) };
-    for k in 0..count {
-        let piece = frame + 0x20 + k * stride;
-        let header = headers + k * 8;
-        let g = if split { blend_group(m.u8(header + 4)) } else { 0 };
-        let points: [[f32; 2]; 4] = if corners {
-            std::array::from_fn(|j| [sixteenth(piece + 4 * j as u32), sixteenth(piece + 2 + 4 * j as u32)])
-        } else {
-            let (x0, y0, x1, y1) =
-                (sixteenth(piece), sixteenth(piece + 2), sixteenth(piece + 4), sixteenth(piece + 6));
-            [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]
-        };
-        let mut quad = [0.0f32; 16];
-        for (j, p) in points.iter().enumerate() {
-            quad[j * 4] = p[0];
-            quad[j * 4 + 1] = p[1];
-            quad[j * 4 + 3] = 1.0;
-        }
+    for piece in frame_pieces(m, frame) {
+        let seg = &mut segments[if split { blend_group(piece.blend) } else { 0 }];
+        let quad = piece.corner_matrix();
         let placed = mul(&matrix, &quad);
-        let work = d.work_matrix.map(|w| mul(&w, &quad));
-        if let Some(work) = work
-            && z_clipped(&placed, &work, &s.screen, corners)
-        {
-            // The clipped quad's indices are zeroed (its vertices are left as they were).
-            let seg = &mut segments[g];
-            seg.positions.extend([[0.0; 3]; 4]);
-            seg.colours.extend([[0.0; 4]; 4]);
-            seg.uvs.extend([[0.0; 2]; 4]);
-            seg.indices.extend([0; 6]);
+        let Some(work) = work_quad(&placed, d.work_matrix, &quad, &s.screen, corners) else {
+            push_dropped_quad(seg);
             continue;
-        }
-        let mut piece_colour: [f32; 4] =
-            std::array::from_fn(|i| f32::from(m.u8(header + i as u32)) * 0.003_906_25);
-        if d.flags & SHAPE_DEPTH_FADE != 0 {
-            let q = apply4(&fade_matrix, [placed[0], placed[1], 0.0, 1.0]);
-            let w = q[3] * 8.0 - 32.0;
-            // (A NaN depth fails the original's `0 <= w` test too, fading to nothing.)
-            let fade = if w.is_nan() || w < 0.0 {
-                0.0
-            } else if w <= 128.0 {
-                w * 0.007_812_5
-            } else {
-                1.0
-            };
-            for c in &mut piece_colour {
-                *c *= fade;
-            }
-        }
-        let vertex_colour: [f32; 4] = std::array::from_fn(|i| draw_colour[i] * piece_colour[i]);
+        };
+        let fade = if d.flags & SHAPE_DEPTH_FADE != 0 {
+            depth_fade(&fade_matrix, placed[0], placed[1])
+        } else {
+            1.0
+        };
+        let vertex_colour: [f32; 4] =
+            std::array::from_fn(|i| draw_colour[i] * (f32::from(piece.colour[i]) * 0.003_906_25 * fade));
         if vertex_colour.iter().any(|&c| 0.5 < c) {
             dim = false;
         }
-        let (u0, v_top) = (unit(piece + uv_at), unit(piece + uv_at + 2));
-        let (w, h) = (unit(piece + uv_at + 4), unit(piece + uv_at + 6));
-        let v0 = 1.0 - v_top;
-        let u1 = w + u0;
-        let v1 = v0 - h;
-        let seg = &mut segments[g];
-        let base = seg.positions.len() as u16;
-        if let Some(work) = work {
-            seg.z_quads.push(ZQuad { first: base, drawn: placed, work });
-        }
-        for j in 0..4 {
-            seg.positions.push([placed[j * 4], placed[j * 4 + 1], placed[j * 4 + 2]]);
-            seg.colours.push(vertex_colour);
-        }
-        seg.uvs.extend([[u0, v0], [u1, v0], [u0, v1], [u1, v1]]);
-        seg.indices.extend([base, base + 2, base + 1, base + 2, base + 3, base + 1]);
+        push_quad(seg, &placed, work, vertex_colour, piece.uvs(piece.texel_units()));
     }
-    let mut world = s.inverse_view;
-    world[3] = 0.0;
-    world[7] = 0.0;
-    world[11] = 0.0;
-    world[15] = 1.0;
-    let z_correction = d.work_matrix.map(|_| ZCorrection {
-        view_space: correction_view_space(&s.view),
-        hold_at_w: !(s.map_id == 0x21e8 || s.map_id == 0x4a6 || s.magic == 0x2b9),
-    });
+    let world = shape_world(s);
+    let z_correction = z_correction_for(d.work_matrix, s);
     segments
         .into_iter()
         .zip(&entry.groups)
@@ -603,6 +693,102 @@ pub fn shape(m: &Space, d: &ShapeInput, entry: &ShapeEntry, s: &Scene) -> Vec<Me
             z_correction,
         })
         .collect()
+}
+
+/// A shape field's entry (createVFXRenderDataBufferShapeField): its render state | 8 (and the YIQ bit on event
+/// 0x188 while a map effect part runs), one blend group, and the texture of the shape's first frame (the
+/// field's filler only fills the entry's first segment).
+pub fn shape_field_entry(m: &Space, shape: u32, create: u32, s: &Scene) -> ShapeEntry {
+    let mut properties = create | 8;
+    if s.map_part.is_some() && s.event == 0x188 {
+        properties |= 0x8_0000;
+    }
+    let first = shape_frame_pieces(m, shape, 0);
+    let texture = Texture::from_words(m.u32(first + 0x10), m.u32(first + 0x14));
+    if texture.page >= 0x3f00 {
+        log::error!(
+            "GAP: shape field {shape:#x} names texture page {:#x}: the remaster's named texture lookup is not ported",
+            texture.page
+        );
+    }
+    ShapeEntry { groups: vec![properties], texture: Some(texture) }
+}
+
+/// A shape field's frame (updateVFXRenderDataShapeField for each live sprite): each sprite's frame pieces
+/// appended as quads to the one entry — corners through the sprite's draw matrix; colour the piece bytes / 256
+/// (alpha / the frame's alpha scale) times the sprite's / 128, faded by the depth of the piece's first corner
+/// with the fade flag; a quad left out where either alpha is 0. Map 0x672's page 0x32c0 pieces take their
+/// texture rectangle at half-texel offsets and double size.
+pub fn shape_field(
+    m: &Space,
+    d: &ShapeFieldDraw,
+    entry: &ShapeEntry,
+    s: &Scene,
+    alpha_scale: f32,
+) -> Option<Mesh> {
+    let mut seg = Segment { texture: entry.texture, ..Segment::default() };
+    let mut dim = true;
+    let mut work_used = None;
+    for sprite in &d.sprites {
+        let frame = shape_frame_pieces(m, d.shape, u32::from(sprite.frame));
+        let corners = m.u8(frame) & 8 != 0;
+        let page = m.u32(frame + 0x10) & 0x3fff;
+        let fade_matrix = mul(&s.screen, &sprite.matrix);
+        let sprite_colour: [f32; 4] = std::array::from_fn(|i| f32::from(sprite.colour[i]) * 0.007_812_5);
+        for piece in frame_pieces(m, frame) {
+            let quad = piece.corner_matrix();
+            let placed = mul(&sprite.matrix, &quad);
+            let Some(work) = work_quad(&placed, sprite.work_matrix, &quad, &s.screen, corners) else {
+                push_dropped_quad(&mut seg);
+                continue;
+            };
+            if sprite.colour[3] == 0 || piece.colour[3] == 0 {
+                push_dropped_quad(&mut seg);
+                continue;
+            }
+            let fade = if d.flags & SHAPE_DEPTH_FADE != 0 {
+                depth_fade(&fade_matrix, piece.corners[0][0], piece.corners[0][1])
+            } else {
+                1.0
+            };
+            let piece_colour = [
+                f32::from(piece.colour[0]) * 0.003_906_25,
+                f32::from(piece.colour[1]) * 0.003_906_25,
+                f32::from(piece.colour[2]) * 0.003_906_25,
+                f32::from(piece.colour[3]) / alpha_scale,
+            ];
+            let colour: [f32; 4] = std::array::from_fn(|i| fade * (piece_colour[i] * sprite_colour[i]));
+            // (The original tests green and blue as "not at most 0.5", so a NaN counts as bright.)
+            let bright = |c: f32| c.is_nan() || 0.5 < c;
+            if 0.5 < colour[0] || bright(colour[1]) || bright(colour[2]) || 0.5 < colour[3] {
+                dim = false;
+            }
+            let mut texels = piece.texel_units();
+            if s.map_id == 0x672 && page == 0x32c0 {
+                if matches!(texels[0], 0.125 | 0.375 | 0.625 | 0.875) {
+                    texels[0] -= 0.125;
+                }
+                if matches!(texels[1], 0.25 | 0.75) {
+                    texels[1] -= 0.25;
+                }
+                texels[2] = f32::from(piece.texels[2]) * 2.0 * 0.000_244_140_62;
+                texels[3] = f32::from(piece.texels[3]) * 2.0 * 0.000_244_140_62;
+            }
+            push_quad(&mut seg, &placed, work, colour, piece.uvs(texels));
+            work_used = work_used.or(sprite.work_matrix);
+        }
+    }
+    (!seg.indices.is_empty()).then(|| Mesh {
+        ref_index: d.ref_index,
+        object: d.object,
+        properties: entry.groups[0],
+        world: shape_world(s),
+        z_matrix: None,
+        semi: false,
+        segments: vec![seg],
+        dim,
+        z_correction: z_correction_for(work_used, s),
+    })
 }
 
 /// The view space the remaster's effect projection is built on (UpdatePhyreViewProjectionMatrix): the

@@ -814,6 +814,9 @@ pub struct FieldState {
     /// The effect geometry of the frame's draw phase (the event effect's, then the map effects'), with the
     /// folder its textures are in.
     pub vfx: Vec<(crate::ppp::vfx::Mesh, String)>,
+    /// The engine's frame-wide effect alpha scale (256 at the frame's start; each model update sets it, the
+    /// shape fields drawn after read it).
+    pub vfx_alpha_scale: f32,
     pub cam_view: Option<[f32; 16]>,
     /// Each worker's camera handle (the original's worker +0x3c), 0 until a camera native first needs one.
     pub cam_slots: Vec<u32>,
@@ -2981,6 +2984,7 @@ impl Event {
         // The draw phase: the map's effects (while they are on and the map is shown), then the running effect's
         // draw and its frame callback.
         self.state.vfx.clear();
+        self.state.vfx_alpha_scale = 256.0;
         map_fx::frame_draw(&mut self.state);
         effects::frame_draw(&mut self.state);
         // The remaster's own animations step by the frame time (a 30 Hz frame here).

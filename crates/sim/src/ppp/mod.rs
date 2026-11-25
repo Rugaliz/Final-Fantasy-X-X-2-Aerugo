@@ -441,6 +441,32 @@ pub struct SpriteDraw {
     pub create: u32,
 }
 
+/// One live sprite of a shape field as the field's draw places it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldSprite {
+    /// The frame of the field's shape it shows.
+    pub frame: u16,
+    /// Its colour (the field's colour history at its age times the part's).
+    pub colour: [u8; 4],
+    /// Its draw matrix, and the work matrix the field's key asks for.
+    pub matrix: crate::chr::elements::Mat,
+    pub work_matrix: Option<crate::chr::elements::Mat>,
+}
+
+/// A shape field's draw (pppDrawShapeField): every live sprite's frame of the field's shape, all in the one
+/// entry of the object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeFieldDraw {
+    pub object: u32,
+    pub ref_index: u32,
+    pub shape: u32,
+    /// The draw flags (0x800, 0x400 the depth fade, from the key).
+    pub flags: u16,
+    /// The render state a new entry is made with (the first frame's blend).
+    pub create: u32,
+    pub sprites: Vec<FieldSprite>,
+}
+
 /// A frame-buffer distortion draw of a model (pppKeMdlDtt).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistortDraw {
@@ -508,6 +534,7 @@ pub enum RenderCall {
     Distort(Box<DistortDraw>),
     Shape(Box<ShapeDraw>),
     Sprite(Box<SpriteDraw>),
+    ShapeField(Box<ShapeFieldDraw>),
     /// A driver's sprite entry (keyed by the sprite's index and its shape) given back.
     SpriteRelease {
         index: u32,

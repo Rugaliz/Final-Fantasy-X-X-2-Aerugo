@@ -48,9 +48,10 @@ pub enum ShapeKey {
 pub struct ShapeEntries(pub std::collections::BTreeMap<ShapeKey, crate::ppp::vfx::ShapeEntry>);
 
 impl ShapeEntries {
-    /// The frame's shape and sprite draws (and entry releases) of `calls` into meshes for the renderer, with
-    /// textures from `dir`. A draw with no entry yet makes one unless it makes none this frame (then nothing is
-    /// drawn).
+    /// The frame's draws of `calls`, in their order, into meshes for the renderer (textures from `dir`): models,
+    /// and the shape, sprite and shape field entries (made on their first draw unless the draw makes none this
+    /// frame, released when asked). `alpha_scale` is the engine's frame-wide alpha scale: each model update
+    /// sets it and the shape fields after it read it.
     pub fn draws(
         &mut self,
         vfx: &mut Vec<(crate::ppp::vfx::Mesh, String)>,
@@ -58,11 +59,30 @@ impl ShapeEntries {
         calls: &[crate::ppp::RenderCall],
         scene: &crate::ppp::vfx::Scene,
         dir: &str,
+        alpha_scale: &mut f32,
     ) {
         use crate::ppp::RenderCall;
-        use crate::ppp::vfx::{ShapeInput, shape, shape_entry};
+        use crate::ppp::vfx::{
+            ShapeInput, model, model_alpha_scale, shape, shape_entry, shape_field, shape_field_entry,
+        };
         for c in calls {
             let (key, input) = match c {
+                RenderCall::Model(d) => {
+                    *alpha_scale = model_alpha_scale(space, d, scene);
+                    vfx.push((model(space, d, scene), dir.to_owned()));
+                    continue;
+                }
+                RenderCall::ShapeField(d) => {
+                    let key = ShapeKey::Program { object: d.object, ref_index: d.ref_index };
+                    let entry = self
+                        .0
+                        .entry(key)
+                        .or_insert_with(|| shape_field_entry(space, d.shape, d.create, scene));
+                    if let Some(mesh) = shape_field(space, d, entry, scene, *alpha_scale) {
+                        vfx.push((mesh, dir.to_owned()));
+                    }
+                    continue;
+                }
                 // Both shape programs' draws (pppDrawShape's own set-up included) end in the same entry
                 // update.
                 RenderCall::Shape(d) => {
@@ -303,12 +323,9 @@ pub fn frame_draw(g: &mut FieldState) {
     if let Some(e) = &g.effects.effect {
         let scene = vfx_scene(g, e.magic, None);
         let dir = format!("ffx_data/gamedata/ps3data/magic/magic_{:04}/tex/d3d11", e.magic);
-        for c in &e.render {
-            if let crate::ppp::RenderCall::Model(d) = c {
-                g.vfx.push((crate::ppp::vfx::model(&e.space, d, &scene), dir.clone()));
-            }
-        }
-        g.effects.shape_entries.draws(&mut g.vfx, &e.space, &e.render, &scene, &dir);
+        let mut alpha_scale = g.vfx_alpha_scale;
+        g.effects.shape_entries.draws(&mut g.vfx, &e.space, &e.render, &scene, &dir, &mut alpha_scale);
+        g.vfx_alpha_scale = alpha_scale;
     }
 }
 

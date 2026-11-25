@@ -2778,6 +2778,126 @@ fn field_step(r: &mut Run, a: u32, key: u32, shape: u32) {
     }
 }
 
+/// The shape field's draw: each live sprite turned to face the camera (the world's and the frame's own turns
+/// undone), then turned and scaled by its own matrix and scale, at its position plus the object's third work
+/// vector, in the world and frame; its colour is the field's history for its age times the part's. On most
+/// maps every sprite goes to the field's one entry; on the maps that keep their entries each sprite is a
+/// shape draw of its own (keyed by the reference index plus 0x32 a sprite). Map 0x1ca draws no field whose
+/// origin falls outside a screen window.
+fn draw_field_sprites(r: &mut Run, o: u32, key: u32, rf: u32, a: u32, entry: u32, shape: u32) {
+    use super::driver::rigid_inverse;
+    use crate::chr::elements::{IDENTITY, mul, normalize};
+    let (_, _, wc) = works3(r, rf);
+    let (event, part, map) = (r.scene.event, r.scene.map_part, r.map_id);
+    let mut flags = 0u16;
+    if r.m.u8(key + 0xc2) != 0 {
+        flags = 0x800;
+    }
+    if r.m.u8(key + 0xc3) != 0 {
+        flags |= 0x400;
+    }
+    let no_work = (event == 0xdb && part == Some(0x12)) || (event == 0x16 && part == Some(2));
+    let with_work = r.m.u8(key + 0xc4) != 0 && !no_work;
+    // The world's and the frame's turns (the frame's axes normalised), translations cleared, inverted.
+    let mut world_turn = r.world;
+    world_turn[12..15].fill(0.0);
+    let mut frame_turn = r.frame;
+    for c in 0..3 {
+        let axis = normalize([
+            frame_turn[c * 4],
+            frame_turn[c * 4 + 1],
+            frame_turn[c * 4 + 2],
+            frame_turn[c * 4 + 3],
+        ]);
+        frame_turn[c * 4..c * 4 + 4].copy_from_slice(&axis);
+    }
+    frame_turn[12..15].fill(0.0);
+    let unturn = mul(&rigid_inverse(&frame_turn), &rigid_inverse(&world_turn));
+    // The key's work offset: its scale (1 when all three are 0) and its place.
+    let mut offset = IDENTITY;
+    let key_scale = [r.m.f32(key + 0xe0), r.m.f32(key + 0xe4), r.m.f32(key + 0xe8)];
+    if key_scale != [0.0; 3] {
+        offset[0] = key_scale[0];
+        offset[5] = key_scale[1];
+        offset[10] = key_scale[2];
+    }
+    offset[12] = r.m.f32(key + 0xd0);
+    offset[13] = r.m.f32(key + 0xd4);
+    offset[14] = r.m.f32(key + 0xd8);
+    let world_frame = mul(&r.world, &r.frame);
+    if map == 0x1ca {
+        let p = mul(&r.screen, &world_frame);
+        let (x, y, z) = (p[12] / p[15], p[13] / p[15], p[14] / p[15]);
+        // Outside the window: below its low edge or at or past its high one (a NaN is neither, and draws).
+        let outside = |v: f32, low: f32, high: f32| v < low || high <= v;
+        if outside(x, 1604.7, 2491.3) || outside(y, 1756.8, 2339.2) || 4_194_304.0 <= z || z <= 0.0 {
+            return;
+        }
+    }
+    let first_blend = |r: &Run, frame: u16| {
+        let pieces = shape.wrapping_add(r.m.u16(shape + 0x10 + u32::from(frame) * 8) as i16 as i32 as u32);
+        r.m.u8(pieces.wrapping_add(r.m.u32(pieces + 4)) + 4)
+    };
+    let (sprite_list, history, third) = (r.m.u32(a + 0x40), r.m.u32(a + 0x50), at(o, wc));
+    let separate = field_keeps_entries(map);
+    let mut sprites = Vec::new();
+    for i in 0..r.m.u32(key + 8) {
+        let p = sprite_list + i * 0xa0;
+        if r.m.u32(p) & 1 == 0 {
+            continue;
+        }
+        let frame = r.m.u16(p + 6);
+        let colour = packed_colour(r, history.wrapping_add(r.m.u32(p + 8).wrapping_mul(8)));
+        let mut scaled = IDENTITY;
+        scaled[0] = r.m.f32(p + 0x30);
+        scaled[5] = r.m.f32(p + 0x34);
+        scaled[10] = r.m.f32(p + 0x38);
+        let facing = mul(&unturn, &mul(&get_mat(r, p + 0x60), &scaled));
+        let mut place = IDENTITY;
+        for k in 0..3 {
+            place[12 + k] = r.m.f32(p + 0x10 + 4 * k as u32) + r.m.f32(third + 4 * k as u32);
+        }
+        if map == 0xc04 && event == 0x77 && matches!(part, Some(4 | 5)) {
+            place[14] += 6.0;
+        }
+        let placed = mul(&place, &facing);
+        let matrix = mul(&world_frame, &placed);
+        let work_matrix = with_work.then(|| match r.m.u8(key + 0xf0) {
+            0 => mul(&world_frame, &mul(&place, &mul(&offset, &facing))),
+            1 => mul(&offset, &mul(&r.world, &mul(&r.frame, &placed))),
+            2 => mul(&r.world, &mul(&offset, &mul(&r.frame, &placed))),
+            _ => facing,
+        });
+        if separate {
+            let draw = super::ShapeDraw {
+                object: o,
+                ref_index: r.ref_index.wrapping_add(i * 0x32),
+                entry,
+                shape,
+                frame: u32::from(frame),
+                flags,
+                colour,
+                matrix,
+                work_matrix,
+                create: Some(blend_state(first_blend(r, frame))),
+                path3: false,
+            };
+            r.render.push(super::RenderCall::Shape(Box::new(draw)));
+        } else {
+            sprites.push(super::FieldSprite { frame, colour, matrix, work_matrix });
+        }
+    }
+    if separate {
+        return;
+    }
+    let mut create = blend_state(first_blend(r, 0));
+    if event == 0xdb && part == Some(0x12) {
+        create |= 0x800;
+    }
+    let draw = super::ShapeFieldDraw { object: o, ref_index: r.ref_index, shape, flags, create, sprites };
+    r.render.push(super::RenderCall::ShapeField(Box::new(draw)));
+}
+
 /// Maps whose shape fields keep their render entries (they are freed with the sprites instead).
 fn field_keeps_entries(map: u32) -> bool {
     matches!(map, 0x76f | 0x18e7 | 0x5c8 | 0x1f7 | 0x4c4 | 0x1b8a | 0x324 | 0x1e8a | 0x1139)
@@ -2846,12 +2966,7 @@ fn draw_shape_field(r: &mut Run, o: u32, key: u32, rf: u32) {
     if !r.paused && !r.part_draining {
         field_spawn(r, a, key);
     }
-    let count = r.m.u32(key + 8);
-    let extra = bytes(r, r.m.u32(a + 0x40), count * 0xa0);
-    let mut hist = bytes(r, r.m.u32(a + 0x50), r.m.u32(a + 0x54) * 8);
-    let mut all = extra;
-    all.append(&mut hist);
-    geometry(r, "pppDrawShapeField", o, key, rf, (0xc4, 0x5c, 8), all);
+    draw_field_sprites(r, o, key, rf, a, entry, shape);
     if !r.paused {
         field_step(r, a, key, shape);
     }
