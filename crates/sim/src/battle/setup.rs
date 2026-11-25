@@ -91,6 +91,7 @@ pub fn start(
         area_id: 0,
         worker_slots: Vec::new(),
         globals: Default::default(),
+        turns: Default::default(),
     };
     b.area_id = b.encounter.area_id;
     log::error!(
@@ -150,7 +151,7 @@ fn set_records(b: &mut Battle, tables: &BattleTables, save: &mut [u8]) {
         let rec = b.records.get_mut(slot);
         if joined || rec.u8_at(r::IN_BATTLE) != 0 {
             rec.set_u8(r::IN_BATTLE, 1);
-            rec.set_u16(0xdd6, 0x101);
+            rec.set_u16(r::TAKES_TURNS, 0x101);
             rec.set_u16(0xdd9, 0x101);
             rec.set_u8(0xdd8, 1);
         }
@@ -205,7 +206,7 @@ fn set_records(b: &mut Battle, tables: &BattleTables, save: &mut [u8]) {
             rec.set_u8(0xdf3, 1);
             rec.set_u8(r::IN_BATTLE, 1);
             rec.set_u8(0x39, 1);
-            rec.set_u16(0xdd6, 0x101);
+            rec.set_u16(r::TAKES_TURNS, 0x101);
             rec.set_u16(0xdd9, 0x101);
             rec.set_u8(0xdd8, 1);
             rec.set_u8(r::ACTIVE, 1);
@@ -648,7 +649,7 @@ pub fn set_auto_status(rec: &mut [u8]) {
     rec.set_u16(0x616, status);
     rec.set_u16(0x628, kept);
     if rec.u8_at(r::STATUS_COUNTERS + 0xa) != 0 && had_612 == 0 {
-        rec.set_u8(0x6d2, 0);
+        rec.set_u8(r::TICKS, 0);
     }
 }
 

@@ -2917,6 +2917,13 @@ impl Event {
                 (self.state.battle_scripts.as_mut(), self.state.battle_state.as_mut())
             {
                 crate::battle::scripts::run_frame(scripts, battle, &mut self.vm.memory.global);
+                // 790c10's turn order step (790fb0), then the command choice (792a90, not ported).
+                if crate::battle::turns::frame(battle).is_some() && !battle.globals.choice_reported {
+                    battle.globals.choice_reported = true;
+                    log::error!(
+                        "GAP: battle command choice (792a90) and the command run (MsBtlReadManage) are not ported"
+                    );
+                }
             }
             return;
         }

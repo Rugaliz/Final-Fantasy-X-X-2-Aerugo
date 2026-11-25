@@ -224,6 +224,12 @@ pub const GRAVITY_MODE: usize = 0x34;
 pub const MODEL_SWITCH: usize = 0x32;
 /// The model's scale (+0x3a0..+0x3a8, 1.0 at the start; 7028 also gives it to the model, 0082b560 mode 7).
 pub const SCALE: usize = 0x3a0;
+/// Times the record is in the input cue (+0xde6), the turn mark a finished wait leaves (+0xde8 = 3), whether
+/// the record takes turns (+0xdd6) and the ticks it has waited (+0x6d2, up to 0xff).
+pub const IN_CUE: usize = 0xde6;
+pub const TURN_MARK: usize = 0xde8;
+pub const TAKES_TURNS: usize = 0xdd6;
+pub const TICKS: usize = 0x6d2;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).

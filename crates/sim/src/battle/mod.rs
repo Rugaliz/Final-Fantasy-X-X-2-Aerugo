@@ -25,6 +25,7 @@ pub mod natives;
 pub mod records;
 pub mod scripts;
 pub mod setup;
+pub mod turns;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -211,6 +212,7 @@ pub struct Battle {
     /// The combatant each script worker stands for (worker +0xc0, 0xff none), by the machine's numbering.
     pub worker_slots: Vec<u8>,
     pub globals: natives::BattleGlobals,
+    pub turns: turns::Turns,
 }
 
 impl Battle {

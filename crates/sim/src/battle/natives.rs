@@ -26,6 +26,8 @@ pub struct BattleGlobals {
     /// znkd09_00: once slot 0x14's stat 0x57 is set to 4, its HP is set to 100 whenever a script sets it (DAT
     /// 1136ac0, the remaster's own rule).
     pub tanker_hp_rule: bool,
+    /// The command choice's GAP has been reported.
+    pub choice_reported: bool,
     /// Stat ids already reported as not ported.
     pub reported: std::collections::BTreeSet<(bool, i32)>,
 }
@@ -39,6 +41,7 @@ impl Default for BattleGlobals {
             second_command_on: true,
             unread_script_flag: false,
             tanker_hp_rule: false,
+            choice_reported: false,
             reported: Default::default(),
         }
     }
@@ -335,7 +338,7 @@ pub fn set_stat(b: &mut Battle, slot: u8, stat: i32, target: i32, value: i32) ->
                 rec.set_u8(r::DEATH_LOOK, value as u8);
                 rec.set_u8(r::DEATH_LOOK_KEPT, value as u8);
             }
-            0x51 => rec.set_u8(0xdd6, value as u8 & 1),
+            0x51 => rec.set_u8(r::TAKES_TURNS, value as u8 & 1),
             0x52 => rec.set_u8(0xdd9, value as u8 & 1),
             0x53 => rec.set_u8(0xdd7, value as u8 & 1),
             stat::ATTACK_NORMAL_FRAME => rec.set_u8(r::ATTACK_NORMAL_FRAME, value as u8),
