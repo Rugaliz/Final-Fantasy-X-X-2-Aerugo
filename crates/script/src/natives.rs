@@ -107,6 +107,19 @@ pub struct Natives<G> {
     pub replay: Option<Replay>,
 }
 
+impl<G> Clone for Natives<G> {
+    fn clone(&self) -> Self {
+        Natives {
+            game: self.game,
+            table: self.table.clone(),
+            stubs: self.stubs.clone(),
+            sites: self.sites.clone(),
+            coverage: self.coverage.clone(),
+            replay: self.replay.clone(),
+        }
+    }
+}
+
 impl<G> std::fmt::Debug for Natives<G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Natives").field("game", &self.game).field("implemented", &self.table.len()).finish()

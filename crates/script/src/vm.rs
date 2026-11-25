@@ -144,6 +144,9 @@ pub struct Context {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Request {
     id: u32,
+    /// Code from another script to run the entry in (a battle control's exec space: script, descriptor); the
+    /// worker takes that script and descriptor when the request starts.
+    pub code: Option<(u16, u16)>,
     /// Requesting worker (`None` for requests from the engine).
     pub from: Option<u16>,
     pub mode: RequestMode,
@@ -170,6 +173,9 @@ pub enum RequestMode {
 #[derive(Debug, Clone)]
 pub struct Worker {
     pub index: usize,
+    /// The group's script the worker comes from, and its descriptor there.
+    pub script: usize,
+    pub descriptor: usize,
     pub kind: u8,
     pub active: bool,
     /// Runs at all (scripts turn other workers off and on); a worker turned off still takes requests.
@@ -299,10 +305,19 @@ pub enum Phase {
     Running,
 }
 
-/// A running script (one event or battle).
-#[derive(Debug)]
+/// A running script (one event), or a group of scripts run as one (a battle's control: workers numbered
+/// across the scripts, every script's actors first).
+#[derive(Debug, Clone)]
 pub struct Vm {
+    /// The group's first script (the event's).
     pub script: Arc<Script>,
+    /// Every script of the group (the first is [`Vm::script`]).
+    pub scripts: Vec<Arc<Script>>,
+    /// Each worker's own script and descriptor (where it comes from; a request may run it in other code).
+    order: Vec<(usize, usize)>,
+    /// The first worker of each control (one control outside battles); a worker's requests and calls number
+    /// the workers of its own control.
+    controls: Vec<usize>,
     pub workers: Vec<Worker>,
     pub memory: Memory,
     pub phase: Phase,
@@ -348,12 +363,39 @@ pub enum Effect {
 impl Vm {
     /// Set up every worker of `script` at entry 0, level 0.
     pub fn new(script: Arc<Script>) -> Vm {
-        let n = script.workers.len();
-        let workers = script
-            .workers
+        Vm::group(vec![script], false)
+    }
+
+    /// Set up a group of scripts as one machine (AtelBattleSetUp): every script's actors in turn, then every
+    /// script's other workers; with `own_work` each worker gets a zeroed work area of its descriptor's size.
+    pub fn group(scripts: Vec<Arc<Script>>, own_work: bool) -> Vm {
+        Vm::controls(vec![scripts], own_work)
+    }
+
+    /// Several controls in one machine (a battle's: the battle group and the monster group), their scripts in
+    /// one list so a request can run any of them; each control numbers its own workers (every script's actors
+    /// first, then the rest).
+    pub fn controls(groups: Vec<Vec<Arc<Script>>>, own_work: bool) -> Vm {
+        let mut order = Vec::new();
+        let mut scripts = Vec::new();
+        let mut controls = Vec::new();
+        for group in groups {
+            controls.push(order.len());
+            let first = scripts.len();
+            for (k, sc) in group.iter().enumerate() {
+                order.extend((0..sc.actor_count()).map(|d| (first + k, d)));
+            }
+            for (k, sc) in group.iter().enumerate() {
+                order.extend((sc.actor_count()..sc.workers.len()).map(|d| (first + k, d)));
+            }
+            scripts.extend(group);
+        }
+        let n = order.len();
+        let workers = order
             .iter()
             .enumerate()
-            .map(|(i, w)| {
+            .map(|(i, &(si, d))| {
+                let w = &scripts[si].workers[d];
                 let mut contexts = vec![Context::default(); 9];
                 // Entry 0 (setup) runs at level 7 (the highest a two-level worker has is 1); level 0 holds entry 1,
                 // which runs once setup ends.
@@ -364,6 +406,8 @@ impl Vm {
                 let runs = w.kind != 0;
                 Worker {
                     index: i,
+                    script: si,
+                    descriptor: d,
                     kind: w.kind,
                     active: runs,
                     enabled: true,
@@ -382,9 +426,17 @@ impl Vm {
                 }
             })
             .collect();
-        let memory = Memory::new(script.data().to_vec(), n);
+        let works = own_work.then(|| {
+            order.iter().map(|&(si, d)| scripts[si].workers[d].work_size as usize).collect::<Vec<_>>()
+        });
+        let memory = Memory::group(scripts.iter().map(|sc| sc.data().to_vec()).collect(), n, works);
+        let script = scripts[0].clone();
+        let order_kept = order.clone();
         let mut vm = Vm {
             script,
+            scripts,
+            order: order_kept,
+            controls,
             workers,
             memory,
             phase: Phase::Init,
@@ -408,6 +460,7 @@ impl Vm {
             vm.next_request += 1;
             vm.workers[w].queue.push(Request {
                 id,
+                code: None,
                 from: None,
                 mode: RequestMode::Plain,
                 level,
@@ -416,11 +469,12 @@ impl Vm {
                 fresh: false,
             });
             vm.workers[w].active_request = Some(id);
-            if vm.script.workers[w].entries.len() > 1 {
+            if vm.descriptor(w).entries.len() > 1 {
                 let id = vm.next_request;
                 vm.next_request += 1;
                 vm.workers[w].queue.push(Request {
                     id,
+                    code: None,
                     from: None,
                     mode: RequestMode::Plain,
                     level: 0,
@@ -431,6 +485,28 @@ impl Vm {
             }
         }
         vm
+    }
+
+    /// The descriptor of the code a worker runs now.
+    pub fn descriptor(&self, w: usize) -> &aerugo_formats::script::Worker {
+        let wk = &self.workers[w];
+        &self.scripts[wk.script].workers[wk.descriptor]
+    }
+
+    /// The first worker of the control `w` belongs to.
+    pub fn control_base(&self, w: usize) -> usize {
+        self.controls.iter().copied().take_while(|&c| c <= w).last().unwrap_or(0)
+    }
+
+    /// Queue a request whose entry runs in other code (a battle exec space: `code` = script, descriptor).
+    pub fn request_in(&mut self, target: usize, level: u8, entry: u16, code: (usize, usize)) -> bool {
+        if !self.request(None, target, RequestMode::Plain, level, entry) {
+            return false;
+        }
+        if let Some(r) = self.workers[target].queue.iter_mut().find(|r| r.fresh && r.entry == entry) {
+            r.code = Some((code.0 as u16, code.1 as u16));
+        }
+        true
     }
 
     /// Arrive by `entrance`: the script's entrance worker is asked (at level 1) to run the entry the entrance
@@ -588,7 +664,7 @@ impl Vm {
         }
         let id = self.next_request;
         self.next_request += 1;
-        let r = Request { id, from, mode, level, entry, running: false, fresh: true };
+        let r = Request { id, code: None, from, mode, level, entry, running: false, fresh: true };
         let at = t
             .queue
             .iter()
@@ -604,6 +680,7 @@ impl Vm {
         self.next_request += 1;
         self.workers[to].queue.push(Request {
             id,
+            code: None,
             from: Some(from as u16),
             mode: RequestMode::Signal,
             level,
@@ -627,8 +704,11 @@ impl Vm {
             if head.running {
                 self.workers[w].level = head.level;
             } else {
-                let entries = &self.script.workers[w].entries;
-                let pc = entries.get(usize::from(head.entry)).copied().unwrap_or(0);
+                if let Some((sc, d)) = head.code {
+                    self.workers[w].script = usize::from(sc);
+                    self.workers[w].descriptor = usize::from(d);
+                }
+                let pc = self.descriptor(w).entries.get(usize::from(head.entry)).copied().unwrap_or(0);
                 self.level_starts.push((w, head.level));
                 let worker = &mut self.workers[w];
                 worker.entry = head.entry;
@@ -681,7 +761,7 @@ impl Vm {
         // the worker re-runs the END every frame.
         self.decode(w, Some(()));
         if restart {
-            let pc = self.script.workers[w].entries.get(1).copied().unwrap_or(0);
+            let pc = self.descriptor(w).entries.get(1).copied().unwrap_or(0);
             let level = self.workers[w].level;
             self.level_starts.push((w, level));
             let worker = &mut self.workers[w];
@@ -781,8 +861,9 @@ impl Vm {
 
     /// Execute one instruction. `Some(run)` replaces the keep-running flag.
     fn step(&mut self, w: usize, host: &mut dyn Host) -> Result<Option<bool>, Fault> {
-        let script = self.script.clone();
-        let desc = &script.workers[w];
+        let si = self.workers[w].script;
+        let script = self.scripts[si].clone();
+        let desc = &script.workers[self.workers[w].descriptor];
         let li = self.workers[w].level_index(self.workers[w].level);
         let pc = self.workers[w].contexts[li].pc;
         let insn = script.instruction(pc).ok_or(Fault::PcOutOfRange)?;
@@ -812,6 +893,7 @@ impl Vm {
         } else {
             Vec::new()
         };
+        let base = self.control_base(w);
         let worker = &mut self.workers[w];
         let s = &mut worker.stack;
         // Binary helpers: right operand on top.
@@ -920,7 +1002,7 @@ impl Vm {
                 let Some(var) = desc.vars.get(usize::from(arg)).copied() else {
                     return Err(Fault::InvalidOpcode(insn.op));
                 };
-                let place = self.memory.place(&var, index, w, desc.data_areas, script.shared_data());
+                let place = self.memory.place(&var, index, w, si, desc.data_areas, script.shared_data());
                 let s = &mut self.workers[w].stack;
                 if insn.op == 0x27 {
                     s.push(Value::Int(encode_address(place)));
@@ -938,7 +1020,7 @@ impl Vm {
                 let indexed = matches!(insn.op, 0x23 | 0x24);
                 let value = s.pop();
                 let index = if indexed { s.pop_int() } else { 0 };
-                let place = self.memory.place(&var, index, w, desc.data_areas, script.shared_data());
+                let place = self.memory.place(&var, index, w, si, desc.data_areas, script.shared_data());
                 match value {
                     Value::Int(v) => self.memory.store_int(place, var.ty, v, saturate),
                     Value::Float(f) => self.memory.store_float(place, var.ty, f, saturate),
@@ -983,7 +1065,8 @@ impl Vm {
                     // Inside a call into another worker, labels are the callee's.
                     let ctx = &worker.contexts[li];
                     let owner = if ctx.depth > 0 { usize::from(ctx.callees[ctx.depth - 1]) } else { w };
-                    let labels = &script.workers.get(owner).ok_or(Fault::PcOutOfRange)?.labels;
+                    let &(os, od) = self.order.get(owner).ok_or(Fault::PcOutOfRange)?;
+                    let labels = &self.scripts[os].workers[od].labels;
                     jump = Some(*labels.get(usize::from(arg)).ok_or(Fault::PcOutOfRange)?);
                 }
             }
@@ -995,9 +1078,13 @@ impl Vm {
                     worker.contexts[li].pc = next;
                     return Ok(run);
                 }
-                let callee = script.workers.get(usize::from(arg)).ok_or(Fault::PcOutOfRange)?;
+                // The callee is numbered across the group; its entry runs in the caller's code (as the original's
+                // CALLSUB adds the callee's entry offset to the caller's script).
+                let callee_index = usize::from(arg) + base;
+                let &(cs, cd) = self.order.get(callee_index).ok_or(Fault::PcOutOfRange)?;
+                let callee = &self.scripts[cs].workers[cd];
                 ctx.returns[ctx.depth] = next;
-                ctx.callees[ctx.depth] = arg;
+                ctx.callees[ctx.depth] = callee_index as u16;
                 ctx.depth += 1;
                 ctx.calling = false;
                 jump = Some(callee.entries.first().copied().unwrap_or(0));
@@ -1097,6 +1184,7 @@ impl Vm {
                         _ => Refuse::SameLevel,
                     },
                 };
+                let target = if target >= 0 { target + base as i32 } else { target };
                 let ok = target >= 0
                     && self.request_with(
                         Some(w as u16),

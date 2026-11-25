@@ -59,11 +59,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let mut out = b"\t0".to_vec();
             let (mut prev, mut count) = (-1, 0u8);
             for i in 0..n.max(0) {
-                let at = match list_p {
-                    Place::Global(b, o) => Place::Global(b, o + 4 * i as usize),
-                    Place::Script(o) => Place::Script(o + 4 * i as usize),
-                    Place::Registers(w, o) => Place::Registers(w, o + 4 * i as usize),
-                };
+                let at = list_p.offset(4 * i as usize);
                 let addr = c.memory.read_u32(at);
                 let text = text_at(g, c, addr);
                 entry(&mut out, &mut prev, &mut count, mask & (1 << (i & 31)) != 0, &text, i >= n - 1);
@@ -94,11 +90,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             let mut out = b"\t0".to_vec();
             let (mut prev, mut count) = (-1, 0u8);
             for i in 0..n.max(0) {
-                let at = match ids_p {
-                    Place::Global(b, o) => Place::Global(b, o + 4 * i as usize),
-                    Place::Script(o) => Place::Script(o + 4 * i as usize),
-                    Place::Registers(w, o) => Place::Registers(w, o + 4 * i as usize),
-                };
+                let at = ids_p.offset(4 * i as usize);
                 let id = (c.memory.read_u32(at) & 0xffff) as i32;
                 let addr = g.texts.macro_text(table, id * 2 + alt).unwrap_or(text_space::EMPTY);
                 let text = text_at(g, c, addr);

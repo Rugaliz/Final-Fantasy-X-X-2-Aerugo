@@ -117,6 +117,8 @@ pub struct Worker {
     pub labels: Vec<u32>,
     /// Offsets (from the script start) of the worker's three private data areas (variable areas 2, 3 and 4).
     pub data_areas: [u32; 3],
+    /// The size of the worker's own work area (descriptor +0x10; a battle group gives each worker a buffer of it).
+    pub work_size: u32,
 }
 
 /// A parsed script.
@@ -374,6 +376,11 @@ impl Script {
         u16_at(&self.data, at).ok()
     }
 
+    /// How many of the workers are actors (header +0x36; a group numbers every script's actors first).
+    pub fn actor_count(&self) -> usize {
+        usize::from(self.header_u16(0x36).unwrap_or(0)).min(self.workers.len())
+    }
+
     /// Offset of the code from the script start.
     pub fn code_start(&self) -> u32 {
         self.code as u32
@@ -570,6 +577,7 @@ fn read_worker(d: &[u8], at: usize) -> Result<Worker> {
     let data_areas = [u32_at(d, at + 0x28)?, u32_at(d, at + 0x2C)?, u32_at(d, at + 0x30)?];
     Ok(Worker {
         data_areas,
+        work_size: u32_at(d, at + 0x10)?,
         kind,
         vars,
         ints: table(0x18, n_ints)?.into_iter().map(|v| v as i32).collect(),

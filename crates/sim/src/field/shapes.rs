@@ -117,11 +117,7 @@ impl Default for Shapes {
 }
 
 fn bytes(mem: &Memory, p: Place, off: usize, n: usize) -> Option<&[u8]> {
-    match p {
-        Place::Global(b, o) => mem.global[b].get(o + off..o + off + n),
-        Place::Script(o) => mem.script.get(o + off..o + off + n),
-        Place::Registers(w, o) => mem.registers.get(w)?.get(o + off..o + off + n),
-    }
+    mem.bytes_at(p.offset(off), n)
 }
 
 fn i16_at(mem: &Memory, p: Option<Place>, off: usize) -> i16 {
@@ -231,7 +227,7 @@ pub(super) fn var_place(g: &FieldState, c: &NativeCall, desc: i32) -> Place {
         count: 1,
     };
     let areas = g.data_areas.get(c.worker).copied().unwrap_or_default();
-    c.memory.place(&var, 0, c.worker, areas, g.shared_data)
+    c.memory.place(&var, 0, c.worker, 0, areas, g.shared_data)
 }
 
 /// A float truncated as the original converts it (out of range: 0), kept to 16 bits.

@@ -22,6 +22,7 @@
 //! The records: [`records`].
 
 pub mod records;
+pub mod scripts;
 pub mod setup;
 
 use std::ops::Range;

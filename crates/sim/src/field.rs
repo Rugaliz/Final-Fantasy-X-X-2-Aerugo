@@ -1073,6 +1073,8 @@ pub struct FieldState {
     pub battle_state: Option<Box<crate::battle::Battle>>,
     /// The kernel tables battles read.
     pub battle_tables: Option<Arc<crate::battle::BattleTables>>,
+    /// The running battle's script machine.
+    pub battle_scripts: Option<Box<crate::battle::scripts::BattleScripts>>,
     /// Values natives set for parts of the engine not ported yet, by (native, worker or actor).
     pub settings: std::collections::HashMap<(u16, usize), Vec<Value>>,
     /// The shop price rate in percent, when scripts changed it from 100.
@@ -2910,6 +2912,12 @@ impl Event {
         // frames, which is not modelled).
         if let Some((_, started)) = &mut self.state.battle {
             *started = true;
+            // The battle's scripts run (the rest of the battle's frame is not ported yet).
+            if let (Some(scripts), Some(battle)) =
+                (self.state.battle_scripts.as_mut(), self.state.battle_state.as_mut())
+            {
+                crate::battle::scripts::run_frame(scripts, battle, &mut self.vm.memory.global);
+            }
             return;
         }
         // A requested menu opens at the start of the next frame and holds the scripts until the host closes it.
@@ -3073,14 +3081,39 @@ impl Event {
             crate::battle::Encounter::new(&encounters, b).ok_or("the battle's area is not in the table")?;
         let inputs = crate::battle::setup::Inputs { vfs, files: &files, tables: &tables };
         let save = &mut self.vm.memory.global[0];
-        let battle = crate::battle::setup::start(&inputs, encounter, save, &mut self.state.rng_streams)?;
+        let mut battle = crate::battle::setup::start(&inputs, encounter, save, &mut self.state.rng_streams)?;
+        // system_01 (battle file 1) and the machine; its set-up pass, then the entries the read steps ask for
+        // (0x18 at step 10, 0x75 at 0xc, 0x76 at 0xf, 0x7c as the battle starts).
+        let path = files.path(crate::battle::BATTLE_SET, 1).ok_or("system_01 is not in the file table")?;
+        let system = vfs.read(&path).map_err(|e| format!("{path}: {e}"))?;
+        let system = crate::battle::ChunkFile::parse(system).ok_or("system_01 is not a chunk file")?;
+        let mut scripts = crate::battle::scripts::BattleScripts::new(system);
+        scripts.machine = Some(crate::battle::scripts::machine(&scripts, &battle)?);
+        let globals = &mut self.vm.memory.global;
+        crate::battle::scripts::run_frame(&mut scripts, &mut battle, globals);
+        for entry in [0x18, 0x75, 0x76, 0x7c] {
+            if crate::battle::scripts::request(&mut scripts, &battle, 0, None, entry).is_none() {
+                log::trace!("battle entry {entry:#x}: no script has it");
+            }
+        }
         self.state.battle_state = Some(Box::new(battle));
+        self.state.battle_scripts = Some(Box::new(scripts));
         Ok(())
     }
 
     /// The running battle's records once set up.
     pub fn battle_state(&self) -> Option<&crate::battle::Battle> {
         self.state.battle_state.as_deref()
+    }
+
+    /// The natives the battle's scripts called that are not ported yet (id, calls).
+    pub fn battle_missing_natives(&self) -> Vec<(u16, u32)> {
+        let Some(s) = &self.state.battle_scripts else { return Vec::new() };
+        let c = &s.natives.coverage;
+        let mut v: Vec<(u16, u32)> =
+            c.missing.iter().map(|&id| (id, c.calls.get(&id).copied().unwrap_or(0) as u32)).collect();
+        v.sort();
+        v
     }
 
     /// Who fights in the set-up battle (the front line, then the formation's monsters).
@@ -3114,6 +3147,7 @@ impl Event {
     pub fn finish_battle(&mut self) {
         self.state.battle = None;
         self.state.battle_state = None;
+        self.state.battle_scripts = None;
         self.state.encounter_counters = Default::default();
     }
 
@@ -3778,7 +3812,7 @@ fn store_float_var(c: &mut NativeCall<'_>, areas: [u32; 3], desc: i32, v: f32) {
     if var.area == 6 {
         return;
     }
-    let place = c.memory.place(&var, 0, c.worker, areas, 0);
+    let place = c.memory.place(&var, 0, c.worker, 0, areas, 0);
     c.memory.store_float(place, var.ty, v, false);
 }
 

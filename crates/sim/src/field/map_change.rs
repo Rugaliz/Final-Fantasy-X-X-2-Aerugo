@@ -93,6 +93,7 @@ pub fn request(g: &mut FieldState, c: &mut NativeCall, target: i32, entrance: i8
     if matches!(g.battle, Some((_, false))) {
         g.battle = None;
         g.battle_state = None;
+        g.battle_scripts = None;
     }
     g.workers.sys.state &= !crate::workers::state::MAP_CHANGE_OPEN;
     g.workers.sys.play |= crate::workers::play::MAP_CHANGE_ASKED;

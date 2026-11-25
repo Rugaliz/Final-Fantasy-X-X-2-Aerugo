@@ -46,11 +46,7 @@ pub struct PosSounds {
 }
 
 fn bytes(mem: &Memory, p: Place, off: usize, n: usize) -> Option<&[u8]> {
-    match p {
-        Place::Global(b, o) => mem.global[b].get(o + off..o + off + n),
-        Place::Script(o) => mem.script.get(o + off..o + off + n),
-        Place::Registers(w, o) => mem.registers.get(w)?.get(o + off..o + off + n),
-    }
+    mem.bytes_at(p.offset(off), n)
 }
 
 fn src_u16(mem: &Memory, p: Place, off: usize) -> u16 {
@@ -66,11 +62,7 @@ fn src_f32(mem: &Memory, p: Place, off: usize) -> f32 {
 }
 
 fn set_src_u16(mem: &mut Memory, p: Place, v: u16) {
-    let b = match p {
-        Place::Global(b, o) => mem.global[b].get_mut(o..o + 2),
-        Place::Script(o) => mem.script.get_mut(o..o + 2),
-        Place::Registers(w, o) => mem.registers.get_mut(w).and_then(|r| r.get_mut(o..o + 2)),
-    };
+    let b = mem.bytes_mut(p, 2);
     if let Some(b) = b {
         b.copy_from_slice(&v.to_le_bytes());
     }

@@ -610,15 +610,7 @@ pub(super) fn register_shapes(n: &mut Natives<FieldState>) {
             let b = c.stack.pop_int();
             let a = c.stack.pop_int();
             let (pa, pb) = (super::shapes::var_place(g, c, a), super::shapes::var_place(g, c, b));
-            let at = |p: aerugo_script::memory::Place, k: usize| match p {
-                aerugo_script::memory::Place::Global(i, o) => {
-                    aerugo_script::memory::Place::Global(i, o + 4 * k)
-                }
-                aerugo_script::memory::Place::Script(o) => aerugo_script::memory::Place::Script(o + 4 * k),
-                aerugo_script::memory::Place::Registers(w, o) => {
-                    aerugo_script::memory::Place::Registers(w, o + 4 * k)
-                }
-            };
+            let at = |p: aerugo_script::memory::Place, k: usize| p.offset(4 * k);
             let mut v = [0.0f32; 6];
             for k in 0..3 {
                 v[k] = f32::from_bits(c.memory.read_u32(at(pa, k)));

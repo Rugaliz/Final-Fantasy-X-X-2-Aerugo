@@ -139,9 +139,8 @@ fn store(c: &mut NativeCall, addr: i32, v: f32) {
 fn table(g: &mut FieldState, c: &NativeCall, addr: i32) -> u32 {
     let place = decode_address(addr);
     let bytes: Option<&[u8]> = match place {
-        Place::Script(off) => c.memory.script.get(off..),
-        Place::Global(b, off) => c.memory.global[b].get(off..),
         Place::Registers(..) => None,
+        _ => c.memory.tail(place),
     };
     let id = TABLE | (addr as u32 & 0x07FF_FFFF);
     if let Some(b) = bytes {
