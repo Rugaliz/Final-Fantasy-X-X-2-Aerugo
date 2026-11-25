@@ -368,15 +368,17 @@ pub struct Window {
     /// The slots' active types (+1), copied from the staged ones when the window opens; the {12:3n}
     /// macros read these. A slot not listed is 0xff (none).
     pub value_types: Vec<u8>,
-    /// The window's colour word (00a2: four bytes) and its +0x28 word (0256 / 0257).
+    /// The window's colour word (00a2: four bytes) and the text flags added to its flags when it opens (0256 /
+    /// 0257: 0x8000 or none).
     pub color: u32,
-    pub word28: u32,
-    /// The +0x16 word (a text's choices in its high byte; 0141).
-    pub word16: u16,
-    /// Bytes +0x22 / +0x23 and the word +0x24 (010f).
-    pub byte22: u8,
-    pub byte23: u8,
-    pub word24: u32,
+    pub extra_text_flags: u32,
+    /// The message's entry counts (0141): digits of its number entry in the low nibble, choices in the high
+    /// byte.
+    pub entry_counts: u16,
+    /// The number entry's digit cursor, the digit it goes back to, and the number it shows (010f).
+    pub number_cursor: u8,
+    pub number_start_cursor: u8,
+    pub number_value: u32,
     /// The number entry a window opened with flag 0x40 takes (its input record).
     pub number: Option<NumberEntry>,
 }
@@ -3716,17 +3718,17 @@ pub(crate) fn msg_open(g: &mut FieldState, image: &[u8], w: usize, mode: u32) {
     let win = &mut g.windows[w];
     win.atel_state = 1;
     if mode & 2 != 0 {
-        let digits = (win.word16 & 0xf) as u8;
-        let choices = (win.word16 >> 8) as u8;
+        let digits = (win.entry_counts & 0xf) as u8;
+        let choices = (win.entry_counts >> 8) as u8;
         if digits == 0 {
-            win.byte22 = 0;
+            win.number_cursor = 0;
             mode &= !0x40;
         } else {
-            if digits <= win.byte22 {
-                win.byte22 = digits - 1;
+            if digits <= win.number_cursor {
+                win.number_cursor = digits - 1;
             }
-            if digits <= win.byte23 {
-                win.byte23 = digits - 1;
+            if digits <= win.number_start_cursor {
+                win.number_start_cursor = digits - 1;
             }
         }
         if choices == 0 {
@@ -3803,10 +3805,16 @@ fn choice_wait(g: &mut FieldState, c: &mut NativeCall<'_>) -> u32 {
 fn open_number(g: &mut FieldState, w: usize, mode: i32) {
     let word = g.windows[w].message.and_then(|m| g.messages.get(m)).map_or(0, |m| m.word);
     let win = &mut g.windows[w];
-    win.word16 = word;
+    win.entry_counts = word;
     let digits = (word & 0xf) as i8;
-    win.number = (mode & 0x40 != 0 && digits != 0)
-        .then(|| NumberEntry::new(i32::from(win.byte22), i32::from(win.byte23), win.word24 as i32, digits));
+    win.number = (mode & 0x40 != 0 && digits != 0).then(|| {
+        NumberEntry::new(
+            i32::from(win.number_cursor),
+            i32::from(win.number_start_cursor),
+            win.number_value as i32,
+            digits,
+        )
+    });
 }
 
 /// Treasure: give treasure `index` (the item, key item, equipment or gil) into the save image. Returns whether
@@ -4001,7 +4009,7 @@ fn register_menus(n: &mut Natives<FieldState>) {
                     win.align = align;
                     win.style = Some(0);
                     win.message = usize::try_from(msg).ok();
-                    win.word16 = word;
+                    win.entry_counts = word;
                     win.flags = 0;
                     win.first_choice = first as u8;
                     win.cancel_choice = cancel as u8;
@@ -4036,9 +4044,9 @@ fn register_menus(n: &mut Natives<FieldState>) {
                 win.align = align;
                 win.message = usize::try_from(msg).ok();
                 win.flags = 0;
-                win.byte22 = cursor as u8;
-                win.byte23 = start as u8;
-                win.word24 = value as u32;
+                win.number_cursor = cursor as u8;
+                win.number_start_cursor = start as u8;
+                win.number_value = value as u32;
                 msg_open(g, &c.memory.global[0], w, 0x42);
                 c.scratch[0] = w as i32;
                 c.scratch[1] = -1;
@@ -4421,7 +4429,7 @@ pub(crate) fn system_message(g: &mut FieldState, image: &[u8], w: usize, text: u
     win.align = 4;
     win.style = Some(0);
     win.message = m;
-    win.word16 = 0;
+    win.entry_counts = 0;
     win.flags = 0;
     msg_open(g, image, w, 0);
     g.control_refresh();
@@ -5286,7 +5294,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             g.last_text = msg;
             let word = usize::try_from(msg).ok().and_then(|m| g.messages.get(m)).map_or(0, |m| m.word);
             g.windows[w].message = usize::try_from(msg).ok();
-            g.windows[w].word16 = word;
+            g.windows[w].entry_counts = word;
             Value::Int(0)
         }),
     );

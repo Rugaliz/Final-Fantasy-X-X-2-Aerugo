@@ -1715,7 +1715,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
                 |g, c| {
                     let w = c.stack.pop_int();
                     if let Some(win) = usize::try_from(w).ok().and_then(|w| g.windows.get_mut(w)) {
-                        win.word28 = 0x8000;
+                        win.extra_text_flags = 0x8000;
                     }
                     Value::Int(w)
                 }
@@ -1723,7 +1723,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
                 |g, c| {
                     let w = c.stack.pop_int();
                     if let Some(win) = usize::try_from(w).ok().and_then(|w| g.windows.get_mut(w)) {
-                        win.word28 = 0;
+                        win.extra_text_flags = 0;
                     }
                     Value::Int(w)
                 }
@@ -2387,19 +2387,19 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(v)
         }),
     );
-    // 010f(win, b22, b23, v): window bytes +0x22/+0x23 and word +0x24; returns the window.
+    // 010f(win, cursor, start cursor, number): the window's number entry; returns the window.
     n.register(
         0x010F,
         Native::result(|g, c| {
-            let v = c.stack.pop_int();
-            let b23 = c.stack.pop_int();
-            let b22 = c.stack.pop_int();
+            let number = c.stack.pop_int();
+            let start_cursor = c.stack.pop_int();
+            let cursor = c.stack.pop_int();
             let w = c.stack.pop_int();
             let i = w.clamp(0, 7) as usize;
             if let Some(win) = g.windows.get_mut(i) {
-                win.byte22 = b22 as u8;
-                win.byte23 = b23 as u8;
-                win.word24 = v as u32;
+                win.number_cursor = cursor as u8;
+                win.number_start_cursor = start_cursor as u8;
+                win.number_value = number as u32;
             }
             Value::Int(w)
         }),

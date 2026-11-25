@@ -186,7 +186,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                 let m = g.messages.len() - 1;
                 if let Some(win) = g.windows.get_mut(w) {
                     win.message = Some(m);
-                    win.word16 = word as u16;
+                    win.entry_counts = word as u16;
                 }
             }
             Value::Int(0)

@@ -603,47 +603,49 @@ pub fn neck_init(ch: &mut super::Chr, parents: &[Option<usize>], joints: &[Joint
     ch.set_f32(0x41c, deg(super::wrap(f32::from_bits(0x3fc9_0fd8))));
 }
 
+/// One cofactor term of the engine's inverse: matrix entry `entry` times the product of entries `pair`.
+type CofactorTerm = (usize, (usize, usize));
+
+/// The engine's cofactors, in its order of terms: each is (the three added terms) − (the three subtracted
+/// ones).
+const COFACTORS: [([CofactorTerm; 3], [CofactorTerm; 3]); 16] = [
+    ([(13, (6, 11)), (9, (7, 14)), (5, (10, 15))], [(5, (14, 11)), (9, (6, 15)), (13, (7, 10))]),
+    ([(13, (3, 10)), (1, (14, 11)), (9, (2, 15))], [(13, (2, 11)), (1, (10, 15)), (9, (3, 14))]),
+    ([(5, (3, 14)), (1, (6, 15)), (13, (2, 7))], [(5, (2, 15)), (1, (7, 14)), (13, (6, 3))]),
+    ([(9, (6, 3)), (1, (7, 10)), (5, (2, 11))], [(9, (2, 7)), (1, (6, 11)), (5, (3, 10))]),
+    ([(12, (7, 10)), (8, (6, 15)), (4, (14, 11))], [(12, (6, 11)), (8, (7, 14)), (4, (10, 15))]),
+    ([(12, (2, 11)), (8, (3, 14)), (0, (10, 15))], [(12, (3, 10)), (8, (2, 15)), (0, (14, 11))]),
+    ([(12, (6, 3)), (0, (7, 14)), (4, (2, 15))], [(12, (2, 7)), (0, (6, 15)), (4, (3, 14))]),
+    ([(0, (6, 11)), (4, (3, 10)), (8, (2, 7))], [(0, (7, 10)), (4, (2, 11)), (8, (6, 3))]),
+    ([(11, (5, 12)), (7, (13, 8)), (15, (4, 9))], [(11, (4, 13)), (7, (9, 12)), (15, (8, 5))]),
+    ([(15, (1, 8)), (11, (0, 13)), (3, (9, 12))], [(15, (0, 9)), (3, (13, 8)), (11, (1, 12))]),
+    ([(15, (0, 5)), (7, (1, 12)), (3, (4, 13))], [(15, (1, 4)), (7, (0, 13)), (3, (5, 12))]),
+    ([(11, (1, 4)), (7, (0, 9)), (3, (8, 5))], [(11, (0, 5)), (7, (1, 8)), (3, (4, 9))]),
+    ([(6, (9, 12)), (10, (4, 13)), (14, (8, 5))], [(10, (5, 12)), (6, (13, 8)), (14, (4, 9))]),
+    ([(10, (1, 12)), (14, (0, 9)), (2, (13, 8))], [(2, (9, 12)), (10, (0, 13)), (14, (1, 8))]),
+    ([(2, (5, 12)), (14, (1, 4)), (6, (0, 13))], [(2, (4, 13)), (14, (0, 5)), (6, (1, 12))]),
+    ([(6, (1, 8)), (2, (4, 9)), (10, (0, 5))], [(2, (8, 5)), (10, (1, 4)), (6, (0, 9))]),
+];
+
 /// The engine's 4×4 inverse (sceVu0InversMatrix4x4, behind the identity when a column is all zero): the
-/// cofactors over the determinant (none when it is 0: all zero). The original runs on the x87; the products
-/// and the cofactors are kept in single precision here as the decompile names them, the sums in double.
+/// cofactors over the determinant (all zero when it is 0). The original runs on the x87; here each pair
+/// product and each cofactor is kept in single precision, the sums in double.
 pub fn vu0_inverse(m: &Mat) -> Mat {
     if (0..4).any(|c| m[c * 4..c * 4 + 4].iter().all(|&v| v == 0.0)) {
         return IDENTITY;
     }
-    let r = |x: f64| x as f32;
-    let (m0, m1, m2, m3) = (d(m[0]), d(m[1]), d(m[2]), d(m[3]));
-    let (m4, m5, m6, m7) = (d(m[4]), d(m[5]), d(m[6]), d(m[7]));
-    let (m8, m9, m10, m11) = (d(m[8]), d(m[9]), d(m[10]), d(m[11]));
-    let (m12, m13, m14, m15) = (d(m[12]), d(m[13]), d(m[14]), d(m[15]));
-    let p = |a: f64, b: f64| d(r(a * b));
-    // The first eight cofactors' pair products.
-    let (f5, f11, f1, f6) = (p(m10, m15), p(m14, m11), p(m6, m15), p(m7, m14));
-    let (f9, f4, f2, f7) = (p(m6, m11), p(m7, m10), p(m2, m15), p(m3, m14));
-    let (f10, f12, f3, f8) = (p(m2, m11), p(m3, m10), p(m2, m7), p(m6, m3));
-    let mut c = [0.0f32; 16];
-    c[0] = r((m13 * f9 + m9 * f6 + f5 * m5) - (f11 * m5 + f1 * m9 + f4 * m13));
-    c[1] = r((m13 * f12 + m1 * f11 + f2 * m9) - (m13 * f10 + m1 * f5 + f7 * m9));
-    c[2] = r((m5 * f7 + m1 * f1 + f3 * m13) - (m5 * f2 + f6 * m1 + f8 * m13));
-    c[3] = r((m9 * f8 + m1 * f4 + m5 * f10) - (m9 * f3 + m1 * f9 + m5 * f12));
-    c[4] = r((m12 * f4 + m8 * f1 + m4 * f11) - (m12 * f9 + m8 * f6 + m4 * f5));
-    c[5] = r((m12 * f10 + m8 * f7 + m0 * f5) - (m12 * f12 + m8 * f2 + m0 * f11));
-    c[6] = r((m12 * f8 + m0 * f6 + m4 * f2) - (m12 * f3 + m0 * f1 + m4 * f7));
-    c[7] = r((m0 * f9 + m4 * f12 + m8 * f3) - (m0 * f4 + m4 * f10 + m8 * f8));
-    // The other eight's pair products (the original reuses four of its inputs' slots for them).
-    let (g7, g4, g6, g5) = (p(m13, m8), p(m9, m12), p(m4, m13), p(m5, m12));
-    let (g3, g2, h13, g8) = (p(m4, m9), p(m8, m5), p(m0, m13), p(m1, m12));
-    let (h9, g1, h5, h1) = (p(m0, m9), p(m1, m8), p(m0, m5), p(m1, m4));
-    c[8] = r((g5 * m11 + g7 * m7 + m15 * g3) - (g6 * m11 + g4 * m7 + g2 * m15));
-    c[9] = r((g1 * m15 + h13 * m11 + g4 * m3) - (h9 * m15 + m3 * g7 + g8 * m11));
-    c[10] = r((h5 * m15 + g8 * m7 + m3 * g6) - (h1 * m15 + h13 * m7 + g5 * m3));
-    c[11] = r((h1 * m11 + h9 * m7 + m3 * g2) - (h5 * m11 + g1 * m7 + m3 * g3));
-    c[12] = r((m6 * g4 + g6 * m10 + g2 * m14) - (g5 * m10 + m6 * g7 + g3 * m14));
-    c[13] = r((g8 * m10 + h9 * m14 + m2 * g7) - (m2 * g4 + h13 * m10 + g1 * m14));
-    c[14] = r((m2 * g5 + h1 * m14 + m6 * h13) - (m2 * g6 + h5 * m14 + m6 * g8));
-    c[15] = r((g1 * m6 + m2 * g3 + m10 * h5) - (m2 * g2 + h1 * m10 + h9 * m6));
-    let det = r(m12 * d(c[3]) + m8 * d(c[2]) + m0 * d(c[0]) + m4 * d(c[1]));
-    let k = if det == 0.0 { 0.0 } else { r(1.0 / d(det)) };
-    std::array::from_fn(|i| c[i] * k)
+    let pair_product = |(i, j): (usize, usize)| d((d(m[i]) * d(m[j])) as f32);
+    let terms = |list: &[CofactorTerm; 3]| {
+        list.iter().map(|&(entry, pair)| d(m[entry]) * pair_product(pair)).fold(0.0, |sum, t| sum + t)
+    };
+    let cofactors: [f32; 16] = std::array::from_fn(|k| {
+        let (added, subtracted) = &COFACTORS[k];
+        (terms(added) - terms(subtracted)) as f32
+    });
+    let determinant = (((d(m[12]) * d(cofactors[3]) + d(m[8]) * d(cofactors[2])) + d(m[0]) * d(cofactors[0]))
+        + d(m[4]) * d(cofactors[1])) as f32;
+    let scale = if determinant == 0.0 { 0.0 } else { (1.0 / d(determinant)) as f32 };
+    cofactors.map(|c| c * scale)
 }
 
 #[cfg(test)]

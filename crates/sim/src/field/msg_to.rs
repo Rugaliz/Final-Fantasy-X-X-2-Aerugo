@@ -432,7 +432,7 @@ pub fn open(g: &mut FieldState, w: usize, image: &[u8]) {
     let language_type = g.language_type;
     let win = &mut g.windows[w];
     let kind = u16::from(win.style.unwrap_or(0));
-    let flags = win.flags | win.word28;
+    let flags = win.flags | win.extra_text_flags;
     // The value slots' staged types become the active ones.
     win.value_types = (0..0x20).map(|k| win.values.get(k).map_or(0xff, |v| v.0)).collect();
     win.to = To::default();
@@ -535,7 +535,7 @@ pub fn waiting(g: &FieldState) -> u8 {
             if w.mode & 0x22 != 0 {
                 return 2;
             }
-            if w.word16 != 0 || w.mode & 0x10 != 0 {
+            if w.entry_counts != 0 || w.mode & 0x10 != 0 {
                 return 1;
             }
         }
