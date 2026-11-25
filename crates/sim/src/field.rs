@@ -1069,6 +1069,10 @@ pub struct FieldState {
     pub encounters_off: bool,
     /// A battle about to start or running (scripts hold while it runs), and whether it has started.
     pub battle: Option<(crate::encounter::Battle, bool)>,
+    /// The running battle once the host has read its files ([`Event::set_up_battle`]).
+    pub battle_state: Option<Box<crate::battle::Battle>>,
+    /// The kernel tables battles read.
+    pub battle_tables: Option<Arc<crate::battle::BattleTables>>,
     /// Values natives set for parts of the engine not ported yet, by (native, worker or actor).
     pub settings: std::collections::HashMap<(u16, usize), Vec<Value>>,
     /// The shop price rate in percent, when scripts changed it from 100.
@@ -2817,6 +2821,7 @@ impl Event {
         if game == Game::Ffx {
             state.items = crate::items::ItemTables::load(vfs, lang);
             state.stat_tables = crate::stats::StatTables::load(vfs, lang);
+            state.battle_tables = crate::battle::BattleTables::load(vfs, lang);
             state.new_game_tables = crate::new_game::NewGameTables::load(vfs, lang);
             state.texts.commands = state.items.as_ref().map(|t| t.commands.data().into());
             state.texts.items = state.items.as_ref().map(|t| t.items.data().into());
@@ -3054,9 +3059,62 @@ impl Event {
         format!("{area}_{:02}", b.formation_id)
     }
 
+    /// Read the running battle's files and set up its records (MsBattleExe's read steps up to the battle's
+    /// scripts). Once per battle; the battle's own frames are not ported yet.
+    pub fn set_up_battle(&mut self, vfs: &Vfs) -> Result<(), String> {
+        let Some(b) = self.running_battle() else { return Ok(()) };
+        if self.state.battle_state.is_some() {
+            return Ok(());
+        }
+        let encounters = self.state.encounters.clone().ok_or("no encounter table")?;
+        let tables = self.state.battle_tables.clone().ok_or("the battle kernel tables are not loaded")?;
+        let files = FileTable::load(vfs).ok_or("no battle file table")?;
+        let encounter =
+            crate::battle::Encounter::new(&encounters, b).ok_or("the battle's area is not in the table")?;
+        let inputs = crate::battle::setup::Inputs { vfs, files: &files, tables: &tables };
+        let save = &mut self.vm.memory.global[0];
+        let battle = crate::battle::setup::start(&inputs, encounter, save, &mut self.state.rng_streams)?;
+        self.state.battle_state = Some(Box::new(battle));
+        Ok(())
+    }
+
+    /// The running battle's records once set up.
+    pub fn battle_state(&self) -> Option<&crate::battle::Battle> {
+        self.state.battle_state.as_deref()
+    }
+
+    /// Who fights in the set-up battle: slot, name, HP, maximum HP, MP, maximum MP (the front line, then the
+    /// formation's monsters).
+    pub fn battle_roster(&self) -> Vec<(usize, String, i32, i32, i32, i32)> {
+        use crate::battle::records::{self as r, Fields};
+        let Some(b) = self.battle_state() else { return Vec::new() };
+        let charset = self.state.items.as_ref().map(|t| &t.charset);
+        let slots = b.front_line[..3].iter().filter(|&&s| s != 0xff).map(|&s| usize::from(s)).chain(
+            (r::FIRST_MONSTER..r::FIRST_MONSTER + r::MONSTERS)
+                .filter(|&s| b.records.get(s).u8_at(r::IN_BATTLE) != 0),
+        );
+        slots
+            .map(|slot| {
+                let rec = b.records.get(slot);
+                let raw = &rec[r::NAME..r::NAME + 0x28];
+                let raw = &raw[..raw.iter().position(|&c| c == 0).unwrap_or(raw.len())];
+                let name = charset.map_or_else(String::new, |c| aerugo_formats::text::decode_display(raw, c));
+                (
+                    slot,
+                    name,
+                    rec.i32_at(r::HP),
+                    rec.i32_at(r::MAX_HP),
+                    rec.i32_at(r::MP),
+                    rec.i32_at(r::MAX_MP),
+                )
+            })
+            .collect()
+    }
+
     /// End the running battle (won); scripts go on with the next tick.
     pub fn finish_battle(&mut self) {
         self.state.battle = None;
+        self.state.battle_state = None;
         self.state.encounter_counters = Default::default();
     }
 

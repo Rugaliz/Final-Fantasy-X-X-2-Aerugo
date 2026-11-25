@@ -1,7 +1,8 @@
 //! Battles from the field: random encounters as the player walks, and battles scripts start.
 //!
 //! `btl.bin` lists encounter areas: a header (u32 at 4: index offset, u32 at 8: group data offset), then
-//! 14-byte index entries (u16 area id, u16 offset into the group data, u16, 8-byte name such as "bjyt02").
+//! 14-byte index entries (u16 area id, u16 offset into the group data, u16 the area's first battle file, 8-byte
+//! name such as "bjyt02").
 //! An area's data is two bytes (the second: its group count) and its groups, each `[formation count, ?, ?,
 //! danger, total weight]` followed by `(formation, weight)` byte pairs; the weight is the pair's high nibble
 //! (seeded from the low one when the area is first used).
@@ -31,6 +32,8 @@ impl Group {
 pub struct Area {
     pub id: u16,
     pub name: String,
+    /// The number of the area's first battle file (battle file set 0xe): its groups' formations follow in order.
+    pub first_file: u16,
     pub groups: Vec<Group>,
 }
 
@@ -48,7 +51,7 @@ impl EncounterTable {
         let mut areas = Vec::new();
         for i in 0..groups.checked_sub(index)? / 14 {
             let e = index + i * 14;
-            let (id, offset) = (u16_at(e)? as u16, u16_at(e + 2)?);
+            let (id, offset, first_file) = (u16_at(e)? as u16, u16_at(e + 2)?, u16_at(e + 4)? as u16);
             let name: String =
                 d.get(e + 6..e + 14)?.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
             let at = groups + offset;
@@ -65,7 +68,7 @@ impl EncounterTable {
                 list.push(Group { danger, formations, seeds });
                 g += 5 + n * 2;
             }
-            areas.push(Area { id, name, groups: list });
+            areas.push(Area { id, name, first_file, groups: list });
         }
         Some(EncounterTable { areas })
     }
@@ -85,6 +88,14 @@ impl EncounterTable {
                 f.1 = s;
             }
         }
+    }
+
+    /// The battle file (set 0xe) of a battle (MsBtlListCDpos): the area's first file, then every formation of the
+    /// groups before, then the formation's place in its group.
+    pub fn battle_file(&self, b: &Battle) -> Option<usize> {
+        let area = self.areas.get(b.area)?;
+        let before: usize = area.groups.iter().take(b.group).map(|g| g.formations.len()).sum();
+        Some(usize::from(area.first_file) + before + b.formation)
     }
 
     /// A battle label (area id << 16 | formation) as area index, group and formation index.
@@ -203,6 +214,7 @@ mod tests {
             areas: vec![Area {
                 id: 0x32,
                 name: "cdsp00".into(),
+                first_file: 0,
                 groups: vec![Group { danger: 60, formations: vec![(0, 1), (1, 3)], seeds: vec![1, 3] }],
             }],
         }

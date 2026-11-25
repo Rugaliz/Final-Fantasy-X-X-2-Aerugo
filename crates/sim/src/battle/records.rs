@@ -1,0 +1,258 @@
+//! The battle character records as the original keeps them (btl_get_chr): 31 full records of 0xf90 bytes (slots
+//! 0–0x11 the characters and aeons in save order, 0x14–0x1b the formation's monsters, the rest spare), 62 short
+//! records of 0x390 bytes (slots 0x1f–0x5c, which only the record head of the battle set-up touches) and one
+//! spare record every other slot reads.
+//!
+//! Offsets are bytes from a record's start. Fields whose role is traced have names here; the set-up's other
+//! defaults are kept as the original writes them (see [`crate::battle::setup`]) until their readers are ported.
+
+/// Full records.
+pub const FULL_SLOTS: usize = 0x1f;
+pub const FULL_SIZE: usize = 0xf90;
+/// Short records (slots 0x1f–0x5c).
+pub const SHORT_SLOTS: usize = 0x5d - FULL_SLOTS;
+pub const SHORT_SIZE: usize = 0x390;
+/// Every slot below this has a record of its own.
+pub const SLOTS: usize = 0x5d;
+/// The characters and aeons (save order: 0–7 characters, 8–0x11 aeons).
+pub const PARTY_SLOTS: usize = 0x12;
+/// The first monster slot, and how many there are.
+pub const FIRST_MONSTER: usize = 0x14;
+pub const MONSTERS: usize = 8;
+
+/// The slot's number (+0xc).
+pub const SLOT: usize = 0xc;
+/// Who holds the slot (+0xe): a character or aeon number, 0x1000 | monster number, 0xffff nobody.
+pub const CHARACTER: usize = 0xe;
+/// Taking part in this battle (+0x10).
+pub const IN_BATTLE: usize = 0x10;
+/// Whether the monster reads its own file (+0x11, 1) or shares an earlier slot's (0; +0x14 then names that
+/// slot).
+pub const OWN_FILE: usize = 0x11;
+pub const FILE_SLOT: usize = 0x14;
+/// Present (+0x24): the monster read checks it before reading a file.
+pub const PRESENT: usize = 0x24;
+/// The record is set up for the battle's display (+0x38, MsBtlReadMonsterProcess).
+pub const DISPLAY_READY: usize = 0x38;
+/// The models (+4: the model number, +8 the battle model; a monster's from its stats, +0x74).
+pub const MODEL: usize = 0x4;
+pub const BATTLE_MODEL: usize = 0x8;
+/// The monster file the slot reads (+0x48 in the original a pointer; here the index of the read file + 1, 0
+/// none).
+pub const MONSTER_FILE: usize = 0x48;
+/// A monster's texts from the monster tables: name (0x40 bytes), the Sensor text (0x100), the Scan text
+/// (0x200).
+pub const MONSTER_NAME: usize = 0x50;
+pub const MONSTER_NAME_SIZE: usize = 0x40;
+pub const SENSOR_TEXT: usize = 0x90;
+pub const SENSOR_TEXT_SIZE: usize = 0x100;
+pub const SCAN_TEXT: usize = 0x190;
+pub const SCAN_TEXT_SIZE: usize = 0x200;
+/// The kind of combatant (+0x4fd): 3 character, 4 aeon, 5 monster.
+pub const KIND: usize = 0x4fd;
+pub const KIND_CHARACTER: u8 = 3;
+pub const KIND_AEON: u8 = 4;
+pub const KIND_MONSTER: u8 = 5;
+/// The order number (+0x4fe): a character's place in the front line, an aeon's number, a monster's place in
+/// the formation.
+pub const ORDER: usize = 0x4fe;
+
+/// The battle parameter block (+0x540, 0x1ec bytes): what the stat natives read and the formulas use.
+pub const PARAMS: usize = 0x540;
+pub const PARAMS_SIZE: usize = 0x1ec;
+/// The name in battle (+0x540: a character's 0x14 bytes from the save, a monster's 0x28 from +0x50).
+pub const NAME: usize = 0x540;
+/// The ply_rom record's flags (+0x590; bit 2 an aeon).
+pub const ROM_FLAGS: usize = 0x590;
+/// The save record's party bits (+0x591).
+pub const PARTY_FLAGS: usize = 0x591;
+/// The equipment worn (+0x592 weapon, +0x593 armour: equipment slots, 0xff none; a monster 0xffff).
+pub const WEAPON: usize = 0x592;
+pub const ARMOUR: usize = 0x593;
+/// Maximum HP and MP (+0x594 / +0x598), and the maximums before the battle's changes (+0x59c / +0x5a0).
+pub const MAX_HP: usize = 0x594;
+pub const MAX_MP: usize = 0x598;
+pub const BASE_MAX_HP: usize = 0x59c;
+pub const BASE_MAX_MP: usize = 0x5a0;
+/// +0x5a4: the save record's +0x24 for a character, a monster's stats +0x1c (also kept at +0xf60).
+pub const OVERKILL_OR_BASE: usize = 0x5a4;
+/// The stats (+0x5a8..+0x5af: strength, defence, magic, magic defence, agility, luck, evasion, accuracy) and
+/// what the battle adds to them (+0x5b0..+0x5b7).
+pub const STATS: usize = 0x5a8;
+pub const STAT_BONUSES: usize = 0x5b0;
+pub const STAT_COUNT: usize = 8;
+/// +0x5b8 the character flags (a monster's from its stats +0x28; a character gets bit 9).
+pub const FLAGS: usize = 0x5b8;
+/// The weapon's damage kind (+0x5c1) and critical bonus (+0x5c7).
+pub const WEAPON_FORMULA: usize = 0x5c1;
+pub const WEAPON_CRITICAL: usize = 0x5c7;
+/// The record's own slot as the kernel sees it (+0x5c2; a monster's from its stats +0x76) and its copy number
+/// (+0x5c3).
+pub const KERNEL_SLOT: usize = 0x5c2;
+pub const COPY_NUMBER: usize = 0x5c3;
+/// HP and MP now (+0x5d0 / +0x5d4), and at the battle's start (+0x6e4 / +0x6e8).
+pub const HP: usize = 0x5d0;
+pub const MP: usize = 0x5d4;
+pub const START_HP: usize = 0x6e4;
+pub const START_MP: usize = 0x6e8;
+/// What the equipment's auto-abilities add up to (+0x5d8: the weapon's power bonus; +0x5d9..+0x5dd the
+/// abilities' bits; +0x5de 0x19 and +0x5f7 0xd sums; +0x604 a word).
+pub const EQUIPMENT_POWER: usize = 0x5d8;
+pub const ABILITY_BITS: usize = 0x5d9;
+pub const ABILITY_SUMS: usize = 0x5de;
+pub const ABILITY_SUMS_COUNT: usize = 0x19;
+pub const ABILITY_SUMS2: usize = 0x5f7;
+pub const ABILITY_SUMS2_COUNT: usize = 0xd;
+pub const ABILITY_WORD: usize = 0x604;
+/// The status bits (+0x606; bit 0 knocked out).
+pub const STATUS: usize = 0x606;
+pub const STATUS_KO: u16 = 1;
+/// Auto-statuses from the equipment (+0x630..+0x634), or the second set (+0x636..+0x63a, with +0x63c set) when
+/// the ability's flags +0x10 bit 0 are set; a monster's from its stats +0x48..+0x4c.
+pub const AUTO_STATUS: usize = 0x630;
+pub const AUTO_STATUS2: usize = 0x636;
+pub const AUTO_STATUS2_ON: usize = 0x63c;
+/// The resistances (+0x641, 0x19 bytes).
+pub const RESISTANCES: usize = 0x641;
+pub const RESISTANCE_COUNT: usize = 0x19;
+/// +0x65a a word the abilities OR in (a monster's stats +0x4e).
+pub const RESIST_WORD: usize = 0x65a;
+/// The commands a character has learned (+0x664, six words from the save record +0x3e) and the shared ones
+/// (+0x670, sixteen words from save +0x3d6c).
+pub const LEARNED: usize = 0x664;
+pub const SHARED_LEARNED: usize = 0x670;
+/// +0x6bc..+0x6c0 words the abilities OR in.
+pub const ABILITY_WORDS: usize = 0x6bc;
+/// The first commands (+0x6c6, +0x6c8).
+pub const FIRST_COMMAND: usize = 0x6c6;
+pub const SECOND_COMMAND: usize = 0x6c8;
+/// On the battlefield (+0xdc8).
+pub const ACTIVE: usize = 0xdc8;
+/// +0xdcc 2 when the record starts knocked out.
+pub const START_STATE: usize = 0xdcc;
+/// A monster's file read order (+0xdf5) and the first byte of its file's chunk 1 (+0xdf6).
+pub const FILE_ORDER: usize = 0xdf5;
+pub const MONSTER_HEAD: usize = 0xdf6;
+
+/// The reward records (0x118 bytes per slot; a monster's copy of its file's chunk 4, a character's untouched).
+pub const REWARD_SIZE: usize = 0x118;
+
+/// All the records.
+#[derive(Clone)]
+pub struct Records {
+    full: Vec<u8>,
+    short: Vec<u8>,
+    spare: Vec<u8>,
+    /// The reward records (DAT 1136068 + slot · 0x118).
+    pub rewards: Vec<u8>,
+}
+
+impl Default for Records {
+    fn default() -> Self {
+        Records {
+            full: vec![0; FULL_SLOTS * FULL_SIZE],
+            short: vec![0; SHORT_SLOTS * SHORT_SIZE],
+            spare: vec![0; FULL_SIZE],
+            rewards: vec![0; FULL_SLOTS * REWARD_SIZE],
+        }
+    }
+}
+
+impl std::fmt::Debug for Records {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Records").finish_non_exhaustive()
+    }
+}
+
+impl Records {
+    /// A slot's record (btl_get_chr: the slot's low byte; slots past the short records read the spare one).
+    pub fn get(&self, slot: usize) -> &[u8] {
+        let slot = slot & 0xff;
+        if slot < FULL_SLOTS {
+            &self.full[slot * FULL_SIZE..(slot + 1) * FULL_SIZE]
+        } else if slot < SLOTS {
+            let i = slot - FULL_SLOTS;
+            &self.short[i * SHORT_SIZE..(i + 1) * SHORT_SIZE]
+        } else {
+            &self.spare
+        }
+    }
+
+    pub fn get_mut(&mut self, slot: usize) -> &mut [u8] {
+        let slot = slot & 0xff;
+        if slot < FULL_SLOTS {
+            &mut self.full[slot * FULL_SIZE..(slot + 1) * FULL_SIZE]
+        } else if slot < SLOTS {
+            let i = slot - FULL_SLOTS;
+            &mut self.short[i * SHORT_SIZE..(i + 1) * SHORT_SIZE]
+        } else {
+            &mut self.spare
+        }
+    }
+
+    /// A monster's record by its place in the formation (MsGetMon).
+    pub fn monster(&self, index: usize) -> &[u8] {
+        self.get(FIRST_MONSTER + index)
+    }
+
+    pub fn reward_mut(&mut self, slot: usize) -> &mut [u8] {
+        &mut self.rewards[slot * REWARD_SIZE..(slot + 1) * REWARD_SIZE]
+    }
+}
+
+/// Whether a slot holds a monster (MsGetRamChrMonster: 0x14–0x1b).
+pub fn is_monster_slot(slot: usize) -> bool {
+    (slot & 0xff).wrapping_sub(FIRST_MONSTER) < MONSTERS
+}
+
+/// Little-endian reads and writes on a record; a field past the record's end reads 0 and is not written.
+pub trait Fields {
+    fn u8_at(&self, at: usize) -> u8;
+    fn u16_at(&self, at: usize) -> u16;
+    fn u32_at(&self, at: usize) -> u32;
+    fn i32_at(&self, at: usize) -> i32 {
+        self.u32_at(at) as i32
+    }
+    fn set_u8(&mut self, at: usize, v: u8);
+    fn set_u16(&mut self, at: usize, v: u16);
+    fn set_u32(&mut self, at: usize, v: u32);
+    fn set_i32(&mut self, at: usize, v: i32) {
+        self.set_u32(at, v as u32);
+    }
+    fn set_f32(&mut self, at: usize, v: f32) {
+        self.set_u32(at, v.to_bits());
+    }
+}
+
+impl Fields for [u8] {
+    fn u8_at(&self, at: usize) -> u8 {
+        self.get(at).copied().unwrap_or(0)
+    }
+    fn u16_at(&self, at: usize) -> u16 {
+        self.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32_at(&self, at: usize) -> u32 {
+        self.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn set_u8(&mut self, at: usize, v: u8) {
+        if let Some(b) = self.get_mut(at) {
+            *b = v;
+        }
+    }
+    fn set_u16(&mut self, at: usize, v: u16) {
+        if let Some(b) = self.get_mut(at..at + 2) {
+            b.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    fn set_u32(&mut self, at: usize, v: u32) {
+        if let Some(b) = self.get_mut(at..at + 4) {
+            b.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// clamp_i32: raised to `low`, then lowered to `high` (so `high` wins when they cross).
+pub fn clamp(v: i32, low: i32, high: i32) -> i32 {
+    let v = if v < low { low } else { v };
+    if v > high { high } else { v }
+}

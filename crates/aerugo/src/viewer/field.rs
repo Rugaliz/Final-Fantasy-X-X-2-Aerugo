@@ -769,11 +769,18 @@ impl FieldView {
         if let Some(mode) = self.session.as_ref().and_then(|s| s.event.open_menu()) {
             self.menu_window(ui, mode);
         }
-        // Battles are not ported yet: a placeholder that ends them as won.
+        // Battles: the set-up is ported (records from the save and the monster files); the battle's frames are
+        // not, so a placeholder ends them as won.
         if let Some(s) = &mut self.session
             && let Some(b) = s.event.running_battle()
         {
+            if s.event.battle_state().is_none()
+                && let Err(e) = s.event.set_up_battle(vfs)
+            {
+                log::error!("GAP: battle set-up failed: {e}");
+            }
             let name = s.event.battle_name(&b);
+            let roster = s.event.battle_roster();
             let mut won = false;
             egui::Window::new("Battle").collapsible(false).show(ui.ctx(), |ui| {
                 ui.label(format!(
@@ -782,6 +789,10 @@ impl FieldView {
                     b.group,
                     b.formation
                 ));
+                for (slot, who, hp, max_hp, mp, max_mp) in &roster {
+                    ui.label(format!("{slot:#04x} {who}: HP {hp}/{max_hp} MP {mp}/{max_mp}"));
+                }
+                ui.label("The battle itself is not ported yet.");
                 won = ui.button("Win").clicked();
             });
             if won {

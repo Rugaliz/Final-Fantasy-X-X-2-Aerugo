@@ -5,6 +5,7 @@
 //! the original timing. This crate has no graphics, audio or window dependencies.
 
 pub mod auto_abilities;
+pub mod battle;
 pub mod camera_move;
 pub mod chr;
 pub mod control;
