@@ -501,30 +501,6 @@ impl F32Bits for f64 {
     }
 }
 
-/// The inputs of a draw whose geometry the renderer builds (the tails, the shape field): the program, the
-/// object and reference, copies of the key and the program's work (and the second work, the colour), the
-/// object's matrix and the part's scale, colour and the camera.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GeometryDraw {
-    pub program: &'static str,
-    pub object: u32,
-    pub ref_index: u32,
-    pub key: Vec<u8>,
-    pub work: Vec<u8>,
-    pub colour_work: Vec<u8>,
-    /// The shape list entry the key names and the shape.
-    pub entry: u32,
-    pub shape: u32,
-    /// The object's matrix (+0x10) and age.
-    pub matrix: crate::chr::elements::Mat,
-    pub age: u32,
-    pub part_scale: [f32; 4],
-    pub part_colour: [u16; 4],
-    pub camera: crate::chr::elements::Mat,
-    /// A buffer the program keeps in the pool (the shape field's sprites and colours).
-    pub extra: Vec<u8>,
-}
-
 /// A program's request to the renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderCall {
@@ -540,7 +516,6 @@ pub enum RenderCall {
         index: u32,
         shape: u32,
     },
-    Geometry(Box<GeometryDraw>),
     /// The render entry of (object, reference index) destroyed.
     Destroy {
         object: u32,

@@ -2480,42 +2480,6 @@ fn ke_lns_fls_init(r: &mut Run, o: u32, rf: u32) {
     r.m.set_u32(a + 4, 0);
 }
 
-/// A copy of `n` bytes at `at`.
-fn bytes(r: &Run, at_: u32, n: u32) -> Vec<u8> {
-    (0..n).map(|i| r.m.u8(at_.wrapping_add(i))).collect()
-}
-
-fn geometry(
-    r: &mut Run,
-    program: &'static str,
-    o: u32,
-    key: u32,
-    rf: u32,
-    sizes: (u32, u32, u32),
-    extra: Vec<u8>,
-) {
-    let (wa, wb) = works(r, rf);
-    let n = r.m.u32(key + 4);
-    let entry = r.env.lists[1].wrapping_add(4 * n);
-    let draw = super::GeometryDraw {
-        program,
-        object: o,
-        ref_index: r.ref_index,
-        key: bytes(r, key, sizes.0),
-        work: bytes(r, at(o, wa), sizes.1),
-        colour_work: bytes(r, at(o, wb), sizes.2),
-        entry,
-        shape: r.m.u32(entry),
-        matrix: get_mat(r, o + 0x10),
-        age: r.m.u32(o + 0xc),
-        part_scale: r.part_scale,
-        part_colour: r.part_colour,
-        camera: r.camera,
-        extra,
-    };
-    r.render.push(super::RenderCall::Geometry(Box::new(draw)));
-}
-
 /// The tails' position history: on the object's first frame every entry is its position (w 1); then the
 /// ring's index steps back (from `len` when 0) and that entry takes the position (w kept).
 fn tail_ring(r: &mut Run, o: u32, ring: u32, index: u32, len: u8) {
@@ -2776,10 +2740,160 @@ fn ke_shp_tail3_draw(r: &mut Run, o: u32, key: u32, rf: u32) {
     if r.paused {
         return;
     }
-    geometry(r, "pppKeShpTail3", o, key, rf, (0x50, 0x200, 8), Vec::new());
+    if r.m.u32(key + 4) != 0xffff {
+        let draw = tail3_instances(r, o, key, rf);
+        r.render.push(super::RenderCall::ShapeField(Box::new(draw)));
+    }
     let (wa, _) = works(r, rf);
     let a = at(o, wa);
     r.m.set_u32(a + 0x1f0, r.m.u32(a + 0x1f0).wrapping_add(r.m.u32(key + 8)));
+}
+
+/// The tail's random generator step (a 16-bit linear congruence).
+fn tail_random(seed: u32) -> u32 {
+    seed.wrapping_mul(0x80d).wrapping_add(7) & 0xffff
+}
+
+/// PppKeShpTail3's draw: copies of the shape along the object's position history, each showing a frame picked
+/// by the tail's random generator (from its seed +0x1f6, the same sequence every frame: the frame its time
+/// +0x1f0 plus the random value reaches). The key gives the count (+0x1c byte), the start and end scales (+0xc /
+/// +0x10), the spacing (+0x18, shrinking with the scale), a random shrink (+0x14: the copy's scale is cut by up
+/// to that share) and a random turn (+0x1e); the colours step from the work's first to its second (four i16
+/// each, times the part's colour · 2⁻¹⁹, the alpha also times the colour work's alpha / 16384). Each copy's
+/// matrix: the object's first two axes, scaled by the part's scale and the copy's (and turned by the random
+/// angle through the engine's sine table), at the camera's transform of its point (w 1). With key +0x1d the
+/// first copy sits at the newest position.
+fn tail3_instances(r: &mut Run, o: u32, key: u32, rf: u32) -> super::ShapeFieldDraw {
+    use crate::chr::elements::{IDENTITY, Mat};
+    let (wa, wb) = works(r, rf);
+    let (a, colour_work) = (at(o, wa), at(o, wb));
+    let entry = r.env.lists[1].wrapping_add(4 * r.m.u32(key + 4));
+    let shape = r.m.u32(entry);
+    let first = shape.wrapping_add(r.m.u16(shape + 0x10) as i16 as i32 as u32);
+    let create = blend_state(r.m.u8(first.wrapping_add(r.m.u32(first + 4)) + 4));
+    let mut draw = super::ShapeFieldDraw {
+        object: o,
+        ref_index: r.ref_index,
+        shape,
+        flags: 0x80,
+        create,
+        sprites: Vec::new(),
+    };
+    let mut count = u32::from(r.m.u8(key + 0x1c));
+    let steps = (count as i32 - 1) as f32;
+    let alpha = f32::from(r.m.u16(colour_work + 6) as i16) * 6.103_515_6e-5;
+    let tinted = |r: &Run, at: u32, c: usize| {
+        (i32::from(r.m.u16(at) as i16).wrapping_mul(i32::from(r.part_colour[c]))) as f32 * 1.907_348_6e-6
+    };
+    let mut colour: [f32; 4] = std::array::from_fn(|c| tinted(r, a + 2 * c as u32, c));
+    let mut end: [f32; 4] = std::array::from_fn(|c| tinted(r, a + 8 + 2 * c as u32, c));
+    colour[3] *= alpha;
+    end[3] *= alpha;
+    let colour_step: [f32; 4] = if steps == 0.0 {
+        [0.0; 4]
+    } else {
+        let k = 1.0 / steps;
+        sub4(colour, end).map(|c| k * c)
+    };
+    let mut scale = r.m.f32(key + 0xc);
+    let scale_step = (scale - r.m.f32(key + 0x10)) / steps;
+    let mut spacing = r.m.f32(key + 0x18);
+    let spacing_step = spacing * (scale_step / scale);
+    if spacing == 0.0 {
+        count = 0;
+    }
+    // The object's first two axes, scaled by the part's scale.
+    let object = get_mat(r, o + 0x10);
+    let axis_x: [f32; 3] = std::array::from_fn(|i| r.part_scale[0] * object[i]);
+    let axis_y: [f32; 3] = std::array::from_fn(|i| object[4 + i] * r.part_scale[1]);
+    let camera = r.camera;
+    let head = u32::from(r.m.u8(a + 0x1f8));
+    let ring = |r: &Run, i: u32| vec4(r, a + 0x30 + 0x10 * i);
+    let next_index = |i: u32| if i == 0x1b { 0 } else { i + 1 };
+    let mut point = ring(r, head);
+    let mut previous = point;
+    let mut index = next_index(head);
+    let mut current = ring(r, index);
+    let mut direction = sub4(current, previous);
+    let mut ahead = length3(direction);
+    let mut segment = ahead;
+    let mut along = spacing;
+    let time = r.m.u32(a + 0x1f0);
+    let mut seed = u32::from(r.m.u16(a + 0x1f6));
+    let (duration, frames) =
+        (r.m.u16(shape + 0x12) as i16 as i32 as u32, r.m.u16(shape + 6) as i16 as i32 as u32);
+    let shrink = r.m.f32(key + 0x14);
+    let turned = r.m.u16(key + 0x1e) != 0;
+    let sine = crate::traced_tables::sine();
+    let mut place_copy = |draw: &mut super::ShapeFieldDraw, colour: [f32; 4], scale: f32, point: [f32; 4]| {
+        seed = tail_random(seed);
+        let frame = if duration == 0 || frames == 0 {
+            // (The original divides by zero here.)
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| log::error!("GAP: tail shape {shape:#x} has a zero frame duration or count"));
+            0
+        } else {
+            ((u64::from(seed.wrapping_add(time)) / u64::from(duration)) % u64::from(frames)) as u16
+        };
+        let k = (1.0 - (seed as f32 / 65535.0) * shrink) * scale;
+        let mut x: [f32; 3] = axis_x.map(|v| k * v);
+        let mut y: [f32; 3] = axis_y.map(|v| v * k);
+        if turned {
+            let (sin, cos) = (sine[(seed >> 4) as usize], sine[((seed + 0x4000) >> 4 & 0xfff) as usize]);
+            let (x0, y0) = (x, y);
+            let d = f64::from;
+            x = std::array::from_fn(|i| (d(cos) * d(x0[i]) + d(sin) * d(y0[i])) as f32);
+            y = std::array::from_fn(|i| (d(cos * y0[i]) - d(sin) * d(x0[i])) as f32);
+        }
+        let mut matrix: Mat = IDENTITY;
+        matrix[..3].copy_from_slice(&x);
+        matrix[4..7].copy_from_slice(&y);
+        let d = f64::from;
+        for c in 0..3 {
+            let xyz = ((d(point[2]) * d(camera[8 + c]) + d(point[0]) * d(camera[c]))
+                + d(point[1]) * d(camera[4 + c])) as f32;
+            matrix[12 + c] = (d(camera[12 + c]) + d(xyz)) as f32;
+        }
+        let packed = colour.map(|c| c.round_ties_even() as i32 as u8);
+        draw.sprites.push(super::FieldSprite { frame, colour: packed, matrix, work_matrix: None });
+    };
+    if r.m.u8(key + 0x1d) != 0 {
+        place_copy(&mut draw, colour, scale, point);
+    }
+    loop {
+        count = count.wrapping_sub(1);
+        if count == 0 {
+            break;
+        }
+        colour = sub4(colour, colour_step);
+        scale -= scale_step;
+        spacing -= spacing_step;
+        if spacing <= 0.0 {
+            break;
+        }
+        // (The comparison walks on when either is NaN, as the x87 one does.)
+        while ahead < spacing || ahead.is_nan() || spacing.is_nan() {
+            index = next_index(index);
+            if index == head {
+                return draw;
+            }
+            previous = current;
+            current = ring(r, index);
+            direction = sub4(current, previous);
+            along -= segment;
+            let y2 = direction[1] * direction[1];
+            let z2 = direction[2] * direction[2];
+            let xy = (f64::from(y2) + f64::from(direction[0]) * f64::from(direction[0])) as f32;
+            segment = f64::from(xy + z2).sqrt() as f32;
+            ahead += segment;
+        }
+        let t = along / segment;
+        point = std::array::from_fn(|i| t * direction[i] + previous[i]);
+        along += spacing;
+        ahead -= spacing;
+        place_copy(&mut draw, colour, scale, point);
+    }
+    draw
 }
 
 /// The init: the index, time and a C-runtime random seed (+0x1f6), the colours cleared.
