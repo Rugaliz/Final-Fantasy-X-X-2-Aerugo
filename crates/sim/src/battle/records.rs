@@ -247,6 +247,12 @@ pub const BOOST_PHYSICAL: usize = 0x65e;
 pub const BOOST_MAGIC: usize = 0x660;
 /// The CTB wait when the command was calculated (+0x6ec, with HP / MP at +0x6e4 / +0x6e8).
 pub const START_WAIT: usize = 0x6ec;
+/// The hit roll's boosts: the attacker's accuracy (+0x65f) and luck (+0x662) boosts, the target's evasion
+/// boost (+0x661) and a bonus the target gives every hit on it (+0x663).
+pub const ACCURACY_BOOST: usize = 0x65f;
+pub const EVASION_BOOST: usize = 0x661;
+pub const LUCK_BOOST: usize = 0x662;
+pub const HIT_BONUS_AGAINST: usize = 0x663;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).

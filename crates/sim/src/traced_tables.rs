@@ -685,6 +685,9 @@ pub const BATTLE_MODELS: [u32; 0x12] = [
     0x3002, 0x3003, 0x3004, 0x3006, 0x3007, 0x3008, 0x3009, 0x300a, 0x300b,
 ];
 
+/// The battle hit chances (of 100) by accuracy step 0–8.
+pub const HIT_CHANCES: [i8; 9] = [25, 30, 30, 40, 40, 50, 60, 80, 100];
+
 #[rustfmt::skip]
 pub const ENGINE_PROGRAMS: [&str; 418] = [
     "pppAccele", "pppAngAccele", "pppSclAccele", "pppColAccele",
