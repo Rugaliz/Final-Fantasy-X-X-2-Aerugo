@@ -253,6 +253,10 @@ pub const ACCURACY_BOOST: usize = 0x65f;
 pub const EVASION_BOOST: usize = 0x661;
 pub const LUCK_BOOST: usize = 0x662;
 pub const HIT_BONUS_AGAINST: usize = 0x663;
+/// A timed damage bonus (+0xd26 on; damage × (gained +0xd2c + 2·base +0xd30) / (2·base)).
+pub const TIMED_BONUS_ON: usize = 0xd26;
+pub const TIMED_BONUS_GAINED: usize = 0xd2c;
+pub const TIMED_BONUS_BASE: usize = 0xd30;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).

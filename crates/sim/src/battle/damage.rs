@@ -305,3 +305,186 @@ pub fn item_healing_boost(attacker: &[u8], cmd: &[u8], command_id: u32, formula:
         damage
     }
 }
+
+/// The record flags (+0x5b8) the damage steps test.
+pub mod record_flags {
+    /// Armoured: physical damage is a third (78a830).
+    pub const ARMOURED: u8 = 1;
+    /// Unaffected by the percentage formulas 5 and 8 (78ad80).
+    pub const NO_PERCENT_DAMAGE: u8 = 2;
+    /// Takes no physical (0x20), magical (0x40) or any (0x80) damage (78aac0).
+    pub const NO_PHYSICAL: u8 = 0x20;
+    pub const NO_MAGICAL: u8 = 0x40;
+    pub const NO_DAMAGE: u8 = 0x80;
+}
+
+/// The damage class of a command (+0x20 bits 0–1): 1 physical, 2 magical.
+fn class(cmd: &[u8]) -> u8 {
+    cmd.u8_at(command::CLASS) & 3
+}
+
+/// 007891e0: the auto-abilities' percents (stats' per-character table: attack physical / magical, defence
+/// physical / magical): the attacker's raise the damage, the target's take it down.
+pub fn ability_percents(attacker: &[u8; 4], target: &[u8; 4], cmd: &[u8], damage: i32) -> i32 {
+    let (raise, lower) = match class(cmd) {
+        1 => (attacker[0], target[2]),
+        2 => (attacker[1], target[3]),
+        _ => return damage,
+    };
+    let mut damage = damage;
+    if raise != 0 {
+        damage += (u32::from(raise) * damage as u32) as i32 / 100;
+    }
+    if lower == 0 {
+        return damage;
+    }
+    // (The original divides u·d by −100 through its reciprocal: d − u·d/100 truncated toward zero.)
+    let product = (u32::from(lower) * damage as u32) as i32;
+    damage - product / 100
+}
+
+/// 0078ad80: formulas 5 and 8 do nothing to a record with [`record_flags::NO_PERCENT_DAMAGE`] (the kind bit is
+/// cleared and the hit counted as nullified).
+pub fn percent_immunity(
+    target: &[u8],
+    formula: u8,
+    kinds: &mut u32,
+    kind: u32,
+    nullified: &mut i32,
+    damage: i32,
+) -> i32 {
+    if (formula == 8 || formula == 5) && target.u8_at(r::FLAGS) & record_flags::NO_PERCENT_DAMAGE != 0 {
+        *kinds &= !kind;
+        *nullified += 1;
+        return 0;
+    }
+    damage
+}
+
+/// 0078a200: a draining command (+0x1c bit 0x100) turns round on exactly one of the attacker's status bit 1 and
+/// the hit's +0x14 bit 1.
+pub fn drain_turn(attacker: &[u8], cmd: &[u8], hit: &[u8], damage: i32) -> i32 {
+    let turned = (attacker.u16_at(r::STATUS) >> 1 & 1) + (hit.u16_at(0x14) >> 1 & 1) == 1;
+    if cmd.u32_at(command::FLAGS) & 0x100 != 0 && turned { -damage } else { damage }
+}
+
+/// 0078a830: an armoured target takes a third, unless the command (+0x1e bit 0) or the attacker (ability word
+/// bit 13) pierces or the hit (+0x14 bit 6) does; `armoured` is set when it applies.
+pub fn armour(
+    attacker: &[u8],
+    target: &[u8],
+    cmd: &[u8],
+    hit: &[u8],
+    armoured: &mut bool,
+    damage: i32,
+) -> i32 {
+    if cmd.u8_at(0x1e) & 1 == 0
+        && target.u8_at(r::FLAGS) & record_flags::ARMOURED != 0
+        && attacker.u16_at(r::ABILITY_WORDS) & 0x2000 == 0
+        && hit.u8_at(0x14) & 0x40 == 0
+    {
+        *armoured = true;
+        return damage / 3;
+    }
+    damage
+}
+
+/// 0078a7d0: a physical hit the hit's +0x16 bits 0x800 / 0x2000 guard halves (+0x6da set; marks 8 or 0x10).
+pub fn guarded(target: &mut [u8], cmd: &[u8], marks: &mut u32, hit: &[u8], damage: i32) -> i32 {
+    if class(cmd) != 1 {
+        return damage;
+    }
+    let guard = hit.u16_at(0x16);
+    if guard & 0x2800 == 0 {
+        return damage;
+    }
+    target.set_u8(0x6da, 1);
+    *marks |= if guard & 0x800 == 0 { 0x10 } else { 8 };
+    damage / 2
+}
+
+/// 00789290: the attacker's status bit 4 halves the physical damage it deals, bit 5 the magical.
+pub fn attacker_halved(attacker: &[u8], cmd: &[u8], damage: i32) -> i32 {
+    let status = attacker.u16_at(r::STATUS);
+    match class(cmd) {
+        1 if status & 0x10 != 0 => damage / 2,
+        2 if status & 0x20 != 0 => damage / 2,
+        _ => damage,
+    }
+}
+
+/// 0078aac0: a target that takes none of this class (or none at all) nullifies the hit.
+pub fn damage_immunity(
+    target: &[u8],
+    cmd: &[u8],
+    kinds: &mut u32,
+    kind: u32,
+    nullified: &mut i32,
+    damage: i32,
+) -> i32 {
+    let flags = target.u8_at(r::FLAGS);
+    let by_class = match class(cmd) {
+        1 => flags & record_flags::NO_PHYSICAL != 0,
+        2 => flags & record_flags::NO_MAGICAL != 0,
+        _ => false,
+    };
+    if flags & record_flags::NO_DAMAGE == 0 && !by_class {
+        return damage;
+    }
+    *kinds &= !kind;
+    *nullified += 1;
+    0
+}
+
+/// 0078bd90: with the attacker's timed bonus on (+0xd26), damage × (gained + 2·base) / (2·base) (+0xd2c,
+/// +0xd30), in the original's float steps.
+pub fn timed_bonus(attacker: &[u8], damage: i32) -> i32 {
+    if attacker.u8_at(r::TIMED_BONUS_ON) == 0 {
+        return damage;
+    }
+    let base = f64::from(f32::from_bits(attacker.u32_at(r::TIMED_BONUS_BASE)));
+    let gained = f64::from(f32::from_bits(attacker.u32_at(r::TIMED_BONUS_GAINED)));
+    let twice = base + base;
+    ((gained + twice) * f64::from(damage as f32) / twice) as i32
+}
+
+/// 0078e0f0: a delaying command (+0x1c bit 0x2000 a turn and a half, 0x4000 three) adds its ticks to the
+/// target's CTB result and marks the CTB kind (4).
+pub fn delay(
+    tables: &super::BattleTables,
+    target: &[u8],
+    cmd: &[u8],
+    kinds: u32,
+    ctb_result: &mut i32,
+) -> u32 {
+    let flags = cmd.u32_at(command::FLAGS);
+    let factor = if flags & 0x4000 != 0 {
+        2
+    } else if flags & 0x2000 != 0 {
+        1
+    } else {
+        return kinds;
+    };
+    let index = r::clamp(i32::from(target.u8_at(r::AGILITY)), 1, 0xff) - 1;
+    let ticks = super::kernel_record(&tables.ctb_base, index as u32).map_or(0, |k| k.bytes.u8_at(0));
+    *ctb_result += (u32::from(ticks) * 3 * factor / 2) as i32;
+    kinds | 4
+}
+
+/// 0078bd50: a hit with +0x14 bit 0x800 cancels the CTB part (the kind bit cleared, counted as nullified).
+pub fn delay_cancelled(
+    hit: &[u8],
+    marks: &mut u32,
+    kind: u32,
+    kinds: u32,
+    nullified: &mut i32,
+    ctb_result: &mut i32,
+) -> u32 {
+    if kinds & 4 == 0 || hit.u16_at(0x14) & 0x800 == 0 {
+        return kinds;
+    }
+    *ctb_result = 0;
+    *marks &= !kind;
+    *nullified += 1;
+    kinds
+}
