@@ -230,6 +230,17 @@ pub const IN_CUE: usize = 0xde6;
 pub const TURN_MARK: usize = 0xde8;
 pub const TAKES_TURNS: usize = 0xdd6;
 pub const TICKS: usize = 0x6d2;
+/// Times the record is in the command cue (+0xde7), its turn's start entry has run (+0xdf7), its input cue
+/// index (+0xde4, 0xff none), a formation monster (+0xdf3), counted for the outcome (+0xdd2 / +0xdd3),
+/// appearing (+0x433: the command cue waits), its command held (+0x50e), the auto-command taken (+0x716).
+pub const IN_COMMAND_CUE: usize = 0xde7;
+pub const TURN_STARTED: usize = 0xdf7;
+pub const INPUT_INDEX: usize = 0xde4;
+pub const FORMATION_MONSTER: usize = 0xdf3;
+pub const COUNTS: usize = 0xdd2;
+pub const APPEARING: usize = 0x433;
+pub const COMMAND_HELD: usize = 0x50e;
+pub const AUTO_COMMAND_DONE: usize = 0x716;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).

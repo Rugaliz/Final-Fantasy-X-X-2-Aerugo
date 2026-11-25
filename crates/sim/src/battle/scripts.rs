@@ -152,26 +152,62 @@ pub fn exec_space(table: &[u8], space: usize, entry: usize) -> Option<(u8, Optio
     Some((worker, run))
 }
 
-/// 00798590 for a target: its chunk-1 table and its script's place in the machine's script list (the battle
-/// control's two, then one per monster slot with a file, by file order +0xdf5).
-fn target_table<'a>(scripts: &'a BattleScripts, b: &'a Battle, t: Target) -> Option<(&'a [u8], usize)> {
+/// 00798590 for a target: its chunk-1 table, its script's place in the machine's script list (the battle
+/// control's two, then one per monster slot with a file, by file order +0xdf5) and the machine worker its
+/// workers count from.
+fn target_table<'a>(
+    scripts: &'a BattleScripts,
+    b: &'a Battle,
+    t: Target,
+) -> Option<(&'a [u8], usize, usize)> {
     match t {
-        Target::BattleScript(0) => Some((scripts.system.chunk(battle_chunk::HEAD), 0)),
-        Target::BattleScript(1) => Some((b.file.chunk(battle_chunk::HEAD), 1)),
+        Target::BattleScript(0) => Some((scripts.system.chunk(battle_chunk::HEAD), 0, 0)),
+        Target::BattleScript(1) => {
+            let base = usize::from(scripts.system.chunk(battle_chunk::HEAD).u8_at(0));
+            Some((b.file.chunk(battle_chunk::HEAD), 1, base))
+        }
         Target::BattleScript(_) => None,
         Target::Monster(slot) => {
             if slot >= r::FULL_SLOTS {
                 return None;
             }
             let file = b.monster_file(slot)?;
-            Some((file.chunk(monster_chunk::HEAD), 2 + usize::from(b.records.get(slot).u8_at(r::FILE_ORDER))))
+            let control = scripts.machine.as_ref()?.control_start(1)?;
+            let base = control
+                + (0..slot).map(|s| usize::from(b.records.get(s).u8_at(r::MONSTER_HEAD))).sum::<usize>();
+            Some((
+                file.chunk(monster_chunk::HEAD),
+                2 + usize::from(b.records.get(slot).u8_at(r::FILE_ORDER)),
+                base,
+            ))
         }
     }
 }
 
-/// 797bc0 + MsAtelRequestExe for `entry` of `space`: the space's worker in system_01 gets a request at level 7
-/// that runs the entry from the first script that has it: the battle's, then the monster slot's (when given),
-/// then system_01's. Returns the worker asked.
+/// MsAtelRequestExe: the worker `owner`'s table gives for `space` gets a request at level 7 running the entry
+/// from the first of `targets` (script, space, entry) that has it. Returns the worker asked.
+pub fn request_exe(
+    scripts: &mut BattleScripts,
+    b: &Battle,
+    owner: Target,
+    space: usize,
+    targets: &[(Target, usize, usize)],
+) -> Option<usize> {
+    let (table, _, base) = target_table(scripts, b, owner)?;
+    let (local, _) = exec_space(table, space, 0)?;
+    let worker = base + usize::from(local);
+    for &(t, t_space, entry) in targets {
+        let Some((table, script, _)) = target_table(scripts, b, t) else { continue };
+        let Some((descriptor, Some(run))) = exec_space(table, t_space, entry) else { continue };
+        let vm = scripts.machine.as_mut()?;
+        vm.request_in(worker, REQUEST_LEVEL, run, (script, usize::from(descriptor)));
+        return Some(worker);
+    }
+    None
+}
+
+/// 797bc0: a battle event entry for `space`: from the battle's script, then the monster slot's (when given),
+/// then system_01's, run by system_01's worker for the space.
 pub fn request(
     scripts: &mut BattleScripts,
     b: &Battle,
@@ -179,20 +215,20 @@ pub fn request(
     monster: Option<usize>,
     entry: usize,
 ) -> Option<usize> {
-    let (worker, _) = exec_space(scripts.system.chunk(battle_chunk::HEAD), space, 0)?;
-    let mut targets = vec![Target::BattleScript(1)];
+    let mut targets = vec![(Target::BattleScript(1), space, entry)];
     if let Some(slot) = monster.filter(|&s| r::is_monster_slot(s)) {
-        targets.push(Target::Monster(slot));
+        targets.push((Target::Monster(slot), space, entry));
     }
-    targets.push(Target::BattleScript(0));
-    for t in targets {
-        let Some((table, script)) = target_table(scripts, b, t) else { continue };
-        let Some((descriptor, Some(run))) = exec_space(table, space, entry) else { continue };
-        let vm = scripts.machine.as_mut()?;
-        vm.request_in(usize::from(worker), REQUEST_LEVEL, run, (script, usize::from(descriptor)));
-        return Some(usize::from(worker));
-    }
-    None
+    targets.push((Target::BattleScript(0), space, entry));
+    request_exe(scripts, b, Target::BattleScript(0), space, &targets)
+}
+
+/// Run a worker's new request at once (a request made with mode 1), with the save image swapped in.
+pub fn run_now(scripts: &mut BattleScripts, battle: &mut Battle, globals: &mut [Vec<u8>; 2], worker: usize) {
+    let Some(vm) = scripts.machine.as_mut() else { return };
+    std::mem::swap(&mut vm.memory.global, globals);
+    vm.run_now(worker, &mut scripts.natives.host(battle));
+    std::mem::swap(&mut vm.memory.global, globals);
 }
 
 /// Run one frame of the machine with the field's global blocks (the save image) swapped in.

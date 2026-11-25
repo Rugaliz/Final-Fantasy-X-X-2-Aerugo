@@ -2917,13 +2917,11 @@ impl Event {
                 (self.state.battle_scripts.as_mut(), self.state.battle_state.as_mut())
             {
                 crate::battle::scripts::run_frame(scripts, battle, &mut self.vm.memory.global);
-                // 790c10's turn order step (790fb0), then the command choice (792a90, not ported).
-                if crate::battle::turns::frame(battle).is_some() && !battle.globals.choice_reported {
-                    battle.globals.choice_reported = true;
-                    log::error!(
-                        "GAP: battle command choice (792a90) and the command run (MsBtlReadManage) are not ported"
-                    );
-                }
+                // 790c10: the turn order (790fb0), the command choice (792a90), the command run (MsBtlReadManage).
+                let globals = &mut self.vm.memory.global;
+                crate::battle::turns::frame(battle);
+                crate::battle::commands::choose(scripts, battle, globals);
+                crate::battle::commands::run(scripts, battle, globals);
             }
             return;
         }
@@ -3089,6 +3087,7 @@ impl Event {
         let inputs = crate::battle::setup::Inputs { vfs, files: &files, tables: &tables };
         let save = &mut self.vm.memory.global[0];
         let mut battle = crate::battle::setup::start(&inputs, encounter, save, &mut self.state.rng_streams)?;
+        battle.tables = Some(tables.clone());
         // system_01 (battle file 1) and the machine; its set-up pass, then the entries the read steps ask for
         // (0x18 at step 10, 0x75 at 0xc, 0x76 at 0xf, 0x7c as the battle starts).
         let path = files.path(crate::battle::BATTLE_SET, 1).ok_or("system_01 is not in the file table")?;
@@ -3112,6 +3111,18 @@ impl Event {
     /// The running battle's records once set up.
     pub fn battle_state(&self) -> Option<&crate::battle::Battle> {
         self.state.battle_state.as_deref()
+    }
+
+    /// The character waiting for the player's command, if any.
+    pub fn battle_awaits_command(&self) -> Option<u8> {
+        self.state.battle_state.as_ref().and_then(|b| b.commands.awaiting_input)
+    }
+
+    /// The player's command for the waiting character (what the battle menu returns).
+    pub fn battle_command(&mut self, command: u16, targets: u32) {
+        if let Some(b) = self.state.battle_state.as_mut() {
+            crate::battle::commands::player_command(b, command, targets);
+        }
     }
 
     /// The natives the battle's scripts called that are not ported yet (id, calls).

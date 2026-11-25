@@ -28,6 +28,8 @@ pub struct BattleGlobals {
     pub tanker_hp_rule: bool,
     /// The command choice's GAP has been reported.
     pub choice_reported: bool,
+    /// The command effects' GAP has been reported.
+    pub command_reported: bool,
     /// Stat ids already reported as not ported.
     pub reported: std::collections::BTreeSet<(bool, i32)>,
 }
@@ -42,6 +44,7 @@ impl Default for BattleGlobals {
             unread_script_flag: false,
             tanker_hp_rule: false,
             choice_reported: false,
+            command_reported: false,
             reported: Default::default(),
         }
     }

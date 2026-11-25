@@ -792,6 +792,17 @@ impl Vm {
     }
 
     /// Run worker `w` for this frame.
+    /// Start the worker's best request and run it at once (AtelDecodeSignal then atel_run_worker: a request made
+    /// to run now).
+    pub fn run_now(&mut self, w: usize, host: &mut dyn Host) {
+        if w >= self.workers.len() {
+            return;
+        }
+        self.decode(w, None);
+        self.tell_level_starts(host);
+        self.run_worker(w, host);
+    }
+
     pub fn run_worker(&mut self, w: usize, host: &mut dyn Host) {
         if !self.workers[w].active || !self.workers[w].enabled || !host.may_run(w) {
             return;

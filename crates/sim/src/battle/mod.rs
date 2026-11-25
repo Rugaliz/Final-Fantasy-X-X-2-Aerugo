@@ -21,6 +21,7 @@
 //!
 //! The records: [`records`].
 
+pub mod commands;
 pub mod natives;
 pub mod records;
 pub mod scripts;
@@ -213,6 +214,9 @@ pub struct Battle {
     pub worker_slots: Vec<u8>,
     pub globals: natives::BattleGlobals,
     pub turns: turns::Turns,
+    pub commands: commands::Commands,
+    /// The kernel tables (the turn end reads ctb_base).
+    pub tables: Option<Arc<BattleTables>>,
 }
 
 impl Battle {

@@ -92,6 +92,8 @@ pub fn start(
         worker_slots: Vec::new(),
         globals: Default::default(),
         turns: Default::default(),
+        commands: Default::default(),
+        tables: None,
     };
     b.area_id = b.encounter.area_id;
     log::error!(
