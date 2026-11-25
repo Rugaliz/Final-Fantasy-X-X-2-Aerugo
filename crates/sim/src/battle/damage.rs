@@ -109,13 +109,14 @@ pub fn formula(
         }
         0xf => scaled(cube(magic)),
         0x10 => (attacker.u32_at(r::MAX_HP).wrapping_mul(power as u32) / 10) as i32,
-        0x11 | 0x12 | 0x13 => {
+        0x11..=0x13 => {
             let (now, max) = if formula == 0x12 {
                 (attacker.u32_at(r::MP), attacker.u32_at(r::MAX_MP))
             } else {
                 (attacker.u32_at(r::HP), attacker.u32_at(r::MAX_HP))
             };
-            let percent = if max != 0 { now.wrapping_mul(100) / max } else { 0 } as i32;
+            // (The original divides by a zero maximum unchecked.)
+            let percent = now.wrapping_mul(100).checked_div(max).unwrap_or(0) as i32;
             let (scale, divisor) =
                 if formula == 0x13 { (0x82 - percent, 0x3c) } else { (percent + 10, 0x6e) };
             ((scale.wrapping_mul(cube(strength)) / divisor).wrapping_mul(power) >> 4).wrapping_mul(variance)
