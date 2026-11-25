@@ -135,10 +135,99 @@ pub const HALVES_WAIT: usize = 0x613;
 pub const DOUBLES_WAIT: usize = 0x614;
 /// Agility, one of [`STATS`].
 pub const AGILITY: usize = STATS + 4;
+/// The motion parameters the debug editors (CHR data 1 / 2) label: +0x4ac the move flags (bits: 1 ATTACK Run
+/// 00+01, 2 Run 01, 4 Miss Motion, 8 Return, 0x10 Pos Check, 0x20 AVOID Move, 0x100 MOVE Back Jump, 0x200 MOVE
+/// Avoid, 0x400 TURN Stay, 0x800 TURN Run, 0x1000 ATTACK Stay Attack, 0x2000 RETURN Wait, 0x4000 AVOID
+/// Disable, 0x8000 MOVE Disable Move Chest, 0x10000 ATTACK Weight Inf).
+pub const MOVE_FLAGS: usize = 0x4ac;
+pub const ROUND_FRAME: usize = 0x4b0;
+pub const ROUND_RETURN_FRAME: usize = 0x4b2;
+pub const IDLE2_CHANCE: usize = 0x4b8;
+pub const ATTACK_INC_SPEED: usize = 0x4b9;
+pub const ATTACK_DEC_SPEED: usize = 0x4ba;
+/// "HOKAN : Type" (the motion interpolation type).
+pub const BLEND_TYPE: usize = 0x4bb;
+pub const ATTACK_START_DISTANCE: usize = 0x4bc;
+pub const ATTACK_OFFSET: usize = 0x4c0;
+pub const ATTACK_HEIGHT: usize = 0x4c4;
+pub const BACK_JUMP_DISTANCE: usize = 0x4c8;
+pub const RUN_FIRST_SPEED: usize = 0x4cc;
+pub const RUN_ACCELERATION: usize = 0x4d0;
+pub const RUN_SPEED: usize = 0x4d4;
+pub const RUN_RETURN_SPEED: usize = 0x4d8;
+pub const WEIGHT: usize = 0x4dc;
+pub const ATTACK_NORMAL_FRAME: usize = 0x40c;
+pub const ATTACK_NEAR_FRAME: usize = 0x40d;
+pub const ATTACK_MOTION_FRAME: usize = 0x40e;
+/// "DIR : Return" and "DIR : Fix".
+pub const DIRECTION_RETURN: usize = 0x41d;
+pub const DIRECTION_FIXED: usize = 0x41b;
+/// What the scripts set for the record's position centre (7029; MsGetChr*Pos take the model's own centre
+/// while it is clear, outside special battles).
+pub const CENTER_SET: usize = 0x505;
+/// The percentage of maximum HP poison takes (MsPoisonProcess; save record +0x37).
+pub const POISON_PERCENT: usize = 0x5ba;
+/// The overdrive mode (save +0x38), charge (+0x39) and its maximum (+0x3a) (MsLimitTypeStatusCheck,
+/// MsLimitUp).
+pub const OVERDRIVE_MODE: usize = 0x5bb;
+pub const OVERDRIVE: usize = 0x5bc;
+pub const OVERDRIVE_MAX: usize = 0x5bd;
+/// The look of the record when it falls (MsSetDeath → MsStoneProcess; characters 0, monsters 0x303) and the
+/// one revival restores it from (MsRelife).
+pub const DEATH_LOOK: usize = 0x3f5;
+pub const DEATH_LOOK_KEPT: usize = 0x3f6;
+/// The model kind (8 a character or aeon, 3 a monster, 4 one exchanged in).
+pub const MODEL_KIND: usize = 0x43d;
+/// The second status word (+0x616: bit 9 eternal life, bit 8 tested at +0x617 bit 0).
+pub const STATUS2: usize = 0x616;
+/// The status counters (+0x608..+0x614, 13).
+pub const STATUS_COUNTERS: usize = 0x608;
+/// The weak state shown (+0x63d) and the weak level (+0x63e, MsCalcWeakLevel).
+pub const WEAK_STATE: usize = 0x63d;
+pub const WEAK_LEVEL: usize = 0x63e;
+/// The record's command flags (one bit per command 0x3nnn, btl_set_cmd_flag).
+pub const COMMAND_FLAGS: usize = 0x690;
+/// The targets the record's command chose (btl_set_targets) and a second target set the scripts name (-0x1a).
+pub const TARGETS: usize = 0xdc0;
+pub const OTHER_TARGETS: usize = 0xdc4;
+/// Escaped from the battle (MsSetEscapeFlag).
+pub const ESCAPED: usize = 0xdcd;
+/// In its falling sequence (MsSetDeath, MsCheckDeathMotion).
+pub const FALLING: usize = 0xdce;
+/// The slot of whoever damaged the record last (MsSetDamage).
+pub const LAST_ATTACKER: usize = 0xded;
+/// Running a command now (the acting record's; target expressions -3 / -2).
+pub const COMMAND_RUNNING: usize = 0xdf0;
+/// The model point the target cursor sits on (MsCalcCursorPos: Ch_OptposGet).
+pub const CURSOR_POINT: usize = 0xdf9;
+/// A character slot's commands on or off (btl_set_cmd_flag with a character id).
+pub const COMMANDS_ON: usize = 0xdd4;
+/// The record's height in battle (+0x534) and how it is found (+0x50c: 0 the base height less half the
+/// model's height plus the offset +0x538, 1 none; 7ab300).
+pub const HEIGHT: usize = 0x534;
+pub const HEIGHT_MODE: usize = 0x50c;
+pub const HEIGHT_OFFSET: usize = 0x538;
+/// A model float the scripts set (+0x4e4, given to the model's +0x4e4: 0 or less takes the model's own; +0x44c
+/// marks it set).
+pub const MODEL_PARAMETER: usize = 0x4e4;
+pub const MODEL_PARAMETER_SET: usize = 0x44c;
+/// Values only the scripts read and write (no engine reader found): a signed byte (+0x4fc) and a bit (+0x4b4).
+pub const SCRIPT_VALUE: usize = 0x4fc;
+pub const SCRIPT_BIT: usize = 0x4b4;
+/// The record's facing (+0x514), the facing it returns to (+0x518) and whether a script set them (+0x512).
+pub const DIRECTION: usize = 0x514;
+pub const HOME_DIRECTION: usize = 0x518;
+pub const DIRECTION_SET: usize = 0x512;
+/// The model's gravity mode (+0x34, given to Ch_SetGravMode).
+pub const GRAVITY_MODE: usize = 0x34;
+/// A model switch the record's weapons copy with +0x2b, +0x2e and +0x34 (MsBtlWeaponRegist).
+pub const MODEL_SWITCH: usize = 0x32;
+/// The model's scale (+0x3a0..+0x3a8, 1.0 at the start; 7028 also gives it to the model, 0082b560 mode 7).
+pub const SCALE: usize = 0x3a0;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
-/// +0xdcc 2 when the record starts knocked out.
-pub const START_STATE: usize = 0xdcc;
+/// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).
+pub const DEATH_STATE: usize = 0xdcc;
 /// A monster's file read order (+0xdf5) and the first byte of its file's chunk 1 (+0xdf6).
 pub const FILE_ORDER: usize = 0xdf5;
 pub const MONSTER_HEAD: usize = 0xdf6;

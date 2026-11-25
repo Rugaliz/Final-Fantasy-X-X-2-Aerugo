@@ -167,8 +167,8 @@ fn set_records(b: &mut Battle, tables: &BattleTables, save: &mut [u8]) {
         let aeon = !r::is_monster_slot(slot) && is_aeon(&b.records, slot);
         let rec = b.records.get_mut(slot);
         if !r::is_monster_slot(slot) {
-            rec.set_u16(0x3f5, 0);
-            rec.set_u8(0x43d, 8);
+            rec.set_u16(r::DEATH_LOOK, 0);
+            rec.set_u8(r::MODEL_KIND, 8);
             if !aeon {
                 rec.set_u8(r::KIND, r::KIND_CHARACTER);
                 rec.set_u8(0x437, 1);
@@ -183,8 +183,8 @@ fn set_records(b: &mut Battle, tables: &BattleTables, save: &mut [u8]) {
                 }
             }
         } else {
-            rec.set_u16(0x3f5, 0x303);
-            rec.set_u8(0x43d, 3);
+            rec.set_u16(r::DEATH_LOOK, 0x303);
+            rec.set_u8(r::MODEL_KIND, 3);
             rec.set_u8(r::KIND, r::KIND_MONSTER);
         }
     }
@@ -232,7 +232,7 @@ fn full_record_defaults(rec: &mut [u8], slot: usize, special: bool) {
     rec.set_u32(0x2e, 0x0101_0101);
     rec.set_u8(0x23, 1);
     rec.set_u8(0x422, slot as u8);
-    rec.set_u8(0xdf9, 1);
+    rec.set_u8(r::CURSOR_POINT, 1);
     rec.set_u16(0xde4, 0xffff);
     rec.set_u8(0x3f1, 0x10);
     rec.set_u16(0xe0e, 0x108);
@@ -244,7 +244,7 @@ fn full_record_defaults(rec: &mut [u8], slot: usize, special: bool) {
     rec.set_u16(0x3fc, 0x100);
     rec.set_u16(0x400, 0x100);
     rec.set_u8(0x406, 8);
-    rec.set_u8(0x41d, 1);
+    rec.set_u8(r::DIRECTION_RETURN, 1);
     rec.set_u8(0x43f, 0xff);
     rec.set_u8(0x442, 0xff);
     rec.set_u8(0x3f2, 0xff);
@@ -253,26 +253,28 @@ fn full_record_defaults(rec: &mut [u8], slot: usize, special: bool) {
     rec.set_u8(0x40f, 1);
     rec.set_u8(0x438, 0xff);
     rec.set_u16(0xf74, 0xffff);
-    for at in [0x3a0, 0x3a4, 0x3a8, 0x3ac] {
-        rec.set_f32(at, 1.0);
+    // The scale and the float after it.
+    for k in 0..4 {
+        rec.set_f32(r::SCALE + 4 * k, 1.0);
     }
     rec.set_u8(0x3f0, 0xff);
-    rec.set_u32(0x4b0, 0x0006_0006);
-    rec.set_u16(0x4b8, 0x2004);
-    rec.set_f32(0x4bc, 40.0);
-    rec.set_u8(0x4ba, 0x20);
-    rec.set_u8(0x32, 1);
-    rec.set_u32(0x4c0, 0);
-    rec.set_u8(0x50c, 1);
-    rec.set_u32(0x4c4, 0);
+    // Round frame and round return frame 6; idle-2 chance 4, attack increase speed 0x20.
+    rec.set_u32(r::ROUND_FRAME, 0x0006_0006);
+    rec.set_u16(r::IDLE2_CHANCE, 0x2004);
+    rec.set_f32(r::ATTACK_START_DISTANCE, 40.0);
+    rec.set_u8(r::ATTACK_DEC_SPEED, 0x20);
+    rec.set_u8(r::MODEL_SWITCH, 1);
+    rec.set_u32(r::ATTACK_OFFSET, 0);
+    rec.set_u8(r::HEIGHT_MODE, 1);
+    rec.set_u32(r::ATTACK_HEIGHT, 0);
     rec.set_u8(0x6d4, 0xff);
-    rec.set_f32(0x4d4, 3.0);
-    rec.set_f32(0x4d8, 3.0);
-    rec.set_f32(0x4d0, f32::from_bits(0x3ecc_cccd));
-    rec.set_f32(0x4dc, 50.0);
+    rec.set_f32(r::RUN_SPEED, 3.0);
+    rec.set_f32(r::RUN_RETURN_SPEED, 3.0);
+    rec.set_f32(r::RUN_ACCELERATION, f32::from_bits(0x3ecc_cccd));
+    rec.set_f32(r::WEIGHT, 50.0);
     rec.set_f32(0x4f0, f32::from_bits(0x3e4c_cccd));
-    rec.set_u32(0x534, 0);
-    rec.set_u8(0x34, u8::from(!special));
+    rec.set_u32(r::HEIGHT, 0);
+    rec.set_u8(r::GRAVITY_MODE, u8::from(!special));
 }
 
 /// MsGetSavePlyJoin: whether a character or aeon has joined (the save record's party bits, bit 0).
@@ -394,7 +396,7 @@ fn finish_record(rec: &mut [u8], special: bool) {
     if rec.i32_at(r::HP) < 1 || rec.u16_at(r::STATUS) & r::STATUS_KO != 0 {
         let v = rec.u16_at(r::STATUS) | r::STATUS_KO;
         rec.set_u16(r::STATUS, v);
-        rec.set_u8(r::START_STATE, 2);
+        rec.set_u8(r::DEATH_STATE, 2);
     }
 }
 
@@ -571,7 +573,7 @@ pub(crate) fn weak_state(rec: &mut [u8], special: bool) {
                 if cannot_weaken {
                     state = 2;
                 }
-                if rec.u8_at(r::START_STATE) == 0 {
+                if rec.u8_at(r::DEATH_STATE) == 0 {
                     state = 2;
                 }
             }
@@ -603,7 +605,8 @@ fn may_weaken(rec: &[u8]) -> bool {
 /// MsSetAutoStatus: the auto-status masks (the second set too while weak), the statuses they hold set and what
 /// they replaced kept, the status counters they hold kept aside.
 pub fn set_auto_status(rec: &mut [u8]) {
-    let (had_612, weak, had_613) = (rec.u8_at(0x612), rec.u8_at(0x63e), rec.u8_at(0x613));
+    let (had_612, weak, had_613) =
+        (rec.u8_at(r::STATUS_COUNTERS + 0xa), rec.u8_at(0x63e), rec.u8_at(r::HALVES_WAIT));
     let mut masks = [rec.u16_at(0x630), rec.u16_at(0x632), rec.u16_at(0x634)];
     if weak == 1 || weak == 2 {
         for (k, m) in masks.iter_mut().enumerate() {
@@ -631,7 +634,7 @@ pub fn set_auto_status(rec: &mut [u8]) {
             rec.set_u8(0x608 + i, 0xff);
         }
     }
-    if had_613 == 0 && rec.u8_at(0x613) != 0 && rec.u8_at(0x614) != 0xff {
+    if had_613 == 0 && rec.u8_at(r::HALVES_WAIT) != 0 && rec.u8_at(r::DOUBLES_WAIT) != 0xff {
         rec.set_u8(0x614, 0);
     }
     let (mut kept, mut status) = (rec.u16_at(0x628), rec.u16_at(0x616));
@@ -644,7 +647,7 @@ pub fn set_auto_status(rec: &mut [u8]) {
     }
     rec.set_u16(0x616, status);
     rec.set_u16(0x628, kept);
-    if rec.u8_at(0x612) != 0 && had_612 == 0 {
+    if rec.u8_at(r::STATUS_COUNTERS + 0xa) != 0 && had_612 == 0 {
         rec.set_u8(0x6d2, 0);
     }
 }
