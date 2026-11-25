@@ -493,6 +493,11 @@ impl Vm {
         &self.scripts[wk.script].workers[wk.descriptor]
     }
 
+    /// The first worker of control `i` (none past the last).
+    pub fn control_start(&self, i: usize) -> Option<usize> {
+        self.controls.get(i).copied()
+    }
+
     /// The first worker of the control `w` belongs to.
     pub fn control_base(&self, w: usize) -> usize {
         self.controls.iter().copied().take_while(|&c| c <= w).last().unwrap_or(0)

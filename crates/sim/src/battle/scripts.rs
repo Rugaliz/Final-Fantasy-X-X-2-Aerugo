@@ -40,9 +40,56 @@ impl std::fmt::Debug for BattleScripts {
 
 impl World for Battle {}
 
-/// The battle natives (none ported yet beyond the state-free groups).
+/// The battle natives.
 pub fn natives() -> Natives<Battle> {
-    Natives::new(Game::Ffx)
+    let mut n = Natives::new(Game::Ffx);
+    super::natives::register(&mut n);
+    n
+}
+
+/// 0x7976a0 (MsAtelChrInit's caller at set-up): the combatant every worker stands for, from the exec-space
+/// tables: the battle's spaces 0x29–0x37 (slots 0–0xe), system_01's 5–0x20, 0x4f–0x6a and 0x6d–0x88 (slots
+/// from 0) and seven fixed ones, each monster's spaces 0x3d, 4 and 0x40 (its slot).
+pub fn bind_slots(scripts: &BattleScripts, b: &mut Battle) {
+    let Some(vm) = &scripts.machine else { return };
+    let mut slots = vec![0xffu8; vm.workers.len()];
+    let system = scripts.system.chunk(battle_chunk::HEAD);
+    let own = b.file.chunk(battle_chunk::HEAD);
+    let own_base = usize::from(system.u8_at(0));
+    let mut bind = |table: &[u8], base: usize, space: usize, slot: u8| {
+        if let Some((w, _)) = exec_space(table, space, 0)
+            && let Some(x) = slots.get_mut(base + usize::from(w))
+        {
+            *x = slot;
+        }
+    };
+    log::trace!("battle: MsAtelChrInit(0, 2, 1, 0x3e) and (0, 2, 0, 0) are not ported");
+    for space in 0x29..0x38 {
+        bind(own, own_base, space, (space - 0x29) as u8);
+    }
+    for (first, end) in [(5, 0x21), (0x4f, 0x6b), (0x6d, 0x89)] {
+        for space in first..end {
+            bind(system, 0, space, (space - first) as u8);
+        }
+    }
+    for (space, slot) in
+        [(0x21, 0x1c), (0x22, 0x1d), (0x23, 0x1e), (0x25, 0xe), (0x26, 0xf), (0x27, 0x10), (0x28, 0x11)]
+    {
+        bind(system, 0, space, slot);
+    }
+    if let Some(monsters) = vm.control_start(1) {
+        for i in 0..r::MONSTERS {
+            let slot = r::FIRST_MONSTER + i;
+            let Some(file) = b.monster_file(slot) else { continue };
+            let base = monsters
+                + (0..slot).map(|s| usize::from(b.records.get(s).u8_at(r::MONSTER_HEAD))).sum::<usize>();
+            let table = file.chunk(monster_chunk::HEAD).to_vec();
+            for space in [0x3d, 4, 0x40] {
+                bind(&table, base, space, slot as u8);
+            }
+        }
+    }
+    b.worker_slots = slots;
 }
 
 /// Where a request's entry may come from (797b70 targets): the battle control's script 0 (system_01) or 1

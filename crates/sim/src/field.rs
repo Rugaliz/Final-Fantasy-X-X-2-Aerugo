@@ -3089,6 +3089,7 @@ impl Event {
         let system = crate::battle::ChunkFile::parse(system).ok_or("system_01 is not a chunk file")?;
         let mut scripts = crate::battle::scripts::BattleScripts::new(system);
         scripts.machine = Some(crate::battle::scripts::machine(&scripts, &battle)?);
+        crate::battle::scripts::bind_slots(&scripts, &mut battle);
         let globals = &mut self.vm.memory.global;
         crate::battle::scripts::run_frame(&mut scripts, &mut battle, globals);
         for entry in [0x18, 0x75, 0x76, 0x7c] {

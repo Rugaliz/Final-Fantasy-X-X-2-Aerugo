@@ -88,7 +88,11 @@ pub fn start(
         front_line: [0xff; 7],
         reserve_order: [0; 20],
         first_attack: 0,
+        area_id: 0,
+        worker_slots: Vec::new(),
+        globals: Default::default(),
     };
+    b.area_id = b.encounter.area_id;
     log::error!(
         "GAP: battle set-up: the damage image (MsSetChrImageDamageAttack), the command lists (MsSetRamChrAbility) and the weapons are not ported"
     );
@@ -548,7 +552,7 @@ pub fn weak_level(hp: i32, max: i32) -> u8 {
 }
 
 /// 0078d7f0 with no level given: the record's weak level (+0x63e) and the weak state shown (+0x63d).
-fn weak_state(rec: &mut [u8], special: bool) {
+pub(crate) fn weak_state(rec: &mut [u8], special: bool) {
     let level = weak_level(rec.i32_at(r::HP), rec.i32_at(r::MAX_HP));
     let state = 'state: {
         if rec.u8_at(0x450) != 0 {

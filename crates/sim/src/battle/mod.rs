@@ -21,6 +21,7 @@
 //!
 //! The records: [`records`].
 
+pub mod natives;
 pub mod records;
 pub mod scripts;
 pub mod setup;
@@ -159,6 +160,8 @@ pub struct Encounter {
     pub file: usize,
     /// "<area>_<nn>".
     pub name: String,
+    /// The area's id.
+    pub area_id: u16,
 }
 
 impl Encounter {
@@ -171,6 +174,7 @@ impl Encounter {
             battle,
             file: table.battle_file(&battle)?,
             name: format!("{}_{:02}", area.name, battle.formation_id),
+            area_id: area.id,
         })
     }
 }
@@ -202,6 +206,11 @@ pub struct Battle {
     pub reserve_order: [u8; 20],
     /// Who strikes first (MsGetFirstAttack): 0 neither, 1 the party, 2 the monsters.
     pub first_attack: u8,
+    /// The area's id (the area entry's first word).
+    pub area_id: u16,
+    /// The combatant each script worker stands for (worker +0xc0, 0xff none), by the machine's numbering.
+    pub worker_slots: Vec<u8>,
+    pub globals: natives::BattleGlobals,
 }
 
 impl Battle {
