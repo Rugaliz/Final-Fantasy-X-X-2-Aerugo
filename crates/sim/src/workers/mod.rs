@@ -258,6 +258,91 @@ impl Worker {
     }
 }
 
+/// Bits of the system block's state byte (+0).
+pub mod state {
+    /// The block runs.
+    pub const ON: u8 = 1;
+    /// The player has control.
+    pub const CONTROL_ON: u8 = 2;
+    /// A confirm press reached a window waiting on it (it lasts the frame).
+    pub const ADVANCE_PRESSED: u8 = 4;
+    /// The frame count runs (the event's background sounds step only then).
+    pub const COUNT_FRAMES: u8 = 8;
+    /// Cleared before the workers every frame; nothing found sets or reads it.
+    pub const CLEARED_EACH_FRAME: u8 = 0x10;
+    /// Control takes the workers' alternate switch (+0x36 bit 3) rather than their switch (+0x34 bit 9).
+    pub const ALTERNATE_SWITCH: u8 = 0x20;
+    /// A map change may be asked for (00be opens it; a change closes it).
+    pub const MAP_CHANGE_OPEN: u8 = 0x80;
+}
+
+/// Bits of the system block's message byte (+1).
+pub mod message {
+    /// A window with choices is up: control is held off (and the main menu and the soft reset).
+    pub const MESSAGE_UP: u8 = 4;
+    /// Message-up follows the windows (00e5); without it the windows clear it.
+    pub const WINDOWS_HOLD_CONTROL: u8 = 8;
+    /// A switch the scripts keep (00e9 sets it, 00ea reads it; nothing else does).
+    pub const SCRIPT_SWITCH: u8 = 0x10;
+}
+
+/// Bits of the system block's scene byte (+2).
+pub mod scene {
+    /// The camera water check runs (0212 / c02f): under water when the camera is below the surface height.
+    pub const CAMERA_WATER_CHECK: u8 = 1;
+    /// With [`FORCE_UNDERWATER`], whether the scene counts as under water (0114).
+    pub const FORCED_UNDERWATER_VALUE: u8 = 2;
+    /// The under-water state is forced rather than the camera water check's (0114).
+    pub const FORCE_UNDERWATER: u8 = 4;
+    /// Random encounters may start (0115; and only after the block's first frames).
+    pub const ENCOUNTERS_ON: u8 = 8;
+    /// A worker was placed this frame (cleared after the workers ran).
+    pub const PLAYER_PLACED: u8 = 0x10;
+    /// Party characters earn the per-event points when an event starts (012b).
+    pub const EVENT_CREDIT_ON: u8 = 0x40;
+    /// The switch 0149 sets: nothing reads it.
+    pub const UNREAD_SWITCH: u8 = 0x80;
+}
+
+/// Bits of the system block's holds byte (+3).
+pub mod holds {
+    /// What the battle end left (the low two bits: 1 a random battle, 2 a scripted one); workers are held.
+    pub const BATTLE_END: u8 = 3;
+    /// A system message window (015b's treasure window) is open.
+    pub const SYSTEM_WINDOW: u8 = 4;
+    /// The player has no control (message up, or control off): the windows' step keeps it.
+    pub const NO_CONTROL: u8 = 0x10;
+    /// The switches 015d and 015e set, in that order: nothing reads them.
+    pub const UNREAD_SWITCHES: [u8; 2] = [8, 0x40];
+    /// The battle music set-up holds control.
+    pub const BATTLE_MUSIC: u8 = 0x80;
+}
+
+/// Bits of the system block's play word (+0x210): what the player may do.
+pub mod play {
+    /// The player's moved distance counts (00aa; with the save's walk flags, unless the menu just opened).
+    pub const COUNT_DISTANCE: u32 = 1;
+    /// A map change has been asked for (no soft reset, the battle status steps it).
+    pub const MAP_CHANGE_ASKED: u32 = 2;
+    /// The main menu opened this frame (AtelCtrl clears it each frame).
+    pub const MENU_OPENED: u32 = 4;
+    /// The main menu may open (0241).
+    pub const MENU_ALLOWED: u32 = 8;
+    /// The save data has been checked (01c5 clears it while it reads): the menu may open, the title's prompt
+    /// blinks.
+    pub const SAVE_CHECKED: u32 = 0x10;
+    /// The soft reset is allowed (024d).
+    pub const SOFT_RESET_ALLOWED: u32 = 0x40;
+}
+
+/// Set or clear `bit` of `flags`.
+pub fn set_flag<T>(flags: &mut T, bit: T, on: bool)
+where
+    T: Copy + std::ops::BitOr<Output = T> + std::ops::BitAnd<Output = T> + std::ops::Not<Output = T>,
+{
+    *flags = if on { *flags | bit } else { *flags & !bit };
+}
+
 /// The event system's own block the engine reads (the first of the original's system blocks): the player and
 /// the talk target the frame picks.
 #[derive(Debug, Clone, PartialEq)]
@@ -274,23 +359,24 @@ pub struct System {
     pub talk_dist: f32,
     /// The player's talk reach.
     pub talk_reach: f32,
-    /// Flags: bit 4 a worker was placed this frame (cleared after the workers ran).
-    pub flags2: u8,
-    /// The mode bits (1, 2) that hold workers.
-    pub mode3: u8,
-    /// The first flags byte (bit 0 on; bit 7 set by 00be) and the +0x210 word (bit 0: 00aa).
-    pub flags0: u8,
-    /// Byte 1 (bit 4 blocks control) and the script mode word (+0x1a of the current block).
-    pub flags1: u8,
-    pub mode1a: u16,
-    pub flags210: u32,
+    /// The scene flags (byte 2; [`scene`] names the bits).
+    pub scene: u8,
+    /// What holds the workers and control (byte 3; [`holds`] names the bits).
+    pub holds: u8,
+    /// The state flags (byte 0; [`state`]) and what the player may do (+0x210; [`play`]).
+    pub state: u8,
+    /// The message flags (byte 1; [`message`]) and the script mode (+0x1a: 0 lets party changes reach the
+    /// bodies and the slot table, and the windows decide message-up).
+    pub message: u8,
+    pub script_mode: u16,
+    pub play: u32,
     /// Every joined member is free (the party code's global flag).
     pub full_member: u8,
     /// The names still to enter after character 0xf joins (00ca sets 3; the name entry asks for characters
     /// 0xf–0x11 one after another, counting down).
     pub sister_names_left: u8,
-    /// The value 0212 sets (+0x208).
-    pub value208: f32,
+    /// The water surface height the camera water check compares the camera with (0212 / c02f).
+    pub water_surface_height: f32,
     /// Party characters (bit per character below 8; 0220 sets and clears them) left out of the points an event
     /// adds once to each party character's save tally when it starts (AtelGetNowEventJumpId).
     pub members_without_event_credit: u32,
@@ -333,8 +419,8 @@ impl Default for System {
     fn default() -> Self {
         System {
             player: -1,
-            flags1: 0x98,
-            mode1a: 0,
+            message: 0x98,
+            script_mode: 0,
             player_pos: [0.0, 0.0, 0.0, 1.0],
             player_prev: [0.0, 0.0, 0.0, 1.0],
             talk_mode: 0,
@@ -342,13 +428,13 @@ impl Default for System {
             talk_target: -1,
             talk_dist: 0.0,
             talk_reach: 0.0,
-            flags2: 0xc8,
-            mode3: 0x30,
-            flags0: 0x81,
-            flags210: 0x49,
+            scene: 0xc8,
+            holds: 0x30,
+            state: 0x81,
+            play: 0x49,
             full_member: 0,
             sister_names_left: 0,
-            value208: 0.0,
+            water_surface_height: 0.0,
             members_without_event_credit: 0,
             al_bhed_letters: 0,
             menu_commands_off: 0,

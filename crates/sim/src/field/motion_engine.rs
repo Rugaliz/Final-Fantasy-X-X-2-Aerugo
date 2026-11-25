@@ -191,7 +191,8 @@ pub struct Player {
     /// The motion record playing.
     record: Option<(Arc<MotionGroup>, usize)>,
     start: i32,
-    end1: i32,
+    /// The range's last frame (its end − 1, in 1/256 frames).
+    last_frame: i32,
     len: i32,
     loops: i16,
     /// Plays for the next range (−1: the sequence's own).
@@ -211,7 +212,9 @@ pub struct Player {
     pub next_blend: i16,
     /// Speed (0x100 normal).
     pub speed: i16,
-    speed2: i16,
+    /// The range's own speed factor: 0x100 while it plays, 0 once its last play ends (the step multiplies the
+    /// speed by it).
+    range_speed: i16,
     step_size: i16,
     blend_count: i16,
     clock: i32,
@@ -299,7 +302,7 @@ impl Player {
             pc: None,
             record: None,
             start: 0,
-            end1: 0,
+            last_frame: 0,
             len: 0,
             loops: 0,
             loops_next: -1,
@@ -311,7 +314,7 @@ impl Player {
             blend: 0,
             next_blend: 1,
             speed: 0x100,
-            speed2: 0,
+            range_speed: 0,
             step_size: 0,
             blend_count: 0,
             clock: 0,
@@ -452,10 +455,10 @@ impl Player {
         let frames = group.motions.get(record).map_or(0, |m| i32::from(m.frames as i16));
         let end = if end < 0 { frames << 8 } else { end };
         self.len = end - start;
-        self.end1 = end - 1;
+        self.last_frame = end - 1;
         self.loops = if self.loops_next == -1 { loops } else { self.loops_next };
         self.loops_next = -1;
-        self.speed2 = 0x100;
+        self.range_speed = 0x100;
         self.clock = self.start;
         self.blend_count = if self.blend == 0 { 1 } else { self.blend };
         self.blended = false;
@@ -624,16 +627,16 @@ impl Player {
         if self.clock < 0 {
             self.clock = 0;
         }
-        let end1 = self.end1;
-        if ((end1 + 1) & !0xFF) < ((i32::from(self.step_size) + 0x1FF + self.clock) & !0xFF)
+        let last_frame = self.last_frame;
+        if ((last_frame + 1) & !0xFF) < ((i32::from(self.step_size) + 0x1FF + self.clock) & !0xFF)
             && self.loops == 1
         {
-            self.clock = end1 & !0xFF;
+            self.clock = last_frame & !0xFF;
             self.in_range = 0;
             return 1;
         }
         loop {
-            if self.clock <= end1 {
+            if self.clock <= last_frame {
                 return 0;
             }
             if self.loops == 0 {
@@ -644,9 +647,9 @@ impl Player {
             } else {
                 self.loops -= 1;
                 if self.loops == 0 {
-                    self.clock = end1 & !0xFF;
+                    self.clock = last_frame & !0xFF;
                     self.in_range = 0;
-                    self.speed2 = 0;
+                    self.range_speed = 0;
                     return 1;
                 }
             }
@@ -659,7 +662,7 @@ impl Player {
         let clock = self.clock;
         self.shown = clock;
         let mut want = (clock + 0x1FF) >> 8;
-        let last = (self.end1 + 1) >> 8;
+        let last = (self.last_frame + 1) >> 8;
         if last < want {
             if self.loops == 1 {
                 want = last;
@@ -734,7 +737,7 @@ impl Player {
         if self.pc.is_none() {
             return;
         }
-        let mut step = ((i32::from(self.speed2) * i32::from(self.speed)) >> 8) * self.rate / 0x1E00;
+        let mut step = ((i32::from(self.range_speed) * i32::from(self.speed)) >> 8) * self.rate / 0x1E00;
         if let Some(scale) = alt_clock {
             step = ((step as u32).wrapping_mul(scale as u32) >> 8) as i32;
         }
@@ -778,7 +781,7 @@ impl Player {
             "m{:x} r{:x}/{:x}/{:x} l{} in{} p{} n{} b{} v{:x}/{:x} st{:x} a{:x} s{:x} rate{:x} j1[{}]",
             self.motion,
             self.start,
-            self.end1,
+            self.last_frame,
             self.len,
             self.loops,
             self.in_range,
@@ -786,7 +789,7 @@ impl Player {
             self.plays,
             self.blend_count,
             self.speed,
-            self.speed2,
+            self.range_speed,
             self.step_size,
             self.clock,
             self.shown,

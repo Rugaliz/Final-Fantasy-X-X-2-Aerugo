@@ -83,7 +83,7 @@ fn shift_save(g: &mut FieldState, save: &mut [u8], target: i32, entrance: i8) {
 /// A map change request: `with_fade` for 0011 / 00ab.
 pub fn request(g: &mut FieldState, c: &mut NativeCall, target: i32, entrance: i8, with_fade: bool) {
     // The original's other gate is its debug switch, off in a release build.
-    if g.workers.sys.flags0 & 0x80 == 0 {
+    if g.workers.sys.state & crate::workers::state::MAP_CHANGE_OPEN == 0 {
         return;
     }
     g.control_off();
@@ -93,8 +93,8 @@ pub fn request(g: &mut FieldState, c: &mut NativeCall, target: i32, entrance: i8
     if matches!(g.battle, Some((_, false))) {
         g.battle = None;
     }
-    g.workers.sys.flags0 &= 0x7f;
-    g.workers.sys.flags210 |= 2;
+    g.workers.sys.state &= !crate::workers::state::MAP_CHANGE_OPEN;
+    g.workers.sys.play |= crate::workers::play::MAP_CHANGE_ASKED;
     g.pos_sounds.rate = f32::from_bits(0xbd88_8889);
     let frames = if with_fade {
         let frames = byte(save, 0x12);

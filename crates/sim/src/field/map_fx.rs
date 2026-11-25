@@ -33,10 +33,11 @@ pub struct MapEffect {
     /// stopped, 2 set by 8003).
     pub state: u32,
     pub mode: u8,
-    /// The second record: flags (+0), two values (+4, +8), the place 805b gives (+0x3c).
+    /// The second record: the bind flags (+0), what the effect is bound to (+4: the worker for a body bind, the
+    /// part for binds 4 and 5) and the body's element (+8), and the place 805b gives (+0x3c).
     pub flags: u32,
-    pub value4: u32,
-    pub value8: u32,
+    pub bind_target: u32,
+    pub bind_element: u32,
     pub place: [f32; 3],
 }
 
@@ -96,8 +97,8 @@ impl MapEffects {
                         state: u32_at(at + 0x50)?,
                         mode: 0,
                         flags: 0,
-                        value4: 0,
-                        value8: 0,
+                        bind_target: 0,
+                        bind_element: 0,
                         place: [0.0; 3],
                     })
                 })
@@ -153,18 +154,18 @@ fn bind_effect(g: &mut FieldState, worker: usize, id: i32, part: i32) {
     match bind {
         1 if live => {
             e.flags |= 1;
-            e.value4 = worker as u32;
-            e.value8 = part as u32;
+            e.bind_target = worker as u32;
+            e.bind_element = part as u32;
         }
         4 => {
             e.flags |= 2;
-            e.value4 = part as u32;
-            e.value8 = 0;
+            e.bind_target = part as u32;
+            e.bind_element = 0;
         }
         5 => {
             e.flags |= 8;
-            e.value4 = part as u32;
-            e.value8 = 0;
+            e.bind_target = part as u32;
+            e.bind_element = 0;
         }
         _ => {}
     }
@@ -256,8 +257,8 @@ pub fn register(n: &mut Natives<FieldState>) {
             let id = c.stack.pop_int();
             if let Some(e) = g.map_effects.first(id) {
                 e.flags |= 2;
-                e.value4 = v;
-                e.value8 = 0;
+                e.bind_target = v;
+                e.bind_element = 0;
             }
             Value::Int(1)
         }),
@@ -351,8 +352,8 @@ pub fn register(n: &mut Natives<FieldState>) {
                 for id in freed {
                     if let Some(e) = g.map_effects.first(id) {
                         e.flags &= !0xf;
-                        e.value8 = 0;
-                        e.value4 = 0;
+                        e.bind_element = 0;
+                        e.bind_target = 0;
                     }
                 }
             }
@@ -627,20 +628,20 @@ impl MapRuntime {
         }
         let t = u32_at(0x38).filter(|&t| t != 0)? as usize;
         let bytes = vpa.get(t..)?.to_vec();
-        let pool2 = u32::from(*bytes.get(1)?) << 13;
+        let overflow_pool = u32::from(*bytes.get(1)?) << 13;
         let mut space = Space::default();
         space.regions.push(Region { base: TABLE_BASE, bytes });
         space.regions.push(Region { base: SCRATCH_VECTOR, bytes: vec![0; 16] });
         space.regions.push(Region { base: WORK, bytes: vec![0; WORK_SIZE as usize] });
-        if pool2 != 0 {
-            space.regions.push(Region { base: POOL2, bytes: vec![0; pool2 as usize] });
+        if overflow_pool != 0 {
+            space.regions.push(Region { base: POOL2, bytes: vec![0; overflow_pool as usize] });
         }
         relocate::bind(&mut space, TABLE_BASE, ENGINE_TABLE);
         let h = TABLE_BASE;
         let lists = [space.u32(h + 0x14), space.u32(h + 0x18), space.u32(h + 0x1c)];
         let mut env = Env::new(&mut space, h, lists, WORK, WORK_SIZE);
-        if pool2 != 0 {
-            env.pool2 = Some(Pool::init(&mut space, POOL2, pool2));
+        if overflow_pool != 0 {
+            env.overflow_pool = Some(Pool::init(&mut space, POOL2, overflow_pool));
         }
         let mut missing = Vec::new();
         let table = crate::traced_tables::ENGINE_PROGRAMS

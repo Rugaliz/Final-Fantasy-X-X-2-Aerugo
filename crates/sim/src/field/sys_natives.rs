@@ -295,7 +295,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                 }
                 c.scratch[1] = 0;
                 g.sound.play_simple_pub(0x8000_0026u32 as i32, 0x3f, 0x7f);
-                g.workers.sys.mode3 |= 4;
+                g.workers.sys.holds |= crate::workers::holds::SYSTEM_WINDOW;
                 let variant = crate::items::text_variant(&c.memory.global[0]);
                 let wi = c.scratch[0] as usize;
                 let chr_name = if chr <= 0x13 {
@@ -328,7 +328,7 @@ pub fn register(n: &mut Natives<FieldState>) {
                 _ => 5,
             }),
             result: Some(|g, c| {
-                g.workers.sys.mode3 &= !4;
+                g.workers.sys.holds &= !crate::workers::holds::SYSTEM_WINDOW;
                 g.control_refresh();
                 crate::stats::set_command(
                     &mut c.memory.global[0],
@@ -597,23 +597,28 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(if v[7] <= best { at } else { 7 })
         }),
     );
-    // The event system's flags: 00aa sets bit 0 of its +0x210 word (00da reads it); 00be bit 7 of its first byte.
+    // 00aa(on): the player's moved distance counts (00da reads it); 00be(on): map changes open.
     n.register(
         0x00AA,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let s = &mut g.workers.sys;
-            s.flags210 = s.flags210 & !1 | u32::from(v != 0);
+            crate::workers::set_flag(&mut s.play, crate::workers::play::COUNT_DISTANCE, v != 0);
             Value::Int(v)
         }),
     );
-    n.register(0x00DA, Native::result(|g, _| Value::Int((g.workers.sys.flags210 & 1) as i32)));
+    n.register(
+        0x00DA,
+        Native::result(|g, _| {
+            Value::Int(i32::from(g.workers.sys.play & crate::workers::play::COUNT_DISTANCE != 0))
+        }),
+    );
     n.register(
         0x00BE,
         Native::result(|g, c| {
             let v = c.stack.pop_int();
             let s = &mut g.workers.sys;
-            s.flags0 = s.flags0 & 0x7f | u8::from(v != 0) << 7;
+            crate::workers::set_flag(&mut s.state, crate::workers::state::MAP_CHANGE_OPEN, v != 0);
             Value::Int(i32::from(v != 0))
         }),
     );
@@ -905,7 +910,7 @@ fn motion_range(g: &mut FieldState, c: &mut NativeCall, mode: u8, other: bool) {
         ch.set_u8(0x870, v);
     }
     if model == 0x66 {
-        g.chr_globals.motion_21092 = u8::from(motion == 0x21092);
+        g.chr_globals.hd_joints_at_rest = u8::from(motion == 0x21092);
     }
     let (table, extend) = match mode {
         0 => (true, true),
@@ -1778,15 +1783,15 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // 0212(on, v): the system's +0x208 value and bit 0 of its +2 flags; returns the switch.
+    // 0212(on, height): the camera water check and its surface height (as c02f); returns the switch.
     n.register(
         0x0212,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.value208 = v;
-            s.flags2 = s.flags2 & !1 | u8::from(on);
+            s.water_surface_height = v;
+            crate::workers::set_flag(&mut s.scene, crate::workers::scene::CAMERA_WATER_CHECK, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -1820,13 +1825,13 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // 024d(on): bit 6 of the system's +0x210 word; returns the switch.
+    // 024d(on): the soft reset allowed; returns the switch.
     n.register(
         0x024D,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags210 = s.flags210 & !0x40 | u32::from(on) << 6;
+            crate::workers::set_flag(&mut s.play, crate::workers::play::SOFT_RESET_ALLOWED, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -1868,13 +1873,13 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
     // 010e / 0135: save words +0x3d10 and +0x3d48.
     n.register(0x010E, Native::result(|_, c| Value::Int(save_i32(c, 0x3d10))));
     n.register(0x0135, Native::result(|_, c| Value::Int(save_i32(c, 0x3d48))));
-    // 0115(on) / 012b(on): bits 3 and 6 of the system's +2 flags; return the switch.
+    // 0115(on) / 012b(on): random encounters on / the per-event points on; return the switch.
     n.register(
         0x0115,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags2 = s.flags2 & !8 | u8::from(on) << 3;
+            crate::workers::set_flag(&mut s.scene, crate::workers::scene::ENCOUNTERS_ON, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -1883,7 +1888,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags2 = s.flags2 & !0x40 | u8::from(on) << 6;
+            crate::workers::set_flag(&mut s.scene, crate::workers::scene::EVENT_CREDIT_ON, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -1893,7 +1898,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         Native::result(|g, c| {
             let on = c.stack.pop_int();
             let slot = c.stack.pop_int();
-            g.shapes.slots[slot.clamp(0, 0x7f) as usize].byte3 = u8::from(on != 0);
+            g.shapes.slots[slot.clamp(0, 0x7f) as usize].unread_switch = u8::from(on != 0);
             Value::Int(slot)
         }),
     );
@@ -2043,8 +2048,17 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(v1)
         }),
     );
-    // 019e: talking is open (the system's mode flags 0x22).
-    n.register(0x019E, Native::result(|g, _| Value::Int(i32::from(g.workers.sys.flags0 & 0x22 != 0))));
+    // 019e: talking is open (control on, or taken through the alternate switch).
+    n.register(
+        0x019E,
+        Native::result(|g, _| {
+            Value::Int(i32::from(
+                g.workers.sys.state
+                    & (crate::workers::state::CONTROL_ON | crate::workers::state::ALTERNATE_SWITCH)
+                    != 0,
+            ))
+        }),
+    );
     // 0210(n): a help event flag (the save's 0x80-byte field at +0x3dcc); returns n.
     n.register(
         0x0210,
@@ -2106,7 +2120,10 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
         }),
     );
     // 01c6: a one-time flag (1 the first time, then 0); 01fa: a value a menu leaves (−1 until then).
-    n.register(0x01C6, Native::result(|g, _| Value::Int(i32::from(std::mem::take(&mut g.globals.first_c6)))));
+    n.register(
+        0x01C6,
+        Native::result(|g, _| Value::Int(i32::from(std::mem::take(&mut g.globals.fresh_boot)))),
+    );
     n.register(0x01FA, Native::result(|g, _| Value::Int(g.globals.menu_value_fa)));
     // Save image values: 00fa(v) +0x2b, 01bc(v) +0xd4 (u16) and +0xd6 = 1, 01c3(v) +0xe4, 01c4(on) +0xe8 (u16).
     n.register(
@@ -2308,12 +2325,12 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(i32::from(on))
         }),
     );
-    // 0149(on): the system block's +2 bit 7; returns on.
+    // 0149(on): a scene switch nothing reads; returns on.
     n.register(
         0x0149,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            g.workers.sys.flags2 = g.workers.sys.flags2 & 0x7f | u8::from(on) << 7;
+            crate::workers::set_flag(&mut g.workers.sys.scene, crate::workers::scene::UNREAD_SWITCH, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -3326,12 +3343,12 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             }
             let (p, part) = if other == -1 { (None, 0) } else { (Some(index(g, other)), part) };
             let tag = p.and_then(|p| chr_of(g, p).map(|ch| ch.i32(0x190)));
-            let b38 = g
+            let motion_unit = g
                 .actors
                 .get(w)
                 .and_then(|a| a.model)
                 .and_then(|m| g.model_optpos.get(&m).cloned().flatten())
-                .map_or(1.0, |o| o.block_38);
+                .map_or(1.0, |o| o.motion_unit);
             let Some(ch) = chr_of(g, w) else { return Value::Int(0) };
             match (p, tag) {
                 (Some(p), Some(tag)) => {
@@ -3344,7 +3361,7 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
                 }
             }
             ch.set_i32(0x1a0, part);
-            let b = f64::from(b38);
+            let b = f64::from(motion_unit);
             ch.set_f32(0x1a4, (b * f64::from(x) * 100.0) as f32);
             ch.set_f32(0x1a8, (f64::from(y) * 100.0 * b) as f32);
             ch.set_f32(0x1ac, (f64::from(z) * 100.0 * b) as f32);
@@ -3562,14 +3579,14 @@ pub(super) fn register_02(n: &mut Natives<FieldState>) {
             Value::Int(n)
         }),
     );
-    // c02f(on, v): the system block's +0x208 = v and +2 bit 0 = on; returns on.
+    // c02f(on, height): the camera water check and its surface height; returns on.
     n.register(
         0xC02F,
         Native::result(|g, c| {
             let v = c.stack.pop_float();
             let on = c.stack.pop_int() != 0;
-            g.workers.sys.value208 = v;
-            g.workers.sys.flags2 = g.workers.sys.flags2 & !1 | u8::from(on);
+            g.workers.sys.water_surface_height = v;
+            crate::workers::set_flag(&mut g.workers.sys.scene, crate::workers::scene::CAMERA_WATER_CHECK, on);
             Value::Int(i32::from(on))
         }),
     );

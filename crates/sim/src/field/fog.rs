@@ -84,8 +84,9 @@ impl PsFog {
 /// The scene settings values the fog natives read (the remaster's scene settings object).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct HdScene {
-    /// +0x50..+0x58 (the camera's +0xc4..+0xcc).
-    pub colour50: [f32; 3],
+    /// What the fog getters take for the fog colour while the colour transform is on: the scene settings'
+    /// +0x50..+0x58, which fall one component into the ambient colour (its green, blue and w).
+    pub transformed_fog_colour: [f32; 3],
     /// +0x60 fog colour, +0x70 near, +0x74 far, +0x7c limit, +0x80 background.
     pub fog_colour: [f32; 3],
     pub near: f32,
@@ -97,7 +98,7 @@ pub struct HdScene {
 impl HdScene {
     pub fn from_settings(s: &aerugo_formats::mesh::SceneSettings) -> HdScene {
         HdScene {
-            colour50: [s.ambient[1], s.ambient[2], s.ambient_w],
+            transformed_fog_colour: [s.ambient[1], s.ambient[2], s.ambient_w],
             fog_colour: s.fog_color,
             near: s.fog_near,
             far: s.fog_far,
@@ -137,7 +138,7 @@ fn colour(g: &FieldState) -> [i32; 4] {
         i32::from(f.rgba[3])
     };
     let h = g.hd_scene.unwrap_or_default();
-    let c = if transform { h.colour50 } else { h.fog_colour };
+    let c = if transform { h.transformed_fog_colour } else { h.fog_colour };
     [ftol(f64::from(c[0]) * 255.0), ftol(f64::from(c[1]) * 255.0), ftol(f64::from(c[2]) * 255.0), a]
 }
 

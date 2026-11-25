@@ -194,7 +194,7 @@ impl Pool {
 pub struct Env {
     pub pool: Pool,
     /// The second pool, used when the first is full (none is set up for the event effects seen).
-    pub pool2: Option<Pool>,
+    pub overflow_pool: Option<Pool>,
     pub lists: [u32; 3],
     /// The objects the pools could not hold.
     pub alloc_failed: bool,
@@ -208,7 +208,7 @@ impl Env {
         let _ = group;
         Env {
             pool: Pool::init(m, work, size),
-            pool2: None,
+            overflow_pool: None,
             lists: group_lists,
             alloc_failed: false,
             scratch_offset: 0,
@@ -222,7 +222,7 @@ impl Env {
         if p != 0 {
             return p;
         }
-        if let Some(p2) = &mut self.pool2 {
+        if let Some(p2) = &mut self.overflow_pool {
             let q = p2.alloc(m, n);
             if q != 0 {
                 return q;
@@ -234,7 +234,7 @@ impl Env {
 
     /// Free a block of whichever pool holds it (the second pool's blocks lie past the first's end).
     pub fn free(&mut self, m: &mut Space, p: u32) {
-        match &mut self.pool2 {
+        match &mut self.overflow_pool {
             Some(p2) if p > self.pool.end => p2.free(m, p),
             _ => self.pool.free(m, p),
         }

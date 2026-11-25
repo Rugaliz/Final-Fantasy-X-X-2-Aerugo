@@ -210,19 +210,19 @@ pub fn element_matrices_with(
     out
 }
 
-/// The world matrix of a body standing on its own (no parent and no matrix of its own): `b30` / `b38`
-/// the model block's +0x30 / +0x38, `tilt` the X turn when +0x160 is set, `place` the position plus the draw
+/// The world matrix of a body standing on its own (no parent and no matrix of its own): its model's `size` and
+/// `motion_unit`, `tilt` the X turn when +0x160 is set, `place` the position plus the draw
 /// offset.
 pub fn body_world(
-    b30: f32,
-    b38: f32,
+    size: f32,
+    motion_unit: f32,
     scale: [f32; 3],
     tilt: Option<f32>,
     facing: f32,
     place: [f32; 3],
 ) -> Mat {
     // The constants are single-precision values held as doubles (0.01f, 1.570796f).
-    let s = ((d(b30) / d(b38)) * d(0.01)) as f32;
+    let s = ((d(size) / d(motion_unit)) * d(0.01)) as f32;
     let mut m = IDENTITY;
     m[0] = (d(s) * d(scale[0])) as f32;
     m[5] = (d(scale[1]) * d(s)) as f32;
@@ -240,25 +240,25 @@ pub fn body_world(
 }
 
 /// The world matrix of a body hung on another body's element (+0x19c set): the element's matrix scaled
-/// by (1 / the other's block +0x30) · +0x1b4, its translation × 1000 and moved by the offset (+0x1a4.., × the
-/// other's block +0x30), in the other's world.
+/// by (1 / the other model's size) · the hang scale (506e), its translation × 1000 and moved by the offset
+/// (+0x1a4.., × the other's size), in the other's world.
 pub fn hung_world(
     parent_world: &Mat,
     parent_elem: &Mat,
-    parent_b30: f32,
-    scale_1b4: f32,
+    parent_size: f32,
+    hang_scale: f32,
     off: [f32; 4],
 ) -> Mat {
-    let k = ((1.0 / d(parent_b30)) * d(scale_1b4)) as f32;
+    let k = ((1.0 / d(parent_size)) * d(hang_scale)) as f32;
     let mut l = IDENTITY;
     l[0] = k;
     l[5] = k;
     l[10] = k;
     let mut m = mul(parent_elem, &l);
     let v = [
-        (d(parent_b30) * d(off[0])) as f32,
-        (d(parent_b30) * d(off[1])) as f32,
-        (d(parent_b30) * d(off[2])) as f32,
+        (d(parent_size) * d(off[0])) as f32,
+        (d(parent_size) * d(off[1])) as f32,
+        (d(parent_size) * d(off[2])) as f32,
         off[3],
     ];
     for t in &mut m[12..15] {
@@ -290,16 +290,16 @@ pub fn element_position(world: &Mat, elems: &[Mat], e: usize, listed: bool) -> [
 }
 
 /// The option points (0x16 of x, y, z, w): each option position at its element (translation × 1000,
-/// then in the world); kind 0x4000 entries add their offset scaled by (10000 / b30) / b30 · b38.
+/// then in the world); kind 0x4000 entries add their offset scaled by (10000 / size) / size · motion_unit.
 pub fn option_points(
     world: &Mat,
     elems: &[Mat],
     entries: &[(u16, i16, [f32; 3])],
-    b30: f32,
-    b38: f32,
+    size: f32,
+    motion_unit: f32,
 ) -> [[f32; 4]; 0x16] {
     let mut pts = [[0.0f32; 4]; 0x16];
-    let k = (((10000.0 / d(b30)) / d(b30)) * d(b38)) as f32;
+    let k = (((10000.0 / d(size)) / d(size)) * d(motion_unit)) as f32;
     for &(key, elem, v) in entries {
         let i = usize::from(key & 0x3fff);
         let mut s = IDENTITY;
@@ -488,10 +488,12 @@ fn atan2(y: f32, x: f32) -> f32 {
 /// What the neck step needs besides the record.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NeckInput {
-    /// The body's option points 0x13 / 0x14 / 9 (from the last batch), as the option point lookup gives them.
-    pub p13: Option<[f32; 4]>,
-    pub p14: Option<[f32; 4]>,
-    pub p9: [f32; 4],
+    /// The body's option points (from the last batch, as the option point lookup gives them): 0x13 and 0x14,
+    /// whose line turns the neck's limits with the body, and 9, the head the neck looks from (and that other
+    /// bodies look at).
+    pub turn_point_a: Option<[f32; 4]>,
+    pub turn_point_b: Option<[f32; 4]>,
+    pub head_point: [f32; 4],
     /// The target point (modes 1–3; mode 2 None when the target body is gone).
     pub target: Option<[f32; 4]>,
     /// The block's +0x40.
@@ -524,18 +526,18 @@ pub fn neck(ch: &mut super::Chr, inp: &NeckInput) -> Option<(Mat, f32)> {
         // (A mode outside 1–4 reads an unset target in the original; it is taken as the origin here.)
         let target = if (1..=3).contains(&mode) { inp.target? } else { [0.0; 4] };
         let mut b = 0.0f32;
-        if let (Some(p13), Some(p14)) = (inp.p13, inp.p14) {
-            let dx = f(d(p13[0]) - d(p14[0]));
-            let dz = f(d(p13[2]) - d(p14[2]));
+        if let (Some(turn_point_a), Some(turn_point_b)) = (inp.turn_point_a, inp.turn_point_b) {
+            let dx = f(d(turn_point_a[0]) - d(turn_point_b[0]));
+            let dz = f(d(turn_point_a[2]) - d(turn_point_b[2]));
             let a = atan2(dz, dx);
             b = f((d(a) + d(half_pi)) - d(facing));
             b = deg(super::wrap(b));
         }
         let dv = normalize([
-            f(d(inp.p9[0]) - d(target[0])),
-            f(d(inp.p9[1]) - d(target[1])),
-            f(d(inp.p9[2]) - d(target[2])),
-            inp.p9[3],
+            f(d(inp.head_point[0]) - d(target[0])),
+            f(d(inp.head_point[1]) - d(target[1])),
+            f(d(inp.head_point[2]) - d(target[2])),
+            inp.head_point[3],
         ]);
         let yaw = atan2(dv[2], dv[0]);
         let mut y = deg(super::wrap(f((d(yaw) - d(half_pi)) - d(facing))));

@@ -24,8 +24,9 @@ pub struct ShapeSlot {
     pub on: bool,
     /// Brightness (the colour's rgb times this / 255).
     pub bright: u8,
-    pub byte2: u8,
-    pub byte3: u8,
+    /// A byte only the reset clears, and the switch 011b and 012a set: the remaster's shape draw reads neither.
+    pub unused_byte: u8,
+    pub unread_switch: u8,
     pub x: i16,
     pub y: i16,
     /// Scale ×1/256 on x and y.
@@ -45,8 +46,8 @@ impl Default for ShapeSlot {
         ShapeSlot {
             on: false,
             bright: 0x80,
-            byte2: 0,
-            byte3: 0,
+            unused_byte: 0,
+            unread_switch: 0,
             x: 0,
             y: 0,
             scale: [0x100, 0x100],
@@ -271,7 +272,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             slot.on = true;
             slot.bright = 0xff;
             slot.color = [0x80; 4];
-            slot.byte3 = 1;
+            slot.unread_switch = 1;
             slot.clock = 0;
             slot.frame = 0;
             if s.tex_table.is_some() && !s.tex_loaded {

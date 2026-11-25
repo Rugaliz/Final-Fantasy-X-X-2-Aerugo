@@ -31,17 +31,19 @@ pub const MOTION: u32 = 0x72c;
 /// The model block values a new record takes defaults from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Block {
-    /// +0x24, +0x28, +0x2c: the defaults of the height values set to −1; +0x34 the scale.
-    pub h24: f32,
-    pub h28: f32,
-    pub h2c: f32,
+    /// The camera width, the body's height and the camera height (block +0x24 / +0x28 / +0x2c; the game's
+    /// MsGetChrCamWidth, its height getter and MsGetChrCamHeight read them back, scaled in battle) that a new
+    /// body takes, and the scale (+0x34).
+    pub camera_width: f32,
+    pub height: f32,
+    pub camera_height: f32,
     pub scale: f32,
 }
 
 /// The values a block has without an info block (the model block set-up's defaults).
 impl Default for Block {
     fn default() -> Self {
-        Block { h24: 1.0, h28: 0.0, h2c: 8.0, scale: 1.0 }
+        Block { camera_width: 1.0, height: 0.0, camera_height: 8.0, scale: 1.0 }
     }
 }
 
@@ -54,8 +56,9 @@ pub struct Globals {
     /// The PS2 frame draws into the fixed buffer (frame and depth base 0xd0) rather than the one its display
     /// mode picks (403a).
     pub draw_to_fixed_buffer: u8,
-    /// Body 0x66 plays motion 0x21092 (the remaster checks it).
-    pub motion_21092: u8,
+    /// Body 0x66 plays motion 0x21092: while it does, the remaster holds the HD model's joints 0x6b and 0x6c at
+    /// their rest pose.
+    pub hd_joints_at_rest: u8,
     /// The second water height (403c; the bodies' step takes the higher of it and the water level) and the map
     /// alpha mode (4034).
     pub second_water_height: f32,
@@ -156,10 +159,10 @@ impl Chr {
         for k in 0..3 {
             c.set_f32(SCALE + k * 4, block.scale);
         }
-        c.set_f32(0x4f4, block.h2c);
-        c.set_f32(0x4f0, block.h28);
+        c.set_f32(0x4f4, block.camera_height);
+        c.set_f32(0x4f0, block.height);
         c.set_f32(0x4e4, -1.0);
-        c.set_f32(0x4ec, block.h24);
+        c.set_f32(0x4ec, block.camera_width);
         c.set_f32(0x17c, f32::from_bits(0x3e4c_cccd));
         c.set_flag(20, true);
         c.set_i16(0x73c, 1);

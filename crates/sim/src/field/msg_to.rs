@@ -518,13 +518,16 @@ pub fn close(g: &mut FieldState, w: usize) {
     }
 }
 
-/// The press check before the block's workers: a confirm (or the second button) while a window waits on
-/// it sets the advance bit (system byte 0 bit 2); the bit lasts one frame.
+/// The confirm button in the pressed word (the other talk button is 0x80, which only starts talks).
+const CONFIRM: u32 = 0x20;
+
+/// The press check before the block's workers: confirm while a window waits for a press sets the advance bit
+/// for the frame.
 pub fn press(g: &mut FieldState, pressed: u32) {
-    let s = &mut g.workers.sys;
-    s.flags0 &= !4 & !0x10;
-    if pressed & 0xa0 != 0 && waiting(g) == 1 {
-        g.workers.sys.flags0 |= 4;
+    use crate::workers::state;
+    g.workers.sys.state &= !(state::ADVANCE_PRESSED | state::CLEARED_EACH_FRAME);
+    if pressed & CONFIRM != 0 && waiting(g) == 1 {
+        g.workers.sys.state |= state::ADVANCE_PRESSED;
     }
 }
 
@@ -563,16 +566,17 @@ pub fn status(g: &mut FieldState) {
             active = i;
         }
     }
-    if g.workers.sys.mode1a == 0 {
+    if g.workers.sys.script_mode == 0 {
+        use crate::workers::{holds, message, set_flag, state};
         let s = &mut g.workers.sys;
-        let b1 = s.flags1;
-        if (b1 >> 2 & 1 != 0) != choice_up {
-            s.flags1 = if b1 & 8 == 0 { b1 & !4 } else { b1 & !4 | u8::from(choice_up) << 2 };
+        if (s.message & message::MESSAGE_UP != 0) != choice_up {
+            let up = choice_up && s.message & message::WINDOWS_HOLD_CONTROL != 0;
+            set_flag(&mut s.message, message::MESSAGE_UP, up);
             g.control_recheck();
         }
         let s = &mut g.workers.sys;
-        let off = s.flags1 & 4 != 0 || s.flags0 & 2 == 0;
-        s.mode3 = s.mode3 & !0x10 | u8::from(off) << 4;
+        let no_control = s.message & message::MESSAGE_UP != 0 || s.state & state::CONTROL_ON == 0;
+        set_flag(&mut s.holds, holds::NO_CONTROL, no_control);
     }
     for (i, w) in g.windows.iter_mut().enumerate() {
         w.to.active = i == active;

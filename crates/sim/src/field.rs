@@ -291,8 +291,9 @@ pub fn model_path(game: Game, id: u16) -> Option<String> {
 pub struct Globals {
     /// The wide-turn limit in degrees (179 at start; 01f0).
     pub turn_limit_deg: f32,
-    /// A one-time flag 01c6 returns and clears (1 at start).
-    pub first_c6: u8,
+    /// 1 from the game's start until 01c6 reads it (it returns it and clears it): only the first call after boot
+    /// sees 1.
+    pub fresh_boot: u8,
     /// A value a menu sets (−1 at start; 01fa reads it).
     pub menu_value_fa: i32,
     /// The save read's argument 01c5 keeps.
@@ -314,7 +315,7 @@ impl Default for Globals {
     fn default() -> Self {
         Globals {
             turn_limit_deg: 179.0,
-            first_c6: 1,
+            fresh_boot: 1,
             menu_value_fa: -1,
             save_read_arg: 0,
             colour_mul: [0.0; 4],
@@ -718,8 +719,8 @@ pub struct EngineValues {
     pub sound_switches: u32,
     /// Event bits (017a sets bit n; an event effect load clears them).
     pub event_bits: u32,
-    /// Set by 017a(9) and cleared by 017a(10) on scene 0x5e, room 0x186.
-    pub event_switch_9: bool,
+    /// Set by 017a(9) and cleared by 017a(10) on scene 0x5e, room 0x186: nothing reads it.
+    pub unread_scene_switch: bool,
     /// The screen copy switch (4014).
     pub screen_copy: bool,
     /// Character ID effect variables (4017) and the current set's effect bytes (403b).
@@ -1103,7 +1104,7 @@ impl World for FieldState {
     fn may_run(&mut self, w: usize) -> bool {
         let Some(wk) = self.workers.list.get(w) else { return true };
         let (f, f2) = (wk.flags(), wk.flags2());
-        let mode = self.workers.sys.mode3 & 3;
+        let mode = self.workers.sys.holds & crate::workers::holds::BATTLE_END;
         (f & 4 != 0 || f2 & 0x40 != 0 || self.battle.is_none())
             && mode != 1
             && (mode != 2 || f2 & 0x8000 != 0)
@@ -1364,7 +1365,7 @@ impl FieldState {
         };
         let rig = self.model_rigs.get(&model).cloned().flatten();
         let opt = self.model_optpos.get(&model).cloned().flatten();
-        let (b30, b38) = opt.as_ref().map_or((1.0, 1.0), |o| (o.block_30, o.block_38));
+        let (size, motion_unit) = opt.as_ref().map_or((1.0, 1.0), |o| (o.size, o.motion_unit));
         let mscale = self.model_motion_scales.get(&model).copied().flatten().unwrap_or(0.001);
         // The element values: the model's own when the body (or its model) is new.
         let fresh = !matches!(&self.chr_joints[w], Some((m, _)) if *m == model);
@@ -1426,9 +1427,9 @@ impl FieldState {
                 _ => None,
             };
             let inp = el::NeckInput {
-                p13: p(0x13),
-                p14: p(0x14),
-                p9: el::point(&pts, 9, body),
+                turn_point_a: p(0x13),
+                turn_point_b: p(0x14),
+                head_point: el::point(&pts, 9, body),
                 target,
                 side: opt.as_ref().map_or(0, |o| o.eye_block(model).0),
             };
@@ -1445,7 +1446,7 @@ impl FieldState {
         let joints = self.chr_joints[w].as_ref().map_or(&[][..], |(_, j)| &j[..]);
         let elems = el::element_matrices_with(&parents, joints, neck);
         let (scale, facing) = ([ch.f32(0x5c), ch.f32(0x60), ch.f32(0x64)], ch.f32(crate::chr::FACING));
-        let (hung, elem, off, k1b4) = (
+        let (hung, elem, off, hang_scale) = (
             ch.u32(crate::chr::PARENT),
             ch.i32(0x1a0),
             [ch.f32(0x1a4), ch.f32(0x1a8), ch.f32(0x1ac), ch.f32(0x1b0)],
@@ -1465,13 +1466,13 @@ impl FieldState {
         let parent = (hung != 0).then(|| hung as usize - 1).and_then(|p| {
             let f = self.chr_frames.get(p).cloned().flatten()?;
             let pm = self.actors.get(p).and_then(|a| a.model)?;
-            let pb30 = self.model_optpos.get(&pm).cloned().flatten().map_or(1.0, |o| o.block_30);
+            let parent_size = self.model_optpos.get(&pm).cloned().flatten().map_or(1.0, |o| o.size);
             let pe = usize::try_from(elem).ok().and_then(|e| f.elems.get(e)).copied().unwrap_or(el::IDENTITY);
-            Some(el::hung_world(&f.world, &pe, pb30, k1b4, off))
+            Some(el::hung_world(&f.world, &pe, parent_size, hang_scale, off))
         });
-        let world = parent.unwrap_or_else(|| el::body_world(b30, b38, scale, tilt, facing, place));
+        let world = parent.unwrap_or_else(|| el::body_world(size, motion_unit, scale, tilt, facing, place));
         let entries = opt.as_ref().map_or(&[][..], |o| &o.entries[..]);
-        let points = el::option_points(&world, &elems, entries, b30, b38);
+        let points = el::option_points(&world, &elems, entries, size, motion_unit);
         // The shadow centre (+0x694..+0x6a0, the old one kept at +0x684): between the feet (points 7 and 8: their
         // mean x and z, the higher y) and point 1, in x and z; the feet's height.
         let body = [world[12], world[13], world[14]];
@@ -1912,8 +1913,10 @@ pub fn chr_path_of_model(model_path: &str) -> Option<String> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OptPos {
     pub entries: Vec<(u16, i16, [f32; 3])>,
-    pub block_30: f32,
-    pub block_38: f32,
+    /// The model's size and motion unit (block +0x30 / +0x38): a free body's world scale is size / motion unit
+    /// / 100, motions move it in motion units of 0.001, and bodies hung on it divide by its size.
+    pub size: f32,
+    pub motion_unit: f32,
     /// The block's +0x40 (neck side), +0x42 (the eyelid's axis), +0x43 (its sign) and +0x44..+0x4c (its turn at
     /// rest), from the info block (+0x24, bytes +0x26 / +0x27, +0x28..+0x30); none before version 10.
     pub eye: Option<(u8, u8, u8, [f32; 3])>,
@@ -1943,7 +1946,7 @@ pub fn chr_optpos(d: &[u8]) -> Option<OptPos> {
             })
             .collect()
     };
-    let (block_30, block_38, eye) = if u32_at(4)? < 10 {
+    let (size, motion_unit, eye) = if u32_at(4)? < 10 {
         (1.0, 1.0, None)
     } else {
         let info = u32_at(0x58)? as usize;
@@ -1952,12 +1955,12 @@ pub fn chr_optpos(d: &[u8]) -> Option<OptPos> {
         let eye = (b(0x24)?, b(0x26)?, b(0x27)?, [f(info + 0x28)?, f(info + 0x2c)?, f(info + 0x30)?]);
         (f(info + 0xc)?, f(info + 0x20)?, Some(eye))
     };
-    Some(OptPos { entries, block_30, block_38, eye })
+    Some(OptPos { entries, size, motion_unit, eye })
 }
 
 impl OptPos {
-    /// The element of the key and its offset (kind 0x4000: the floats × (10000 / b30 / b30)
-    /// · b38; kind 0: none), with the kind code it returns (0, 1, 2 for 0x8000, else 0).
+    /// The element of the key and its offset (kind 0x4000: the floats × (10000 / size / size)
+    /// · motion unit; kind 0: none), with the kind code it returns (0, 1, 2 for 0x8000, else 0).
     pub fn element(&self, key: u32) -> Option<(i32, [f32; 4], u8)> {
         let &(k, elem, v) =
             self.entries.iter().find(|e| u32::from(e.0 as i16 as i32 as u32 as u16 & 0x3fff) == key)?;
@@ -1966,8 +1969,8 @@ impl OptPos {
         let code = match kind {
             0 => 0,
             0x4000 => {
-                let s = ((10000.0f64 / f64::from(self.block_30) / f64::from(self.block_30))
-                    * f64::from(self.block_38)) as f32;
+                let s = ((10000.0f64 / f64::from(self.size) / f64::from(self.size))
+                    * f64::from(self.motion_unit)) as f32;
                 off = [
                     (f64::from(s) * f64::from(v[0])) as f32,
                     (f64::from(v[1]) * f64::from(s)) as f32,
@@ -2000,7 +2003,12 @@ pub fn chr_block(d: &[u8]) -> Option<crate::chr::Block> {
     }
     let info = u32_at(0x58)? as usize;
     let f = |o: usize| u32_at(info + o).map(f32::from_bits);
-    Some(crate::chr::Block { h24: f(0x18)?, h28: f(0x14)?, h2c: f(8)?, scale: f(0x1c)? })
+    Some(crate::chr::Block {
+        camera_width: f(0x18)?,
+        height: f(0x14)?,
+        camera_height: f(8)?,
+        scale: f(0x1c)?,
+    })
 }
 
 pub fn chr_radius(d: &[u8]) -> Option<f32> {
@@ -2381,18 +2389,27 @@ impl FieldState {
         on
     }
 
-    /// Whether control is blocked (system block byte 1 bit 4, byte 3 bits 0x84).
+    /// Whether control is held off: a message with choices is up, a system window is open, or the battle music
+    /// is being set up.
     fn control_blocked(&self) -> bool {
-        self.workers.sys.flags1 & 4 != 0 || self.workers.sys.mode3 & 0x84 != 0
+        use crate::workers::{holds, message};
+        let s = &self.workers.sys;
+        s.message & message::MESSAGE_UP != 0 || s.holds & (holds::SYSTEM_WINDOW | holds::BATTLE_MUSIC) != 0
+    }
+
+    /// Whether control was on or taken through the alternate switch (what a recheck turns control back on for).
+    fn had_control(state: u8) -> bool {
+        use crate::workers::state as bits;
+        state & (bits::CONTROL_ON | bits::ALTERNATE_SWITCH) != 0
     }
 
     /// Control on: unless blocked, every kind-1 worker with a body, a party character and its switch on
-    /// (flag 0x200 of +0x34, or with byte 0 bit 0x20 flag 8 of +0x36) is taken over (+0x34 |= 0x20), and the
-    /// player's one becomes the controlled body; byte 0 bit 1 set.
+    /// (flag 0x200 of +0x34, or with the alternate switch flag 8 of +0x36) is taken over (+0x34 |= 0x20), and
+    /// the player's one becomes the controlled body; control is on.
     pub fn control_on(&mut self) {
         let mut controlled = None;
         if !self.control_blocked() {
-            let alt = self.workers.sys.flags0 & 0x20 != 0;
+            let alt = self.workers.sys.state & crate::workers::state::ALTERNATE_SWITCH != 0;
             let player = self.workers.sys.player;
             for w in 0..self.workers.list.len() {
                 let wk = &mut self.workers.list[w];
@@ -2409,12 +2426,12 @@ impl FieldState {
             }
         }
         self.controlled = controlled;
-        self.workers.sys.flags0 |= 2;
+        self.workers.sys.state |= crate::workers::state::CONTROL_ON;
         self.user_control = true;
     }
 
     /// Control off: every taken-over kind-1 worker with a body is let go (its record's +0x564 and its body's
-    /// speed 0); no body controlled; byte 0 bit 1 cleared.
+    /// speed 0); no body controlled; control is off.
     pub fn control_off(&mut self) {
         for w in 0..self.workers.list.len() {
             let wk = &mut self.workers.list[w];
@@ -2427,12 +2444,12 @@ impl FieldState {
             }
         }
         self.controlled = None;
-        self.workers.sys.flags0 &= !2;
+        self.workers.sys.state &= !crate::workers::state::CONTROL_ON;
         self.user_control = false;
     }
 
-    /// Control off, then on again unless byte 1 bit 2 or byte 3 bits 0x84 block it, when byte 0 had 0x22
-    /// before.
+    /// Control off, then on again unless it is held off, when it was on (or taken through the alternate
+    /// switch) before.
     /// the event's area for index `n` — the header's area word, or with its bit 15 the n-th of its table
     /// (past the table: the first); 0 without a script.
     pub fn area_word(&self, n: u32) -> u16 {
@@ -2447,23 +2464,25 @@ impl FieldState {
     }
 
     pub fn control_refresh(&mut self) {
-        let kept = self.workers.sys.flags0;
+        let kept = self.workers.sys.state;
         self.control_off();
-        if self.workers.sys.flags1 & 4 == 0 && self.workers.sys.mode3 & 0x84 == 0 && kept & 0x22 != 0 {
+        if !self.control_blocked() && Self::had_control(kept) {
             self.control_on();
         }
     }
 
-    /// Control checked again: off, then on when not blocked and the kept byte 0 had 0x22; bit 1 of byte 0
-    /// restored from the kept byte.
+    /// Control checked again: off, then on when not held off and it was on (or taken) before; the control bit
+    /// itself is put back as it was.
     pub fn control_recheck(&mut self) {
-        let kept = self.workers.sys.flags0;
+        use crate::workers::state;
+        let kept = self.workers.sys.state;
         self.control_off();
-        if !self.control_blocked() && kept & 0x22 != 0 {
+        if !self.control_blocked() && Self::had_control(kept) {
             self.control_on();
         }
-        self.workers.sys.flags0 = self.workers.sys.flags0 & !2 | kept & 2;
-        self.user_control = self.workers.sys.flags0 & 2 != 0;
+        let was_on = kept & state::CONTROL_ON != 0;
+        crate::workers::set_flag(&mut self.workers.sys.state, state::CONTROL_ON, was_on);
+        self.user_control = was_on;
     }
 
     /// A new walk mesh: every body in use looks its triangle up again.
@@ -3157,15 +3176,18 @@ fn register_settings(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // 0114(a, b): system byte 2 bit 2 = a != 0, bit 1 = b != 0; returns a != 0.
+    // 0114(force, underwater): the scene's under-water state forced (to `underwater`) or left to the camera
+    // water check; returns force != 0.
     n.register(
         0x0114,
         Native::result(|g, c| {
-            let b = c.stack.pop_int();
-            let a = c.stack.pop_int();
+            use crate::workers::{scene, set_flag};
+            let underwater = c.stack.pop_int() != 0;
+            let force = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags2 = s.flags2 & 0xf9 | u8::from(a != 0) << 2 | u8::from(b != 0) << 1;
-            Value::Int(i32::from(a != 0))
+            set_flag(&mut s.scene, scene::FORCE_UNDERWATER, force);
+            set_flag(&mut s.scene, scene::FORCED_UNDERWATER_VALUE, underwater);
+            Value::Int(i32::from(force))
         }),
     );
     // 0148(v, worker): the worker's +0xbc = v | 0x80000000 (0 stays 0) and +0xb4 = −10000.0.
@@ -3443,7 +3465,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             init: Some(|g, c| {
                 let mode = c.stack.pop_int();
                 let a = c.stack.pop_int();
-                g.workers.sys.flags210 &= !0x10;
+                g.workers.sys.play &= !crate::workers::play::SAVE_CHECKED;
                 g.globals.save_read_arg = a;
                 c.scratch[1] = mode as i8 as i32;
                 if g.workers.list.get(c.worker).is_some_and(|w| w.u16(crate::workers::BIND_ID) == 0x5045) {
@@ -3452,7 +3474,7 @@ fn register_fixed_results(n: &mut Natives<FieldState>) {
             }),
             wait: Some(|_, _| WAIT_DONE),
             result: Some(|g, c| {
-                g.workers.sys.flags210 |= 0x10;
+                g.workers.sys.play |= crate::workers::play::SAVE_CHECKED;
                 Value::Int(if c.scratch[1] == 1 { 0 } else { 2 })
             }),
         },
@@ -3763,9 +3785,11 @@ pub(crate) fn msg_wait_init(g: &mut FieldState, w: usize) {
 pub(crate) fn msg_wait(g: &mut FieldState, w: usize) -> u32 {
     match g.windows[w].atel_state {
         0 | 4 => WAIT_DONE,
-        2 if g.windows[w].text_state() == 3 && g.workers.sys.flags0 & 4 != 0 => {
+        2 if g.windows[w].text_state() == 3
+            && g.workers.sys.state & crate::workers::state::ADVANCE_PRESSED != 0 =>
+        {
             msg_to::close(g, w);
-            g.workers.sys.flags0 &= !4;
+            g.workers.sys.state &= !crate::workers::state::ADVANCE_PRESSED;
             0
         }
         _ => 0,
@@ -3868,13 +3892,13 @@ fn register_menus(n: &mut Natives<FieldState>) {
             Value::Int(number)
         }),
     );
-    // 0241(on): bit 3 of the system block's +0x210 word; returns on != 0.
+    // 0241(on): the main menu allowed; returns on != 0.
     n.register(
         0x0241,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags210 = s.flags210 & !8 | u32::from(on) << 3;
+            crate::workers::set_flag(&mut s.play, crate::workers::play::MENU_ALLOWED, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -4275,14 +4299,14 @@ fn register_queries(n: &mut Natives<FieldState>) {
     for id in [0x00DFu16, 0x00E0] {
         n.register(id, Native::result(|_, c| Value::Int(c.stack.pop_int())));
     }
-    // 00e9(on): the system's byte 1 bit 4; 0177(on): the caller's +0x36 bit 6, and bit 15 when on
-    // (both run gates of atel_run_worker). The result is on ≠ 0.
+    // 00e9(on): the scripts' own switch in the message byte (00ea reads it; nothing else does); 0177(on): the
+    // caller's +0x36 bit 6, and bit 15 when on (a run gate of atel_run_worker). The result is on ≠ 0.
     n.register(
         0x00E9,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
             let s = &mut g.workers.sys;
-            s.flags1 = s.flags1 & !0x10 | u8::from(on) << 4;
+            crate::workers::set_flag(&mut s.message, crate::workers::message::SCRIPT_SWITCH, on);
             Value::Int(i32::from(on))
         }),
     );
@@ -4312,7 +4336,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
             init: Some(|g, c| {
                 use crate::items::Treasure;
                 g.sound.play_simple_pub(0x8000_0026u32 as i32, 0x3f, 0x7f);
-                g.workers.sys.mode3 |= 4;
+                g.workers.sys.holds |= crate::workers::holds::SYSTEM_WINDOW;
                 let index = c.stack.pop_int();
                 let w = window(c);
                 let (got, full) = give_treasure(g, &mut c.memory.global[0], index);
@@ -4371,7 +4395,7 @@ fn register_treasure(n: &mut Natives<FieldState>) {
                 }
             }),
             result: Some(|g, _| {
-                g.workers.sys.mode3 &= !4;
+                g.workers.sys.holds &= !crate::workers::holds::SYSTEM_WINDOW;
                 g.control_refresh();
                 Value::Int(1)
             }),
@@ -4550,9 +4574,9 @@ fn register_engine_values(n: &mut Natives<FieldState>) {
             let room = c.memory.global[0].get(0xBEC..0xBEE).map(|b| u16::from_le_bytes([b[0], b[1]]));
             if g.scene == Some(0x5E) && room == Some(0x186) {
                 if v == 10 {
-                    g.engine.event_switch_9 = false;
+                    g.engine.unread_scene_switch = false;
                 } else if v == 9 {
-                    g.engine.event_switch_9 = true;
+                    g.engine.unread_scene_switch = true;
                 }
             }
             g.engine.event_bits |= 1 << (v as u32 & 31);
@@ -5217,7 +5241,7 @@ pub fn register(n: &mut Natives<FieldState>) {
             g.worker_switch(c.worker, n == 0);
             g.control_recheck();
             let slot = if (n as u32) < 8 { n as u8 } else { 0xf };
-            if g.workers.sys.mode1a == 0 {
+            if g.workers.sys.script_mode == 0 {
                 if let Some(wk) = g.workers.list.get_mut(c.worker) {
                     wk.set_u8(0xaf, slot);
                 }

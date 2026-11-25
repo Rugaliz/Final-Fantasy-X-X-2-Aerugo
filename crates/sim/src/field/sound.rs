@@ -683,14 +683,15 @@ pub fn register(n: &mut Natives<FieldState>) {
             Value::Int(1)
         }),
     );
-    // 015d(on) / 015e(on): bits 3 / 6 of the system's +3 byte; return the bit before.
+    // 015d(on) / 015e(on): two switches of the system's holds byte that nothing reads; return the switch before.
     n.register(
         0x015D,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            let m = &mut g.workers.sys.mode3;
-            let old = *m >> 3 & 1;
-            *m = *m & !8 | u8::from(on) << 3;
+            let holds = &mut g.workers.sys.holds;
+            let bit = crate::workers::holds::UNREAD_SWITCHES[0];
+            let old = *holds & bit != 0;
+            crate::workers::set_flag(holds, bit, on);
             Value::Int(i32::from(old))
         }),
     );
@@ -698,9 +699,10 @@ pub fn register(n: &mut Natives<FieldState>) {
         0x015E,
         Native::result(|g, c| {
             let on = c.stack.pop_int() != 0;
-            let m = &mut g.workers.sys.mode3;
-            let old = *m >> 6 & 1;
-            *m = *m & !0x40 | u8::from(on) << 6;
+            let holds = &mut g.workers.sys.holds;
+            let bit = crate::workers::holds::UNREAD_SWITCHES[1];
+            let old = *holds & bit != 0;
+            crate::workers::set_flag(holds, bit, on);
             Value::Int(i32::from(old))
         }),
     );

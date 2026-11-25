@@ -156,7 +156,7 @@ pub(super) fn place_worker(
             wk.set_pf(p::PREV + k * 4, pos[k as usize]);
         }
     }
-    g.workers.sys.flags2 |= 0x10;
+    g.workers.sys.scene |= crate::workers::scene::PLAYER_PLACED;
     g.player_placed = true;
     g.show_worker(w);
 }
