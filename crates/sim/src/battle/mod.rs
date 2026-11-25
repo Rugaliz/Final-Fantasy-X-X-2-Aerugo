@@ -22,6 +22,7 @@
 //! The records: [`records`].
 
 pub mod commands;
+pub mod damage;
 pub mod natives;
 pub mod records;
 pub mod scripts;

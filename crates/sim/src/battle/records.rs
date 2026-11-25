@@ -90,7 +90,7 @@ pub const WEAPON_CRITICAL: usize = 0x5c7;
 /// (+0x5c3).
 pub const KERNEL_SLOT: usize = 0x5c2;
 pub const COPY_NUMBER: usize = 0x5c3;
-/// HP and MP now (+0x5d0 / +0x5d4), and at the battle's start (+0x6e4 / +0x6e8).
+/// HP and MP now (+0x5d0 / +0x5d4), and when the last command was calculated (+0x6e4 / +0x6e8; set at the start).
 pub const HP: usize = 0x5d0;
 pub const MP: usize = 0x5d4;
 pub const START_HP: usize = 0x6e4;
@@ -241,6 +241,12 @@ pub const COUNTS: usize = 0xdd2;
 pub const APPEARING: usize = 0x433;
 pub const COMMAND_HELD: usize = 0x50e;
 pub const AUTO_COMMAND_DONE: usize = 0x716;
+/// The boosts the attack formulas add to strength / magic and take off the target's damage (+0x65e / +0x660,
+/// out of 15).
+pub const BOOST_PHYSICAL: usize = 0x65e;
+pub const BOOST_MAGIC: usize = 0x660;
+/// The CTB wait when the command was calculated (+0x6ec, with HP / MP at +0x6e4 / +0x6e8).
+pub const START_WAIT: usize = 0x6ec;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// The record's death state (+0xdcc: 2 fallen; MsCheckDeathMotion).
