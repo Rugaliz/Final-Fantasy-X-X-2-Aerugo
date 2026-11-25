@@ -87,13 +87,17 @@ pub fn start(
         records: Records::default(),
         front_line: [0xff; 7],
         reserve_order: [0; 20],
+        first_attack: 0,
     };
     log::error!(
         "GAP: battle set-up: the damage image (MsSetChrImageDamageAttack), the command lists (MsSetRamChrAbility) and the weapons are not ported"
     );
     set_records(&mut b, inputs.tables, save);
+    // Read step 10.
+    b.first_attack = first_attack(&b.records, save, random, FIRST_ATTACK_CHANCE);
+    count_battle(save);
     read_monsters(&mut b, inputs)?;
-    set_monster_records(&mut b, random);
+    set_monster_records(&mut b, inputs.tables, random);
     Ok(b)
 }
 
@@ -736,7 +740,7 @@ fn monster_file_read(b: &mut Battle, slot: usize, order: u8) {
 }
 
 /// MsSetRamMonData's record part: btl_chr_init for every formation monster, then the copy letters.
-fn set_monster_records(b: &mut Battle, random: &mut RngStreams) {
+fn set_monster_records(b: &mut Battle, tables: &BattleTables, random: &mut RngStreams) {
     let special = b.special();
     for i in 0..r::MONSTERS {
         let slot = r::FIRST_MONSTER + i;
@@ -745,6 +749,119 @@ fn set_monster_records(b: &mut Battle, random: &mut RngStreams) {
         }
     }
     copy_letters(&mut b.records, random);
+    first_turn_order(&mut b.records, tables, random, b.first_attack);
+    // 0079a0e0: HP and MP within the maximums.
+    for slot in 0..r::FULL_SLOTS {
+        let rec = b.records.get_mut(slot);
+        if rec.u8_at(r::IN_BATTLE) != 0 {
+            let hp = clamp(rec.i32_at(r::HP), 0, rec.i32_at(r::MAX_HP));
+            rec.set_i32(r::HP, hp);
+            let mp = clamp(rec.i32_at(r::MP), 0, rec.i32_at(r::MAX_MP));
+            rec.set_i32(r::MP, mp);
+        }
+    }
+}
+
+/// The chance MsGetFirstAttack is asked with (of 256) at read step 10.
+const FIRST_ATTACK_CHANCE: i32 = 0x20;
+
+/// The save's battle count (save +0x3d14), raised at read step 10 below 0xfffffff (DAT c9e5 = 2 keeps it; that
+/// mode is not set up yet).
+fn count_battle(save: &mut [u8]) {
+    const BATTLES: usize = 0x3d14;
+    let n = save.u32_at(BATTLES);
+    if (n as i32) < 0x0fff_ffff {
+        save.set_u32(BATTLES, n.wrapping_add(1));
+    }
+}
+
+/// MsGetFirstAttack: a roll on stream 1 (0–255): below `chance` the party strikes first (1), at 255 − chance or
+/// more the monsters do (2), else neither; a front-line character with the auto-ability flag at save record
+/// +0x4a bit 2 lowers the roll by chance + 1.
+fn first_attack(records: &Records, save: &[u8], random: &mut RngStreams, chance: i32) -> u8 {
+    let mut roll = (random.next(1) & 0xff) as i32;
+    let first_strike = (0..r::PARTY_SLOTS).any(|slot| {
+        records.get(slot).u8_at(r::ACTIVE) != 0
+            && save.u8_at(save::RECORDS + slot * save::RECORD_SIZE + 0x4a) & 4 != 0
+    });
+    if first_strike {
+        roll += -1 - chance;
+    }
+    if roll < 0xff - chance { u8::from(roll < chance) } else { 2 }
+}
+
+/// MsGetRomCTBcount and the ctb_base record (agility clamped to 1–255, record agility − 1).
+fn ctb_record(tables: &BattleTables, agility: u8) -> &[u8] {
+    let index = clamp(i32::from(agility), 1, 0xff) - 1;
+    kernel_record(&tables.ctb_base, index as u32).map_or(&[], |k| k.bytes)
+}
+
+/// MsGetRomCTBbase: a wait halved and doubled by the record's status counters, kept within 0–255.
+fn wait_of(rec: &[u8], wait: i32) -> u8 {
+    let mut wait = wait;
+    if rec.u8_at(r::HALVES_WAIT) != 0 {
+        wait /= 2;
+    }
+    if rec.u8_at(r::DOUBLES_WAIT) != 0 {
+        wait *= 2;
+    }
+    clamp(wait, 0, 0xff) as u8
+}
+
+/// MsSetFirstCTB: every record's turn length (ticks ×3), then the first waits: the party none when it strikes
+/// first, a full turn when the monsters do, else a turn less a random head start; the monsters a full turn
+/// when the party strikes first, none when they do, else a turn stretched by up to 10%. With ability word
+/// bit 1 (+0x6bc) the wait is 0. The shortest wait on the field then comes off every record on the field.
+fn first_turn_order(records: &mut Records, tables: &BattleTables, random: &mut RngStreams, first: u8) {
+    for slot in 0..r::FULL_SLOTS {
+        let agility = records.get(slot).u8_at(r::AGILITY);
+        let ticks = ctb_record(tables, agility).u8_at(0);
+        records.get_mut(slot).set_u8(r::CTB_TURN, ticks.wrapping_mul(3));
+    }
+    let mut shortest: i32 = -1;
+    let place = |records: &mut Records, slot: usize, wait: i32, shortest: &mut i32| {
+        let rec = records.get_mut(slot);
+        let wait = if rec.u8_at(r::ABILITY_WORDS) & 2 != 0 { 0 } else { wait };
+        let w = wait_of(rec, wait);
+        rec.set_u8(r::CTB, w);
+        if rec.u8_at(r::ACTIVE) != 0 && (*shortest < 0 || i32::from(w) < *shortest) {
+            *shortest = i32::from(w);
+        }
+    };
+    for slot in 0..r::PARTY_SLOTS {
+        let turn = i32::from(records.get(slot).u8_at(r::CTB_TURN));
+        let wait = match first {
+            1 => 0,
+            2 => turn,
+            _ => {
+                let range = i32::from(ctb_record(tables, records.get(slot).u8_at(r::AGILITY)).u8_at(1));
+                let roll = random.next(damage_stream(records, slot)) as i32;
+                turn - roll % (range + 1)
+            }
+        };
+        place(records, slot, wait, &mut shortest);
+    }
+    for i in 0..r::MONSTERS {
+        let slot = r::FIRST_MONSTER + i;
+        let turn = i64::from(records.get(slot).u8_at(r::CTB_TURN));
+        let wait = match first {
+            1 => turn as i32,
+            2 => 0,
+            _ => {
+                let roll = random.next(damage_stream(records, slot)) as i32;
+                let w = (turn * 100 / i64::from(100 - roll % 11)) as i32;
+                w.max(0)
+            }
+        };
+        place(records, slot, wait, &mut shortest);
+    }
+    for slot in 0..r::FULL_SLOTS {
+        let rec = records.get_mut(slot);
+        if rec.u8_at(r::ACTIVE) != 0 {
+            let v = rec.u8_at(r::CTB).wrapping_sub(shortest as u8);
+            rec.set_u8(r::CTB, v);
+        }
+    }
 }
 
 /// btl_chr_init for a monster: the parameter block from the monster file's stats.

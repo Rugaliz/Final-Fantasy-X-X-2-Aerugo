@@ -789,8 +789,11 @@ impl FieldView {
                     b.group,
                     b.formation
                 ));
-                for (slot, who, hp, max_hp, mp, max_mp) in &roster {
-                    ui.label(format!("{slot:#04x} {who}: HP {hp}/{max_hp} MP {mp}/{max_mp}"));
+                for c in &roster {
+                    ui.label(format!(
+                        "{:#04x} {}: HP {}/{} MP {}/{} wait {}",
+                        c.slot, c.name, c.hp, c.max_hp, c.mp, c.max_mp, c.wait
+                    ));
                 }
                 ui.label("The battle itself is not ported yet.");
                 won = ui.button("Win").clicked();

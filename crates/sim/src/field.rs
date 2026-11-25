@@ -3083,9 +3083,8 @@ impl Event {
         self.state.battle_state.as_deref()
     }
 
-    /// Who fights in the set-up battle: slot, name, HP, maximum HP, MP, maximum MP (the front line, then the
-    /// formation's monsters).
-    pub fn battle_roster(&self) -> Vec<(usize, String, i32, i32, i32, i32)> {
+    /// Who fights in the set-up battle (the front line, then the formation's monsters).
+    pub fn battle_roster(&self) -> Vec<crate::battle::Combatant> {
         use crate::battle::records::{self as r, Fields};
         let Some(b) = self.battle_state() else { return Vec::new() };
         let charset = self.state.items.as_ref().map(|t| &t.charset);
@@ -3098,15 +3097,15 @@ impl Event {
                 let rec = b.records.get(slot);
                 let raw = &rec[r::NAME..r::NAME + 0x28];
                 let raw = &raw[..raw.iter().position(|&c| c == 0).unwrap_or(raw.len())];
-                let name = charset.map_or_else(String::new, |c| aerugo_formats::text::decode_display(raw, c));
-                (
+                crate::battle::Combatant {
                     slot,
-                    name,
-                    rec.i32_at(r::HP),
-                    rec.i32_at(r::MAX_HP),
-                    rec.i32_at(r::MP),
-                    rec.i32_at(r::MAX_MP),
-                )
+                    name: charset.map_or_else(String::new, |c| aerugo_formats::text::decode_display(raw, c)),
+                    hp: rec.i32_at(r::HP),
+                    max_hp: rec.i32_at(r::MAX_HP),
+                    mp: rec.i32_at(r::MP),
+                    max_mp: rec.i32_at(r::MAX_MP),
+                    wait: rec.u8_at(r::CTB),
+                }
             })
             .collect()
     }

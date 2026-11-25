@@ -126,6 +126,15 @@ pub const ABILITY_WORDS: usize = 0x6bc;
 /// The first commands (+0x6c6, +0x6c8).
 pub const FIRST_COMMAND: usize = 0x6c6;
 pub const SECOND_COMMAND: usize = 0x6c8;
+/// The turn order: the ticks left before the record's turn (+0x65c) and the ticks of a turn ×3 (+0x65d, from
+/// ctb_base by agility).
+pub const CTB: usize = 0x65c;
+pub const CTB_TURN: usize = 0x65d;
+/// Status counters that halve (+0x613) or double (+0x614) the first wait.
+pub const HALVES_WAIT: usize = 0x613;
+pub const DOUBLES_WAIT: usize = 0x614;
+/// Agility, one of [`STATS`].
+pub const AGILITY: usize = STATS + 4;
 /// On the battlefield (+0xdc8).
 pub const ACTIVE: usize = 0xdc8;
 /// +0xdcc 2 when the record starts knocked out.

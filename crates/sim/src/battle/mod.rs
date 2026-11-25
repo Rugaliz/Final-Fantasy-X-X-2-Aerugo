@@ -118,6 +118,9 @@ pub struct BattleTables {
     pub monster_magic2: KernelTable,
     /// monster1–3.
     pub monsters: [KernelTable; 3],
+    /// ctb_base (kernel file 0xb, not localized): by agility − 1, +0 the ticks of a turn, +1 the range of the
+    /// first turn's random head start.
+    pub ctb_base: KernelTable,
 }
 
 impl BattleTables {
@@ -134,6 +137,10 @@ impl BattleTables {
             monster_magic1: table("monmagic1")?,
             monster_magic2: table("monmagic2")?,
             monsters: [table("monster1")?, table("monster2")?, table("monster3")?],
+            ctb_base: KernelTable::parse(
+                vfs.read("ffx_ps2/ffx/master/jppc/battle/kernel/ctb_base.bin").ok()?,
+            )
+            .ok()?,
         }))
     }
 }
@@ -167,6 +174,19 @@ impl Encounter {
     }
 }
 
+/// One combatant as the host shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Combatant {
+    pub slot: usize,
+    pub name: String,
+    pub hp: i32,
+    pub max_hp: i32,
+    pub mp: i32,
+    pub max_mp: i32,
+    /// Ticks before its turn.
+    pub wait: u8,
+}
+
 /// A battle.
 #[derive(Debug, Clone)]
 pub struct Battle {
@@ -179,6 +199,8 @@ pub struct Battle {
     pub front_line: [u8; 7],
     /// The save's reserve order as the battle copied it (save +0x3d5b, 20 bytes).
     pub reserve_order: [u8; 20],
+    /// Who strikes first (MsGetFirstAttack): 0 neither, 1 the party, 2 the monsters.
+    pub first_attack: u8,
 }
 
 impl Battle {
